@@ -10,13 +10,10 @@ import app.cash.sqldelight.driver.android.AndroidSqliteDriver
  * `CorePlatformFreeCheckTask`). The rule that protects the iPad path is the
  * `iosSimulatorArm64` link, and this file has no effect on it.
  */
-public class AndroidDatabaseDriverFactory(
-    private val context: Context,
-) : DatabaseDriverFactory {
-    override fun create(): SqlDriver =
-        AndroidSqliteDriver(
-            schema = InkstoneDatabase.Schema,
-            context = context,
-            name = DATABASE_FILE_NAME,
-        )
+public class AndroidDatabaseDriverFactory(private val context: Context) : DatabaseDriverFactory {
+    override fun create(): SqlDriver = AndroidSqliteDriver(
+        schema = InkstoneDatabase.Schema,
+        context = context,
+        name = DATABASE_FILE_NAME,
+    )
 }

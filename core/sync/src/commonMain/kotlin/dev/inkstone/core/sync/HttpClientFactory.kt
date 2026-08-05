@@ -19,9 +19,7 @@ public const val INKSTONE_USER_AGENT: String = "Inkstone/1.0 (Android)"
  * The engine is the only platform-specific part of the HTTP stack: OkHttp on
  * Android, Darwin on iOS. Everything above it is shared.
  */
-internal expect fun platformHttpClient(
-    configure: HttpClientConfig<*>.() -> Unit = {},
-): HttpClient
+internal expect fun platformHttpClient(configure: HttpClientConfig<*>.() -> Unit = {}): HttpClient
 
 /**
  * M0 wires the client so that Guardrail 2 has something real to link. The

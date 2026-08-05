@@ -1,13 +1,16 @@
 package dev.inkstone.core.model
 
-/**
- * SPEC §2.2 — the capabilities `:core:*` cannot implement itself.
+/*
+ * SPEC §2.2 — the capabilities :core:* cannot implement itself.
  *
- * Declared here, implemented in `:app`. This is the escape hatch that lets core
+ * Declared here, implemented in :app. This is the escape hatch that lets core
  * stay platform-free without becoming useless: when core needs something only
- * the platform can do, it gets an interface, not an `androidx` import.
+ * the platform can do, it gets an interface, not an androidx import.
  *
  * Every member below is a stub in M0. The owning milestone is named on each.
+ *
+ * Block comment, not KDoc — a file-level KDoc attached to no declaration is a
+ * "dangling toplevel KDoc" and ktlint cannot auto-correct it.
  */
 
 /**
@@ -24,12 +27,7 @@ public fun interface DocumentMaterializer {
  *   matches afterwards — otherwise the note changed mid-flight and that work
  *   becomes invisible to sync forever.
  */
-public data class MaterializedFile(
-    val path: String,
-    val sizeBytes: Long,
-    val sha256: String,
-    val localRev: Long,
-)
+public data class MaterializedFile(val path: String, val sizeBytes: Long, val sha256: String, val localRev: Long)
 
 /**
  * SPEC §7.1 — [loginName] and [uid] are not interchangeable.

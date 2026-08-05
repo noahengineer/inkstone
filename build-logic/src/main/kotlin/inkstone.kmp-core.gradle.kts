@@ -2,14 +2,14 @@ import dev.inkstone.gradle.CorePlatformFreeCheckTask
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.dsl.KotlinMultiplatformExtension
 
-/**
- * Convention for every `:core:*` module (SPEC §2.1).
+/*
+ * Convention for every :core:* module (SPEC §2.1).
  *
  * Two guardrails, applied here rather than per-module so they cannot be
  * forgotten:
  *
- *  1. [CorePlatformFreeCheckTask] — no `android.*` / `androidx.*` in shared code.
- *  2. Real `iosArm64` + `iosSimulatorArm64` targets, each producing a framework
+ *  1. CorePlatformFreeCheckTask — no android.* / androidx.* in shared code.
+ *  2. Real iosArm64 + iosSimulatorArm64 targets, each producing a framework
  *     binary. This is the one that matters (SPEC §2.3): OkHttp and dav4jvm are
  *     JVM-only and would sail past the import check while silently killing the
  *     iPad path.

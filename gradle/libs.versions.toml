@@ -35,10 +35,25 @@ graphicsCore = "1.0.4"
 inputMotionPrediction = "1.0.0"
 
 # ---- Platform --------------------------------------------------------------
+# ⚠️ "Latest stable" here means "latest stable that works with AGP 8.13.0 and
+# compileSdk 36" (SPEC §0.2 pins both). The androidx ecosystem has moved on to
+# AGP 9.1.0 / compileSdk 37, so several artifacts' newest releases are NOT
+# usable. Read from each AAR's own aar-metadata.properties:
+#
+#   core-ktx                 1.18.0 -> minCompileSdk 36, minAGP 8.9.1   OK
+#                            1.19.0 -> minCompileSdk 37, minAGP 9.1.0   NO
+#   lifecycle                2.10.0 -> minCompileSdk 35, minAGP 8.6.0   OK
+#                            2.11.0 -> minCompileSdk 37, minAGP 9.1.0   NO
+#   hilt-navigation-compose  1.3.0  -> minCompileSdk 35, minAGP 8.6.0   OK
+#                            1.4.0  -> minCompileSdk 37, minAGP 9.1.0   NO
+#   activity-compose         1.13.0 -> minCompileSdk 36, minAGP 8.9.1   OK (latest)
+#
+# Before bumping any of these, check aar-metadata.properties. A version that
+# resolves is not the same as a version that builds.
 composeBom = "2026.06.01"
 activityCompose = "1.13.0"
-coreKtx = "1.19.0"
-lifecycle = "2.11.0"
+coreKtx = "1.18.0"
+lifecycle = "2.10.0"
 work = "2.11.2"
 # NOT the latest (2.60.1). Measured against AGP 8.13.0, which SPEC §0.2 pins:
 #   2.59.1 .. 2.60.1  hard-fail at apply time: "only compatible with AGP 9.0.0+"
@@ -50,7 +65,7 @@ work = "2.11.2"
 # Do not "fix" a Hilt upgrade by bumping AGP. That is a spec change, not a
 # version bump — and AGP is what the whole toolchain is pinned around.
 hilt = "2.58"
-hiltNavigationCompose = "1.4.0"
+hiltNavigationCompose = "1.3.0"
 annotation = "1.10.0"
 
 # ---- Data ------------------------------------------------------------------

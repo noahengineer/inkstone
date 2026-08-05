@@ -80,24 +80,33 @@ JDK 21 was installed after the first pass, so Gradle now runs. Everything below 
 
 | Check | Result |
 |---|---|
-| Whole-build **configuration** | ✅ all 9 modules, both convention plugins, `build-logic` compiles |
-| `gradle wrapper` | ✅ `gradlew`, `gradlew.bat`, `gradle-wrapper.jar` generated and committed |
+| **`./gradlew build`** | ✅ **BUILD SUCCESSFUL**, 964 tasks. Debug and release APKs produced. |
 | `verifyCatalogCoordinates` | ✅ **all 58 pinned coordinates resolved** |
 | `checkCoreIsPlatformFree` | ✅ green, and demonstrably scanning: 3 files in `:core:model`, 2 in `:core:database`, 2 in `:core:sync`, 1 each in `:core:storage` / `:core:search` — `androidMain` correctly excluded |
-| `verify-guardrails.sh imports` | ✅ **PASS** — plants `import android.content.Context` in `:core:model`, Guardrail 1 fails with its own message, green again after revert |
+| `spotlessCheck` + `detekt` | ✅ green on all 9 modules |
+| `verify-guardrails.sh imports` | ✅ **PASS** |
+| `verify-guardrails.sh ios` | ✅ **PASS** |
 
-That last row is ROADMAP M0 acceptance box 3, genuinely ticked.
+ROADMAP M0 acceptance boxes 1, 3, 4 and 5 are ticked by the above.
 
-### Still blocked
+### Guardrail 2 turned out to be testable on Windows after all
 
-| Blocker | Detail | Fix |
-|---|---|---|
-| **No Android SDK** | No Android Studio, no `%LOCALAPPDATA%\Android\Sdk`. Configuration succeeds without it, but `./gradlew build` cannot compile or link resources. | Android Studio, or `cmdline-tools` + `sdkmanager "platforms;android-36" "build-tools;36.0.0"` (requires accepting Google's SDK licences) |
-| **Windows host** | Kotlin/Native cannot compile Apple targets off macOS. `linkDebugFrameworkIosSimulatorArm64` cannot run here **at all** — a hard platform limit, not a configuration gap. | CI runs it on `macos-latest`. `kotlin.native.ignoreDisabledTargets=true` makes the local build skip those tasks instead of failing configuration. |
+I previously recorded that `linkDebugFrameworkIosSimulatorArm64` "cannot run here at all". That is true of *linking* and false of the thing the guardrail is actually for.
 
-So of ROADMAP M0's six acceptance boxes: the coordinate box and the Guardrail 1 negative test are **done**; `./gradlew build` needs the SDK; the iOS link and its negative test need macOS (both are CI jobs); CI-green needs a push.
+The build log shows all 10 `compileKotlinIosArm64` / `compileKotlinIosSimulatorArm64` tasks **executing** on this Windows host — zero skipped — while only the five `link*` tasks skip. Kotlin/Native cross-compiles klibs for Apple targets off macOS; only producing a framework binary needs the real toolchain.
 
-Note the JDK trap for anyone repeating this: **installing JDK 21 does not make it the default.** Oracle's `javapath` shim stays ahead of it on `PATH`, so `java -version` still reports 26 and Gradle refuses to start. Set `JAVA_HOME` explicitly.
+So the guardrail's actual question — *does a JVM-only dependency break the iOS build?* — is answerable everywhere. `tools/verify-guardrails.sh ios` now picks its task by host (`compileKotlinIosSimulatorArm64` off macOS, the full link on it) and **passes on Windows**: planting OkHttp in `:core:sync` **commonMain** breaks the iOS compile while `checkCoreIsPlatformFree` stays green throughout — which is the entire point of having two guardrails.
+
+The macOS CI job still runs the real link, because a klib compiling is not proof that a framework links.
+
+### Still outstanding
+
+| Box | Needs |
+|---|---|
+| `linkDebugFrameworkIosSimulatorArm64` succeeds | a macOS runner — the CI job exists, nothing has run it |
+| CI green on a pushed branch | a GitHub remote; there is none yet |
+
+Note the JDK trap for anyone repeating this: **installing JDK 21 does not make it the default.** Oracle's `javapath` shim stays ahead of it on `PATH`, so `java -version` still reports 26 and Gradle refuses to start. Set `JAVA_HOME` explicitly, or build from Android Studio, which uses its own bundled JBR 21.
 
 ---
 
@@ -160,14 +169,43 @@ The first implementation used a resolvable `Configuration` with `@pom` artifact-
 
 Rewritten to use `createArtifactResolutionQuery().withArtifacts(MavenModule, MavenPomArtifact)`, which asks for the POM directly and sidesteps variant selection. That is exactly the question being asked: does this coordinate exist?
 
+### 5.7 The androidx ecosystem has moved past AGP 8.13 — five more downgrades
+
+Same failure class as Hilt (§5.5), found the same way: by running the build. `:app` and all three `:android:*` modules failed `checkDebugAarMetadata`. Every AAR declares its own floor in `META-INF/.../aar-metadata.properties`, and the newest releases have moved to AGP 9.1.0 / compileSdk 37:
+
+| Library | I had picked | Ceiling for AGP 8.13.0 + compileSdk 36 | What the newest release demands |
+|---|---|---|---|
+| `androidx.core:core-ktx` | 1.19.0 | **1.18.0** | compileSdk 37, AGP 9.1.0 |
+| `androidx.lifecycle:*` | 2.11.0 | **2.10.0** | compileSdk 37, AGP 9.1.0 |
+| `androidx.hilt:hilt-navigation-compose` | 1.4.0 | **1.3.0** | compileSdk 37, AGP 9.1.0 |
+| `androidx.activity:activity-compose` | 1.13.0 | **1.13.0** — already fine | (min 36 / AGP 8.9.1) |
+| Compose BOM `2026.06.01` | — | fine (`ui-android` 1.11.x needs only 35) | — |
+
+**No SPEC-pinned version changed.** Every one of these was a "latest stable at M0" slot, and SPEC §0.2 delegates that choice — which can only mean *latest stable that works with the pinned AGP*. AGP stays at 8.13.0.
+
+The check worth internalising for M1+: **read `aar-metadata.properties` before bumping an androidx version.** A coordinate that resolves is not a coordinate that builds, and the failure surfaces late, at `checkDebugAarMetadata`, long after dependency resolution has happily succeeded.
+
+### 5.8 SPEC §0.2's `androidx.pdf` pin needs an SDK extension level it doesn't mention
+
+Every `androidx.pdf:1.0.0-alpha19` artifact requires a compile SDK with **extension level ≥ 19**. The installed API 36 platform ships extension level **17** (API 37 ships 22). So `compileSdk = 36` alone cannot consume the pin SPEC §0.2 names.
+
+This is a real gap in SPEC §0.2, not a version-picking mistake — and it bites at **M4**, not M0. `:android:pdf` has no code until then, so M0 leaves the dependency undeclared with the constraint recorded in the build file; `verifyCatalogCoordinates` still proves the coordinate resolves. M4 will have to choose between an ext-19 platform package and compileSdk 37, and that is a decision to take deliberately rather than discover.
+
+### 5.9 ktlint rejects KDoc in `.gradle.kts` and dangling file-level KDoc
+
+Five files used `/** … */` where no declaration follows — the four convention plugins and `Platform.kt`. `standard:kdoc` rejects both "KDoc not allowed inside 'block'" and "dangling toplevel KDoc", and the second is **not auto-correctable**, so `spotlessApply` could not fix it. Converted to plain block comments.
+
 ### Findings that did not survive
 
 Three claims were refuted on inspection and correctly *not* acted on: that the root `clean` task collided with Spotless's `base` plugin (the task had already been removed for that exact reason); that `verifyCatalogCoordinates` could not resolve Spotless's portal-only plugin marker (already fixed with a content-filtered `gradlePluginPortal()`); and that `:app` could not see the generated `InkstoneDatabase` type (the SQLDelight plugin adds its runtime as an `api` dependency, so it is visible).
 
 ---
 
-## 6. Known risk carried into M1
+## 6. Risks carried into M1
 
-**detekt 1.23.8 against Kotlin 2.3.20 is unverified here.** detekt 1.23.x embeds a Kotlin 1.9-era compiler frontend. It is normally fine alongside a newer Kotlin because it analyses with its own embedded compiler, but that combination has not been executed on this machine and 1.23.8 is the newest release available.
+**detekt 1.23.8 against Kotlin 2.3.20 — retired.** This was flagged as unverified. It has now run green on all nine modules as part of `./gradlew build`. No action needed.
 
-If `./gradlew detekt` fails at configuration or analysis time, that is the cause. It is isolated to `build-logic/src/main/kotlin/inkstone.quality.gradle.kts` and removing the `id("io.gitlab.arturbosch.detekt")` line there degrades cleanly to Spotless + ktlint only. Do not "fix" it by changing the Kotlin version.
+**The AGP 8.13 ceiling is a standing tax.** Three separate libraries (Hilt, five androidx artifacts, and `androidx.pdf`'s extension level) collided with the pinned AGP inside a single milestone. The ecosystem has moved to AGP 9.1 / compileSdk 37 and will keep moving, so this recurs on every dependency bump for the rest of the project. Two consequences worth holding:
+
+- Before bumping any Android library, read its `aar-metadata.properties` (`minCompileSdk`, `minCompileSdkExtension`, `minAndroidGradlePluginVersion`). Resolution success proves nothing.
+- At some point the honest move is to reconsider the AGP 8.13.0 / compileSdk 36 pin itself. That is a SPEC decision, not a maintenance one, and M4 will force the question anyway via `androidx.pdf` (§5.8). Worth deciding then rather than drifting into it.

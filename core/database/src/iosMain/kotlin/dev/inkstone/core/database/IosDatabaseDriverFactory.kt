@@ -8,9 +8,8 @@ import app.cash.sqldelight.driver.native.NativeSqliteDriver
  * this module's `commonMain`, this is the file that stops compiling.
  */
 public class IosDatabaseDriverFactory : DatabaseDriverFactory {
-    override fun create(): SqlDriver =
-        NativeSqliteDriver(
-            schema = InkstoneDatabase.Schema,
-            name = DATABASE_FILE_NAME,
-        )
+    override fun create(): SqlDriver = NativeSqliteDriver(
+        schema = InkstoneDatabase.Schema,
+        name = DATABASE_FILE_NAME,
+    )
 }

@@ -6,7 +6,7 @@ A handwriting-first note-taking app for Android tablets, storing notes as ordina
 
 **Current state: M0 — skeleton and guardrails.** One empty Compose screen. That is the whole intended functionality of this milestone.
 
-Verified green: whole-build configuration, all 58 pinned coordinates resolving, Guardrail 1 (including its planted-violation test). Pending an Android SDK: `./gradlew build`. Pending macOS/CI: Guardrail 2. See [docs/M0-VERIFICATION.md](docs/M0-VERIFICATION.md).
+**Verified green locally:** `./gradlew build` (964 tasks, both APKs), all 58 pinned coordinates resolving, `spotlessCheck` + `detekt` on all 9 modules, and **both guardrails including their planted-violation tests**. Outstanding: the real iOS *framework link* (needs macOS) and CI-green-on-a-branch (needs a remote). See [docs/M0-VERIFICATION.md](docs/M0-VERIFICATION.md).
 
 ---
 
@@ -60,19 +60,21 @@ The wrapper is committed, so there is nothing to bootstrap:
 ./gradlew checkCoreIsPlatformFree
 ```
 
-**Guardrail 2 — every `:core:*` module still links for iOS.** macOS only:
+**Guardrail 2 — every `:core:*` module still builds for iOS.** The full framework link is macOS-only:
 
 ```bash
 ./gradlew linkIosCore
 ```
 
-Guardrail 2 is the one that matters. OkHttp and dav4jvm contain no `android.*` import at all, so they sail past Guardrail 1 while killing the iPad path silently. Both run in CI, the second on a macOS runner.
+Guardrail 2 is the one that matters. OkHttp and dav4jvm contain no `android.*` import at all, so they sail past Guardrail 1 while killing the iPad path silently.
 
-Prove they still work by planting a violation (macOS for the `ios` case):
+Kotlin/Native *cross-compiles* Apple klibs on Windows and Linux — only linking a framework needs macOS. So the guardrail's substance is testable anywhere. Prove both, on any OS:
 
 ```bash
 bash tools/verify-guardrails.sh all
 ```
+
+It plants a real violation for each (an `android.content.Context` import in `:core:model`, an OkHttp dependency in `:core:sync` **commonMain**), asserts the right one fails, and reverts. Off macOS the iOS half uses `compileKotlinIosSimulatorArm64`; the macOS CI job runs the real link.
 
 ---
 

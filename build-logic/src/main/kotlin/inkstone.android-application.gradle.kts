@@ -1,8 +1,11 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
-/**
- * Convention for `:app` — Compose UI, DI, WorkManager, and the platform
- * implementations of the interfaces `:core:model` declares (SPEC §2.2).
+/*
+ * Convention for :app — Compose UI, DI, WorkManager, and the platform
+ * implementations of the interfaces :core:model declares (SPEC §2.2).
+ *
+ * Block comment, not KDoc: a .gradle.kts script has no declaration for KDoc to
+ * attach to, and ktlint's standard:kdoc rule rejects it.
  */
 plugins {
     id("com.android.application")

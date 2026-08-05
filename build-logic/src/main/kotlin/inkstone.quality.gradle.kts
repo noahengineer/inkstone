@@ -2,7 +2,7 @@ import io.gitlab.arturbosch.detekt.Detekt
 import io.gitlab.arturbosch.detekt.DetektCreateBaselineTask
 import org.gradle.api.artifacts.VersionCatalogsExtension
 
-/**
+/*
  * Formatting (Spotless + ktlint) and static analysis (detekt), applied to every
  * module so the rules are uniform.
  */

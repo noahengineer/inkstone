@@ -59,8 +59,7 @@ object PlatformProvidersModule {
 
     @Provides
     @Singleton
-    fun provideWorkManager(@ApplicationContext context: Context): WorkManager =
-        WorkManager.getInstance(context)
+    fun provideWorkManager(@ApplicationContext context: Context): WorkManager = WorkManager.getInstance(context)
 
     @Provides
     @Singleton
@@ -69,6 +68,5 @@ object PlatformProvidersModule {
 
     @Provides
     @Singleton
-    fun provideDatabase(driverFactory: DatabaseDriverFactory): InkstoneDatabase =
-        createDatabase(driverFactory)
+    fun provideDatabase(driverFactory: DatabaseDriverFactory): InkstoneDatabase = createDatabase(driverFactory)
 }

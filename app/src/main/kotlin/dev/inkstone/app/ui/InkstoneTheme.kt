@@ -11,10 +11,7 @@ import androidx.compose.runtime.Composable
  * paper colour are ROADMAP M10.
  */
 @Composable
-fun InkstoneTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    content: @Composable () -> Unit,
-) {
+fun InkstoneTheme(darkTheme: Boolean = isSystemInDarkTheme(), content: @Composable () -> Unit) {
     MaterialTheme(
         colorScheme = if (darkTheme) darkColorScheme() else lightColorScheme(),
         content = content,

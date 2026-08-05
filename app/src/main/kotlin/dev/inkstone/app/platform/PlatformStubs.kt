@@ -40,9 +40,8 @@ class SystemClock @Inject constructor() : Clock {
  * goes in the destination's own directory — not in a cache dir.
  */
 @Singleton
-class AndroidFileSystem @Inject constructor(
-    @ApplicationContext @Suppress("unused") private val context: Context,
-) : FileSystem {
+class AndroidFileSystem @Inject constructor(@ApplicationContext @Suppress("unused") private val context: Context) :
+    FileSystem {
     override suspend fun exists(path: String): Boolean = TODO("M2 — storage")
 
     override suspend fun readBytes(path: String): ByteArray = TODO("M2 — storage")
@@ -73,8 +72,7 @@ class KeystoreCredentialStore @Inject constructor(
     override suspend fun get(accountId: String): NextcloudCredential? =
         TODO("M5 — Keystore AES-GCM, not EncryptedSharedPreferences")
 
-    override suspend fun remove(accountId: String): Unit =
-        TODO("M5 — Keystore AES-GCM, not EncryptedSharedPreferences")
+    override suspend fun remove(accountId: String): Unit = TODO("M5 — Keystore AES-GCM, not EncryptedSharedPreferences")
 }
 
 /**
@@ -83,9 +81,8 @@ class KeystoreCredentialStore @Inject constructor(
  * (CLAUDE.md rule 4).
  */
 @Singleton
-class WorkManagerScheduler @Inject constructor(
-    @Suppress("unused") private val workManager: WorkManager,
-) : WorkScheduler {
+class WorkManagerScheduler @Inject constructor(@Suppress("unused") private val workManager: WorkManager) :
+    WorkScheduler {
     override fun enqueueOutboxDrain(): Unit = TODO("M5 — outbox drainer")
 
     override fun enqueueMaterialization(noteId: DocumentId): Unit = TODO("M4 — PDF materialization")
@@ -97,6 +94,5 @@ class WorkManagerScheduler @Inject constructor(
  */
 @Singleton
 class PdfDocumentMaterializer @Inject constructor() : DocumentMaterializer {
-    override suspend fun materialize(noteId: DocumentId): MaterializedFile =
-        TODO("M4 — PDF incremental update")
+    override suspend fun materialize(noteId: DocumentId): MaterializedFile = TODO("M4 — PDF incremental update")
 }

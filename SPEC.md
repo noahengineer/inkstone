@@ -54,7 +54,7 @@ Pin these. Verified 5 Aug 2026.
 | Serialization | `org.jetbrains.kotlinx:kotlinx-serialization-json` | **1.11.0** — resolved at M0 |
 | **Features** | | |
 | Handwriting recognition | `com.google.mlkit:digital-ink-recognition` | **19.0.0** |
-| PDF viewer | `androidx.pdf:pdf-viewer-fragment` | **1.0.0-alpha19** |
+| PDF viewer | `androidx.pdf:pdf-viewer-fragment` | **1.0.0-alpha19** ⚠️ needs **compile SDK extension level ≥ 19** — see below |
 | PDF writing (fallback) | `com.tom-roush:pdfbox-android` | **2.0.27.0** ⚠️ dormant since Jan 2023 — §6.3 |
 
 **Explicitly not used:**
@@ -64,6 +64,14 @@ Pin these. Verified 5 Aug 2026.
 - ⚠️ **`EncryptedSharedPreferences`** was deprecated by Google in 2025. **Do not use it.** Store credentials as an AES-GCM-encrypted blob with the key in the Android Keystore (`KeyGenParameterSpec`, `setUserAuthenticationRequired(false)`), written to a private file. ~60 lines, no deprecated dependency. See §14.
 
 **If a coordinate doesn't resolve from a clean Gradle cache:** report the actual available version with a link to the release page, and stop. Do not silently substitute. Do not invent.
+
+⚠️ **Resolving is not the same as building — added in M0.** Every Android library declares its own floor in `META-INF/com/android/build/gradle/aar-metadata.properties` (`minCompileSdk`, `minCompileSdkExtension`, `minAndroidGradlePluginVersion`). A too-new version resolves perfectly and then fails at `checkDebugAarMetadata`. Three collisions with the AGP 8.13.0 pin turned up in M0 alone:
+
+- **Hilt**: 2.59+ needs AGP 9.x. Pinned **2.58**, the last AGP-8 release.
+- **androidx** "latest stable": `core-ktx` 1.19.0, `lifecycle` 2.11.0 and `hilt-navigation-compose` 1.4.0 all require compileSdk 37 + AGP 9.1.0. Pinned **1.18.0 / 2.10.0 / 1.3.0**. Wherever this table says "latest stable at M0", read it as **latest stable that works with the pinned AGP**.
+- **`androidx.pdf` 1.0.0-alpha19** requires compile SDK **extension level ≥ 19**. The API 36 platform ships extension level 17; API 37 ships 22. **`compileSdk = 36` alone cannot consume this pin.** M4 must choose between an ext-19 platform package and moving to compileSdk 37 — decide it deliberately. Until then `:android:pdf` leaves the dependency undeclared and `verifyCatalogCoordinates` proves the coordinate resolves.
+
+Before bumping any Android library, read its `aar-metadata.properties`.
 
 ### 0.3 What this actually costs
 
