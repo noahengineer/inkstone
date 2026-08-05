@@ -86,8 +86,15 @@ JDK 21 was installed after the first pass, so Gradle now runs. Everything below 
 | `spotlessCheck` + `detekt` | ✅ green on all 9 modules |
 | `verify-guardrails.sh imports` | ✅ **PASS** |
 | `verify-guardrails.sh ios` | ✅ **PASS** |
+| **Runs on the target device** | ✅ installed and launched on a **Galaxy Tab S9 FE+**, correct screen, no crash |
 
-ROADMAP M0 acceptance boxes 1, 3, 4 and 5 are ticked by the above.
+ROADMAP M0 acceptance boxes 1, 3, 4 and 5 are ticked by the above, as is CLAUDE.md's definition-of-done item 4 ("used on the actual Galaxy Tab, not just an emulator").
+
+### Device notes for M1
+
+The target device is a **Galaxy Tab S9 FE+**, which ships with a passive S Pen. Nothing in SPEC §0.1 #2 changes for it — the dead Samsung SDK and the S Pen Bluetooth removal are both irrelevant to a passive pen. Pressure, tilt, orientation, the eraser tip and the barrel button all arrive as plain `MotionEvent` axes, which is exactly what SPEC §3.3 is built on.
+
+⚠️ **`adb` is not yet working on this device** — USB debugging is not enabled, so M0 was installed by copying the APK over MTP. That is fine for "does it launch" and **not** fine from M1 onward: `dumpsys gfxinfo` (M1's sustained-framerate criterion), `adb logcat`, `./gradlew installDebug`, `adb shell am force-stop` mid-stroke (M2's crash-safety criterion) and all instrumented tests need it. Resolve before starting M1.
 
 ### Guardrail 2 turned out to be testable on Windows after all
 
