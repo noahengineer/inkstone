@@ -4,7 +4,9 @@ A handwriting-first note-taking app for Android tablets, storing notes as ordina
 
 `SPEC.md` is the technical specification. `ROADMAP.md` is the build order. `CLAUDE.md` is the repo rules. `START-HERE.md` explains how the three fit together.
 
-**Current state: M0 — skeleton and guardrails.** The app builds and shows one empty Compose screen. That is the whole intended functionality of this milestone.
+**Current state: M0 — skeleton and guardrails.** One empty Compose screen. That is the whole intended functionality of this milestone.
+
+Verified green: whole-build configuration, all 58 pinned coordinates resolving, Guardrail 1 (including its planted-violation test). Pending an Android SDK: `./gradlew build`. Pending macOS/CI: Guardrail 2. See [docs/M0-VERIFICATION.md](docs/M0-VERIFICATION.md).
 
 ---
 
@@ -12,29 +14,29 @@ A handwriting-first note-taking app for Android tablets, storing notes as ordina
 
 | | Version | Notes |
 |---|---|---|
-| JDK | **21 (LTS)** | Gradle 8.14 supports Java 17–24. **JDK 25/26 will not work** — the daemon refuses to start. |
-| Android SDK | API 36 | Android Studio, or `cmdline-tools` + `sdkmanager "platforms;android-36" "build-tools;36.0.0"` |
+| JDK | **21 (LTS)** | Gradle 8.14 supports Java 17–24. **JDK 25/26 will not work** — the daemon refuses to start, and the error doesn't say why. |
+| Android SDK | API 36 | Easiest via Android Studio. |
 | macOS | only for the iOS guardrail | Kotlin/Native cannot build Apple targets on Windows or Linux. CI covers it. |
 
 ```bash
-winget install EclipseAdoptium.Temurin.21.JDK
+winget install Google.AndroidStudio
 ```
 
-Point `local.properties` at your SDK (Android Studio writes this for you):
+Open this folder in Android Studio once. It installs the SDK, writes `local.properties` (gitignored), and runs Gradle on its own bundled JBR 21 — so builds from inside the IDE work regardless of what's on your `PATH`.
 
+### ⚠️ For command-line builds, set `JAVA_HOME`
+
+Installing JDK 21 does **not** make it the default. Oracle's `javapath` shim stays ahead of it on `PATH`, so `java -version` keeps reporting 26 and Gradle refuses to start:
+
+```powershell
+$env:JAVA_HOME = 'C:\Program Files\Eclipse Adoptium\jdk-21.0.12.8-hotspot'
 ```
-sdk.dir=C\:\\Users\\<you>\\AppData\\Local\\Android\\Sdk
-```
+
+To make it permanent, set `JAVA_HOME` in System Properties → Environment Variables, and move the JDK 21 `\bin` above `C:\Program Files\Common Files\Oracle\Java\javapath` in `PATH`.
 
 ## First run
 
-The Gradle wrapper JAR is not checked in. Generate it once — or just open the project in Android Studio, which does the same thing:
-
-```bash
-powershell -ExecutionPolicy Bypass -File tools\bootstrap-wrapper.ps1
-```
-
-Then:
+The wrapper is committed, so there is nothing to bootstrap:
 
 ```bash
 ./gradlew verifyCatalogCoordinates
@@ -43,6 +45,8 @@ Then:
 ```bash
 ./gradlew build
 ```
+
+(`tools/bootstrap-wrapper.ps1` regenerates the wrapper if it is ever lost, and checks your JDK first.)
 
 ---
 
