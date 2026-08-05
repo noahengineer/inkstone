@@ -1,4 +1,7 @@
 import org.gradle.api.artifacts.VersionCatalogsExtension
+import org.gradle.api.artifacts.result.ResolvedArtifactResult
+import org.gradle.maven.MavenModule
+import org.gradle.maven.MavenPomArtifact
 
 plugins {
     alias(libs.plugins.android.application) apply false
@@ -60,16 +63,15 @@ tasks.register("linkIosCore") {
 // modules happen to use would leave the not-yet-wired pins (PdfBox, ktor-mock,
 // the ink artifacts M1 needs) unverified until the milestone that needs them.
 //
-// Metadata-only (`@pom`, non-transitive) so this works from the root project,
-// which has no Android or Kotlin plugin and therefore cannot match AAR variants.
+// Implemented with an artifact-resolution query rather than a resolvable
+// configuration. A configuration cannot do this job: `@pom` notation does not
+// bypass variant-aware resolution, and the catalog spans modules with no common
+// variant — `ktor-client-darwin` and `sqldelight-native-driver` publish Apple
+// targets only, while `junit` and the plugin markers are plain JVM. Any single
+// set of consumer attributes fails on one group or the other. Asking for the
+// POM directly sidesteps variant selection entirely, which is exactly the
+// question being asked: does this coordinate exist?
 // ---------------------------------------------------------------------------
-val catalogProbe: Configuration by configurations.creating {
-    isCanBeConsumed = false
-    isCanBeResolved = true
-    isTransitive = false
-    description = "Metadata-only probe proving every version-catalog coordinate resolves."
-}
-
 val catalogCoordinates: List<String> = run {
     val catalog = extensions.getByType<VersionCatalogsExtension>().named("libs")
     val libraries = catalog.libraryAliases.mapNotNull { alias ->
@@ -87,20 +89,41 @@ val catalogCoordinates: List<String> = run {
     (libraries + pluginMarkers).distinct().sorted()
 }
 
-dependencies {
-    catalogCoordinates.forEach { coordinate ->
-        catalogProbe("$coordinate@pom")
-    }
-}
-
 tasks.register("verifyCatalogCoordinates") {
     group = "verification"
-    description = "Resolves every version-catalog coordinate from the configured repositories."
-    val probe = catalogProbe
+    description = "Proves every version-catalog coordinate resolves from the configured repositories."
     val expected = catalogCoordinates
+    val dependencyHandler = dependencies
     doLast {
-        val resolved = probe.resolve()
-        logger.lifecycle("Verified ${expected.size} catalog coordinate(s); ${resolved.size} metadata file(s) fetched.")
-        expected.forEach { logger.info("  ok  $it") }
+        val unresolved = mutableListOf<String>()
+
+        expected.forEach { coordinate ->
+            val (group, name, version) = coordinate.split(":")
+            val query = dependencyHandler.createArtifactResolutionQuery()
+                .forModule(group, name, version)
+                .withArtifacts(MavenModule::class.java, MavenPomArtifact::class.java)
+                .execute()
+
+            val found = query.resolvedComponents
+                .flatMap { it.getArtifacts(MavenPomArtifact::class.java) }
+                .any { it is ResolvedArtifactResult }
+
+            if (found) logger.info("  ok  $coordinate") else unresolved += coordinate
+        }
+
+        if (unresolved.isNotEmpty()) {
+            throw GradleException(
+                buildString {
+                    appendLine()
+                    appendLine("${unresolved.size} pinned coordinate(s) did not resolve:")
+                    unresolved.forEach { appendLine("  $it") }
+                    appendLine()
+                    appendLine("SPEC §0.2: report the actual available version with a link to its")
+                    append("release page, and STOP. Do not silently substitute. Do not invent.")
+                },
+            )
+        }
+
+        logger.lifecycle("All ${expected.size} pinned catalog coordinates resolved.")
     }
 }

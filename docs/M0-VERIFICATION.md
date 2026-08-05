@@ -30,7 +30,7 @@ Each coordinate below was fetched directly from Google Maven (`dl.google.com/dl/
 |---|---|---|
 | Compose BOM | `2026.06.01` | latest stable |
 | WorkManager | `2.11.2` | latest **stable**; 2.12.0-beta01 exists and was not taken |
-| Hilt | `2.60.1` | latest stable |
+| Hilt | **`2.58`** | **not** the latest — see §5.5. Latest stable Hilt does not work with the pinned AGP |
 | kotlinx-serialization-json | `1.11.0` | latest stable |
 | kotlinx-coroutines | `1.11.0` | latest stable |
 | KSP | `2.3.11` | KSP left the `<kotlin>-<ksp>` scheme after `2.2.21-2.0.5`. `2.3.11`'s POM depends on `kotlin-stdlib` **2.3.20** — exact alignment with our Kotlin pin |
@@ -72,19 +72,32 @@ This costs nothing that matters, because the import scan was never the load-bear
 
 ---
 
-## 3. What could NOT be verified on this machine
+## 3. What has actually been run, and what has not
 
-This is the honest part. **The build has not been executed.** Three blockers, all environmental:
+JDK 21 was installed after the first pass, so Gradle now runs. Everything below is a real result from this machine unless marked otherwise.
+
+### Executed and green
+
+| Check | Result |
+|---|---|
+| Whole-build **configuration** | ✅ all 9 modules, both convention plugins, `build-logic` compiles |
+| `gradle wrapper` | ✅ `gradlew`, `gradlew.bat`, `gradle-wrapper.jar` generated and committed |
+| `verifyCatalogCoordinates` | ✅ **all 58 pinned coordinates resolved** |
+| `checkCoreIsPlatformFree` | ✅ green, and demonstrably scanning: 3 files in `:core:model`, 2 in `:core:database`, 2 in `:core:sync`, 1 each in `:core:storage` / `:core:search` — `androidMain` correctly excluded |
+| `verify-guardrails.sh imports` | ✅ **PASS** — plants `import android.content.Context` in `:core:model`, Guardrail 1 fails with its own message, green again after revert |
+
+That last row is ROADMAP M0 acceptance box 3, genuinely ticked.
+
+### Still blocked
 
 | Blocker | Detail | Fix |
 |---|---|---|
-| **JDK 26** | The only JDK installed is `26.0.1`. Gradle 8.14 supports Java 17–24 and its daemon refuses to start on 25+. The error message does not say so clearly. | Install JDK 21: `winget install EclipseAdoptium.Temurin.21.JDK` |
-| **No Android SDK** | No Android Studio, no `%LOCALAPPDATA%\Android\Sdk`. `compileSdk 36` cannot be resolved. | Android Studio, or `cmdline-tools` + `sdkmanager "platforms;android-36"` |
-| **Windows host** | Kotlin/Native cannot compile Apple targets off macOS. `linkDebugFrameworkIosSimulatorArm64` cannot run here **at all** — this is a hard platform limit, not a configuration gap. | CI runs it on `macos-latest`. `kotlin.native.ignoreDisabledTargets=true` makes the local build skip those tasks instead of failing configuration. |
+| **No Android SDK** | No Android Studio, no `%LOCALAPPDATA%\Android\Sdk`. Configuration succeeds without it, but `./gradlew build` cannot compile or link resources. | Android Studio, or `cmdline-tools` + `sdkmanager "platforms;android-36" "build-tools;36.0.0"` (requires accepting Google's SDK licences) |
+| **Windows host** | Kotlin/Native cannot compile Apple targets off macOS. `linkDebugFrameworkIosSimulatorArm64` cannot run here **at all** — a hard platform limit, not a configuration gap. | CI runs it on `macos-latest`. `kotlin.native.ignoreDisabledTargets=true` makes the local build skip those tasks instead of failing configuration. |
 
-**Consequence for ROADMAP M0's acceptance list:** the first four boxes (`./gradlew build`, the iOS link, the two planted-violation demonstrations) are *set up and automated* but **not yet ticked**. They tick the first time CI runs, or locally once a JDK 21 and the Android SDK are installed. The last two — every coordinate resolving, and CI green on a pushed branch — are respectively verified out-of-band above, and pending a push.
+So of ROADMAP M0's six acceptance boxes: the coordinate box and the Guardrail 1 negative test are **done**; `./gradlew build` needs the SDK; the iOS link and its negative test need macOS (both are CI jobs); CI-green needs a push.
 
-Both planted-violation demonstrations run as their own CI jobs (`guardrail-negative-imports`, `guardrail-negative-ios`), so they are proven on every push rather than once by hand.
+Note the JDK trap for anyone repeating this: **installing JDK 21 does not make it the default.** Oracle's `javapath` shim stays ahead of it on `PATH`, so `java -version` still reports 26 and Gradle refuses to start. Set `JAVA_HOME` explicitly.
 
 ---
 
@@ -126,6 +139,26 @@ ktlint 1.x defaults to `ktlint_official`, and Spotless 8.9.0 only substitutes `i
 ### 5.4 One misordered import block
 
 `InkstoneTheme.kt` had `androidx.compose.foundation.isSystemInDarkTheme` last instead of first. Cosmetic in nature, build-breaking in effect, because `spotlessCheck` is wired into `check`. Fixed.
+
+### 5.5 Hilt: "latest stable" is not usable with the pinned AGP ⭐
+
+Found by *running the build*, not by review. SPEC §0.2 said "DI — Hilt — latest stable at M0", and latest stable (2.60.1) **cannot be used with AGP 8.13.0**. Measured across the version range:
+
+| Hilt | Against AGP 8.13.0 |
+|---|---|
+| ≤ 2.58 | works |
+| 2.59 | applies, then dies configuring `:app` with `NoClassDefFoundError: ScopedArtifact$POST_COMPILATION_CLASSES`. Its own version check still claims a minimum of 8.4.0 — the check is stale, so the failure is a missing class rather than a clear message |
+| 2.59.1 – 2.60.1 | hard-fail at apply: *"only compatible with Android Gradle plugin (AGP) version 9.0.0 or higher"* |
+
+**Pinned 2.58.** The tempting "fix" is to bump AGP to 9.x — AGP 9 is released and 9.4.0-alpha07 exists. That is a spec change, not a version bump: SPEC §0.2 pins 8.13.0 and everything else is pinned around it, so it is not a decision to take in passing while chasing a DI library. Recorded here so the constraint is visible when someone does want to take it deliberately.
+
+Generalised lesson for the rest of the roadmap: **"latest stable" is not a specification.** It has to mean "latest stable that works with the pinned AGP", and the only way to know is to apply the plugin. A coordinate resolving proves nothing about compatibility.
+
+### 5.6 `verifyCatalogCoordinates` was resolving nothing
+
+The first implementation used a resolvable `Configuration` with `@pom` artifact-only notation. `@pom` does **not** bypass variant-aware resolution, and the catalog spans modules with no common variant — `ktor-client-darwin` and `sqldelight-native-driver` publish Apple targets only, `junit` and the plugin markers are plain JVM — so no single set of consumer attributes can satisfy both. It failed with a wall of "cannot choose between the available variants".
+
+Rewritten to use `createArtifactResolutionQuery().withArtifacts(MavenModule, MavenPomArtifact)`, which asks for the POM directly and sidesteps variant selection. That is exactly the question being asked: does this coordinate exist?
 
 ### Findings that did not survive
 

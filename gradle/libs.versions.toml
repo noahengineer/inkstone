@@ -40,7 +40,16 @@ activityCompose = "1.13.0"
 coreKtx = "1.19.0"
 lifecycle = "2.11.0"
 work = "2.11.2"
-hilt = "2.60.1"
+# NOT the latest (2.60.1). Measured against AGP 8.13.0, which SPEC §0.2 pins:
+#   2.59.1 .. 2.60.1  hard-fail at apply time: "only compatible with AGP 9.0.0+"
+#   2.59              applies, then dies configuring :app with
+#                     NoClassDefFoundError ScopedArtifact$POST_COMPILATION_CLASSES.
+#                     Its declared minimum still says 8.4.0 — the version check
+#                     is stale, so the failure is a missing class, not a message.
+#   2.58              works. This is the real ceiling for AGP 8.x.
+# Do not "fix" a Hilt upgrade by bumping AGP. That is a spec change, not a
+# version bump — and AGP is what the whole toolchain is pinned around.
+hilt = "2.58"
 hiltNavigationCompose = "1.4.0"
 annotation = "1.10.0"
 
