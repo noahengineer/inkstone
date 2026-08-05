@@ -1,0 +1,28 @@
+name: Set up the Inkstone build
+description: JDK 21, Gradle 8.14, and a wrapper that exists even before one is committed.
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        # SPEC pins Gradle 8.14, which supports Java 17-24. AGP 8.13 needs 17+.
+        # 21 is the LTS in that window.
+        java-version: '21'
+
+    - uses: gradle/actions/setup-gradle@v4
+      with:
+        gradle-version: '8.14'
+
+    # gradle-wrapper.jar is a binary and is not in the repo yet. Generating it
+    # here keeps every `./gradlew` invocation below working, and becomes a no-op
+    # the moment the wrapper is committed.
+    - name: Ensure the Gradle wrapper exists
+      shell: bash
+      run: |
+        if [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then
+          echo "No wrapper JAR committed; generating one for Gradle 8.14."
+          gradle wrapper --gradle-version 8.14 --distribution-type bin
+        fi
+        ./gradlew --version

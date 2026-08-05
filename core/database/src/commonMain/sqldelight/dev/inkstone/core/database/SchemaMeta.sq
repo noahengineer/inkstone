@@ -1,0 +1,20 @@
+-- M0: the schema is deliberately near-empty.
+--
+-- The real tables arrive with their owning milestones:
+--   M2  document / page / op-log metadata (SPEC §4, §5)
+--   M3  folders, favourites, trash        (ROADMAP M3)
+--   M5  note / remote_binding / outbox    (SPEC §7.6)
+--
+-- One table exists now so the generated InkstoneDatabase is real rather than
+-- degenerate, and so the M2 migration has something to migrate from.
+
+CREATE TABLE schemaMeta (
+    id INTEGER NOT NULL PRIMARY KEY,
+    schemaVersion INTEGER NOT NULL
+);
+
+selectSchemaVersion:
+SELECT schemaVersion FROM schemaMeta WHERE id = 1;
+
+upsertSchemaVersion:
+INSERT OR REPLACE INTO schemaMeta(id, schemaVersion) VALUES (1, ?);

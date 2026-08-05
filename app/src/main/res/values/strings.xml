@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Inkstone</string>
+    <string name="m0_skeleton_headline">Inkstone</string>
+    <string name="m0_skeleton_body">M0 — skeleton and guardrails. No functionality yet, by design.</string>
+</resources>

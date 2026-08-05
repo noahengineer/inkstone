@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GRADLE_OPTS: -Dorg.gradle.daemon=false
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # SPEC §0.2 — every pinned coordinate must resolve from a clean cache.
+  # Runs first and with --refresh-dependencies so a bad pin fails in seconds
+  # rather than after a full compile.
+  # ---------------------------------------------------------------------------
+  coordinates:
+    name: Version catalog resolves
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-build
+      - run: ./gradlew verifyCatalogCoordinates --refresh-dependencies
+
+  build:
+    name: Build + test (Android)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-build
+
+      # Guardrail 1 — :core:* stays platform-free (SPEC §2.3).
+      - name: Guardrail 1 — core is platform-free
+        run: ./gradlew checkCoreIsPlatformFree
+
+      - name: Formatting and static analysis
+        run: ./gradlew spotlessCheck detekt
+
+      - name: Build and unit test
+        run: ./gradlew build
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: reports-build
+          path: '**/build/reports/**'
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Guardrail 2 — the one that actually matters (SPEC §2.3).
+  #
+  # OkHttp and dav4jvm are JVM-only. They pass the import check above without
+  # complaint and only fail HERE. Kotlin/Native cannot compile Apple targets on
+  # Linux or Windows, so this job requires a macOS runner — it cannot be folded
+  # into the build job and it cannot be run on a Windows dev machine.
+  # ---------------------------------------------------------------------------
+  ios-core-link:
+    name: Guardrail 2 — :core:* links for iOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-build
+
+      - name: Link every :core:* module for iosSimulatorArm64
+        run: ./gradlew linkIosCore
+
+      - name: Link :core:sync explicitly (the ROADMAP M0 acceptance command)
+        run: ./gradlew :core:sync:linkDebugFrameworkIosSimulatorArm64
+
+  # ---------------------------------------------------------------------------
+  # ROADMAP M0 asks for both guardrails to be PROVEN by introducing a violation
+  # and showing the failure. Doing it in CI means they stay proven — a guardrail
+  # that has silently stopped guarding is worse than no guardrail.
+  # ---------------------------------------------------------------------------
+  guardrail-negative-imports:
+    name: Guardrail 1 rejects a planted violation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-build
+      - run: bash tools/verify-guardrails.sh imports
+
+  guardrail-negative-ios:
+    name: Guardrail 2 rejects a planted JVM-only dependency
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-build
+      - run: bash tools/verify-guardrails.sh ios

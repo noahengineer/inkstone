@@ -1,0 +1,32 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+
+[*.{kt,kts}]
+max_line_length = 120
+# Pin the style explicitly. ktlint 1.x defaults to `ktlint_official`, and
+# Spotless only substitutes `intellij_idea` when an editorConfigOverride map is
+# passed — which the Gradle setup does not do. Leaving it unset would silently
+# enable the OfficialCodeStyle-only rules (no-empty-first-line-in-class-body,
+# function-signature, multiline-expression-wrapping) against code written in the
+# conventional IDEA style, failing `spotlessCheck` and therefore `build`.
+ktlint_code_style = intellij_idea
+ktlint_standard_function-naming = disabled
+ktlint_standard_property-naming = disabled
+ij_kotlin_allow_trailing_comma = true
+ij_kotlin_allow_trailing_comma_on_call_site = true
+
+[*.{yml,yaml,json,toml}]
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false
+
+[gradlew.bat]
+end_of_line = crlf

@@ -1,0 +1,43 @@
+# Overrides on top of detekt's default config (buildUponDefaultConfig = true).
+# Kept small on purpose — M0 should not spend its budget arguing with a linter.
+
+build:
+  maxIssues: 0
+
+complexity:
+  LongParameterList:
+    functionThreshold: 8
+    constructorThreshold: 10
+  TooManyFunctions:
+    # KMP expect/actual and Compose files legitimately hold many small functions.
+    thresholdInFiles: 20
+    thresholdInClasses: 20
+    ignoreAnnotatedFunctions: ['Composable']
+
+style:
+  MagicNumber:
+    ignorePropertyDeclaration: true
+    ignoreCompanionObjectPropertyDeclaration: true
+  MaxLineLength:
+    maxLineLength: 120
+    excludeCommentStatements: true
+  ForbiddenComment:
+    # TODO(Mn) markers are how open work is tracked against the roadmap.
+    active: false
+  UnusedPrivateMember:
+    active: true
+
+exceptions:
+  TooGenericExceptionCaught:
+    active: true
+  SwallowedException:
+    active: true
+
+naming:
+  FunctionNaming:
+    ignoreAnnotated: ['Composable']
+
+potential-bugs:
+  # CLAUDE.md: no `!!` outside tests. Model it so it cannot be null instead.
+  UnsafeCallOnNullableType:
+    active: true

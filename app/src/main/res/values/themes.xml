@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Compose owns theming (Material 3, dynamic colour — M10). This XML theme
+      exists only so the Activity has a window before Compose takes over; it
+      deliberately does not depend on the Material Components view library.
+    -->
+    <!--
+      The parent must be Theme.DeviceDefault.DayNight: there is no
+      `.DayNight.NoActionBar` in the framework. AOSP publishes exactly two
+      DayNight styles (Theme.DeviceDefault.DayNight and
+      ThemeOverlay.DeviceDefault.Accent.DayNight); every DeviceDefault
+      NoActionBar variant is non-DayNight. An unresolvable parent is an aapt2
+      link error, not a warning. So the action bar is removed by attribute.
+    -->
+    <style name="Theme.Inkstone" parent="android:Theme.DeviceDefault.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+    </style>
+</resources>
