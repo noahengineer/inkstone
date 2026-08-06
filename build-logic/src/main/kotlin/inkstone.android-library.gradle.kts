@@ -37,3 +37,22 @@ kotlin {
         jvmTarget.set(JvmTarget.JVM_17)
     }
 }
+
+/*
+ * Instrumented tests must at least COMPILE as part of `check`.
+ *
+ * They cannot be *run* without a device, so `build` has never executed them — and that is
+ * fine and expected. What is not fine is what happened in M3: a schema change altered a
+ * `LibraryIndex` signature, `./gradlew build` stayed green, and the instrumented test that
+ * called it had been broken for two commits. A test that does not compile is worse than no
+ * test, because it looks like coverage.
+ *
+ * Compiling is cheap and catches exactly that class of drift. Running still needs
+ * `connectedDebugAndroidTest` and a tablet.
+ */
+tasks.named("check") {
+    // A live TaskCollection, so it resolves when the execution graph is built rather than
+    // during configuration — the KMP and non-KMP variants of this task are named differently
+    // and neither exists yet at the point this runs.
+    dependsOn(tasks.matching { it.name.startsWith("compileDebugAndroidTestKotlin") })
+}

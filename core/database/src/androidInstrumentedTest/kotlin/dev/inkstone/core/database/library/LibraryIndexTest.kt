@@ -6,9 +6,11 @@ import app.cash.sqldelight.driver.android.AndroidSqliteDriver
 import dev.inkstone.core.database.InkstoneDatabase
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.Folder
+import dev.inkstone.core.model.FolderCover
 import dev.inkstone.core.model.FolderIcon
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.NoteSummary
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
@@ -36,6 +38,7 @@ import kotlin.test.assertTrue
  *
  * In-memory (`name = null`), so each test starts empty and nothing is left on the device.
  */
+@OptIn(ExperimentalCoroutinesApi::class)
 @RunWith(AndroidJUnit4::class)
 class LibraryIndexTest {
 
@@ -190,7 +193,13 @@ class LibraryIndexTest {
     @Test
     fun `folders and notes round-trip through their rows`() = runTest {
         index.insertFolder(folder("f1", name = "Physics"))
-        index.setFolderAppearance(FolderId("f1"), colorArgb = 0xFFAABBCC.toInt(), FolderIcon.FLASK, 2_000)
+        index.setFolderAppearance(
+            id = FolderId("f1"),
+            colorArgb = 0xFFAABBCC.toInt(),
+            icon = FolderIcon.FLASK,
+            cover = FolderCover.Icon,
+            nowEpochMillis = 2_000,
+        )
         index.insertNote(note("n1", folder = "f1", title = "Waves"))
         index.setFavourite(DocumentId("n1"), true)
 
@@ -202,6 +211,79 @@ class LibraryIndexTest {
         val note = assertNotNull(index.note(DocumentId("n1")))
         assertEquals(FolderId("f1"), note.folderId)
         assertTrue(note.favourite)
+    }
+
+    // -----------------------------------------------------------------------
+    // Folder covers (SPEC §9)
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `every cover kind survives a round-trip`() = runTest {
+        index.insertFolder(folder("f1"))
+        val covers = listOf(
+            FolderCover.Icon,
+            FolderCover.LatestNote,
+            FolderCover.Drawn(DocumentId("cover-note")),
+            FolderCover.Image("folders/f1/cover.webp"),
+        )
+
+        for (cover in covers) {
+            index.setFolderAppearance(FolderId("f1"), null, FolderIcon.BOOK, cover, 1_000)
+            assertEquals(cover, assertNotNull(index.folder(FolderId("f1"))).cover)
+        }
+    }
+
+    @Test
+    fun `a cover note is not a library note`() = runTest {
+        // It is an ordinary note in every other way — same editor, same thumbnail pipeline.
+        // What it must not do is show up in the library as a note the user has to explain to
+        // themselves.
+        index.insertFolder(folder("f1"))
+        index.insertNote(note("real", folder = "f1"))
+        index.insertNote(note("cover").copy(isCover = true))
+
+        assertEquals(listOf("real"), index.allNotes().map { it.id.value })
+        // ...but it is still a row, so its thumbnail is not swept as an orphan and
+        // `reconcile` does not adopt its directory back as a new note.
+        assertEquals(
+            setOf("real", "cover"),
+            index.allNotes(includeTrashed = true).mapTo(HashSet()) { it.id.value },
+        )
+        assertTrue(assertNotNull(index.note(DocumentId("cover"))).isCover)
+    }
+
+    @Test
+    fun `the latest-note cover picks the most recent note in the subtree`() = runTest {
+        index.insertFolder(folder("root"))
+        index.insertFolder(folder("child", parent = "root"))
+        index.insertNote(note("old", folder = "root").copy(modifiedEpochMillis = 1))
+        index.insertNote(note("newest", folder = "child").copy(modifiedEpochMillis = 9))
+        index.insertNote(note("elsewhere").copy(modifiedEpochMillis = 99))
+
+        val latest = index.latestNoteIn(listOf(FolderId("root"), FolderId("child")))
+
+        assertEquals("newest", assertNotNull(latest).id.value)
+    }
+
+    @Test
+    fun `a folder showing its latest note never picks its own cover note`() = runTest {
+        // Otherwise a folder whose cover is "the latest note" would draw its own cover note
+        // back to itself the moment the user edited it — which is the newest note in the
+        // folder by definition.
+        index.insertFolder(folder("f1"))
+        index.insertNote(note("real", folder = "f1").copy(modifiedEpochMillis = 1))
+        index.insertNote(note("cover", folder = "f1").copy(isCover = true, modifiedEpochMillis = 99))
+
+        assertEquals("real", assertNotNull(index.latestNoteIn(listOf(FolderId("f1")))).id.value)
+    }
+
+    @Test
+    fun `an empty folder has no latest note rather than an arbitrary one`() = runTest {
+        index.insertFolder(folder("f1"))
+        index.insertNote(note("outside"))
+
+        assertNull(index.latestNoteIn(listOf(FolderId("f1"))))
+        assertNull(index.latestNoteIn(emptyList()))
     }
 
     @Test

@@ -170,7 +170,42 @@ renderer decides per draw call from the canvas it is handed anyway — so nothin
 
 ---
 
-## 6. A bug the tests found
+## 6. What the tablet changed
+
+Three rounds of feedback, and two of them were real design faults rather than taste.
+
+**The folder label was unreadable.** Choosing a colour tinted the whole card, label strip
+included, so the name was painted onto its own background — gone entirely on the darker
+swatches. Two mistakes: the colour belonged to the *tile*, not the card, and even inside the
+tile a fixed ink colour cannot work across a palette. `FolderTile` now tints only the picture
+area and picks its ink by relative luminance.
+
+The dialog is why it shipped: it offered a colour and an icon as abstract chips and showed
+the result only after saving. It now previews the real `FolderTile` and the real label strip,
+live — so the contrast rule is visible while you choose.
+
+**The icons were Unicode characters**, and half the set (`🗀`, `⚗`, `🖩`) are
+text-presentation symbols rather than emoji. The font draws those as thin line art at a
+different optical weight and baseline from the emoji beside them: inconsistent sizes, wrong
+vertical alignment, occasional tofu. `material-icons-core` would have fixed it and is not on
+the classpath — Material3 1.4.0 dropped the dependency. So `FolderGlyph` draws all ten on a
+24×24 grid: one optical size, upright by construction, tinted for contrast.
+
+**Folder covers** came out of the same conversation. A tile can be its icon, the first page
+of the folder's most recently edited note, an imported image, or a note the user draws. The
+drawn case is worth pointing at because it is almost no code: it is an ordinary single-page
+note in the ordinary editor, so it gets autosave, undo and every brush — and its thumbnail is
+regenerated on materialize like any other note's, so a redrawn cover updates through the
+pipeline that already existed. `isCover` keeps it out of the library's own lists, and out of
+the "latest note" query so a folder cannot show its own cover back to itself.
+
+Imported images go through the system photo picker, which needs **no permission** — worth
+keeping, since the app has none at all — and are downsampled and re-encoded at import. A
+picked photo is routinely 12 megapixels: 48 MB decoded, for something drawn 180 dp wide.
+
+---
+
+## 7. A bug the tests found
 
 `RemoteName.truncateToBytes` stepped by `Char` and charged each surrogate two bytes. That
 gives the right *total* for a pair and the wrong answer at the boundary: with two bytes of
@@ -181,13 +216,19 @@ Fixed by stepping per code point. It would never have been noticed by hand.
 
 ---
 
-## 7. Migrations are verified from this milestone on
+## 8. Migrations are verified from this milestone on
 
 `:core:database` now has `verifyMigrations = true` and a committed `1.db` — the pre-M3
 schema. The verifier applies `1.sqm` to it and asserts the result matches the `CREATE`
 statements in the `.sq` files, so the classic failure (a column added to the schema and
 forgotten in the migration, which only crashes on a device that has the old database) fails a
 build instead.
+
+Schema 3 as of the folder-cover work. `2.sqm` is additive with defaults that mean "what it
+did before", and its new columns are **last** in the `CREATE TABLE` — because
+`ALTER TABLE ADD COLUMN` appends, so a fresh install has to produce the same column order a
+migrated database does. The verifier catches that disagreement, which is the whole reason it
+is on.
 
 One surprise worth writing down: **the schema-generating task does not exist unless
 `schemaOutputDirectory` is set.** `generateCommonMainInkstoneDatabaseSchema` is registered
@@ -196,7 +237,7 @@ present" and no way to produce one.
 
 ---
 
-## 8. What M3 does not do
+## 9. What M3 does not do
 
 - **No drag-and-drop page reorder.** The overview has thumbnails, tap-to-go and
   move-left/right. The model already supports arbitrary reordering by fractional key, so
@@ -209,7 +250,7 @@ present" and no way to produce one.
 
 ---
 
-## 9. What still has to be measured on the device
+## 10. What still has to be measured on the device
 
 Two of M3's acceptance criteria are device gates and are **outstanding**:
 
@@ -228,3 +269,8 @@ erase tests are — the thing under test is the engine:
 
 It has not been run in this session: no device was attached, and the JVM alternative
 (`sqldelight-driver-sqlite`) could not be fetched through this network.
+
+**`check` now compiles instrumented tests**, in both convention plugins. It does not run them
+— that still needs a tablet — but a test that does not compile is worse than no test, because
+it looks like coverage. M3 proved the point: a schema change altered a `LibraryIndex`
+signature, `./gradlew build` stayed green, and this file had been broken for two commits.
