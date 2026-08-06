@@ -16,6 +16,7 @@ import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 /**
@@ -41,6 +42,7 @@ class NoteEditorViewModel @Inject constructor(
     private val library: LibraryRepository,
     private val thumbnails: Thumbnails,
     private val sourcePages: SourcePages,
+    private val sharing: NoteSharing,
     materializer: DocumentMaterializer,
     savedState: SavedStateHandle,
 ) : ViewModel() {
@@ -86,7 +88,7 @@ class NoteEditorViewModel @Inject constructor(
 
     fun rename(title: String) = editor.rename(title)
 
-    fun dismissMessage() = editor.dismissMessage()
+    fun dismissMessage() = editor.showMessage(null)
 
     /**
      * A page thumbnail, folded from the **open session** rather than from disk.
@@ -103,7 +105,31 @@ class NoteEditorViewModel @Inject constructor(
      * SPEC §5.1 — fold the journal into the bundle. Called from `Activity.onStop`, which is the
      * last point Android guarantees the process is alive.
      */
-    fun materialize() = editor.materialize()
+    fun materialize() {
+        viewModelScope.launch { editor.materializeNow() }
+    }
+
+    /**
+     * ROADMAP M4 — *"annotate 10 pages, export"*. Publish, then snapshot for another app.
+     *
+     * The order is the whole point and is not an optimisation: `document.pdf` is allowed to
+     * be one editing session stale (SPEC §5.1), so exporting without materializing first
+     * would routinely hand out a file missing the ink drawn since the note was opened.
+     *
+     * @return null when there is nothing to export yet — no note open, or the PDF could not
+     *   be written. The caller says so; it is never silent.
+     */
+    suspend fun exportPdf(): android.net.Uri? {
+        val id = state.value.documentId ?: return null
+        if (!editor.materializeNow()) return null
+        return sharing.snapshot(id, state.value.title)
+    }
+
+    /** Tell the user the export produced nothing, through the editor's own snackbar. */
+    fun reportExportFailed() = editor.showMessage(NoteEditor.EXPORT_FAILED)
+
+    /** The chooser for a Uri from [exportPdf]. */
+    fun chooserFor(uri: android.net.Uri) = sharing.chooserFor(uri, state.value.title)
 
     /**
      * SPEC §6.2 — the imported page this note page was drawn on, rendered.

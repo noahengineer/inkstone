@@ -16,6 +16,7 @@ kotlin {
             implementation(libs.ktor.client.content.negotiation)
             implementation(libs.ktor.serialization.kotlinx.json)
             implementation(libs.kotlinx.serialization.json)
+            implementation(libs.kotlinx.coroutines.core)
         }
         androidMain.dependencies {
             // OkHttp appears here and ONLY here — as Ktor's Android engine, in
@@ -27,7 +28,15 @@ kotlin {
             implementation(libs.ktor.client.darwin)
         }
         commonTest.dependencies {
+            // M5's protocol tests run against Ktor's MockEngine rather than a live
+            // server. SPEC §13 requires the *sync* tests — the merge matrix, ETag churn,
+            // brute-force lockout — to run against a real Nextcloud in Docker, and M6
+            // does that. What is testable here is the part that is pure protocol: the
+            // PROPFIND body, the multistatus parse, weak-ETag normalisation, the login
+            // flow's six rules, and the 401 policy. A mock is the right tool for those
+            // precisely because it can produce a weak ETag on demand.
             implementation(libs.ktor.client.mock)
+            implementation(libs.kotlinx.coroutines.test)
         }
     }
 }

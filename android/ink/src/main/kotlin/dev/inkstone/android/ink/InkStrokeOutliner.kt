@@ -68,9 +68,11 @@ public class InkStrokeOutliner(
         )
 
         val result = ArrayList<StrokeOutline>(store.size)
-        // Highlighters first, then ink (SPEC §3.4). Annotation order is paint order
-        // in a PDF too, so this is not merely cosmetic: get it wrong and every
-        // highlight covers the words it was drawn over.
+        // Ink first, then highlighters (SPEC §3.4 — reversed after M4). Annotation order is
+        // paint order in a PDF too, so this is not merely cosmetic: it is the same z-order
+        // the editor draws, and the published file disagreeing with the screen is the one
+        // bug in this milestone the user would notice and could not explain. The highlight
+        // tints rather than hides what it covers because of its alpha, exactly as on screen.
         store.forEachInRenderOrder(visibleBounds = null) { dry -> result += outlineOf(dry) }
         result
     }

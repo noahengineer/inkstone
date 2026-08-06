@@ -36,6 +36,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.inkstone.core.model.Folder
 import dev.inkstone.core.model.NoteSummary
+import dev.inkstone.core.model.NoteSyncState
 
 /**
  * One note in the grid — its thumbnail, title, and the actions on it.
@@ -245,6 +246,27 @@ private fun NoteMenu(
                 onDismiss()
             },
         )
+        // SPEC §7.6 — binding is per note and reversible, so both directions live here.
+        // `syncState` is the only thing the library index knows about a note's binding,
+        // and LOCAL_ONLY is exactly "not bound"; asking the binding store per row would
+        // be a query per tile, which is what SPEC §5.7 exists to avoid.
+        if (note.syncState == NoteSyncState.LOCAL_ONLY) {
+            DropdownMenuItem(
+                text = { Text("Save to Nextcloud…") },
+                onClick = {
+                    actions.onSaveToNextcloud(note.id)
+                    onDismiss()
+                },
+            )
+        } else {
+            DropdownMenuItem(
+                text = { Text("Stop syncing") },
+                onClick = {
+                    actions.onStopSyncing(note.id)
+                    onDismiss()
+                },
+            )
+        }
         // "Move to trash", not "Delete". There is no delete (ROADMAP M3).
         DropdownMenuItem(
             text = { Text("Move to trash") },

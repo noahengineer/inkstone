@@ -14,6 +14,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -53,6 +54,8 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     val note by editor.state.collectAsState()
     var surface by remember { mutableStateOf<InkSurfaceView?>(null) }
     var pageOverviewOpen by remember { mutableStateOf(false) }
+    var exporting by remember { mutableStateOf(false) }
+    val context = LocalContext.current
 
     // The latency HUD (SPEC §3.6). Polled rather than pushed: ink reports a LatencyData for
     // every input, and turning 240 of those a second into recompositions would be measuring the
@@ -86,23 +89,22 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
         InkToolbar(
             state = ui,
             modifier = Modifier.align(Alignment.TopStart).padding(12.dp),
-            actions = InkToolbarActions(
-                onFit = { mode -> surface?.resetCamera(mode) },
-                onUndo = { editor.undo() },
-                onRedo = { editor.redo() },
-                onClear = { surface?.clearPage() },
-                onLoadSyntheticPage = { count -> loadSyntheticPage(scope, surface, ui, count) },
-                onResetLatency = {
-                    surface?.latency?.reset()
-                    surface?.stylus?.reset()
-                },
-            ),
+            actions = inkToolbarActions(surface, editor, ui, scope),
         )
 
         PageBar(
             state = note,
             modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp),
-            actions = pageBarActions(editor, note) { pageOverviewOpen = true },
+            actions = pageBarActions(editor, note, { pageOverviewOpen = true }) {
+                if (!exporting) {
+                    exporting = true
+                    scope.launch {
+                        exportAndShare(editor, context)
+                        exporting = false
+                    }
+                }
+            },
+            exporting = exporting,
         )
     }
 
@@ -117,18 +119,60 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     }
 }
 
-private fun pageBarActions(editor: NoteEditorViewModel, note: NoteEditorState, onShowPages: () -> Unit) =
-    PageBarActions(
-        onPrevious = { editor.goToPage(note.pageIndex - 1) },
-        onNext = { editor.goToPage(note.pageIndex + 1) },
-        onAddPage = { editor.addPage(note.template) },
-        onDuplicatePage = { editor.duplicateCurrentPage() },
-        onDeletePage = { editor.deleteCurrentPage() },
-        onMoveLeft = { editor.movePage(note.pageIndex - 1) },
-        onMoveRight = { editor.movePage(note.pageIndex + 1) },
-        onTemplate = { template -> editor.setTemplate(template) },
-        onShowPages = onShowPages,
-    )
+/** The M1 toolbar's wiring — kept beside [pageBarActions] rather than inline, for the same reason. */
+private fun inkToolbarActions(
+    surface: InkSurfaceView?,
+    editor: NoteEditorViewModel,
+    ui: InkUiState,
+    scope: CoroutineScope,
+) = InkToolbarActions(
+    onFit = { mode -> surface?.resetCamera(mode) },
+    onUndo = { editor.undo() },
+    onRedo = { editor.redo() },
+    onClear = { surface?.clearPage() },
+    onLoadSyntheticPage = { count -> loadSyntheticPage(scope, surface, ui, count) },
+    onResetLatency = {
+        surface?.latency?.reset()
+        surface?.stylus?.reset()
+    },
+)
+
+private fun pageBarActions(
+    editor: NoteEditorViewModel,
+    note: NoteEditorState,
+    onShowPages: () -> Unit,
+    onShare: () -> Unit,
+) = PageBarActions(
+    onPrevious = { editor.goToPage(note.pageIndex - 1) },
+    onNext = { editor.goToPage(note.pageIndex + 1) },
+    onAddPage = { editor.addPage(note.template) },
+    onDuplicatePage = { editor.duplicateCurrentPage() },
+    onDeletePage = { editor.deleteCurrentPage() },
+    onMoveLeft = { editor.movePage(note.pageIndex - 1) },
+    onMoveRight = { editor.movePage(note.pageIndex + 1) },
+    onTemplate = { template -> editor.setTemplate(template) },
+    onShowPages = onShowPages,
+    onShare = onShare,
+)
+
+/**
+ * ROADMAP M4 — materialize, then hand the published PDF to whatever the user picks.
+ *
+ * Lives here rather than in the view model because both halves are Android UI: a chooser
+ * needs an `Activity` context, and [NoteEditorViewModel] deliberately holds neither.
+ *
+ * [context] must be the activity's, not the application's — starting a chooser from an
+ * application context requires `FLAG_ACTIVITY_NEW_TASK`, which launches it outside the note's
+ * task and leaves the user in a back stack that does not return here.
+ */
+private suspend fun exportAndShare(editor: NoteEditorViewModel, context: android.content.Context) {
+    val uri = editor.exportPdf()
+    if (uri == null) {
+        editor.reportExportFailed()
+        return
+    }
+    context.startActivity(editor.chooserFor(uri))
+}
 
 /**
  * The ink surface itself — SPEC §3.2's `AndroidView` seam.

@@ -16,3 +16,6 @@ captures/
 xcuserdata/
 *.hprof
 .kotlin/errors/
+
+# Graphify knowledge-graph output. A derived artifact — rebuildable with `graphify update .`
+graphify-out/

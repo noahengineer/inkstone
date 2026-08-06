@@ -1,0 +1,172 @@
+-- M5 — SPEC §7.6's sync schema: accounts, bindings, outbox.
+--
+-- WHAT IS NOT HERE, AND WHY
+--
+-- **The app password.** It lives in the Keystore, AES-GCM encrypted, behind
+-- `CredentialStore` (SPEC §14) — keyed by `account.id`. Everything in this file is the
+-- part that is safe in a plain SQLite database on a device with no full-disk encryption
+-- guarantee: which server, which user, which folder, what ETag we last saw.
+--
+-- **Note bytes.** SPEC §7.6: *"rows are markers, never payloads. Never store note bytes
+-- in the outbox — that's a second copy of every note."* There is deliberately no BLOB
+-- column anywhere below. The drainer reads a snapshot of `document.pdf` at drain time,
+-- which is also what makes 500 offline edits cost one upload rather than 500 queued
+-- copies of a 40 MB lecture.
+--
+-- NO FOREIGN KEYS, for the reason Library.sq gives
+--
+-- SQLite does not enforce them without `PRAGMA foreign_keys = ON`, so a constraint here
+-- would be documentation dressed as a guarantee. `remoteBinding.noteId` and
+-- `remoteBinding.accountId` are unconstrained; the drainer treats a binding whose note or
+-- account has gone as "nothing is owed" and drops the row, which is a recoverable outcome.
+-- A failed insert mid-sync is not.
+
+CREATE TABLE account (
+    id            TEXT    NOT NULL PRIMARY KEY,
+    serverUrl     TEXT    NOT NULL,
+    -- SPEC §0.1 #3 — these two are NOT interchangeable and both are stored.
+    -- `loginName` authenticates (Basic auth) and may be an email address.
+    loginName     TEXT    NOT NULL,
+    -- `uid` is `ocs.data.id` and is the WebDAV path segment. Empty means "not resolved
+    -- yet" (state NEEDS_UID); nothing may build a DAV URL from an empty one.
+    uid           TEXT    NOT NULL,
+    displayName   TEXT,
+    defaultFolder TEXT    NOT NULL DEFAULT 'Inkstone',
+    -- ACTIVE | NEEDS_REAUTH | NEEDS_UID. A 401 puts an account in NEEDS_REAUTH and
+    -- nothing is sent until the user logs in again (SPEC §7.2, CLAUDE.md rule 5).
+    state         TEXT    NOT NULL DEFAULT 'ACTIVE',
+    -- The cached §7.9 capabilities document, refetched on a server version change.
+    capabilities  TEXT,
+    lastError     TEXT
+);
+
+CREATE TABLE remoteBinding (
+    noteId             TEXT    NOT NULL PRIMARY KEY,
+    accountId          TEXT    NOT NULL,
+    -- Where the note *should* be. Always the intended path, so nothing downstream has to
+    -- decide which of two paths is current.
+    remotePath         TEXT    NOT NULL,
+    -- SPEC §7.3: `oc:id`, NOT `oc:fileid`. Globally unique (<padded-fileid><instanceid>),
+    -- which is what keeps this correct if the user ever adds a second Nextcloud.
+    remoteOcId         TEXT,
+    -- Stored UNQUOTED (SPEC §7.3's table); quotes are re-added for If-Match.
+    lastSyncedEtag     TEXT,
+    -- ⚠️ SPEC §7.3: a weak ETag (W/"…") returned in If-Match causes a PERMANENT 412 loop.
+    -- The flag has to be persisted with the value, because "was this weak" cannot be
+    -- recovered from the stripped string and recomputing it at each call site is how one
+    -- of four call sites gets it wrong.
+    lastSyncedEtagWeak INTEGER NOT NULL DEFAULT 0,
+    lastSyncedRev      INTEGER NOT NULL DEFAULT 0,
+    -- SPEC §7.6's 30-second minimum inter-upload interval is measured from here.
+    lastUploadAt       INTEGER NOT NULL DEFAULT 0,
+    -- MD5 of the bytes last uploaded — the fallback comparison when the ETag was weak.
+    lastChecksum       TEXT,
+    -- Where the file still is while a MOVE is owed. NULL almost always.
+    movedFromPath      TEXT
+);
+
+CREATE INDEX remoteBindingByAccount ON remoteBinding(accountId);
+
+-- SPEC §7.6, verbatim:
+--   outbox(note_id, op_type, local_rev_at_enqueue, attempts, next_attempt_at, created_at,
+--          PRIMARY KEY (note_id, op_type))     -- the coalescing key
+--
+-- The composite primary key IS the coalescing rule. An UPLOAD enqueued while an UPLOAD is
+-- pending is an UPSERT on this key, which is why 500 offline edits leave one row.
+CREATE TABLE outbox (
+    noteId            TEXT    NOT NULL,
+    opType            TEXT    NOT NULL,
+    -- What note.localRev was at enqueue. Compared against the note's CURRENT rev after a
+    -- 2xx: if they differ the note changed mid-flight, and marking SYNCED would make that
+    -- work invisible to sync forever (SPEC §7.6).
+    localRevAtEnqueue INTEGER NOT NULL,
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    -- Inherited on coalesce, never reset — resetting it turns an actively edited note that
+    -- is failing to upload into a hot loop against the user's server.
+    nextAttemptAt     INTEGER NOT NULL DEFAULT 0,
+    createdAt         INTEGER NOT NULL,
+    PRIMARY KEY (noteId, opType)
+);
+
+CREATE INDEX outboxDue ON outbox(nextAttemptAt);
+
+-- ---------------------------------------------------------------------------
+-- Accounts
+-- ---------------------------------------------------------------------------
+
+selectAllAccounts:
+SELECT * FROM account;
+
+selectAccount:
+SELECT * FROM account WHERE id = ?;
+
+upsertAccount:
+INSERT OR REPLACE INTO account(id, serverUrl, loginName, uid, displayName, defaultFolder,
+                               state, capabilities, lastError)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+updateAccountState:
+UPDATE account SET state = :state, lastError = :lastError WHERE id = :id;
+
+deleteAccount:
+DELETE FROM account WHERE id = ?;
+
+-- ---------------------------------------------------------------------------
+-- Bindings
+-- ---------------------------------------------------------------------------
+
+selectBinding:
+SELECT * FROM remoteBinding WHERE noteId = ?;
+
+selectBindingsForAccount:
+SELECT * FROM remoteBinding WHERE accountId = ?;
+
+upsertBinding:
+INSERT OR REPLACE INTO remoteBinding(noteId, accountId, remotePath, remoteOcId, lastSyncedEtag,
+                                     lastSyncedEtagWeak, lastSyncedRev, lastUploadAt,
+                                     lastChecksum, movedFromPath)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+deleteBinding:
+DELETE FROM remoteBinding WHERE noteId = ?;
+
+-- ---------------------------------------------------------------------------
+-- Outbox
+-- ---------------------------------------------------------------------------
+
+selectOutboxForNote:
+SELECT * FROM outbox WHERE noteId = ?;
+
+selectAllOutbox:
+SELECT * FROM outbox ORDER BY createdAt;
+
+-- Drain order (SPEC §7.6): MKCOL before anything targeting a path inside it, MOVE before
+-- UPLOAD for the same note, DELETE last so a MOVE-then-DELETE deletes at the new path.
+--
+-- Ordered globally by priority rather than per note. Global order trivially implies the
+-- per-note order the spec requires, and it needs no window function — which SQLDelight
+-- would happily generate and older Android SQLite builds would not run.
+selectDueOutbox:
+SELECT * FROM outbox
+WHERE nextAttemptAt <= :now
+ORDER BY CASE opType
+    WHEN 'MKCOL'  THEN 0
+    WHEN 'MOVE'   THEN 1
+    WHEN 'UPLOAD' THEN 2
+    ELSE 3
+END, createdAt
+LIMIT :limit;
+
+upsertOutbox:
+INSERT OR REPLACE INTO outbox(noteId, opType, localRevAtEnqueue, attempts, nextAttemptAt, createdAt)
+VALUES (?, ?, ?, ?, ?, ?);
+
+rescheduleOutbox:
+UPDATE outbox SET attempts = :attempts, nextAttemptAt = :nextAttemptAt
+WHERE noteId = :noteId AND opType = :opType;
+
+deleteOutboxRow:
+DELETE FROM outbox WHERE noteId = :noteId AND opType = :opType;
+
+countOutbox:
+SELECT count(*) FROM outbox;

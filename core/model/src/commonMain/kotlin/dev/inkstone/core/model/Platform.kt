@@ -41,12 +41,16 @@ public data class MaterializedFile(val path: String, val sizeBytes: Long, val sh
  */
 public fun interface PageThumbnailRenderer {
     /**
+     * @param noteId which note [page] belongs to. Needed since M4: a page whose background
+     *   is a [Background.SourcePdfPage] has its paper inside that note's `document.pdf`,
+     *   and a [FoldedPage] carries only the page *index*, not the file it indexes into.
+     *   Without this the library drew imported notes as blank paper with ink floating on it.
      * @param widthPx the thumbnail's width. Height follows from the page's aspect ratio,
      *   so a thumbnail is never letterboxed and never distorted.
      * @return the encoded image, or null when the page could not be rendered — a decode
      *   failure is a missing thumbnail, never a crash in the library.
      */
-    public suspend fun render(page: FoldedPage, widthPx: Int): ByteArray?
+    public suspend fun render(noteId: DocumentId, page: FoldedPage, widthPx: Int): ByteArray?
 }
 
 /**

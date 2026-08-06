@@ -52,7 +52,7 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
      *
      * M3 moved this out of here. The library shows a picture of the same page, and two
      * renderers maintained side by side is how a preview ends up with different line
-     * spacing or the highlighter in front of the ink. See [PagePainter].
+     * spacing or the highlighter behind the ink. See [PagePainter].
      */
     private val painter = PagePainter(textureStore)
 

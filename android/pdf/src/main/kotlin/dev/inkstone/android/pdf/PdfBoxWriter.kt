@@ -259,8 +259,7 @@ internal class PdfBoxWriter : PdfWriter {
      */
     private fun inkAnnotation(doc: PDDocument, outline: StrokeOutline, geometry: PdfPageGeometry): COSDictionary {
         val rect = boundsOf(outline, geometry)
-        val alpha = PdfContent.alphaValue(outline.colorArgb)
-        val stateName = if (alpha < 1f) TRANSLUCENT_STATE else PdfContent.OPAQUE_STATE
+        val stateName = PdfContent.stateNameFor(outline)
 
         val annotation = COSDictionary().apply {
             setItem(COSName.TYPE, COSName.ANNOT)
@@ -279,14 +278,14 @@ internal class PdfBoxWriter : PdfWriter {
                     markUpdated(this)
                 },
             )
-            setFloat(COSName.CA, alpha)
+            setFloat(COSName.CA, PdfContent.alphaValue(outline.colorArgb))
             // Bit 3, "Print". Without it the ink is on screen and absent from paper,
             // which is a bug report waiting to happen.
             setItem(COSName.F, COSInteger.get(ANNOTATION_FLAG_PRINT.toLong()))
             setItem(
                 COSName.AP,
                 COSDictionary().apply {
-                    setItem(COSName.N, appearance(doc, outline, geometry, rect, stateName, alpha))
+                    setItem(COSName.N, appearance(doc, outline, geometry, rect, stateName))
                     markUpdated(this)
                 },
             )
@@ -319,7 +318,6 @@ internal class PdfBoxWriter : PdfWriter {
         geometry: PdfPageGeometry,
         rect: PdfBox,
         stateName: String,
-        alpha: Float,
     ): COSStream {
         val content = PdfContent.strokeAppearance(outline, geometry, stateName)
         val stream = PDStream(doc, ByteArrayInputStream(content), COSName.FLATE_DECODE).cosObject
@@ -327,19 +325,15 @@ internal class PdfBoxWriter : PdfWriter {
         stream.setItem(COSName.SUBTYPE, COSName.FORM)
         stream.setItem(COSName.BBOX, rect.toCosArray())
         stream.setItem(COSName.MATRIX, identityMatrix())
-        stream.setItem(COSName.RESOURCES, graphicsStates(mapOf(stateName to alpha)))
+        stream.setItem(COSName.RESOURCES, graphicsStates(listOf(outline)))
         markUpdated(stream)
         return stream
     }
 
     private fun flattened(doc: PDDocument, outlines: List<StrokeOutline>, geometry: PdfPageGeometry): COSStream {
-        val states = outlines.associate { PdfContent.alpha(it.colorArgb) to stateNameFor(it.colorArgb) }
-        val content = PdfContent.flattenedOverlay(outlines, geometry, states)
+        val content = PdfContent.flattenedOverlay(outlines, geometry)
         val stream = PDStream(doc, ByteArrayInputStream(content), COSName.FLATE_DECODE).cosObject
-        stream.setItem(
-            COSName.RESOURCES,
-            graphicsStates(outlines.associate { stateNameFor(it.colorArgb) to PdfContent.alphaValue(it.colorArgb) }),
-        )
+        stream.setItem(COSName.RESOURCES, graphicsStates(outlines))
         markUpdated(stream)
         return stream
     }
@@ -512,18 +506,21 @@ internal class PdfBoxWriter : PdfWriter {
     }
 
     /**
-     * `/Resources /ExtGState` for the alpha values a page uses.
+     * `/Resources /ExtGState` for the compositing the strokes on a page use.
      *
-     * Plain alpha, `/Normal` blending — the same compositing [PagePainter] does on
-     * screen. A `/Multiply` blend would arguably read better as a highlighter, and
-     * is deliberately not used: the published PDF has to look like the editor, and
-     * "looks better than the app" is still a mismatch the user has to explain.
+     * Plain alpha, `/Normal` blending — the same compositing [PagePainter] does on screen.
+     *
+     * A `/Multiply` blend was written here briefly after M4 and removed along with the
+     * editor's: over dark ink it is indistinguishable from drawing behind, which is the
+     * thing SPEC §3.4 stopped doing. What keeps the published file honest is that it
+     * matches the editor, not that it is physically faithful.
      */
-    private fun graphicsStates(states: Map<String, Float>): COSDictionary {
+    private fun graphicsStates(outlines: List<StrokeOutline>): COSDictionary {
         val extGState = COSDictionary()
-        for ((name, alpha) in states) {
+        for (outline in outlines.distinctBy { PdfContent.stateNameFor(it) }) {
+            val alpha = PdfContent.alphaValue(outline.colorArgb)
             extGState.setItem(
-                COSName.getPDFName(name),
+                COSName.getPDFName(PdfContent.stateNameFor(outline)),
                 COSDictionary().apply {
                     setFloat(COSName.CA, alpha)
                     setFloat(COSName.getPDFName("ca"), alpha)
@@ -537,8 +534,6 @@ internal class PdfBoxWriter : PdfWriter {
             markUpdated(this)
         }
     }
-
-    private fun stateNameFor(argb: Int): String = "GS${PdfContent.alpha(argb)}"
 
     private fun PdfBox.toCosArray(): COSArray = COSArray().apply {
         add(COSFloat(x0))
@@ -556,7 +551,6 @@ internal class PdfBoxWriter : PdfWriter {
 
         const val INK_SUBTYPE = "Ink"
         const val INK_LIST = "InkList"
-        const val TRANSLUCENT_STATE = "GStr"
         const val TEXT_FONT_NAME = "InkstoneF0"
         const val BUNDLE_MIME = "application/vnd.inkstone.note"
         const val ANNOTATION_FLAG_PRINT = 4

@@ -61,6 +61,12 @@ dependencies {
     // up are the same argument in two modules.
     testImplementation(kotlin("test"))
     testImplementation(libs.kotlinx.coroutines.test)
+    // TEST ONLY, and it stays that way. SPEC Appendix B spike #4 asks whether an
+    // incremental-update PDF survives Nextcloud's storage — a question about this
+    // module's output that only :core:sync can ask over the wire. The main source set
+    // has no idea sync exists, so SPEC §2.1's :app -> :android:* -> :core:* direction
+    // is untouched. See PdfRoundTripSpikeTest.
+    testImplementation(project(":core:sync"))
 
     androidTestImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.junit)

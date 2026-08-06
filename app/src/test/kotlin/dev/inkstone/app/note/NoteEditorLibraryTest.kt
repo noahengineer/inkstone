@@ -106,7 +106,7 @@ class NoteEditorLibraryTest {
         runCurrent()
 
         surface.queueGesture(listOf(stroke("obj-1")))
-        editor.materialize()
+        editor.materializeNow()
         runCurrent()
 
         val materialized = library.materializations.lastOrNull()

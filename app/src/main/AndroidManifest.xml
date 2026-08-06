@@ -2,10 +2,13 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <!--
-      No INTERNET permission yet. It arrives with M5, together with the
-      Nextcloud client, so that M0-M4 cannot accidentally acquire a network
-      code path outside the outbox (CLAUDE.md rule 4).
+      M5. The only outbound traffic is the user's own Nextcloud (SPEC §14: "note content
+      goes nowhere except the user's own server"), and every remote *mutation* goes
+      through the outbox (CLAUDE.md rule 4). ACCESS_NETWORK_STATE is WorkManager's, for
+      the CONNECTED constraint that keeps the drainer from being woken with no network.
     -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <application
         android:name=".InkstoneApplication"
@@ -13,7 +16,9 @@
         android:fullBackupContent="false"
         android:label="@string/app_name"
         android:supportsRtl="true"
-        android:theme="@style/Theme.Inkstone">
+        android:theme="@style/Theme.Inkstone"
+        android:usesCleartextTraffic="false"
+        android:networkSecurityConfig="@xml/network_security_config">
 
         <activity
             android:name=".MainActivity"
@@ -38,6 +43,25 @@
             android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
             android:parentActivityName=".MainActivity"
             android:theme="@style/Theme.Inkstone" />
+
+        <!--
+          How the published PDF leaves the app (SPEC §5.2 — "opens in any PDF viewer,
+          emailed to anyone"). Notes live in private storage, so without this there is no
+          way for a user to get one out, and ROADMAP M4's export criterion is unreachable.
+
+          `exported="false"` with `grantUriPermissions`: no other app may enumerate this
+          provider, and one only gets access to the single Uri handed to it by a chooser,
+          for as long as that grant lasts.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 
 </manifest>

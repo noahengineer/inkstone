@@ -10,6 +10,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.browser.customtabs.CustomTabsIntent
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
@@ -32,6 +33,9 @@ import dev.inkstone.app.library.LibraryScreen
 import dev.inkstone.app.library.LibraryViewModel
 import dev.inkstone.app.library.TrashScreen
 import dev.inkstone.app.note.NoteActivity
+import dev.inkstone.app.sync.SyncActions
+import dev.inkstone.app.sync.SyncScreen
+import dev.inkstone.app.sync.SyncViewModel
 import dev.inkstone.app.ui.InkstoneTheme
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
@@ -64,6 +68,7 @@ import javax.inject.Inject
 class MainActivity : ComponentActivity() {
 
     private val library: LibraryViewModel by viewModels()
+    private val sync: SyncViewModel by viewModels()
 
     /** For the trash screen's "N days left", which is display-only time (SPEC §4.1). */
     @Inject
@@ -131,8 +136,10 @@ class MainActivity : ComponentActivity() {
     private fun Content() {
         val state by library.state.collectAsState()
         val trash by library.trash.collectAsState()
+        val syncState by sync.state.collectAsState()
         val snackbars = remember { SnackbarHostState() }
         var showingTrash by rememberSaveable { mutableStateOf(false) }
+        var showingSync by rememberSaveable { mutableStateOf(false) }
 
         LaunchedEffect(state.message) {
             state.message?.let {
@@ -141,12 +148,22 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // SPEC §7.1 — the browser is the Activity's to launch, not the view model's. The
+        // login URL is delivered once and consumed, so a recomposition (or a rotation)
+        // cannot reopen the browser on a flow the user already finished.
+        LaunchedEffect(syncState.openInBrowser) {
+            syncState.openInBrowser?.let { pending ->
+                sync.browserOpened()
+                openLoginPage(pending.browserUrl)
+            }
+        }
+
         Scaffold(
             modifier = Modifier.fillMaxSize(),
             snackbarHost = { SnackbarHost(snackbars) },
         ) { innerPadding ->
-            if (showingTrash) {
-                TrashScreen(
+            when {
+                showingTrash -> TrashScreen(
                     state = trash,
                     nowEpochMillis = clock.nowEpochMillis(),
                     onRestoreNote = library::restoreNote,
@@ -154,17 +171,59 @@ class MainActivity : ComponentActivity() {
                     onBack = { showingTrash = false },
                     modifier = Modifier.padding(innerPadding),
                 )
-            } else {
-                LibraryScreen(
+
+                showingSync -> SyncScreen(
+                    state = syncState,
+                    onBack = { showingSync = false },
+                    actions = syncActions(),
+                    modifier = Modifier.padding(innerPadding),
+                )
+
+                else -> LibraryScreen(
                     state = state,
                     modifier = Modifier.padding(innerPadding),
-                    actions = libraryActions(onOpenTrash = { showingTrash = true }),
+                    actions = libraryActions(
+                        onOpenTrash = { showingTrash = true },
+                        onOpenSync = { noteId ->
+                            sync.open(noteId)
+                            showingSync = true
+                        },
+                    ),
                 )
             }
         }
     }
 
-    private fun libraryActions(onOpenTrash: () -> Unit) = LibraryActions(
+    private fun syncActions() = SyncActions(
+        onServerUrlChange = sync::setServerUrl,
+        onStartLogin = sync::startLogin,
+        onCancelLogin = sync::cancelLogin,
+        onSignOut = sync::signOut,
+        onChooseAccount = sync::chooseAccount,
+        onBrowseTo = sync::browseTo,
+        onGoUp = sync::goUp,
+        onCreateFolder = sync::createFolder,
+        onBindHere = sync::bindHere,
+        onCancelBrowse = sync::cancelBrowse,
+        onSyncNow = sync::syncNow,
+    )
+
+    /**
+     * SPEC §7.1 — *"open `login` in a Custom Tab"*.
+     *
+     * A Custom Tab keeps the user inside the app and, more importantly, shares the
+     * browser's cookie jar — so somebody already signed into their Nextcloud in Chrome
+     * approves with one tap instead of typing a password on a tablet. If no browser on
+     * the device supports one, this falls back to a plain `ACTION_VIEW`, which works and
+     * simply looks like leaving the app.
+     */
+    private fun openLoginPage(url: String) {
+        val intent = CustomTabsIntent.Builder().setShowTitle(true).build()
+        runCatching { intent.launchUrl(this, Uri.parse(url)) }
+            .onFailure { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+    }
+
+    private fun libraryActions(onOpenTrash: () -> Unit, onOpenSync: (DocumentId?) -> Unit) = LibraryActions(
         onOpenNote = ::openNote,
         onOpenFolder = library::openFolder,
         onGoUp = { library.goUp() },
@@ -192,6 +251,9 @@ class MainActivity : ComponentActivity() {
         onFavourite = library::setFavourite,
         onDuplicate = library::duplicate,
         onOpenTrash = onOpenTrash,
+        onSaveToNextcloud = { noteId -> onOpenSync(noteId) },
+        onStopSyncing = sync::unbind,
+        onOpenNextcloud = { onOpenSync(null) },
         onFillForMeasurement = library::fillForMeasurement,
         thumbnail = library::thumbnail,
         folderCover = library::folderCover,

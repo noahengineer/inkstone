@@ -26,6 +26,8 @@ import dev.inkstone.core.storage.NoteStore
 import dev.inkstone.core.storage.NoteTrash
 import dev.inkstone.core.storage.ThumbnailCache
 import dev.inkstone.core.storage.duplicateNote
+import dev.inkstone.core.sync.RemoteBinding
+import dev.inkstone.core.sync.SyncEngine
 import kotlinx.coroutines.flow.Flow
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -68,6 +70,14 @@ class LibraryRepository @Inject constructor(
     private val thumbnailCache: ThumbnailCache,
     /** SPEC §5.6 (M4) — the only way a PDF gets into the library. */
     private val gateway: PdfGateway,
+    /**
+     * SPEC §7.6 (M5) — where "this note owes the server something" gets recorded.
+     *
+     * Every call into it is local: an outbox row and a nudge to WorkManager, never a
+     * request (CLAUDE.md rule 4). That is what keeps every method here as fast offline as
+     * on, and it is why binding a note does not block editing it.
+     */
+    private val sync: SyncEngine,
 ) {
 
     private val ids = IdFactory(clock)
@@ -276,7 +286,12 @@ class LibraryRepository @Inject constructor(
     }
 
     suspend fun renameNote(id: DocumentId, title: String) {
-        index.renameNote(id, title.trim().ifEmpty { UNTITLED }, clock.nowEpochMillis())
+        val legal = title.trim().ifEmpty { UNTITLED }
+        index.renameNote(id, legal, clock.nowEpochMillis())
+        // The remote file is named after the note, so a rename is a remote MOVE — which
+        // SPEC §7.6 drains before that note's UPLOAD, so the bytes never land at the old
+        // path and get shuffled afterwards. A no-op for an unbound note, which is most.
+        sync.notePathChanged(id, legal)
     }
 
     suspend fun moveNotes(ids: Collection<DocumentId>, folderId: FolderId?) {
@@ -320,6 +335,10 @@ class LibraryRepository @Inject constructor(
             val path = trash.trash(id)
             index.trashNote(id, path, now)
             thumbnails.invalidate(id)
+            // SPEC §7.6 — local trash immediately, remote DELETE enqueued. The DELETE
+            // annihilates any pending UPLOAD, so a note deleted with an upload still
+            // queued is not re-created on the server moments later.
+            sync.noteTrashed(id)
         }
     }
 
@@ -334,6 +353,10 @@ class LibraryRepository @Inject constructor(
     suspend fun restoreNote(id: DocumentId): Boolean {
         if (!trash.restore(id)) return false
         index.restoreNote(id)
+        // SPEC §7.6 — re-enqueue an UPLOAD, and drop the stored oc:id and ETag: a
+        // Nextcloud trash-restore changes the fileid, so an If-Match built from the old
+        // one would 412 forever.
+        sync.noteRestored(id)
         return true
     }
 
@@ -534,6 +557,11 @@ class LibraryRepository @Inject constructor(
     suspend fun noteSaved(id: DocumentId, localRev: Long, pageCount: Int) {
         index.recordSave(id, localRev, pageCount, clock.nowEpochMillis())
         thumbnails.invalidate(id)
+        // Safe on every two-second autosave tick: the outbox UPSERTs on
+        // `(note_id, UPLOAD)`, so 500 offline edits leave exactly one row, and the
+        // drainer's 30-second floor turns "upload immediately" into "at most once per
+        // 30 s" (SPEC §7.6).
+        sync.noteChanged(id)
     }
 
     /** The note closed and its bundle was rewritten (SPEC §5.1). Redraw the library's picture. */
@@ -541,7 +569,44 @@ class LibraryRepository @Inject constructor(
         index.recordSave(id, localRev, pageCount, clock.nowEpochMillis())
         thumbnails.invalidate(id)
         if (thumbnails.refreshCover(id, cover)) index.recordThumbnail(id, localRev)
+        sync.noteChanged(id)
     }
+
+    /**
+     * `document.pdf` was rewritten by the background materializer (M5's `MaterializeWorker`)
+     * rather than by the editor closing.
+     *
+     * Only the thumbnail is invalidated, not re-rendered: this runs while the user is
+     * somewhere else, and the library redraws it on demand.
+     */
+    suspend fun noteRepublished(id: DocumentId, localRev: Long) {
+        val note = index.note(id) ?: return
+        index.recordSave(id, localRev, note.pageCount, clock.nowEpochMillis())
+        thumbnails.invalidate(id)
+    }
+
+    // -----------------------------------------------------------------------
+    // Nextcloud (SPEC §7.6)
+    // -----------------------------------------------------------------------
+
+    /**
+     * SPEC §7.6 — *"Save to Nextcloud…"*.
+     *
+     * Three local writes and a nudge to WorkManager. **Never blocks, never needs a
+     * network**, and the note stays fully editable throughout — which is SPEC §7.6
+     * point 4 and the reason binding is not a modal progress dialog.
+     */
+    suspend fun bindToNextcloud(id: DocumentId, accountId: String, remoteFolder: String?): RemoteBinding? {
+        val note = index.note(id) ?: return null
+        return sync.bind(noteId = id, accountId = accountId, title = note.title, remoteFolder = remoteFolder)
+    }
+
+    /** Stop syncing a note. **Not** a remote delete — the copy on the server stays where it is. */
+    suspend fun unbindFromNextcloud(id: DocumentId) {
+        sync.unbind(id)
+    }
+
+    suspend fun bindingOf(id: DocumentId): RemoteBinding? = sync.bindingOf(id)
 
     // -----------------------------------------------------------------------
     // Thumbnails

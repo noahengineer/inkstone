@@ -35,6 +35,7 @@ One milestone per session. A half-built ink engine sitting next to a half-built 
 | M3 | Library + organisation | Folders, search, trash | Low |
 | M4 | PDF import + materialization | Annotate a PDF, export a real PDF | 🟡 Unverified dependency + coordinate math |
 | M5 | Nextcloud auth + upload | Bind a note, upload it, offline queue | 🟡 Auth is fiddly |
+
 | M6 | Nextcloud pull + conflicts | Two-way sync that can't lose data | 🔴 **Second highest** |
 | — | — | *usable app from here* | |
 | M7 | Recognition + search | Searchable handwriting, in-app and in the PDF | Medium |
@@ -388,17 +389,32 @@ annotations will hang Preview and Chrome.
 
 ### Acceptance
 
-- [ ] Login works against a real Nextcloud, **including an instance where the user logs in with an email address** (the UID test)
-- [ ] Airplane mode → create a note → write 20 pages → bind to a folder → **note stays fully editable throughout**
-- [ ] Disable airplane mode → uploads automatically
-- [ ] **500 offline edits → exactly one upload**
-- [ ] **Note edited while its PUT is in flight → not marked SYNCED, re-enqueued** (`local_rev`)
-- [ ] Force-stop with a full outbox → relaunch → outbox intact, drains
-- [ ] Delete a bound note → local trash + remote DELETE; restore → re-uploads
-- [ ] Revoke the app password server-side → re-login prompt, **no retry loop** (check the Nextcloud log — zero brute-force warnings)
-- [ ] A note titled with emoji and `/` syncs to a correctly sanitised filename
-- [ ] The app password shows a readable name in Nextcloud's security settings, not "okhttp"
-- [ ] **Download the uploaded PDF and verify the incremental update is intact**
+Automated (green — `./gradlew build`, 1068 tests):
+
+- [x] **500 offline edits → exactly one upload** — `OutboxDrainerTest`, and `SqlSyncStoresTest` against real SQLite
+- [x] **Note edited while its PUT is in flight → not marked SYNCED, re-enqueued** (`local_rev`) — `OutboxDrainerTest`
+- [x] Revoke the app password → halt with **no retry loop**: one PUT, one confirmation GET, nothing else — `OutboxDrainerTest`
+- [x] The UID test, against a mock instance whose login name is an email address — `LoginFlowV2Test`
+- [x] A note titled with emoji and `/` sanitises correctly — `RemoteNameTest`, `NextcloudCapabilitiesTest`
+- [x] The app password's name is `Inkstone/1.0 (Android)`, not "okhttp" — `LoginFlowV2Test`
+- [x] Delete a bound note → the DELETE annihilates a pending UPLOAD and the binding goes; restore → re-uploads as a create — `OutboxCoalescingTest`, `OutboxDrainerTest`
+- [x] **Download the uploaded PDF and verify the incremental update is intact** — done against a **live Nextcloud**: `PdfRoundTripSpikeTest` PASS, byte-identical. **SPEC Appendix B #4 is closed.**
+
+Verified on a device against a real Nextcloud (emulator — see `docs/M5-NEXTCLOUD.md` §7):
+
+- [x] Login works against a real Nextcloud; capabilities fetched and cached
+- [x] Airplane mode → create a note → write 20 pages → bind to a folder → **note stays fully
+      editable throughout**, and ~55 revisions of offline editing left **one** outbox row
+- [x] Disable airplane mode → **uploads automatically within 9 s, no user action**
+- [x] Force-stop with a full outbox → relaunch → outbox intact, drains
+- [x] A note titled `Physics: Term 1 / 2 📘` synced to `Physics_ Term 1 _ 2 📘.pdf`
+
+Still owed:
+
+- [ ] Login against an instance where the user logs in with an **email address** (uid ≠ loginName).
+      Covered by `LoginFlowV2Test` against a mock; the live account tested had uid == loginName.
+- [ ] Revoke the app password server-side → check the Nextcloud log: **zero brute-force warnings**
+- [ ] A confirmation pass on the **actual Galaxy Tab** (CLAUDE.md definition of done #4)
 
 ### Prompt
 

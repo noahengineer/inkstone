@@ -260,6 +260,7 @@ private fun LibraryToolbar(state: LibraryUiState, actions: LibraryActions, onNew
             ) { Text(if (state.layout == LibraryLayout.GRID) "List" else "Grid") }
             TextButton(onClick = onNewFolder) { Text("New folder") }
             TextButton(onClick = actions.onOpenTrash) { Text("Trash") }
+            TextButton(onClick = actions.onOpenNextcloud) { Text("Nextcloud") }
             MeasureMenu(actions)
         }
 
@@ -441,6 +442,11 @@ data class LibraryActions(
     val onFavourite: (DocumentId, Boolean) -> Unit,
     val onDuplicate: (DocumentId) -> Unit,
     val onOpenTrash: () -> Unit,
+    /** SPEC §7.6 — *"Save to Nextcloud…"*. Opens the account/folder picker for this note. */
+    val onSaveToNextcloud: (DocumentId) -> Unit,
+    /** Stop syncing a bound note. Not a remote delete — the copy on the server stays. */
+    val onStopSyncing: (DocumentId) -> Unit,
+    val onOpenNextcloud: () -> Unit,
     /** ROADMAP M3's frame-rate gate needs 500 notes. See `LibraryFixture`. */
     val onFillForMeasurement: () -> Unit,
     val thumbnail: suspend (NoteSummary) -> androidx.compose.ui.graphics.ImageBitmap?,

@@ -78,7 +78,7 @@ class Thumbnails @Inject constructor(private val cache: ThumbnailCache, private 
             // behind may have been the same note, and rendering it twice is pure waste.
             memory.get(key)?.let { return@withPermit it }
             val page = fold(note.id) ?: return@withPermit null
-            val bytes = renderer.render(page, ThumbnailCache.COVER_WIDTH_PX) ?: return@withPermit null
+            val bytes = renderer.render(note.id, page, ThumbnailCache.COVER_WIDTH_PX) ?: return@withPermit null
             cache.writeCover(note.id, bytes)
             decode(bytes)?.also { memory.put(key, it) }
         }
@@ -98,7 +98,7 @@ class Thumbnails @Inject constructor(private val cache: ThumbnailCache, private 
         return renderPermits.withPermit {
             memory.get(key)?.let { return@withPermit it }
             val page = fold() ?: return@withPermit null
-            val bytes = renderer.render(page, ThumbnailCache.PAGE_WIDTH_PX) ?: return@withPermit null
+            val bytes = renderer.render(id, page, ThumbnailCache.PAGE_WIDTH_PX) ?: return@withPermit null
             cache.writePage(id, pageId, bytes)
             decode(bytes)?.also { memory.put(key, it) }
         }
@@ -130,7 +130,7 @@ class Thumbnails @Inject constructor(private val cache: ThumbnailCache, private 
 
     /** Render and store a cover from a page already folded — the save path (SPEC §5.1). */
     suspend fun refreshCover(id: DocumentId, page: FoldedPage): Boolean {
-        val bytes = renderer.render(page, ThumbnailCache.COVER_WIDTH_PX) ?: return false
+        val bytes = renderer.render(id, page, ThumbnailCache.COVER_WIDTH_PX) ?: return false
         cache.writeCover(id, bytes)
         decode(bytes)?.let { memory.put(id.value, it) }
         return true

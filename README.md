@@ -8,7 +8,7 @@ A handwriting-first note-taking app for Android tablets, storing notes as ordina
 
 `./gradlew build` is green, including `detekt`, Android lint, both `:core` guardrails, and — new in M3 — SQLDelight migration verification against a committed schema fixture.
 
-What is **outstanding** and needs the tablet: M3's two performance criteria (500 notes at 60fps, no jank while thumbnails generate), the instrumented `:core:database` test, and M1's latency gates. [docs/M3-LIBRARY.md](docs/M3-LIBRARY.md) §9 lists them.
+What is **outstanding** and needs the tablet: M3's two performance criteria (500 notes at 60fps, no jank while thumbnails generate) and M1's latency gates. The instrumented `:core:database` tests now run on an emulator — see *Testing on an emulator*. [docs/M3-LIBRARY.md](docs/M3-LIBRARY.md) §9 lists them.
 
 Milestone notes, newest first:
 
@@ -92,6 +92,61 @@ debugging at all.
 ⚠️ **Measuring still needs adb.** `dumpsys gfxinfo` — the M1 frame-rate gate —
 has no MTP equivalent. Getting a build onto the tablet and measuring it are
 different problems, and the script only solves the first.
+
+---
+
+## Testing on an emulator
+
+The tablet is required *at the end* of a milestone. It is a slow way to find
+bugs on the way there, and if USB debugging is not authorized it cannot run
+instrumented tests at all. **Create an AVD** — Android Studio → Device Manager →
+Create Virtual Device, any tablet image at API 35+ — and most of a milestone's
+device work can be driven from the command line.
+
+Added in M5, which found three bugs this way that no JVM test could have.
+
+```bash
+adb devices                                              # emulator-5554
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+./gradlew :core:database:connectedDebugAndroidTest       # the instrumented tests
+```
+
+### Driving the app
+
+```bash
+adb shell uiautomator dump /sdcard/ui.xml   # then read bounds= and tap the centre
+adb shell input tap <x> <y>
+adb shell cmd connectivity airplane-mode enable      # …and disable
+adb shell am force-stop dev.inkstone
+adb exec-out run-as dev.inkstone cat databases/inkstone.db > local.db
+```
+
+⚠️ **Drawing needs `input stylus`, not `input`.** `PalmGuard` accepts only
+`TOOL_TYPE_STYLUS` and `TOOL_TYPE_ERASER` (SPEC §3.3), so a plain
+`input swipe` lands on the canvas and draws **nothing** — silently, with no
+error and a stroke count that stays at zero:
+
+```bash
+adb shell input stylus swipe 600 700 1600 900 400
+```
+
+⚠️ **Re-dump before every tap.** The UI changes under you — tapping "Save here"
+switches the folder browser to the accounts pane — and coordinates from a stale
+dump land on whatever moved into that spot. In M5 that was **Sign out**, which
+took a while to understand.
+
+⚠️ **In Git Bash, prefix device paths with `MSYS_NO_PATHCONV=1`**, or
+`/sdcard/ui.xml` is rewritten to `C:/Program Files/Git/sdcard/ui.xml`.
+
+### What an emulator cannot tell you
+
+- **Ink feel and frame timing.** The whole reason CLAUDE.md's definition of done
+  says *"not just an emulator"*.
+- **`:android:ink`'s instrumented tests**, which fail on x86_64 and pass on
+  arm64: M1's synthetic-ink fixture does not clamp orientation to `[0, 2π)` and
+  x86_64 rounding puts it a thousandth outside, which `androidx.ink` rejects.
+- Anything about **the tablet's own SQLite build**, which is the argument
+  `:core:database` makes for its tests being instrumented in the first place.
 
 ---
 

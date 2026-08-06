@@ -23,13 +23,14 @@ import dev.inkstone.core.model.PageSize
  * It is used by two things that must not disagree: [DryStrokesView], which draws what the
  * user is looking at, and [InkPageThumbnailRenderer], which draws the picture the library
  * shows of the same page. A thumbnail whose rules are spaced differently, or whose
- * highlighter sits in front of the ink, is a bug the user sees as "the preview is wrong"
+ * highlighter sits behind the ink, is a bug the user sees as "the preview is wrong"
  * — and it is exactly what happens when two renderers are maintained side by side.
  *
  * The three things that have to be shared, and were duplicated before this existed:
  *
- * 1. **Render order.** [StrokeStore.forEachInRenderOrder] emits highlighters first
- *    (SPEC §3.4 — the highlighter draws *behind* ink).
+ * 1. **Render order.** [StrokeStore.forEachInRenderOrder] emits highlighters *last*, with
+ *    plain alpha, so a highlight tints the writing it covers (SPEC §3.4 — reversed after
+ *    M4; [InkBrushKind.drawsOverInk] records why, and why a multiply blend was rejected).
  * 2. **Erasure compositing.** An erased stroke is drawn into an offscreen layer and the
  *    swept region punched out with `DST_OUT` (SPEC §3.5). Clipping would be cheaper and
  *    its edge is only as good as the hardware renderer's clip antialiasing.

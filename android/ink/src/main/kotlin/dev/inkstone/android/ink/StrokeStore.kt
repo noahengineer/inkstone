@@ -93,14 +93,15 @@ internal class DryStroke(val id: ObjectId, val stroke: Stroke, val kind: InkBrus
 internal class StrokeStore {
 
     /**
-     * SPEC §3.4 — the highlighter "draws *behind* ink". Two lists rather than one sorted list,
-     * so render order is free rather than a per-frame sort of 5,000 elements.
+     * SPEC §3.4 — the highlighter draws **over** ink, multiplied ([InkBrushKind.drawsOverInk]
+     * records why that reversed after M4). Two lists rather than one sorted list, so render
+     * order is free rather than a per-frame sort of 5,000 elements.
      *
      * This is a *band*, not a z-order: within each band, order is insertion order, which
      * matches the fractional keys the recorder hands out in the same sequence.
      */
-    private val behind = ArrayList<DryStroke>()
-    private val above = ArrayList<DryStroke>()
+    private val ink = ArrayList<DryStroke>()
+    private val highlight = ArrayList<DryStroke>()
 
     private val byId = HashMap<ObjectId, DryStroke>()
 
@@ -118,7 +119,7 @@ internal class StrokeStore {
     var revision: Long = 0L
         private set
 
-    val size: Int get() = behind.size + above.size
+    val size: Int get() = ink.size + highlight.size
 
     // --- Gesture brackets ---------------------------------------------------
 
@@ -174,12 +175,12 @@ internal class StrokeStore {
     }
 
     private fun insert(dry: DryStroke) {
-        (if (dry.kind.drawsBehindInk) behind else above).add(dry)
+        (if (dry.kind.drawsOverInk) highlight else ink).add(dry)
         byId[dry.id] = dry
     }
 
     private fun remove(dry: DryStroke) {
-        (if (dry.kind.drawsBehindInk) behind else above).remove(dry)
+        (if (dry.kind.drawsOverInk) highlight else ink).remove(dry)
         byId.remove(dry.id)
     }
 
@@ -243,8 +244,8 @@ internal class StrokeStore {
 
     /** Drop everything on screen without touching the page's log. Used when switching pages. */
     fun reset() {
-        behind.clear()
-        above.clear()
+        ink.clear()
+        highlight.clear()
         byId.clear()
         removedThisGesture.clear()
         erasedThisGesture.clear()
@@ -272,15 +273,16 @@ internal class StrokeStore {
     // --- Rendering ----------------------------------------------------------
 
     /**
-     * Visit every stroke in render order — highlighters first.
+     * Visit every stroke in render order — ink first, highlighters last, so a highlight
+     * multiplies over the writing it was drawn across.
      *
      * [visibleBounds] culls in page space. It does nothing when the whole page is on screen; it
      * earns its keep when zoomed in, which is where the frame budget is tightest because each
      * visible stroke covers more pixels.
      */
     fun forEachInRenderOrder(visibleBounds: Box?, action: (DryStroke) -> Unit) {
-        emit(behind, visibleBounds, action)
-        emit(above, visibleBounds, action)
+        emit(ink, visibleBounds, action)
+        emit(highlight, visibleBounds, action)
     }
 
     private fun emit(strokes: List<DryStroke>, visibleBounds: Box?, action: (DryStroke) -> Unit) {
@@ -319,8 +321,8 @@ internal class StrokeStore {
         )
         val capsule = ErasedRegion.Capsule(from.x, from.y, to.x, to.y, radiusPageUnits)
 
-        val touched = applyErase(behind, coarse, sweptTip, capsule, mode) +
-            applyErase(above, coarse, sweptTip, capsule, mode)
+        val touched = applyErase(ink, coarse, sweptTip, capsule, mode) +
+            applyErase(highlight, coarse, sweptTip, capsule, mode)
         if (touched > 0) revision++
         return touched
     }
@@ -374,7 +376,7 @@ internal class StrokeStore {
     fun pruneFullyErased() {
         var removed = false
         var budget = PRUNE_BUDGET
-        for (list in listOf(behind, above)) {
+        for (list in listOf(ink, highlight)) {
             val iterator = list.iterator()
             while (iterator.hasNext() && budget > 0) {
                 val dry = iterator.next()

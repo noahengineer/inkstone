@@ -3,6 +3,10 @@ plugins {
     alias(libs.plugins.compose.compiler)
     alias(libs.plugins.ksp)
     alias(libs.plugins.hilt)
+    // M5. `KeystoreCredentialStore` seals a four-field record into an AES-GCM envelope
+    // (SPEC §14); hand-rolling the escaping for it would be the one place in this app
+    // where a stray quote in a login name silently corrupts a credential.
+    alias(libs.plugins.kotlin.serialization)
 }
 
 dependencies {
@@ -29,12 +33,15 @@ dependencies {
     implementation(libs.androidx.lifecycle.viewmodel.compose)
 
     implementation(libs.androidx.work.runtime.ktx)
+    // SPEC §7.1 — the login flow opens in a Custom Tab.
+    implementation(libs.androidx.browser)
 
     implementation(libs.hilt.android)
     implementation(libs.hilt.navigation.compose)
     ksp(libs.hilt.compiler)
 
     implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.kotlinx.serialization.json)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)

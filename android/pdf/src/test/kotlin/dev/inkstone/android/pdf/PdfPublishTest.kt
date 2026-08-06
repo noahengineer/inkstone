@@ -311,6 +311,56 @@ class PdfPublishTest {
     }
 
     // -----------------------------------------------------------------------
+    // SPEC §3.4 — the highlighter draws over ink, multiplied
+    // -----------------------------------------------------------------------
+
+    /**
+     * The half of the M4 highlighter fix that PDF viewers see: annotation order is paint
+     * order, so a highlighter written after the ink is a highlighter drawn over it.
+     */
+    @Test
+    fun `a highlighter is painted after the ink it covers`() {
+        val original = PdfFixtures.sourcePdf()
+        // Handed over in the order the outliner emits them: ink first, highlighters last.
+        val published = publishInk(
+            original,
+            0,
+            listOf(PdfFixtures.square("word", 72f, 72f, 40f), PdfFixtures.highlight("hl", 70f, 70f, 44f)),
+        )
+
+        val annotations = annotationsOf(published, 0)
+        assertEquals(
+            listOf("word", "hl"),
+            annotations.map { AnnotationName.parse(it.getString(COSName.NM))?.value },
+            "annotation order is paint order — the highlight must come second",
+        )
+    }
+
+    /**
+     * **Nothing carries a blend mode**, and the highlighter especially must not.
+     *
+     * `/BM /Multiply` was written here briefly and removed (SPEC §3.4): over dark ink,
+     * multiply is indistinguishable from drawing behind, which is the thing this milestone
+     * stopped doing. The rule that outlives the episode is that the published file
+     * composites exactly the way the editor does — plain alpha, `/Normal` — so a blend
+     * mode reappearing here means the two have drifted apart again.
+     */
+    @Test
+    fun `nothing is published with a blend mode`() {
+        val original = PdfFixtures.sourcePdf()
+        val published = publishInk(
+            original,
+            0,
+            listOf(PdfFixtures.square("word", 72f, 72f, 40f), PdfFixtures.highlight("hl", 70f, 70f, 44f)),
+        )
+
+        for (annotation in annotationsOf(published, 0)) {
+            val blend = blendModesOf(annotation)
+            assertTrue(blend.isEmpty(), "expected /Normal compositing throughout, got $blend")
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // ⭐ SPEC §6.4 — the density rule
     // -----------------------------------------------------------------------
 
@@ -518,6 +568,26 @@ class PdfPublishTest {
         val annots = doc.getPage(pageIndex).cosObject.getDictionaryObject(COSName.ANNOTS) as? COSArray
             ?: return emptyList()
         (0 until annots.size()).mapNotNull { annots.getObject(it) as? COSDictionary }
+    }
+
+    /**
+     * Every `/BM` in an annotation's `/AP /N` resources.
+     *
+     * Walked with `getDictionaryObject` at each step rather than by casting what `values`
+     * returns: once a file has been written and re-parsed, a dictionary's entries are
+     * indirect references, so `filterIsInstance<COSDictionary>()` over them silently finds
+     * nothing — and an assertion that the blend mode is *absent* then passes for the wrong
+     * reason. `getDictionaryObject` resolves the reference.
+     */
+    private fun blendModesOf(annotation: COSDictionary): List<COSName> {
+        val appearance = annotation.getDictionaryObject(COSName.AP) as COSDictionary
+        val normal = appearance.getDictionaryObject(COSName.N) as COSDictionary
+        val resources = normal.getDictionaryObject(COSName.RESOURCES) as COSDictionary
+        val extGState = resources.getDictionaryObject(COSName.EXT_G_STATE) as COSDictionary
+        return extGState.keySet().mapNotNull { name ->
+            (extGState.getDictionaryObject(name) as? COSDictionary)
+                ?.getDictionaryObject(COSName.getPDFName("BM")) as? COSName
+        }
     }
 
     private fun inkListPoints(annotation: COSDictionary): List<dev.inkstone.core.model.PdfPoint> {

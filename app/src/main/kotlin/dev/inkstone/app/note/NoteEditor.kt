@@ -36,7 +36,7 @@ import kotlinx.coroutines.withContext
  *
  * - **Every ~2 s**, [autosaveLoop] drains the ink surface and appends to `journal.ops`. One
  *   append. The document is not rewritten.
- * - **On close**, [materialize] folds the journal into the bundle. That is where the rewrite
+ * - **On close**, [materializeNow] folds the journal into the bundle. That is where the rewrite
  *   happens, and it happens once.
  *
  * Draining encodes stroke geometry, so it runs on [Dispatchers.Default] — CLAUDE.md rule 7
@@ -189,9 +189,14 @@ class NoteEditor(
         deviceId = note.document.deviceId.ifEmpty { ids.newDeviceId() }
         val opened = NoteSession.open(store, ids, clock, note, deviceId)
         session = opened
+        // Where this device left off, falling back to the first page. Checked against the live
+        // pages rather than trusted: the remembered page may have been deleted here, or deleted
+        // on the other tablet and merged in since, and `view.json` is not part of that merge.
+        val live = opened.document.livePages
+        val remembered = store.loadViewState(opened.document.id)?.takeIf { saved -> live.any { it.id == saved } }
         // Directly, not through `showPage`: that launches a coroutine, and publishing before it
         // ran would show a note with no page.
-        display(opened, opened.document.livePages.first().id)
+        display(opened, remembered ?: live.first().id)
         // The other half of the binding race — see `bindSurface`. On a real device this is the
         // side that runs second, and if it did not bind, nothing the user drew would be recorded.
         bindSurface()
@@ -268,37 +273,44 @@ class NoteEditor(
     }
 
     /**
-     * SPEC §5.1 — fold the journal into the bundle. Called when the note goes away.
+     * SPEC §5.1 — fold the journal into the bundle, then republish the PDF. Called when the
+     * note goes away, and before an export.
      *
-     * `Activity.onStop` is the last point the process is reliably alive, so this is what keeps
+     * `Activity.onStop` is the last point the process is reliably alive, so that is what keeps
      * the invariant that the published file is never more than one editing session stale.
+     *
+     * Suspending rather than fire-and-forget because export has to wait for it: sharing before
+     * the rewrite hands out a file SPEC §5.1 explicitly allows to be a session behind, and a
+     * note exported without the ink just drawn on it looks exactly like data loss.
+     *
+     * @return false when the PDF could not be written. The bundle is still saved — see the
+     *   comment on the publish step — so this is "not publishable yet", never "lost".
      */
-    fun materialize() {
-        val session = this.session ?: return
-        work.launch {
-            save()
-            session.close()
-            // The bundle has just been rewritten, so this fold is what the note now *is* —
-            // which makes it the only honest moment to redraw the library's thumbnail. The
-            // published PDF cannot be the source: it may be one session stale (SPEC §5.1).
-            session.document.livePages.firstOrNull()?.let { first ->
-                library?.onMaterialized(
-                    id = session.document.id,
-                    localRev = session.document.localRev,
-                    pageCount = session.pageCount,
-                    cover = session.page(first.id),
-                )
-            }
-            // SPEC §5.1/§5.2 — and strictly after the bundle: the published PDF embeds
-            // those exact bytes and records their hash, so publishing first would write
-            // a marker describing a bundle that no longer exists (SPEC §5.6).
-            //
-            // Failure here is reported and does not undo the save. The bundle is already
-            // on disk and is the truth; a note whose PDF could not be written is a note
-            // that opens perfectly and cannot yet be read elsewhere.
-            val published = materializer?.let { runCatching { it.materialize(session.document.id) } }
-            publish(message = if (published?.isFailure == true) PUBLISH_FAILED else null)
+    suspend fun materializeNow(): Boolean {
+        val session = this.session ?: return false
+        save()
+        session.close()
+        // The bundle has just been rewritten, so this fold is what the note now *is* —
+        // which makes it the only honest moment to redraw the library's thumbnail. The
+        // published PDF cannot be the source: it may be one session stale (SPEC §5.1).
+        session.document.livePages.firstOrNull()?.let { first ->
+            library?.onMaterialized(
+                id = session.document.id,
+                localRev = session.document.localRev,
+                pageCount = session.pageCount,
+                cover = session.page(first.id),
+            )
         }
+        // SPEC §5.1/§5.2 — and strictly after the bundle: the published PDF embeds
+        // those exact bytes and records their hash, so publishing first would write
+        // a marker describing a bundle that no longer exists (SPEC §5.6).
+        //
+        // Failure here is reported and does not undo the save. The bundle is already
+        // on disk and is the truth; a note whose PDF could not be written is a note
+        // that opens perfectly and cannot yet be read elsewhere.
+        val published = materializer?.let { runCatching { it.materialize(session.document.id) } }
+        publish(message = if (published?.isFailure == true) PUBLISH_FAILED else null)
+        return published?.isSuccess ?: false
     }
 
     /** ROADMAP M3 — rename from inside the editor. The library sees it through [LibraryUpdates]. */
@@ -386,11 +398,18 @@ class NoteEditor(
         }
     }
 
+    /**
+     * The one place the current page changes — which is why remembering it lives here rather
+     * than in each of the six callers that navigate.
+     */
     private suspend fun display(session: NoteSession, page: PageId) {
         currentPage = page
         val folded = session.page(page)
         currentTemplate = (folded.background as? Background.Template)?.template ?: PageTemplate.BLANK
         surface?.loadPage(folded)
+        // Convenience, not data: a note that cannot record where it was still opens, on page
+        // one. So this must never be able to fail an edit that has already happened.
+        runCatching { store.saveViewState(session.document.id, page) }
     }
 
     fun goToPage(index: Int) {
@@ -497,11 +516,17 @@ class NoteEditor(
         work.cancel()
     }
 
-    fun dismissMessage() {
-        _state.value = _state.value.copy(message = null)
+    /**
+     * Put a message in front of the user, or clear it with null.
+     *
+     * One setter rather than one function per message: the snackbar is the only channel the
+     * editor has, and a second way to reach it is a second thing to keep in step.
+     */
+    fun showMessage(text: String?) {
+        _state.value = _state.value.copy(message = text)
     }
 
-    private companion object {
+    internal companion object {
         /** SPEC §5.1 — "flushed ~2 s". */
         const val AUTOSAVE_INTERVAL_MS = 2_000L
         const val DEFAULT_TITLE = "Notebook"
@@ -513,6 +538,13 @@ class NoteEditor(
          * is safe, and the file other apps read is one session behind.
          */
         const val PUBLISH_FAILED = "Saved. Could not update the shareable PDF this time."
+
+        /**
+         * Export found nothing to hand over. Says which half is fine, because "export
+         * failed" on a note-taking app reads as "your note is gone" and it is not: the
+         * bundle is the truth (SPEC §5.3) and it is already on disk.
+         */
+        const val EXPORT_FAILED = "Your note is saved, but the PDF could not be prepared to share."
 
         /** Ops built only to update the screen; never journaled. See `reconcile`. */
         val REPLAY_CLOCK = LamportClock(0, "replay")

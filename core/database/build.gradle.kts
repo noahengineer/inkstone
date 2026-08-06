@@ -7,6 +7,11 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             api(project(":core:model"))
+            // M5. The sync *semantics* live in :core:sync so they can be tested against a
+            // fake without a driver or a device; this module supplies the rows and the one
+            // transaction they need. The edge is within :core:*, so SPEC §2.1's one-way
+            // rule is untouched, and it is acyclic: :core:database -> :core:sync -> :core:model.
+            api(project(":core:sync"))
             api(libs.sqldelight.runtime)
             api(libs.sqldelight.coroutines)
             implementation(libs.kotlinx.coroutines.core)
@@ -27,6 +32,11 @@ kotlin {
             implementation(kotlin("test"))
             implementation(libs.kotlinx.coroutines.test)
             implementation(libs.androidx.test.junit)
+            // The class `testInstrumentationRunner` below names. It is NOT pulled in
+            // transitively by androidx.test.ext:junit — without it the test process dies
+            // with ClassNotFoundException before a single test runs, and `check`'s
+            // compile-only guard cannot see it because compiling is not dexing.
+            implementation(libs.androidx.test.runner)
             implementation(libs.androidx.test.core)
         }
         androidMain.dependencies {

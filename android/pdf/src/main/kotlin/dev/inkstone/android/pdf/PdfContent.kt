@@ -67,27 +67,26 @@ internal object PdfContent {
      * truth, and Recovered mode for such a page can only get a flat image back —
      * which is why [PdfPageKeys.FLATTENED] is written beside it.
      */
-    fun flattenedOverlay(outlines: List<StrokeOutline>, geometry: PdfPageGeometry, alphaStates: Map<Int, String>) =
-        buildContent {
-            line("q")
-            var currentAlpha: String? = null
-            for (outline in outlines) {
-                if (outline.isEmpty) continue
-                val state = alphaStates[alpha(outline.colorArgb)]
-                if (state != currentAlpha) {
-                    // One `gs` per change rather than per stroke: a page of 2,000
-                    // strokes is 2,000 redundant operators otherwise, and they are
-                    // parsed by every viewer on every draw.
-                    line("/${state ?: OPAQUE_STATE} gs")
-                    currentAlpha = state
-                }
-                val color = outline.colorArgb
-                line("${component(color shr RED_SHIFT)} ${component(color shr GREEN_SHIFT)} ${component(color)} rg")
-                appendPolygons(outline.contours, geometry)
-                line("f")
+    fun flattenedOverlay(outlines: List<StrokeOutline>, geometry: PdfPageGeometry) = buildContent {
+        line("q")
+        var currentAlpha: String? = null
+        for (outline in outlines) {
+            if (outline.isEmpty) continue
+            val state = stateNameFor(outline)
+            if (state != currentAlpha) {
+                // One `gs` per change rather than per stroke: a page of 2,000
+                // strokes is 2,000 redundant operators otherwise, and they are
+                // parsed by every viewer on every draw.
+                line("/$state gs")
+                currentAlpha = state
             }
-            line("Q")
+            val color = outline.colorArgb
+            line("${component(color shr RED_SHIFT)} ${component(color shr GREEN_SHIFT)} ${component(color)} rg")
+            appendPolygons(outline.contours, geometry)
+            line("f")
         }
+        line("Q")
+    }
 
     /**
      * SPEC §5.5 — the invisible searchable text layer, rendering mode `3 Tr`.
@@ -239,6 +238,15 @@ internal object PdfContent {
 
     fun alpha(colorArgb: Int): Int = (colorArgb ushr ALPHA_SHIFT) and BYTE_MASK
 
+    /**
+     * The `/ExtGState` name for an outline's compositing.
+     *
+     * Derived rather than passed as a map so the content stream and the resource
+     * dictionary that has to satisfy it cannot name different things: `PdfBoxWriter`
+     * calls this too.
+     */
+    fun stateNameFor(outline: StrokeOutline): String = "GS${alpha(outline.colorArgb)}"
+
     /** The `/ca` value for an ARGB colour, as a PDF real. */
     fun alphaValue(colorArgb: Int): Float = alpha(colorArgb) / BYTE_MASK.toFloat()
 
@@ -276,9 +284,6 @@ internal object PdfContent {
     }
 
     private fun buildContent(block: ContentBuilder.() -> Unit): ByteArray = ContentBuilder().apply(block).toByteArray()
-
-    /** The name of the fully-opaque graphics state every plan carries. */
-    const val OPAQUE_STATE: String = "GSop"
 
     // An ARGB int's channel offsets. These are the layout, not tunables.
     private const val ALPHA_SHIFT = 24

@@ -99,6 +99,10 @@ internal object PdfFixtures {
         )
     }
 
+    /** A highlighter outline: translucent, and written after the ink it covers (SPEC §3.4). */
+    fun highlight(id: String, left: Float, top: Float, side: Float): StrokeOutline =
+        square(id, left, top, side, TRANSLUCENT_YELLOW)
+
     fun plan(
         sourceIndex: Int,
         outlines: List<StrokeOutline>,

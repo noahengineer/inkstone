@@ -411,6 +411,40 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
         fs.writeBytesAtomically(NoteLayout.undo(id), out.toByteArray())
     }
 
+    /**
+     * Remember which page [id] was left on, so reopening it lands where the user was.
+     *
+     * Local and per-device (see [NoteLayout.VIEW_JSON]). Written on every page change, which
+     * is a few hundred bytes at human speed and nowhere near the ink path.
+     *
+     * **Not fatal.** A note whose view state cannot be written still opens, on page one —
+     * so this deliberately does not participate in the save's success or failure.
+     */
+    public suspend fun saveViewState(id: DocumentId, pageId: PageId) {
+        val json = buildJsonObject { put(V_PAGE, JsonPrimitive(pageId.value)) }
+        fs.writeBytesAtomically(
+            NoteLayout.viewState(id),
+            OpCodec.json.encodeToString(JsonObject.serializer(), json).encodeToByteArray(),
+        )
+    }
+
+    /**
+     * @return the page [id] was last left on, or null when there is no record of one — a note
+     *   never opened on this device, or one whose pages have changed underneath it. **The
+     *   caller must check the page still exists**: it may have been deleted here, or deleted
+     *   on the other tablet and merged in since.
+     */
+    public suspend fun loadViewState(id: DocumentId): PageId? {
+        val path = NoteLayout.viewState(id)
+        if (!fs.exists(path)) return null
+        // A truncated or hand-mangled view.json is a note that opens on page one, never a
+        // note that fails to open.
+        return runCatching {
+            OpCodec.json.parseToJsonElement(fs.readBytes(path).decodeToString())
+                .jsonObject[V_PAGE]?.jsonPrimitive?.content?.takeIf { it.isNotEmpty() }?.let(::PageId)
+        }.getOrNull()
+    }
+
     public suspend fun loadUndo(id: DocumentId): Pair<List<UndoEntry>, List<UndoEntry>> {
         val path = NoteLayout.undo(id)
         if (!fs.exists(path)) return emptyList<UndoEntry>() to emptyList()
@@ -494,6 +528,9 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
         const val HEADER_BYTES = 4
         const val U_UNDO = "undo"
         const val U_REDO = "redo"
+
+        /** `view.json`'s only key — the page this device was last on. */
+        const val V_PAGE = "pageId"
         const val U_FORWARD = "f"
         const val U_INVERSE = "i"
     }

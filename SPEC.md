@@ -123,6 +123,10 @@ No real-time collaboration. No AI. No infinite canvas. No audio recording. See �
 
 **Dependency direction:** `:app` → `:android:*` → `:core:*`. Never the reverse. Third-party types never cross a module boundary — PdfBox stays behind a `PdfWriter` interface in `:android:pdf`, ML Kit stays in `:android:ocr`.
 
+*Added in M5.* Within `:core:*` there is now one edge: **`:core:database` → `:core:sync`**. The outbox's semantics — coalescing, annihilation, backoff inheritance, the mid-flight `local_rev` guard — are the part of §7.6 that fails quietly, so they live in `:core:sync` behind ports (`OutboxStore`, `BindingStore`, `AccountStore`, `SyncNotes`) that `:core:database` implements. The reverse edge would have put the rules in the module that owns SQLDelight and made *"500 offline edits produce one upload"* an instrumented test. Acyclic, and the one-way rule above is untouched. There is also a **test-only** `:android:pdf` → `:core:sync` edge, for Appendix B #4's spike only.
+
+**Ktor is a third-party type too.** `:core:sync` exposes `NextcloudTransport`, which is opaque outside the module — so `:app` cannot name an `HttpClient`, and therefore has nothing to make a request *with* outside the outbox (§7.6). Added in M5, when Hilt asked `:app` to name a provider's return type.
+
 ### 2.2 Interfaces core needs from the platform
 
 `:core:*` cannot do these itself. Define them in `:core:model`, implement in `:app`:
@@ -220,7 +224,19 @@ Predicted segments are speculative; un-draw them when real events arrive. Verify
 | **Fountain** | Pressure → width. Slight velocity taper. Default. |
 | **Ballpoint** | Uniform width, no pressure response. |
 | **Pencil** | Pressure + tilt → opacity and width. ~~Grain texture.~~ **Deferred to M10** — see below. |
-| **Highlighter** | Uniform width, multiply blend, draws *behind* ink, stroke-stabilization slider. |
+| **Highlighter** | Uniform width, ~~multiply blend~~ plain alpha, draws **over** ink, stroke-stabilization slider. |
+
+⚠️ **Corrected after M4, from the tablet, in three attempts — the middle one is the instructive part.** Originally *"multiply blend, draws behind ink"*. Reported first as *"you can't highlight your own writing, it gets put under it"*, and then twice more.
+
+**1. "Behind" was only tenable because the multiply was never implemented.** M1 delivered the z-order and not the blend, so the highlighter was a plain translucent stroke. Plain translucent yellow over black writing lightens it, so behind was the only order that kept writing legible. It went unquestioned for three milestones because nothing in the app highlighted anything but blank paper, where the two orders are indistinguishable.
+
+**2. "Multiply, on top" is the principled fix and is wrong here.** It is what a physical highlighter does, and the arithmetic defeats it: multiply cannot lighten, so yellow over black leaves the writing *exactly* black — **pixel-identical to drawing behind it**. Shipping it produced the same report again. Note what this means for debugging: over dark ink, *behind* and *multiply-on-top* are the same pixels, so the visible difference being reported lived entirely in the **wet** stroke, which is plain alpha and did tint the writing while the pen was down.
+
+That produced one genuine finding, worth keeping even though what it enabled was reverted: **wet ink cannot carry a blend mode.** `InProgressStrokesView` renders through a **SurfaceView front buffer** (`CanvasInProgressStrokesRenderHelperV33` on API 33+) which SurfaceFlinger composites over the window, and a separate surface only alpha-blends. `useHighLatencyRenderHelper` (`@RestrictTo(LIBRARY_GROUP)`) moves it onto HWUI, where `setLayerType(LAYER_TYPE_HARDWARE, paint)` applies an xfermode — at the cost of the low-latency path. So **any brush whose dry rendering uses a blend mode must give up the front buffer to stay consistent.**
+
+**3. Plain alpha, on top, is what shipped.** The highlight tints what it covers. "Leaves the writing untouched" and "looks like it is over the writing" are contradictory requirements and no blend mode satisfies both — tinting is the only thing that reads as *on top*. It also needs nothing from the wet layer, because plain alpha is what the wet layer already does: the stroke does not change at the instant it lands, and the highlighter keeps its front buffer.
+
+On screen this is render order alone (`StrokeStore.forEachInRenderOrder` emits highlighters last); in the published PDF it is annotation order alone, since annotation order is paint order. **No `/BM` is written anywhere**, and `PdfPublishTest` asserts its absence — the invariant that outlives this episode is that the published file composites exactly the way the editor does.
 
 Per-brush: colour (hex + wheel + eyedropper), width, 12 saved slots. *(M1 ships hex + wheel + 12 slots, which is what ROADMAP M1's scope line asks for. The eyedropper needs to sample the rendered canvas and belongs with M10's toolbar work.)*
 
@@ -780,6 +796,8 @@ POST <poll.endpoint>  body: token=<pollToken>   every 2–5 s
    ```
    Store both: `loginName` for Basic auth, `id` for the path.
 
+⚠️ **Rules 3 and 6 pull in opposite directions, and M5 found the resolution.** The uid can only be fetched *using* the app password, over the network, which can fail — so the credential is persisted **twice**: once the instant the 200 arrives with `uid = ""` (rule 3 satisfied, nothing lost), and again once the uid is known. An account in that intermediate state is `NEEDS_UID`, is finished on the next launch, and **may not be used for WebDAV in the meantime** — `NextcloudSession` refuses to be constructed without a uid, because the alternative is `/remote.php/dav/files//…` whose 404 reads as "the file is not there". See `docs/M5-NEXTCLOUD.md` §3.1.
+
 **Sign-out:** `DELETE /ocs/v2.php/core/apppassword`. If it returns non-200, **remove the local account anyway** (Nextcloud's own guidance).
 
 ### 7.2 On 401 — stop, never retry
@@ -854,7 +872,11 @@ OC-Checksum: md5:<hex>
 | 423 | Locked; retry with backoff (`nc:lock*` says who) |
 | 401 | §7.2 — halt |
 
+⚠️ **`OC-Checksum` needs a digest `:core:*` does not have** (M5). Nextcloud *verifies* the header, so a wrong implementation turns every upload into a 400 — and there is no MD5 in common Kotlin, while `java.security.MessageDigest` is JVM-only and would kill the iPad path exactly as OkHttp would. `:core:sync` therefore hand-writes MD5 against RFC 1321's own vectors, for the same reason `:core:storage` hand-writes SHA-256 (§5.4). It is `internal`, used for this one header, and is **not** a security primitive; the content fingerprint is still SHA-256 (§5.6).
+
 **Create:** `If-None-Match: *`. **Move:** `MOVE` with **`Overwrite: F`**.
+
+⚠️ *"Was this note ever uploaded"* — which decides whether a PUT carries `If-None-Match: *` — **must not be read from `oc:id` and the ETag alone** (M5). A reverse proxy that strips `OC-ETag` and `OC-FileId` leaves a successfully uploaded note looking un-uploaded, and the next PUT then sends `If-None-Match: *` against a file that exists and 412s forever. Keep a local upload timestamp in `remote_binding` and include it in the test.
 
 **Chunked upload: not in v1.** ⚠️ Note for later: Nextcloud's *own* Android client silently drops `If-Match` on the chunked path, so chunked uploads there aren't ETag-protected. If you add it, put `If-Match` on the final `MOVE` yourself. Also note a 412 on a large PDF means download-remote → extract → union → rewrite → re-upload, inside a WorkManager job with a 10-minute execution ceiling; for files over ~50 MB that needs a foreground service.
 
@@ -878,6 +900,8 @@ outbox(note_id, op_type, local_rev_at_enqueue, attempts, next_attempt_at, create
 ```
 
 `sync_state ∈ { LOCAL_ONLY, SYNCED, PENDING_UPLOAD, PENDING_DOWNLOAD, CONFLICT, ERROR, NEEDS_REAUTH }`
+
+*M5:* the enum is `NoteSyncState` in `:core:model` (it lives there because §4.7's compaction rule needs it). It spells the fifth state `CONFLICTED`, and **`ERROR` was missing until M5 added it** — it is where a 507, a forbidden folder and a non-retryable 4xx land, and it has to be distinct from `CONFLICTED` (which needs a merge) and from `NEEDS_REAUTH` (where the credential is fine).
 
 #### Outbox semantics ⭐
 
@@ -1178,4 +1202,12 @@ Verified 5 Aug 2026:
 | 1 | ~~Does `androidx.pdf` write standard `/Ink` readable by Acrobat, and does variable width survive save→reload?~~ **CLOSED in M4.0: no, and no.** It writes `/Stamp` annotations holding filled paths — the platform's `PdfAnnotationType` has no ink type at all — cannot set `/NM`, and saves by full PDFium re-serialisation, which forecloses §5.2. Width survives outbound only; reading it back gives a polygon. PdfBox-Android behind `PdfWriter` it is, and `androidx.pdf` is dropped entirely, so compileSdk stays 36. See §6.1 and `docs/M4-PDF.md` §1. | M4 ✅ | — |
 | 2 | ~~Does `androidx.ink` 1.0.0 apply motion prediction internally?~~ **CLOSED in M1: no.** `input-motionprediction` kept; it is the only predictor in the pipeline. Ink takes prediction as an explicit parameter and un-draws the predicted tail itself. See §3.1 and `docs/M1-INK.md` §1. | M1 ✅ | — |
 | 3 | Does `If-Match` work on the chunked-assembly `MOVE`? | Only if chunking is added (post-v1) | Treat chunked uploads as unprotected; verify by checksum after |
-| 4 | Does a PDF incremental update survive Nextcloud's storage and any server-side processing intact? | **M5** | Fall back to full rewrite; re-add `assets/source.pdf` to the bundle and accept the size |
+| 4 | ~~Does a PDF incremental update survive Nextcloud's storage and any server-side processing intact?~~ **CLOSED in M5: yes, byte-identically.** Verified against a live Nextcloud (`PdfRoundTripSpikeTest`), not only a mock: a real published PDF — original bytes verbatim at the front, one incremental update appended — was PUT, GET back, and compared byte for byte. The original prefix survived, the XMP marker parsed, `detectOpenMode` still returned `Normal`, the page count was unchanged and the `/Ink` annotations were still readable. **§5.2's incremental update stands and the full-rewrite fallback is not needed.** | M5 ✅ | — |
+
+**Three things spike #4 confirmed on the way past**, each worth more than the headline because each was assumed rather than tested:
+
+- **The uid path is right on a real server.** The upload addressed `/remote.php/dav/files/<uid>/…` built from `ocs.data.id` and got a `201`. Had §0.1 #3 been got wrong it would have 404'd — so the project's "most likely bug" is now checked against real hardware.
+- **`OC-ETag` and `OC-FileId` really do come back on the PUT** (§7.4), and the ETag was **strong**, no `W/`. That is what keeps an upload to one round trip with no follow-up PROPFIND — and it means the weak-ETag path in §7.3 is a real-but-uncommon case, not the default.
+- **The client is byte-transparent independently of the server.** `:core:sync`'s `ByteTransparencyTest` round-trips a 3 MB payload shaped like a published note through the real `WebDavClient`, so a future failure can be attributed to one side or the other rather than guessed at.
+
+Re-run at any time with `INKSTONE_SPIKE_URL` / `_LOGIN` / `_UID` / `_APP_PASSWORD` set; unset, it skips loudly rather than passing quietly. See `docs/M5-NEXTCLOUD.md` §1.

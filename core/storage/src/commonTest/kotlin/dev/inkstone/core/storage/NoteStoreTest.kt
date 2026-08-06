@@ -368,6 +368,42 @@ class NoteStoreTest {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // view.json — where this device left off
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `a note remembers the page it was left on`() = runTest {
+        val note = store.create(title = "n", deviceId = "d", background = Background.Template(PageTemplate.RULED))
+        val session = NoteSession.open(store, ids, clock, note, "d")
+        val second = session.addPage(1, background = Background.Template(PageTemplate.BLANK))
+        session.flush()
+
+        store.saveViewState(note.document.id, second)
+
+        assertEquals(second, store.loadViewState(note.document.id))
+    }
+
+    @Test
+    fun `a note never opened on this device remembers nothing`() = runTest {
+        val note = store.create(title = "n", deviceId = "d", background = Background.Template(PageTemplate.RULED))
+
+        assertNull(store.loadViewState(note.document.id))
+    }
+
+    /**
+     * The file is a convenience, so a damaged one must degrade to "open on page one" rather
+     * than take the note down with it — the note itself is elsewhere and is fine.
+     */
+    @Test
+    fun `a corrupt view state is not a corrupt note`() = runTest {
+        val note = store.create(title = "n", deviceId = "d", background = Background.Template(PageTemplate.RULED))
+        fs.writeBytesAtomically(NoteLayout.viewState(note.document.id), "{ this is not json".encodeToByteArray())
+
+        assertNull(store.loadViewState(note.document.id))
+        assertNotNull(store.open(note.document.id))
+    }
+
     private class CountingByteSource(private val delegate: ByteSource) : ByteSource {
         var bytesRead: Int = 0
             private set

@@ -22,10 +22,36 @@ public enum class InkBrushKind {
     ;
 
     /**
-     * SPEC §3.4 — the highlighter "draws *behind* ink". That is a z-order rule,
-     * not a blend mode, and it is the dry layer that has to honour it.
+     * SPEC §3.4 — the highlighter draws **over** ink, with plain alpha, so it tints what
+     * it covers.
+     *
+     * ⚠️ **Reversed after M4, from the tablet, and it took three attempts.** The rule was
+     * "draws *behind* ink" and was reported as "you can't highlight your own writing". The
+     * whole sequence is recorded because the wrong turn in the middle is instructive:
+     *
+     * 1. **Behind** was only ever tenable because SPEC §3.4's other half — *"multiply
+     *    blend"* — was never implemented. The highlighter was a plain translucent stroke,
+     *    and plain translucent yellow drawn over black writing lightens it, so behind was
+     *    the only order that kept writing legible. It went unquestioned for three
+     *    milestones because nothing in the app highlighted anything but blank paper.
+     * 2. **Multiply, on top** looked like the principled fix and is what a physical
+     *    highlighter does. It is wrong here, and the reason is arithmetic: multiply cannot
+     *    lighten, so yellow over black leaves the writing *exactly* black — which is
+     *    **pixel-identical to drawing behind it**. It was reported back as the highlight
+     *    still snapping behind the pen marks, because that is precisely what it looked
+     *    like. Chasing the remaining difference into the wet layer was chasing nothing.
+     * 3. **Plain alpha, on top** is what shipped. The marks get tinted. That is the only
+     *    thing that reads as *on top of* the writing, because "leaves the writing
+     *    untouched" and "looks like it is over the writing" are contradictory requirements
+     *    and no blend mode satisfies both.
+     *
+     * Plain alpha also has a property multiply could not have: it is what the wet layer
+     * already does natively, so a stroke does not change appearance at the instant it
+     * lands, and the highlighter keeps the low-latency front buffer.
+     * `InProgressStrokesView` front-buffers through a SurfaceView, which cannot carry a
+     * blend mode at all — so any blended brush must give that up to stay consistent.
      */
-    public val drawsBehindInk: Boolean get() = this == HIGHLIGHTER
+    public val drawsOverInk: Boolean get() = this == HIGHLIGHTER
 }
 
 /**

@@ -44,4 +44,7 @@ dependencies {
     androidTestImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.androidx.test.core)
+    // See the note in :core:database — not transitive, and its absence only shows up when
+    // an instrumented test is actually run rather than merely compiled.
+    androidTestImplementation(libs.androidx.test.runner)
 }

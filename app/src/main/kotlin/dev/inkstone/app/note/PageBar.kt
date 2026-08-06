@@ -29,7 +29,17 @@ import dev.inkstone.core.model.PageTemplate
  * milestone exists to answer.
  */
 @Composable
-fun PageBar(state: NoteEditorState, actions: PageBarActions, modifier: Modifier = Modifier) {
+fun PageBar(
+    state: NoteEditorState,
+    actions: PageBarActions,
+    modifier: Modifier = Modifier,
+    /**
+     * Whether an export is in flight. UI-local rather than part of [NoteEditorState]: the
+     * export is driven from the composition, because handing a Uri to another app needs a
+     * `Context` and a chooser, and neither belongs in the editor.
+     */
+    exporting: Boolean = false,
+) {
     var templateMenuOpen by remember { mutableStateOf(false) }
 
     Card(modifier = modifier) {
@@ -82,6 +92,13 @@ fun PageBar(state: NoteEditorState, actions: PageBarActions, modifier: Modifier 
                 }
             }
 
+            // SPEC §5.2 — how the published PDF leaves the app. Disabled while an export is
+            // running rather than hidden: it materializes first, which on a large notebook
+            // takes long enough that a second tap would otherwise queue a second rewrite.
+            TextButton(onClick = actions.onShare, enabled = !exporting) {
+                Text(if (exporting) "Exporting…" else "Share PDF")
+            }
+
             // The autosave heartbeat. `local_rev` is bumped on every committed change
             // (SPEC §7.6), so a number that stops moving while you write is a bug you can see.
             Text(
@@ -112,4 +129,6 @@ data class PageBarActions(
     val onTemplate: (PageTemplate) -> Unit,
     /** ROADMAP M3 — the page overview, with a thumbnail per page. */
     val onShowPages: () -> Unit,
+    /** ROADMAP M4 — materialize and hand the published PDF to another app (SPEC §5.2). */
+    val onShare: () -> Unit,
 )

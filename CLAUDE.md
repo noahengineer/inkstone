@@ -52,6 +52,8 @@ No code path performs a network write directly. Every remote mutation enqueues a
 
 Nextcloud has brute-force protection on by default. A 401 halts the sync worker and flags `NEEDS_REAUTH`. Auto-retrying credentials is the documented way real users get IP-blocked by their own server.
 
+Two corollaries, both found in M5. **The HTTP client owns no retry policy** — Ktor's `basic` auth provider is challenge-response and would produce a deliberate 401 per call, so the `Authorization` header is attached by hand. And **a WorkManager job that halted on a 401 returns `success`, not `retry`** — WorkManager's backoff would otherwise *be* the credential retry loop. The one permitted follow-up is SPEC §7.2's single `GET /ocs/v2.php/cloud/user`; if that cannot be *reached*, conclude nothing, because treating unreachable as "credentials dead" signs the user out every time they walk into a lift.
+
 ### 6. No conflict dialogs
 
 Conflicts resolve automatically and non-destructively, then appear in a "Needs attention" list. Never a modal. Never blocking sync. Nextcloud's official Android client uses the modal-from-notification pattern and has ~9 open bugs from it.
@@ -116,6 +118,7 @@ Required before a milestone is done:
 - **`:core:sync`** — all **21 rows** of the SPEC §13.2 merge matrix, as automated tests
 - **`:core:model`** — coordinate conversions, including `/Rotate 90` and non-zero-origin CropBox
 - **Crash safety** — instrumented process kill during stroke capture, journal flush, materialization, and upload
+- **Run the instrumented tests at least once per milestone that adds one.** `check` compiles them; it does not dex or run them, so a dex-illegal test name or a missing `androidx.test:runner` sits there looking like coverage. An emulator is enough — see the README.
 - **Performance** — macrobenchmarks for cold start, large-notebook open, sustained draw frame rate
 
 Sync tests run against a **real Nextcloud in Docker**, not a mock. Mocks won't reproduce weak ETags, fileid churn on trash-restore, or brute-force lockout.
@@ -130,6 +133,8 @@ A milestone is done when:
 2. New logic has tests
 3. `./gradlew build` is green, including the `:core` guardrail
 4. It has been used on the actual Galaxy Tab, not just an emulator — `tools/send-to-tablet.ps1` builds and copies the APK over MTP, which works when `adb install` can't because USB debugging is unauthorized. Measuring still needs adb; see the README.
+
+   **Get there via an emulator, though.** The tablet is the *last* check, not the only one. An AVD gives adb for free, so it can run the instrumented tests, and the app can be driven end-to-end from the command line — `uiautomator dump` to find a control, `input tap` to press it, `cmd connectivity airplane-mode` to cut the network, `run-as … cat databases/inkstone.db` to read the result. ⚠️ **Drawing needs `adb shell input stylus`**, not plain `input`: `PalmGuard` accepts only `TOOL_TYPE_STYLUS`, so an ordinary swipe draws nothing and says nothing. M5 found three real bugs this way in twenty minutes, none of which 1068 JVM tests had caught. See the README's *Testing on an emulator*.
 5. `SPEC.md` has been updated if anything in it turned out to be wrong
 
 ---
@@ -177,6 +182,7 @@ A milestone is done when:
 | Out of scope | SPEC §12 |
 | Open spikes + owning milestone | SPEC Appendix B |
 | **M4.0 spike result + PDF decisions** | `docs/M4-PDF.md` |
+| **M5 Nextcloud decisions + spike #4 status** | `docs/M5-NEXTCLOUD.md` |
 
 ---
 
@@ -191,8 +197,17 @@ Collected during research so they don't get reintroduced from stale training dat
 - **`androidx.ink:ink-storage` 1.0.0 cannot serialize a `Stroke`.** It offers `StrokeInputBatchSerialization` and `BrushFamilySerialization` and nothing else — no `Stroke.encode`, no `decodeStroke`, no container format. SPEC §5.4 said otherwise and has been corrected. M2's blob is a small container written by `StrokeGeometryCodec`: brush kind, colour, size, epsilon and input model in a fixed header, then the input batch. Do **not** serialize the `BrushFamily` — the families are code, and every constructor for one is `@RestrictTo(LIBRARY_GROUP)`.
 - **A stroke's colour and width live in two places, and only one is the truth.** The geometry blob holds what it was captured with; `SetStyle` is an override that starts null. Duplicating capture-time style into a register would give two sources that drift.
 - **`CanvasStrokeRenderer.create(forcePathRendering, textureStore)` is `@RestrictTo(LIBRARY_GROUP)`** — the one-argument overload is not. Found in M3, when thumbnails needed path rendering for a software canvas. The renderer decides that per draw call anyway, so use the public overload.
+- **`InProgressStrokesView` front-buffers through a `SurfaceView`, so wet ink cannot carry a blend mode.** On API 33+ it uses `CanvasInProgressStrokesRenderHelperV33`, which SurfaceFlinger composites over the window — and a separate surface only alpha-blends. Any brush whose *dry* rendering uses a blend mode will visibly change appearance at the moment the stroke lands. The escape is `useHighLatencyRenderHelper` (`@RestrictTo(LIBRARY_GROUP)`, like the rest of this library's interesting surface), which moves the wet layer onto HWUI where `setLayerType(LAYER_TYPE_HARDWARE, paint)` applies an xfermode — at the cost of the low-latency path. **No brush currently uses a blend mode**, so nothing pays this; the highlighter tried and reverted (SPEC §3.4). Note also that it is read once when the render helper is built, so setting it after `eagerInit()` does nothing.
+- **Over dark ink, "multiply on top" and "drawn behind" are the same pixels.** Multiply cannot lighten, so a yellow highlighter multiplied over black writing leaves the writing exactly black — which is what drawing behind it looks like. Two hours of M4 went into a difference that did not exist. If a z-order or blend change is supposed to be visible, check it against a *light-coloured* stroke, where the two actually differ.
+- **`javap` on the `$annotations` synthetic does not tell you whether a Kotlin property is `@RestrictTo`.** It carries the `@Metadata` string table and nothing else; the annotation sits on the getter/setter. Lint is the authority here, and it disagreed with a clean `javap` reading during M4. Check by compiling, not by reading the class file.
 - **`addToStroke` must be given the whole `MotionEvent`.** Ink reads pressure, tilt, orientation, tool type and every historical point off it. Hand-built `StrokeInput`s compile, draw, and silently drop all of them.
-- **OkHttp and dav4jvm are JVM-only.** They cannot go in `:core:*`. Ktor can.
+- **OkHttp and dav4jvm are JVM-only.** They cannot go in `:core:*`. Ktor can — but **Ktor's own types must not leave `:core:sync` either** (M5). `:app` is Android-only, so nothing would complain if it started holding an `HttpClient` and later made a request outside the outbox. `NextcloudTransport` is opaque outside the module, so there is nothing in `:app` to make a request *with*.
+- **There is no digest in common Kotlin**, and `java.security.MessageDigest` is JVM-only. SHA-256 (`:core:storage`, SPEC §5.6) and MD5 (`:core:sync`, for SPEC §7.5's `OC-Checksum`, which Nextcloud *verifies*) are both hand-written against published test vectors. MD5 is a transport integrity check and must never become a security primitive.
+- **A backtick test-function name may not contain a comma — and in an instrumented test, not an apostrophe either.** Kotlin/Native rejects the comma (`Name contains illegal characters: ","`) and **D8 rejects both** (`Method name '…' cannot be represented in dex format`). The JVM compiler accepts them all, so neither surfaces until `compileTestKotlinIosArm64` or `dexBuilderDebugAndroidTest` runs. Keep instrumented test names to `[A-Za-z0-9 _-]`. Found in M5, twelve names deep.
+- ⚠️ **`androidx.test:runner` is NOT transitive from `androidx.test.ext:junit`** — and `testInstrumentationRunner` names a class from it. Without the dependency every instrumented test in the module dies with `ClassNotFoundException: androidx.test.runner.AndroidJUnitRunner` before a single test runs. `:core:database` and `:android:ink` were both missing it and nobody knew, because **`check` compiles instrumented tests but does not dex or run them** — the guard M3 added catches a broken *signature*, not a broken *classpath*. Run `connectedDebugAndroidTest` against something at least once per milestone that adds instrumented tests.
+- **`:android:ink`'s instrumented tests fail on an x86_64 emulator and pass on the arm64 tablet.** Not a logic bug: M1's synthetic-ink fixture computes orientations without clamping to `[0, 2π)`, and x86_64 rounding puts them a thousandth outside, which `androidx.ink` rejects (`StrokeInput::orientation … Got: -0.00147393π`). One assertion also has an arm64-tuned float tolerance. Found in M5; **not fixed, because it is M1's code**. Anything measuring ink still needs the real tablet regardless (CLAUDE.md definition of done #4).
+- **A weak ETag has to be stored as a flag beside the value, not recomputed.** SPEC §7.3: returning `W/"…"` in `If-Match` is a permanent 412 loop, and "was this weak" cannot be recovered from the stripped string. `ETag(value, weak)` carries it and `asIfMatch` returns **null** for a weak one, so the trap is unrepresentable rather than remembered.
+- **"Was this ever uploaded" cannot be read from `oc:id` and the ETag alone** (M5). A reverse proxy that strips `OC-ETag`/`OC-FileId` leaves a *successful* upload looking un-uploaded, and the next PUT sends `If-None-Match: *` against a file that exists — a permanent 412. Keep a local upload timestamp too.
 - **`EncryptedSharedPreferences` was deprecated in 2025.** Keystore AES-GCM directly.
 - Nextcloud's `loginName` is **not** the WebDAV path segment. Fetch the UID from `/ocs/v2.php/cloud/user`.
 - Nextcloud forbids only `\` and `/` by default — **not** the Windows character set. Read the real rules from capabilities.

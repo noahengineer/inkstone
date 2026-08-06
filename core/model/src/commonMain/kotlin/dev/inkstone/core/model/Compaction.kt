@@ -92,6 +92,19 @@ public enum class NoteSyncState {
     /** A non-destructive conflicted copy exists (SPEC §7.7). Appears in "Needs attention". */
     CONFLICTED,
 
+    /**
+     * The server refused for a reason waiting will not fix — a full quota, a folder the
+     * user may not write to, a 4xx that is not a conflict.
+     *
+     * Added in M5, and it is SPEC §7.6's `ERROR`. Distinct from [CONFLICTED] because the
+     * two need different things from the user: a conflict is resolved by merging (M6),
+     * whereas this is resolved by changing something on the server. Distinct from
+     * [NEEDS_REAUTH] because the credential is fine. The note's outbox row is kept and
+     * parked, never dropped — SPEC §7.7 rule 3: flagged and skipped, everything else
+     * keeps syncing.
+     */
+    ERROR,
+
     /** A 401. The worker halted and did **not** retry (CLAUDE.md rule 5). */
     NEEDS_REAUTH,
 }

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SPEC §14: "HTTPS only, no cleartext exception. Refuse an invalid certificate; do not
+  offer 'accept anyway'."
+
+  `cleartextTrafficPermitted="false"` is the enforcement, and it is set here as well as
+  on <application android:usesCleartextTraffic="false"> because the two cover different
+  paths: the manifest attribute is the platform default, this file is what a base-config
+  applies to every connection including ones a library makes.
+
+  There is deliberately no <debug-overrides> and no <trust-anchors> block. Both are the
+  usual route to "just let me test against my local server", and both are how a client
+  ends up shipping with a user-installed CA trusted in release. A self-hosted Nextcloud
+  on a private CA is a real situation — the answer is to install the CA in the Android
+  system trust store, which is the user's decision to make and not this app's to bypass.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

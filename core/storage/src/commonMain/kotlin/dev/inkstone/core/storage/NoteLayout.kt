@@ -17,7 +17,8 @@ import dev.inkstone.core.model.PageId
  * ├── note.inkstone     the lossless bundle (SPEC §5.3)
  * ├── journal.ops       append-only op log since the last materialization. Flushed ~2s.
  * ├── snapshot.bundle   optional compaction snapshot (SPEC §4.7)
- * └── undo.json         local undo/redo stacks — per device, never synced
+ * ├── undo.json         local undo/redo stacks — per device, never synced
+ * └── view.json         which page this device last had open — per device, never synced
  * ```
  *
  * ## Two notes on this, added in M2
@@ -52,6 +53,16 @@ public object NoteLayout {
 
     /** Local, per-device undo/redo stacks (SPEC §4.6). Never uploaded. */
     public const val UNDO_JSON: String = "undo.json"
+
+    /**
+     * Where the reader was — which page this device last had open.
+     *
+     * Local and per-device for the same reason [UNDO_JSON] is: two tablets reading the same
+     * 200-page notebook are in different places in it, and syncing this would have each one
+     * yank the other back to where it was. It is also pure convenience, so it is stored
+     * beside the note rather than inside the bundle where a corrupt byte would matter.
+     */
+    public const val VIEW_JSON: String = "view.json"
 
     /**
      * SPEC §5.7 — thumbnails are a cache, not bundle content.
@@ -100,6 +111,8 @@ public object NoteLayout {
     public fun snapshot(id: DocumentId): String = "${noteDir(id)}/$SNAPSHOT_BUNDLE"
 
     public fun undo(id: DocumentId): String = "${noteDir(id)}/$UNDO_JSON"
+
+    public fun viewState(id: DocumentId): String = "${noteDir(id)}/$VIEW_JSON"
 
     public fun trashEntry(id: DocumentId, deletedEpochMillis: Long): String =
         "$TRASH_DIR/$deletedEpochMillis-${id.value}"

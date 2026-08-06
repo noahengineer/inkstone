@@ -16,6 +16,7 @@ import dev.inkstone.android.ink.InkStrokeRebuilder
 import dev.inkstone.android.pdf.InkstonePdfMaterializer
 import dev.inkstone.android.pdf.PdfGateway
 import dev.inkstone.android.pdf.PdfPageRasterizer
+import dev.inkstone.app.library.ThumbnailSourcePagesImpl
 import dev.inkstone.app.platform.AndroidFileSystem
 import dev.inkstone.app.platform.KeystoreCredentialStore
 import dev.inkstone.app.platform.SystemClock
@@ -154,8 +155,10 @@ object PlatformProvidersModule {
      */
     @Provides
     @Singleton
-    fun providePageThumbnailRenderer(brushes: InkBrushFactory): PageThumbnailRenderer =
-        InkPageThumbnailRenderer(brushes)
+    fun providePageThumbnailRenderer(
+        brushes: InkBrushFactory,
+        sourcePages: ThumbnailSourcePagesImpl,
+    ): PageThumbnailRenderer = InkPageThumbnailRenderer(brushes, sourcePages)
 
     /**
      * The brush factory, shared by the thumbnail renderer and the measurement fixture.

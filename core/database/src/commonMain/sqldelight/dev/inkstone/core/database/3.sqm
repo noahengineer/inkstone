@@ -1,0 +1,50 @@
+-- Migration 3 → 4: SPEC §7.6's sync schema (M5).
+--
+-- Purely additive: three new tables and their indexes. `note` already carries `syncState`,
+-- `localRev` and `lastError` — M3 added those columns ahead of time precisely so this
+-- milestone would not have to alter a table the library reads on every launch.
+--
+-- Nothing is backfilled. Every existing note is LOCAL_ONLY, which is what it was, and a
+-- note becomes bound only when the user picks a folder for it (SPEC §7.6).
+--
+-- The column comments live in Sync.sq — this file is the delta, and duplicating them here
+-- would give two places to keep in step.
+
+CREATE TABLE account (
+    id            TEXT    NOT NULL PRIMARY KEY,
+    serverUrl     TEXT    NOT NULL,
+    loginName     TEXT    NOT NULL,
+    uid           TEXT    NOT NULL,
+    displayName   TEXT,
+    defaultFolder TEXT    NOT NULL DEFAULT 'Inkstone',
+    state         TEXT    NOT NULL DEFAULT 'ACTIVE',
+    capabilities  TEXT,
+    lastError     TEXT
+);
+
+CREATE TABLE remoteBinding (
+    noteId             TEXT    NOT NULL PRIMARY KEY,
+    accountId          TEXT    NOT NULL,
+    remotePath         TEXT    NOT NULL,
+    remoteOcId         TEXT,
+    lastSyncedEtag     TEXT,
+    lastSyncedEtagWeak INTEGER NOT NULL DEFAULT 0,
+    lastSyncedRev      INTEGER NOT NULL DEFAULT 0,
+    lastUploadAt       INTEGER NOT NULL DEFAULT 0,
+    lastChecksum       TEXT,
+    movedFromPath      TEXT
+);
+
+CREATE INDEX remoteBindingByAccount ON remoteBinding(accountId);
+
+CREATE TABLE outbox (
+    noteId            TEXT    NOT NULL,
+    opType            TEXT    NOT NULL,
+    localRevAtEnqueue INTEGER NOT NULL,
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    nextAttemptAt     INTEGER NOT NULL DEFAULT 0,
+    createdAt         INTEGER NOT NULL,
+    PRIMARY KEY (noteId, opType)
+);
+
+CREATE INDEX outboxDue ON outbox(nextAttemptAt);

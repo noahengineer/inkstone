@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What the FileProvider is allowed to hand out.
+
+  Exactly one directory, and deliberately NOT `files/notes/`. The published
+  document.pdf is rewritten in place by materialization (SPEC §5.1), and a receiving
+  app that holds a content Uri may read it minutes later, in another process, while
+  that rewrite is happening — which is the torn-read CLAUDE.md rule 10 exists to
+  prevent. NoteSharing copies to this cache directory first, so what is shared is a
+  snapshot nothing will touch again.
+
+  It also gives the file a real name: FileProvider serves the file's own filename, and
+  every note sharing a file literally called "document.pdf" would be useless in a mail
+  client.
+-->
+<paths>
+    <cache-path
+        name="shared-pdfs"
+        path="share/" />
+</paths>
