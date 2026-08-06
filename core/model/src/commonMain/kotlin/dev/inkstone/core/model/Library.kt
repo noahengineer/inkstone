@@ -34,12 +34,46 @@ public data class Folder(
     val sortKey: FractionalKey = FractionalKey.Initial,
     val colorArgb: Int? = null,
     val icon: FolderIcon = FolderIcon.FOLDER,
+    val cover: FolderCover = FolderCover.Icon,
     val createdEpochMillis: Long = 0L,
     val modifiedEpochMillis: Long = 0L,
     val deletedEpochMillis: Long? = null,
     val deletedWithFolderId: FolderId? = null,
 ) {
     public val isTrashed: Boolean get() = deletedEpochMillis != null
+}
+
+/**
+ * What fills a folder's tile in the library.
+ *
+ * [icon] and [colorArgb] are always set and are what a folder falls back to, so removing a
+ * picture never leaves a blank tile. This says what is drawn *instead of* the icon, when
+ * anything is.
+ *
+ * The two interesting variants both reuse machinery that already exists rather than adding
+ * a second way to store a picture:
+ *
+ * - [LatestNote] draws the first page of the most recently edited note inside the folder.
+ *   That is a thumbnail the library has already rendered (SPEC §5.7), so it costs nothing
+ *   and it stays current on its own.
+ * - [Drawn] points at an ordinary single-page note that the user draws in the ordinary
+ *   editor. Its cover thumbnail is regenerated on materialize like any other note's, so a
+ *   redrawn folder cover updates with no extra code at all. The note is marked
+ *   `isCover` so it does not also appear in the library as a note.
+ */
+public sealed interface FolderCover {
+
+    /** The default: [Folder.icon] on [Folder.colorArgb]. */
+    public data object Icon : FolderCover
+
+    /** The first page of the most recently edited note in this folder or below it. */
+    public data object LatestNote : FolderCover
+
+    /** A note the user drew for the purpose. See the interface KDoc. */
+    public data class Drawn(val noteId: DocumentId) : FolderCover
+
+    /** An imported image, stored under `folders/<folderId>/`. */
+    public data class Image(val asset: String) : FolderCover
 }
 
 /**
@@ -79,6 +113,14 @@ public data class NoteSummary(
     val title: String,
     val folderId: FolderId? = null,
     val favourite: Boolean = false,
+    /**
+     * True for a note that exists only to be a folder's [FolderCover.Drawn] picture.
+     *
+     * It is an ordinary note in every other way — same editor, same journal, same thumbnail
+     * pipeline — and this flag keeps it out of the library's own lists so a folder cover
+     * does not also show up as a note the user has to explain to themselves.
+     */
+    val isCover: Boolean = false,
     val pageCount: Int = 1,
     val syncState: NoteSyncState = NoteSyncState.LOCAL_ONLY,
     val localRev: Long = 0L,

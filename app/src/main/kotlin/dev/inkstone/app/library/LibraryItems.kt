@@ -2,6 +2,7 @@ package dev.inkstone.app.library
 
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -11,6 +12,7 @@ import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
@@ -26,13 +28,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.inkstone.core.model.Folder
-import dev.inkstone.core.model.FolderIcon
 import dev.inkstone.core.model.NoteSummary
 
 /**
@@ -110,17 +112,7 @@ fun NoteCard(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            FavouriteButton(note, actions)
-            Box {
-                TextButton(onClick = { menuOpen = true }) { Text("⋯") }
-                NoteMenu(
-                    note = note,
-                    expanded = menuOpen,
-                    onDismiss = { menuOpen = false },
-                    actions = actions,
-                    onRename = onRename,
-                )
-            }
+            NoteRowControls(note, actions, menuOpen, { menuOpen = it }, onRename)
         }
     }
 }
@@ -163,25 +155,63 @@ fun NoteRow(
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-            FavouriteButton(note, actions)
-            Box {
-                TextButton(onClick = { menuOpen = true }) { Text("⋯") }
-                NoteMenu(
-                    note = note,
-                    expanded = menuOpen,
-                    onDismiss = { menuOpen = false },
-                    actions = actions,
-                    onRename = onRename,
-                )
-            }
+            NoteRowControls(note, actions, menuOpen, { menuOpen = it }, onRename)
         }
     }
 }
 
+/**
+ * The star and the overflow, as one group hard against the right edge.
+ *
+ * They were two `TextButton`s, and a `TextButton` carries a wide minimum width and the
+ * generous horizontal padding meant for a *labelled* button. Two side by side left a visible
+ * gap between the star and the dots and floated the pair well short of the edge — reported
+ * from the tablet as wanting them closer together and further along.
+ *
+ * So both are bare square tap targets with [CONTROL_GAP] between them and no internal
+ * padding to spread them apart. [CONTROL_SIZE] keeps each one a comfortable target.
+ */
 @Composable
-private fun FavouriteButton(note: NoteSummary, actions: LibraryActions) {
-    TextButton(onClick = { actions.onFavourite(note.id, !note.favourite) }) {
-        Text(if (note.favourite) "★" else "☆")
+private fun NoteRowControls(
+    note: NoteSummary,
+    actions: LibraryActions,
+    menuOpen: Boolean,
+    onMenuOpenChange: (Boolean) -> Unit,
+    onRename: () -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(CONTROL_GAP),
+    ) {
+        Box(
+            modifier = Modifier
+                .size(CONTROL_SIZE)
+                .clickable { actions.onFavourite(note.id, !note.favourite) },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(
+                text = if (note.favourite) "★" else "☆",
+                style = MaterialTheme.typography.titleMedium,
+                color = if (note.favourite) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+        }
+        Box(
+            modifier = Modifier.size(CONTROL_SIZE).clickable { onMenuOpenChange(true) },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text("⋯", style = MaterialTheme.typography.titleMedium)
+            NoteMenu(
+                note = note,
+                expanded = menuOpen,
+                onDismiss = { onMenuOpenChange(false) },
+                actions = actions,
+                onRename = onRename,
+            )
+        }
     }
 }
 
@@ -242,20 +272,26 @@ data class FolderActions(
 )
 
 @Composable
-fun FolderCard(folder: Folder, noteCount: Int, actions: FolderActions, modifier: Modifier = Modifier) {
+fun FolderCard(
+    folder: Folder,
+    noteCount: Int,
+    actions: FolderActions,
+    modifier: Modifier = Modifier,
+    cover: ImageBitmap? = null,
+) {
     var menuOpen by remember { mutableStateOf(false) }
 
-    Card(
-        modifier = modifier.fillMaxWidth(),
-        colors = folder.colorArgb?.let { CardDefaults.cardColors(containerColor = Color(it)) }
-            ?: CardDefaults.cardColors(),
-    ) {
-        Box(
-            modifier = Modifier.fillMaxWidth().aspectRatio(PAGE_ASPECT).combinedClickable(onClick = actions.onOpen),
-            contentAlignment = Alignment.Center,
-        ) {
-            Text(folder.icon.glyph, style = MaterialTheme.typography.displayMedium)
-        }
+    // The card stays on the theme's surface and only the *tile* is tinted. Tinting the whole
+    // card painted the folder's name onto its own background — see `FolderTile`.
+    Card(modifier = modifier.fillMaxWidth()) {
+        FolderTile(
+            folder = folder,
+            cover = cover,
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(PAGE_ASPECT)
+                .combinedClickable(onClick = actions.onOpen),
+        )
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -281,20 +317,20 @@ fun FolderCard(folder: Folder, noteCount: Int, actions: FolderActions, modifier:
 }
 
 @Composable
-fun FolderRow(folder: Folder, actions: FolderActions, modifier: Modifier = Modifier) {
+fun FolderRow(folder: Folder, actions: FolderActions, modifier: Modifier = Modifier, cover: ImageBitmap? = null) {
     var menuOpen by remember { mutableStateOf(false) }
 
-    Card(
-        modifier = modifier.fillMaxWidth(),
-        colors = folder.colorArgb?.let { CardDefaults.cardColors(containerColor = Color(it)) }
-            ?: CardDefaults.cardColors(),
-    ) {
+    Card(modifier = modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier.fillMaxWidth().combinedClickable(onClick = actions.onOpen).padding(12.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text(folder.icon.glyph, style = MaterialTheme.typography.titleLarge)
+            FolderTile(
+                folder = folder,
+                cover = cover,
+                modifier = Modifier.size(ROW_TILE_SIZE).clip(MaterialTheme.shapes.small),
+            )
             Text(folder.name, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
             Box {
                 TextButton(onClick = { menuOpen = true }) { Text("⋯") }
@@ -358,22 +394,10 @@ private fun rememberThumbnail(note: NoteSummary, actions: LibraryActions): Image
 private const val PAGE_ASPECT = 612f / 792f
 
 /**
- * A glyph per icon.
- *
- * Text rather than vector assets: the set is small, it has to render identically in a card
- * and in a list row, and shipping ten drawables for M3 would be M10's job done early and
- * probably wrong. The enum is the durable part (SPEC §9); this mapping is not.
+ * The star and the overflow: square tap targets with nothing between them but [CONTROL_GAP].
  */
-private val FolderIcon.glyph: String
-    get() = when (this) {
-        FolderIcon.FOLDER -> "🗀"
-        FolderIcon.STAR -> "★"
-        FolderIcon.BOOK -> "📕"
-        FolderIcon.NOTE -> "🗒"
-        FolderIcon.FLASK -> "⚗"
-        FolderIcon.CALCULATOR -> "🖩"
-        FolderIcon.GLOBE -> "🌐"
-        FolderIcon.HEART -> "♥"
-        FolderIcon.BRIEFCASE -> "💼"
-        FolderIcon.TAG -> "🏷"
-    }
+private val CONTROL_SIZE = 36.dp
+private val CONTROL_GAP = 2.dp
+
+/** The folder's picture in the list layout. */
+private val ROW_TILE_SIZE = 44.dp

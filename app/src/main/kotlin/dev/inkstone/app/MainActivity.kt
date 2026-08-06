@@ -1,10 +1,14 @@
 package dev.inkstone.app
 
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -20,7 +24,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.lifecycle.lifecycleScope
 import dagger.hilt.android.AndroidEntryPoint
+import dev.inkstone.app.library.FolderCoverImage
 import dev.inkstone.app.library.LibraryActions
 import dev.inkstone.app.library.LibraryScreen
 import dev.inkstone.app.library.LibraryViewModel
@@ -29,6 +35,10 @@ import dev.inkstone.app.note.NoteActivity
 import dev.inkstone.app.ui.InkstoneTheme
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.FolderId
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 /**
@@ -59,10 +69,62 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var clock: Clock
 
+    /**
+     * The folder whose cover the photo picker is being opened for.
+     *
+     * A field rather than Compose state: the picker is an activity, so this process can be
+     * killed while it is in front, and the callback has to know what it was for. `Bundle`
+     * round-trips it in [onSaveInstanceState].
+     */
+    private var pickingCoverFor: FolderId? = null
+
+    /**
+     * The system photo picker (`PickVisualMedia`).
+     *
+     * The modern one, not `ACTION_GET_CONTENT`: it needs **no permission at all**, shows only
+     * images, and the user chooses exactly what this app can see. Asking for
+     * `READ_MEDIA_IMAGES` to set a folder icon would be wildly out of proportion — and this
+     * app has no permissions at all today, which is worth keeping.
+     */
+    private val pickCoverImage = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        val folderId = pickingCoverFor ?: return@registerForActivityResult
+        pickingCoverFor = null
+        if (uri != null) importCoverImage(folderId, uri)
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        pickingCoverFor = savedInstanceState?.getString(STATE_PICKING_COVER_FOR)?.let(::FolderId)
         setContent { InkstoneTheme { Content() } }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pickingCoverFor?.let { outState.putString(STATE_PICKING_COVER_FOR, it.value) }
+    }
+
+    /**
+     * Decode a picked image, downscale it, and hand the bytes to the library.
+     *
+     * Decoding happens here because it needs `BitmapFactory` and a `ContentResolver`, and
+     * re-encoding at import means the stored file is a known format at a known size — so
+     * nothing downstream has to sniff a file the user picked, and a 12-megapixel photo does
+     * not sit in app storage to be decoded on every launch.
+     */
+    private fun importCoverImage(folderId: FolderId, uri: Uri) {
+        lifecycleScope.launch {
+            val encoded = withContext(Dispatchers.IO) {
+                runCatching {
+                    contentResolver.openInputStream(uri).use { it?.readBytes() }
+                }.getOrNull()?.let { FolderCoverImage.reEncode(it) }
+            }
+            if (encoded == null) {
+                Toast.makeText(this@MainActivity, R.string.cover_image_failed, Toast.LENGTH_SHORT).show()
+            } else {
+                library.setImageCover(folderId, encoded)
+            }
+        }
     }
 
     @Composable
@@ -127,7 +189,21 @@ class MainActivity : ComponentActivity() {
         onDuplicate = library::duplicate,
         onOpenTrash = onOpenTrash,
         thumbnail = library::thumbnail,
+        folderCover = library::folderCover,
+        // A drawn cover is an ordinary note in the ordinary editor — the same activity a
+        // notebook opens in. That is the whole feature.
+        onDrawCover = { folderId -> library.drawCover(folderId, ::openNote) },
+        onPickCoverImage = { folderId ->
+            pickingCoverFor = folderId
+            pickCoverImage.launch(
+                PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+            )
+        },
     )
+
+    private companion object {
+        const val STATE_PICKING_COVER_FOR = "pickingCoverFor"
+    }
 
     private fun openNote(id: DocumentId) {
         startActivity(

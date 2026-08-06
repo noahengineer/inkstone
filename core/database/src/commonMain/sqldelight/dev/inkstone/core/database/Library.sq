@@ -48,7 +48,16 @@ CREATE TABLE folder (
     deletedAt           INTEGER,
     -- Set on every descendant when an ancestor is trashed, so the trash shows one entry
     -- for a deleted folder of fifty notes and restore puts the whole subtree back.
-    deletedWithFolderId TEXT
+    deletedWithFolderId TEXT,
+    -- Added by 2.sqm, so they are last: ALTER TABLE ADD COLUMN appends, and a fresh install
+    -- has to produce the same column order a migrated database does.
+    --
+    -- What fills the folder's tile: ICON, LATEST_NOTE, DRAWN or IMAGE. `coverRef` carries
+    -- the note id or the asset path for the last two and is NULL for the first two. The
+    -- icon and colour stay set whatever this says, so removing a picture never leaves a
+    -- blank tile.
+    coverKind           TEXT    NOT NULL DEFAULT 'ICON',
+    coverRef            TEXT
 );
 
 CREATE INDEX folderByParent  ON folder(parentId);
@@ -76,7 +85,11 @@ CREATE TABLE note (
     deletedAt           INTEGER,
     deletedWithFolderId TEXT,
     -- Where `NoteTrash` moved the note's directory, so restore does not have to guess.
-    trashPath           TEXT
+    trashPath           TEXT,
+    -- Added by 2.sqm — last, for the reason given on `folder.coverKind`.
+    -- 1 for a note that exists only as a folder's drawn cover. Ordinary in every other way;
+    -- this keeps it out of the library's own lists.
+    isCover             INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX noteByFolder   ON note(folderId);
@@ -104,14 +117,16 @@ SELECT * FROM folder WHERE deletedAt >= 0 AND deletedWithFolderId IS NULL
 ORDER BY deletedAt DESC;
 
 insertFolder:
-INSERT INTO folder(id, parentId, name, nameFold, sortKey, colorArgb, icon, createdAt, modifiedAt)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+INSERT INTO folder(id, parentId, name, nameFold, sortKey, colorArgb, icon, coverKind, coverRef, createdAt, modifiedAt)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 updateFolderName:
 UPDATE folder SET name = :name, nameFold = :nameFold, modifiedAt = :modifiedAt WHERE id = :id;
 
 updateFolderAppearance:
-UPDATE folder SET colorArgb = :colorArgb, icon = :icon, modifiedAt = :modifiedAt WHERE id = :id;
+UPDATE folder SET colorArgb = :colorArgb, icon = :icon, coverKind = :coverKind, coverRef = :coverRef,
+                 modifiedAt = :modifiedAt
+WHERE id = :id;
 
 updateFolderParent:
 UPDATE folder SET parentId = :parentId, sortKey = :sortKey, modifiedAt = :modifiedAt WHERE id = :id;
@@ -143,7 +158,7 @@ DELETE FROM folder WHERE id = ?;
 -- ---------------------------------------------------------------------------
 
 selectAllNotes:
-SELECT * FROM note WHERE deletedAt IS NULL;
+SELECT * FROM note WHERE deletedAt IS NULL AND isCover = 0;
 
 -- Trashed ones too. `reconcile` needs it — a directory under `trash/` must not be adopted
 -- back into the library as a note the index "lost", and a trashed note's thumbnails must
@@ -162,8 +177,17 @@ selectNotesTrashedWithFolder:
 SELECT * FROM note WHERE deletedWithFolderId = ?;
 
 insertNote:
-INSERT INTO note(id, title, titleFold, folderId, pageCount, localRev, createdAt, modifiedAt)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+INSERT INTO note(id, title, titleFold, folderId, pageCount, localRev, isCover, createdAt, modifiedAt)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- The most recently edited note in a set of folders, for `FolderCover.LATEST_NOTE`. Cover
+-- notes are excluded: a folder whose cover is "the latest note" must not end up showing its
+-- own cover note back to itself.
+selectLatestNoteIn:
+SELECT * FROM note
+WHERE deletedAt IS NULL AND isCover = 0 AND folderId IN :folderIds
+ORDER BY modifiedAt DESC
+LIMIT 1;
 
 updateNoteTitle:
 UPDATE note SET title = :title, titleFold = :titleFold, modifiedAt = :modifiedAt WHERE id = :id;

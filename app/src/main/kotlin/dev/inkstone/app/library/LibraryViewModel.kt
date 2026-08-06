@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.Folder
+import dev.inkstone.core.model.FolderCover
 import dev.inkstone.core.model.FolderIcon
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.FolderTree
@@ -38,7 +39,10 @@ import javax.inject.Inject
  * wherever it is, which is the entire reason for having search in an app that also has
  * folders.
  */
+// One method per thing the library screen can do, almost all of them a single delegation to
+// the repository. The count tracks the size of the UI, not the complexity of this class.
 @HiltViewModel
+@Suppress("TooManyFunctions")
 class LibraryViewModel @Inject constructor(private val repository: LibraryRepository) : ViewModel() {
 
     private val controls = MutableStateFlow(LibraryControls())
@@ -129,9 +133,26 @@ class LibraryViewModel @Inject constructor(private val repository: LibraryReposi
 
     fun renameFolder(id: FolderId, name: String) = viewModelScope.launch { repository.renameFolder(id, name) }
 
-    fun setFolderAppearance(id: FolderId, colorArgb: Int?, icon: FolderIcon) = viewModelScope.launch {
-        repository.setFolderAppearance(id, colorArgb, icon)
+    fun setFolderAppearance(id: FolderId, colorArgb: Int?, icon: FolderIcon, cover: FolderCover) =
+        viewModelScope.launch { repository.setFolderAppearance(id, colorArgb, icon, cover) }
+
+    /**
+     * Start (or resume) drawing a folder's cover.
+     *
+     * @param onCreated invoked with the note to open — it is an ordinary note in the
+     *   ordinary editor, which is the whole trick. See `LibraryRepository.createDrawnCover`.
+     */
+    fun drawCover(id: FolderId, onCreated: (DocumentId) -> Unit) = viewModelScope.launch {
+        repository.createDrawnCover(id)?.let(onCreated) ?: run { message.value = "Could not create a cover" }
     }
+
+    /** @param encoded already decoded, downscaled and re-encoded by the caller. */
+    fun setImageCover(id: FolderId, encoded: ByteArray) = viewModelScope.launch {
+        repository.setImageCover(id, encoded)
+    }
+
+    /** The picture for a folder's tile, or null when it shows its icon. */
+    suspend fun folderCover(folder: Folder) = repository.coverFor(folder)
 
     fun setFavourite(id: DocumentId, favourite: Boolean) = viewModelScope.launch {
         repository.setFavourite(id, favourite)

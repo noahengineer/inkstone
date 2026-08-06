@@ -104,6 +104,30 @@ class Thumbnails @Inject constructor(private val cache: ThumbnailCache, private 
         }
     }
 
+    /**
+     * A folder's imported cover image.
+     *
+     * Cached in the same memory tier as thumbnails and **downsampled on decode**. A picked
+     * photo is routinely 12 megapixels, which is 48 MB decoded at full size — enough to OOM
+     * the 4 GB device SPEC §10 says to test on, for a picture that is drawn 180 dp wide.
+     *
+     * @param load reads the stored bytes. Only called on a miss.
+     */
+    suspend fun folderImage(assetPath: String, load: suspend () -> ByteArray?): ImageBitmap? {
+        val key = "folder-image:$assetPath"
+        memory.get(key)?.let { return it }
+        return renderPermits.withPermit {
+            memory.get(key)?.let { return@withPermit it }
+            val bytes = load() ?: return@withPermit null
+            decodeDownsampled(bytes, ThumbnailCache.COVER_WIDTH_PX)?.also { memory.put(key, it) }
+        }
+    }
+
+    /** Forget a decoded folder image — after the user replaces or clears it. */
+    fun invalidateFolderImage(assetPath: String) {
+        memory.remove("folder-image:$assetPath")
+    }
+
     /** Render and store a cover from a page already folded — the save path (SPEC §5.1). */
     suspend fun refreshCover(id: DocumentId, page: FoldedPage): Boolean {
         val bytes = renderer.render(page, ThumbnailCache.COVER_WIDTH_PX) ?: return false
@@ -130,6 +154,30 @@ class Thumbnails @Inject constructor(private val cache: ThumbnailCache, private 
     private suspend fun decode(bytes: ByteArray): ImageBitmap? = withContext(Dispatchers.Default) {
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
     }
+
+    /**
+     * Decode to roughly [targetWidthPx] wide, never larger.
+     *
+     * Two passes: `inJustDecodeBounds` reads the header only, then `inSampleSize` makes the
+     * decoder skip pixels as it reads. That is the difference between allocating the full
+     * image and allocating what is drawn — the decoder never holds the large bitmap at all,
+     * so downscaling afterwards would not be the same thing.
+     *
+     * `inSampleSize` is rounded to a power of two by the decoder anyway, so the result is
+     * *at least* the target width rather than exactly it.
+     */
+    private suspend fun decodeDownsampled(bytes: ByteArray, targetWidthPx: Int): ImageBitmap? =
+        withContext(Dispatchers.Default) {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+            if (bounds.outWidth <= 0) return@withContext null
+
+            var sample = 1
+            while (bounds.outWidth / (sample * 2) >= targetWidthPx) sample *= 2
+
+            val options = BitmapFactory.Options().apply { inSampleSize = sample }
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.asImageBitmap()
+        }
 
     private companion object {
         /**

@@ -23,6 +23,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -30,6 +31,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.inkstone.core.model.DocumentId
@@ -120,6 +122,32 @@ class LibraryDialogState {
 
 @Composable
 private fun LibraryDialogHost(state: LibraryUiState, actions: LibraryActions, dialogs: LibraryDialogState) {
+    RenameAndCreateDialogs(actions, dialogs)
+    MoveDialogs(state, actions, dialogs)
+
+    dialogs.stylingFolder?.let { folder ->
+        FolderAppearanceDialog(
+            folder = folder,
+            cover = rememberFolderCover(folder, actions),
+            onDismiss = { dialogs.stylingFolder = null },
+            onConfirm = { color, icon, cover ->
+                actions.onStyleFolder(folder.id, color, icon, cover)
+                dialogs.stylingFolder = null
+            },
+            onDrawCover = {
+                actions.onDrawCover(folder.id)
+                dialogs.stylingFolder = null
+            },
+            onPickImage = {
+                actions.onPickCoverImage(folder.id)
+                dialogs.stylingFolder = null
+            },
+        )
+    }
+}
+
+@Composable
+private fun RenameAndCreateDialogs(actions: LibraryActions, dialogs: LibraryDialogState) {
     dialogs.renaming?.let { target ->
         TextPromptDialog(
             title = if (target.folderId != null) "Rename folder" else "Rename note",
@@ -144,7 +172,10 @@ private fun LibraryDialogHost(state: LibraryUiState, actions: LibraryActions, di
             },
         )
     }
+}
 
+@Composable
+private fun MoveDialogs(state: LibraryUiState, actions: LibraryActions, dialogs: LibraryDialogState) {
     if (dialogs.movingNotes) {
         FolderPickerDialog(
             title = "Move ${state.selection.size} to…",
@@ -167,17 +198,6 @@ private fun LibraryDialogHost(state: LibraryUiState, actions: LibraryActions, di
             onPick = {
                 actions.onMoveFolder(folder.id, it)
                 dialogs.movingFolder = null
-            },
-        )
-    }
-
-    dialogs.stylingFolder?.let { folder ->
-        FolderAppearanceDialog(
-            folder = folder,
-            onDismiss = { dialogs.stylingFolder = null },
-            onConfirm = { color, icon ->
-                actions.onStyleFolder(folder.id, color, icon)
-                dialogs.stylingFolder = null
             },
         )
     }
@@ -316,6 +336,7 @@ private fun LibraryGrid(state: LibraryUiState, actions: LibraryActions, dialogs:
                 folder = folder,
                 noteCount = state.allNotes.count { !it.isTrashed && it.folderId == folder.id },
                 actions = folderActions(folder, actions, dialogs),
+                cover = rememberFolderCover(folder, actions),
             )
         }
         gridItems(state.notes, key = { "note-${it.id.value}" }) { note ->
@@ -338,7 +359,11 @@ private fun LibraryList(state: LibraryUiState, actions: LibraryActions, dialogs:
         modifier = Modifier.fillMaxSize(),
     ) {
         items(state.folders, key = { "folder-${it.id.value}" }) { folder ->
-            FolderRow(folder = folder, actions = folderActions(folder, actions, dialogs))
+            FolderRow(
+                folder = folder,
+                actions = folderActions(folder, actions, dialogs),
+                cover = rememberFolderCover(folder, actions),
+            )
         }
         items(state.notes, key = { "note-${it.id.value}" }) { note ->
             NoteRow(
@@ -381,12 +406,39 @@ data class LibraryActions(
     val onRenameNote: (DocumentId, String) -> Unit,
     val onRenameFolder: (FolderId, String) -> Unit,
     val onMoveFolder: (FolderId, FolderId?) -> Unit,
-    val onStyleFolder: (FolderId, Int?, dev.inkstone.core.model.FolderIcon) -> Unit,
+    val onStyleFolder: (
+        FolderId,
+        Int?,
+        dev.inkstone.core.model.FolderIcon,
+        dev.inkstone.core.model.FolderCover,
+    ) -> Unit,
     val onFavourite: (DocumentId, Boolean) -> Unit,
     val onDuplicate: (DocumentId) -> Unit,
     val onOpenTrash: () -> Unit,
     val thumbnail: suspend (NoteSummary) -> androidx.compose.ui.graphics.ImageBitmap?,
+    /** A folder's cover picture, or null when it shows its icon (SPEC §9). */
+    val folderCover: suspend (Folder) -> androidx.compose.ui.graphics.ImageBitmap?,
+    /** Open the editor on the note that *is* this folder's cover, creating it if needed. */
+    val onDrawCover: (FolderId) -> Unit,
+    /** Launch the system photo picker for this folder's cover. */
+    val onPickCoverImage: (FolderId) -> Unit,
 )
 
 /** Wide enough for a legible page thumbnail on a tablet, narrow enough for three columns. */
 private const val GRID_CELL_MIN_WIDTH = 180
+
+/**
+ * A folder's cover picture, loaded off the composition.
+ *
+ * Keyed on the cover *and* the folder's `modifiedAt`, so redrawing a cover or importing a new
+ * image refreshes the tile without the grid having to be told. The underlying pipeline is the
+ * note thumbnail cache, so a hit costs nothing (SPEC §5.7).
+ */
+@Composable
+private fun rememberFolderCover(folder: Folder, actions: LibraryActions): ImageBitmap? {
+    var image by remember(folder.id.value) { mutableStateOf<ImageBitmap?>(null) }
+    LaunchedEffect(folder.id.value, folder.cover, folder.modifiedEpochMillis) {
+        image = actions.folderCover(folder)
+    }
+    return image
+}

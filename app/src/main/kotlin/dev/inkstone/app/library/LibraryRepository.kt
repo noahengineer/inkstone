@@ -1,5 +1,6 @@
 package dev.inkstone.app.library
 
+import androidx.compose.ui.graphics.ImageBitmap
 import dev.inkstone.core.database.library.LibraryIndex
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
@@ -7,6 +8,7 @@ import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.Folder
+import dev.inkstone.core.model.FolderCover
 import dev.inkstone.core.model.FolderIcon
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.FolderTree
@@ -50,7 +52,12 @@ import javax.inject.Singleton
  * it is driven by a 30-day clock rather than by a user action, and it is not reachable from
  * any button.
  */
+// The library's whole surface: notes, folders, covers, trash, retention and thumbnails. Each
+// one is a few lines, and the alternative — splitting by noun — would put the trash cascade's
+// file-then-row ordering across two classes. That ordering is the thing this file exists to
+// get right (see the KDoc), so it stays in one place.
 @Singleton
+@Suppress("TooManyFunctions")
 class LibraryRepository @Inject constructor(
     private val fs: FileSystem,
     private val clock: Clock,
@@ -283,8 +290,101 @@ class LibraryRepository @Inject constructor(
         index.renameFolder(id, legalName(name), clock.nowEpochMillis())
     }
 
-    suspend fun setFolderAppearance(id: FolderId, colorArgb: Int?, icon: FolderIcon) {
-        index.setFolderAppearance(id, colorArgb, icon, clock.nowEpochMillis())
+    suspend fun setFolderAppearance(id: FolderId, colorArgb: Int?, icon: FolderIcon, cover: FolderCover) {
+        index.setFolderAppearance(id, colorArgb, icon, cover, clock.nowEpochMillis())
+    }
+
+    // -----------------------------------------------------------------------
+    // Folder covers
+    // -----------------------------------------------------------------------
+
+    /**
+     * The picture for a folder's tile, or null to fall back to its icon.
+     *
+     * Every branch reuses the thumbnail pipeline rather than adding a second one — which is
+     * why a redrawn cover updates by itself: [FolderCover.Drawn] points at an ordinary note,
+     * and an ordinary note's cover thumbnail is regenerated on materialize (SPEC §5.7).
+     */
+    suspend fun coverFor(folder: Folder): ImageBitmap? = when (val cover = folder.cover) {
+        FolderCover.Icon -> null
+
+        FolderCover.LatestNote -> {
+            val subtree = FolderTree.subtreeOf(folder.id, index.allFolders()).map { it.id }
+            index.latestNoteIn(subtree)?.let { thumbnailOf(it) }
+        }
+
+        // A cover note that has been trashed or lost leaves the folder on its icon rather
+        // than blank — `index.note` returning null is a normal outcome, not an error.
+        is FolderCover.Drawn -> index.note(cover.noteId)?.let { thumbnailOf(it) }
+
+        is FolderCover.Image -> thumbnails.folderImage(cover.asset) {
+            if (fs.exists(cover.asset)) fs.readBytes(cover.asset) else null
+        }
+    }
+
+    /**
+     * Create the note that *is* a folder's cover, and point the folder at it.
+     *
+     * The whole feature, and it is almost no code: a folder cover the user draws is an
+     * ordinary single-page note opened in the ordinary editor. It gets autosave, undo, every
+     * brush, and — the part that matters — its thumbnail is regenerated when it closes, so
+     * the folder's tile updates with nothing else written.
+     *
+     * `isCover` keeps it out of the library's own lists, so the user is not left wondering
+     * why there is a note called "Cover" next to their notebooks.
+     *
+     * @return the note to open in the editor.
+     */
+    suspend fun createDrawnCover(folderId: FolderId): DocumentId? {
+        val folder = index.folder(folderId) ?: return null
+        // Reuse the existing drawing if there is one, so "draw a cover" a second time edits
+        // the picture instead of silently abandoning it and starting a blank one.
+        (folder.cover as? FolderCover.Drawn)?.let { existing ->
+            if (index.note(existing.noteId) != null) return existing.noteId
+        }
+
+        val note = store.create(
+            title = "$COVER_TITLE_PREFIX${folder.name}",
+            deviceId = deviceId,
+            background = Background.Blank,
+        )
+        val now = clock.nowEpochMillis()
+        index.insertNote(
+            NoteSummary(
+                id = note.document.id,
+                title = note.document.title,
+                isCover = true,
+                localRev = note.document.localRev,
+                createdEpochMillis = now,
+                modifiedEpochMillis = now,
+            ),
+        )
+        index.setFolderAppearance(folderId, folder.colorArgb, folder.icon, FolderCover.Drawn(note.document.id), now)
+        return note.document.id
+    }
+
+    /**
+     * Store a picked image as a folder's cover.
+     *
+     * The bytes arrive already re-encoded and downscaled by the caller — `:app` owns the
+     * decode because it needs `BitmapFactory`. This writes them atomically and points the
+     * folder at the file.
+     */
+    suspend fun setImageCover(folderId: FolderId, encoded: ByteArray) {
+        val folder = index.folder(folderId) ?: return
+        val path = NoteLayout.folderCoverImage(folderId)
+        fs.createDirectories(NoteLayout.folderDir(folderId))
+        fs.writeBytesAtomically(path, encoded)
+        // The path does not change between imports, so a previously decoded image would
+        // otherwise stay in the memory cache and the folder would keep showing the old one.
+        thumbnails.invalidateFolderImage(path)
+        index.setFolderAppearance(
+            folderId,
+            folder.colorArgb,
+            folder.icon,
+            FolderCover.Image(path),
+            clock.nowEpochMillis(),
+        )
     }
 
     /**
@@ -419,6 +519,9 @@ class LibraryRepository @Inject constructor(
 
     private companion object {
         const val UNTITLED = "Untitled"
+
+        /** Titles a folder cover note, so it is recognisable if it ever surfaces. */
+        const val COVER_TITLE_PREFIX = "Cover — "
         const val COPY_SUFFIX = "copy"
     }
 }

@@ -5,6 +5,7 @@ import app.cash.sqldelight.coroutines.mapToList
 import dev.inkstone.core.database.InkstoneDatabase
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.Folder
+import dev.inkstone.core.model.FolderCover
 import dev.inkstone.core.model.FolderIcon
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.FractionalKey
@@ -115,6 +116,8 @@ public class LibraryIndex(private val database: InkstoneDatabase, private val di
             sortKey = folder.sortKey.value,
             colorArgb = folder.colorArgb?.toLong(),
             icon = folder.icon.name,
+            coverKind = folder.cover.kind,
+            coverRef = folder.cover.ref,
             createdAt = folder.createdEpochMillis,
             modifiedAt = folder.modifiedEpochMillis,
         )
@@ -127,9 +130,31 @@ public class LibraryIndex(private val database: InkstoneDatabase, private val di
         id: FolderId,
         colorArgb: Int?,
         icon: FolderIcon,
+        cover: FolderCover,
         nowEpochMillis: Long,
     ): Unit = withContext(dispatcher) {
-        queries.updateFolderAppearance(colorArgb?.toLong(), icon.name, nowEpochMillis, id.value)
+        queries.updateFolderAppearance(
+            colorArgb = colorArgb?.toLong(),
+            icon = icon.name,
+            coverKind = cover.kind,
+            coverRef = cover.ref,
+            modifiedAt = nowEpochMillis,
+            id = id.value,
+        )
+    }
+
+    /**
+     * The most recently edited note in any of [folderIds] — `FolderCover.LatestNote`.
+     *
+     * Takes the whole subtree rather than one folder, so a folder of folders still shows
+     * something rather than looking empty.
+     */
+    public suspend fun latestNoteIn(folderIds: Collection<FolderId>): NoteSummary? = withContext(dispatcher) {
+        if (folderIds.isEmpty()) {
+            null
+        } else {
+            queries.selectLatestNoteIn(folderIds.map { it.value }).executeAsOneOrNull()?.toSummary()
+        }
     }
 
     /**
@@ -202,6 +227,7 @@ public class LibraryIndex(private val database: InkstoneDatabase, private val di
             folderId = note.folderId?.value,
             pageCount = note.pageCount.toLong(),
             localRev = note.localRev,
+            isCover = if (note.isCover) 1L else 0L,
             createdAt = note.createdEpochMillis,
             modifiedAt = note.modifiedEpochMillis,
         )
@@ -298,6 +324,37 @@ public data class ExpiredEntries(val notes: List<NoteSummary>, val folders: List
 // generated `dev.inkstone.core.database.Folder` and the model's `Folder` collide. This file
 // lives in a sub-package so the *model* type is the unqualified one — it is the type the
 // rest of the app speaks — and the row types are named only here, once each.
+
+/**
+ * The stored `(kind, ref)` pair as a [FolderCover].
+ *
+ * An unrecognised kind — or a `DRAWN`/`IMAGE` row whose reference went missing — falls back
+ * to the icon rather than failing. A folder that will not render is worse than a folder that
+ * renders plainly, and the icon and colour are always set.
+ */
+private fun folderCoverOf(kind: String, ref: String?): FolderCover = when (kind) {
+    FolderCover.LatestNote.kind -> FolderCover.LatestNote
+    "DRAWN" -> ref?.let { FolderCover.Drawn(DocumentId(it)) } ?: FolderCover.Icon
+    "IMAGE" -> ref?.let { FolderCover.Image(it) } ?: FolderCover.Icon
+    else -> FolderCover.Icon
+}
+
+/** How a cover is stored. Kept beside [folderCoverOf] so the two cannot drift apart. */
+private val FolderCover.kind: String
+    get() = when (this) {
+        FolderCover.Icon -> "ICON"
+        FolderCover.LatestNote -> "LATEST_NOTE"
+        is FolderCover.Drawn -> "DRAWN"
+        is FolderCover.Image -> "IMAGE"
+    }
+
+private val FolderCover.ref: String?
+    get() = when (this) {
+        FolderCover.Icon, FolderCover.LatestNote -> null
+        is FolderCover.Drawn -> noteId.value
+        is FolderCover.Image -> asset
+    }
+
 private fun dev.inkstone.core.database.Folder.toFolder() = Folder(
     id = FolderId(id),
     parentId = parentId?.let(::FolderId),
@@ -305,6 +362,7 @@ private fun dev.inkstone.core.database.Folder.toFolder() = Folder(
     sortKey = FractionalKey(sortKey),
     colorArgb = colorArgb?.toInt(),
     icon = FolderIcon.entries.firstOrNull { it.name == icon } ?: FolderIcon.FOLDER,
+    cover = folderCoverOf(coverKind, coverRef),
     createdEpochMillis = createdAt,
     modifiedEpochMillis = modifiedAt,
     deletedEpochMillis = deletedAt,
@@ -316,6 +374,7 @@ private fun dev.inkstone.core.database.Note.toSummary() = NoteSummary(
     title = title,
     folderId = folderId?.let(::FolderId),
     favourite = favourite != 0L,
+    isCover = isCover != 0L,
     pageCount = pageCount.toInt(),
     // An unrecognised state is treated as local-only rather than rejected: a database
     // written by a newer build must not stop an older one from opening the library.

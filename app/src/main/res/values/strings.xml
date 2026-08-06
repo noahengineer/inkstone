@@ -3,4 +3,6 @@
     <string name="app_name">Inkstone</string>
     <!-- Shown when the journal ended in a torn record — a crash mid-stroke (SPEC §5.1). -->
     <string name="recovered_from_crash">Recovered after an unexpected close. At most the stroke in progress was lost.</string>
+    <!-- A picked image that could not be decoded — a content URI can always turn out not to be one. -->
+    <string name="cover_image_failed">That image could not be read</string>
 </resources>

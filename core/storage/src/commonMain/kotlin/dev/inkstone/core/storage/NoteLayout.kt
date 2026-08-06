@@ -2,6 +2,7 @@ package dev.inkstone.core.storage
 
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FileSystem
+import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.PageId
 
 /**
@@ -102,4 +103,23 @@ public object NoteLayout {
 
     public fun trashEntry(id: DocumentId, deletedEpochMillis: Long): String =
         "$TRASH_DIR/$deletedEpochMillis-${id.value}"
+
+    /**
+     * Where a folder's own files live — currently just an imported cover image.
+     *
+     * Beside `notes/` rather than under the thumbnail cache, because this one is **not** a
+     * cache: the user chose the picture and it cannot be regenerated. Evicting it would
+     * lose it.
+     */
+    public const val FOLDERS_DIR: String = "folders"
+
+    public fun folderDir(id: FolderId): String = "$FOLDERS_DIR/${id.value}"
+
+    /**
+     * A folder's imported cover image.
+     *
+     * The name carries no extension: the bytes are re-encoded to a known format on import,
+     * so nothing downstream has to sniff a file the user picked.
+     */
+    public fun folderCoverImage(id: FolderId): String = "${folderDir(id)}/cover$THUMBNAIL_EXTENSION"
 }

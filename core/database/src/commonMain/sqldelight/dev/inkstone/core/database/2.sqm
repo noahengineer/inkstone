@@ -1,0 +1,13 @@
+-- Migration 2 → 3: folder covers.
+--
+-- A folder's tile can now show the first page of its most recently edited note, an imported
+-- image, or a note the user drew for the purpose — see `FolderCover`. The drawn case is an
+-- ordinary note, so it needs a flag that keeps it out of the library's own lists.
+--
+-- Additive only, and every column has a default that means "what it did before": ICON for
+-- the cover kind, 0 for isCover. An existing database migrates without touching a row.
+
+ALTER TABLE folder ADD COLUMN coverKind TEXT NOT NULL DEFAULT 'ICON';
+ALTER TABLE folder ADD COLUMN coverRef TEXT;
+
+ALTER TABLE note ADD COLUMN isCover INTEGER NOT NULL DEFAULT 0;
