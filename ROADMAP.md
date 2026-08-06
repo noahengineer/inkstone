@@ -264,8 +264,8 @@ both break naive implementations.
 
 ### Acceptance
 
-- [ ] 500 notes across 50 nested folders → library scrolls at 60fps — **outstanding, device gate.** Needs a fixture generator and `dumpsys gfxinfo`, same instrument as M1's frame-rate gate
-- [ ] Thumbnails generate off the main thread; no jank while scrolling — **rendering is off-thread and bounded to two concurrent renders; "no jank" is still a measurement, outstanding**
+- [ ] 500 notes across 50 nested folders → library scrolls at 60fps — **tool built** (Measure → Fill library), numbers outstanding: needs `adb dumpsys gfxinfo`, and the tablet is `unauthorized`. Procedure in docs/M3-LIBRARY.md §10
+- [ ] Thumbnails generate off the main thread; no jank while scrolling — same run, cold-cache pass. Rendering is off-thread and bounded to two concurrent renders, but "no jank" is a measurement
 - [x] Delete → restore from trash → content intact — notes and whole folders, files-before-rows, `LibraryIndexTest` (instrumented) covers the cascade and the partial-restore case
 - [x] Title search returns results as you type — Unicode-case-folded, searches every folder, `LibraryFilteringTest`
 

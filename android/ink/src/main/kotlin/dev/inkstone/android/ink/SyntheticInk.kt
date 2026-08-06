@@ -3,7 +3,12 @@ package dev.inkstone.android.ink
 import androidx.ink.brush.InputToolType
 import androidx.ink.strokes.MutableStrokeInputBatch
 import androidx.ink.strokes.Stroke
+import dev.inkstone.core.model.FractionalKey
+import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
+import dev.inkstone.core.model.StrokeObject
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.random.Random
@@ -88,6 +93,46 @@ public object SyntheticInk {
             result += Stroke(factory.brushFor(config), batch) to kind
         }
         return Batch(result)
+    }
+
+    /**
+     * A synthetic page as **encoded ops**, ready to write to a note.
+     *
+     * ROADMAP M3's frame-rate gate needs 500 notes, and a library of 500 *blank* notes would
+     * measure nothing: every thumbnail would be an identical near-empty WebP that decodes in
+     * no time, so the two costs the gate exists to catch — rendering a page and decoding its
+     * picture — would both be missing.
+     *
+     * So the fixture writes real ink. This is [generate] plus the encode step, kept here
+     * because `StrokeGeometryCodec` is internal to this module and `Stroke` must not cross
+     * out of it (CLAUDE.md, "third-party types don't leak across module boundaries"). The
+     * caller supplies its own id and clock generators and receives ordinary [PageOp]s.
+     *
+     * **Off the main thread.** Tessellation plus encoding, times [count].
+     */
+    public fun generatePageOps(
+        count: Int,
+        page: PageSize,
+        factory: InkBrushFactory,
+        seed: Int,
+        nextObjectId: () -> ObjectId,
+        nextOpId: () -> String,
+        nextClock: () -> LamportClock,
+    ): List<PageOp> {
+        val batch = generate(count, page, factory, seed)
+        var z = FractionalKey.Initial
+        return batch.items.map { (stroke, kind) ->
+            z = FractionalKey.between(z, null)
+            PageOp.AddObject(
+                opId = nextOpId(),
+                clock = nextClock(),
+                obj = StrokeObject(
+                    id = nextObjectId(),
+                    geometry = StrokeGeometryCodec.encode(stroke, kind, InkInputModel.SPRING),
+                    z = z,
+                ),
+            )
+        }
     }
 
     private const val DEFAULT_SEED = 20260805

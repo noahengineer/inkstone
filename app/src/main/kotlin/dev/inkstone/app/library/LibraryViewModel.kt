@@ -43,7 +43,10 @@ import javax.inject.Inject
 // the repository. The count tracks the size of the UI, not the complexity of this class.
 @HiltViewModel
 @Suppress("TooManyFunctions")
-class LibraryViewModel @Inject constructor(private val repository: LibraryRepository) : ViewModel() {
+class LibraryViewModel @Inject constructor(
+    private val repository: LibraryRepository,
+    private val fixture: LibraryFixture,
+) : ViewModel() {
 
     private val controls = MutableStateFlow(LibraryControls())
 
@@ -209,6 +212,17 @@ class LibraryViewModel @Inject constructor(private val repository: LibraryReposi
         if (failed.isNotEmpty()) {
             message.value = "Folder restored; ${failed.size} ${notesWord(failed.size)} stayed in the trash"
         }
+    }
+
+    /**
+     * ROADMAP M3's frame-rate gate needs 500 notes across 50 folders. See [LibraryFixture]:
+     * this is the library-scale twin of M1's "Load 5,000 strokes", and it is slow because the
+     * notes contain real ink — a library of blank pages would measure nothing.
+     */
+    fun fillForMeasurement() = viewModelScope.launch {
+        message.value = "Generating 500 notes — this takes a couple of minutes"
+        val created = fixture.generate { done, total -> message.value = "Generated $done of $total notes…" }
+        message.value = "$created notes created. Scroll the library, then read dumpsys gfxinfo."
     }
 
     fun dismissMessage() {

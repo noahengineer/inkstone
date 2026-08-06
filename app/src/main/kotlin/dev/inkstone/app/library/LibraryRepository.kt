@@ -136,6 +136,29 @@ class LibraryRepository @Inject constructor(
         }
     }
 
+    /**
+     * Index a note that [LibraryFixture] wrote directly through `NoteStore`.
+     *
+     * The fixture bypasses [createNote] because it needs a session to write strokes into,
+     * and this is the row that would otherwise be missing. Not a general-purpose hook — the
+     * only other thing that indexes an unknown directory is [reconcile], and it deliberately
+     * knows nothing about folders.
+     */
+    suspend fun adoptGenerated(id: DocumentId, title: String, folderId: FolderId?) {
+        val now = clock.nowEpochMillis()
+        index.insertNote(
+            NoteSummary(
+                id = id,
+                title = title,
+                folderId = folderId,
+                pageCount = 1,
+                localRev = store.open(id)?.document?.localRev ?: 0L,
+                createdEpochMillis = now,
+                modifiedEpochMillis = now,
+            ),
+        )
+    }
+
     /** Pull a note the index does not know about into the library, reading its manifest. */
     private suspend fun adopt(id: DocumentId) {
         val note = store.open(id) ?: return

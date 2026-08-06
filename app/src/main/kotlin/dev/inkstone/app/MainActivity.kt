@@ -188,6 +188,7 @@ class MainActivity : ComponentActivity() {
         onFavourite = library::setFavourite,
         onDuplicate = library::duplicate,
         onOpenTrash = onOpenTrash,
+        onFillForMeasurement = library::fillForMeasurement,
         thumbnail = library::thumbnail,
         folderCover = library::folderCover,
         // A drawn cover is an ordinary note in the ordinary editor — the same activity a

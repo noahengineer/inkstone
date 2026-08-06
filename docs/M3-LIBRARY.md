@@ -252,13 +252,42 @@ present" and no way to produce one.
 
 ## 10. What still has to be measured on the device
 
-Two of M3's acceptance criteria are device gates and are **outstanding**:
+Two of M3's acceptance criteria are device gates. The **tool** for both now exists —
+**Measure → Fill library (500 notes, 50 folders)** in the library toolbar — and the numbers
+are still outstanding, because reading them needs `adb`.
 
-- **500 notes across 50 nested folders → 60 fps.** Needs a fixture generator and
-  `dumpsys gfxinfo`, the same instrument M1's frame-rate gate uses.
-- **Thumbnails generate off the main thread with no jank while scrolling.** The renderer
-  hops to `Dispatchers.Default` itself and generation is bounded to two at a time, but "no
-  jank" is a measurement, not an argument.
+### The procedure
+
+The fixture writes 500 notes across 50 nested folders, each with a page of 120 synthetic
+strokes. Blank pages would measure nothing: every thumbnail would be an identical near-empty
+WebP that decodes instantly, so both costs the gate exists to catch would be missing. It takes
+a couple of minutes and reports progress.
+
+```bash
+adb shell am force-stop dev.inkstone
+```
+
+Then open the app, tap **Measure → Fill library**, wait for "500 notes created", and:
+
+```bash
+adb shell dumpsys gfxinfo dev.inkstone reset
+```
+
+Fling the library end to end several times — first pass with a cold thumbnail cache (that is
+the jank criterion), then again once it is warm (that is the frame-rate criterion). Then:
+
+```bash
+adb shell dumpsys gfxinfo dev.inkstone
+```
+
+**What passes:** *Janky frames* under 1% for the warm pass, and the 95th percentile under
+16 ms. The cold pass will show worse numbers and that is expected — what it must not show is
+a stall, which is what an unbounded render queue would produce.
+
+**Note the fixture cannot clean up after itself.** A "remove the fixture" button would be a
+hard delete with a wildcard's blast radius, which is precisely what this milestone rules out.
+The generated notes are ordinary notes: multi-select them and move them to the trash, where
+they expire in 30 days like anything else.
 
 `LibraryIndexTest` is instrumented rather than a JVM unit test, for the reason `:android:ink`'s
 erase tests are — the thing under test is the engine:
@@ -267,8 +296,9 @@ erase tests are — the thing under test is the engine:
 ./gradlew :core:database:connectedDebugAndroidTest
 ```
 
-It has not been run in this session: no device was attached, and the JVM alternative
-(`sqldelight-driver-sqlite`) could not be fetched through this network.
+It has not been run: `adb` reports the tablet as `unauthorized`, so the "Allow USB
+debugging?" dialog has not been accepted on the device. The JVM alternative
+(`sqldelight-driver-sqlite`) could not be fetched through this network either.
 
 **`check` now compiles instrumented tests**, in both convention plugins. It does not run them
 — that still needs a tablet — but a test that does not compile is worse than no test, because

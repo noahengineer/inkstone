@@ -237,6 +237,7 @@ private fun LibraryToolbar(state: LibraryUiState, actions: LibraryActions, onNew
             ) { Text(if (state.layout == LibraryLayout.GRID) "List" else "Grid") }
             TextButton(onClick = onNewFolder) { Text("New folder") }
             TextButton(onClick = actions.onOpenTrash) { Text("Trash") }
+            MeasureMenu(actions)
         }
 
         Row(
@@ -415,6 +416,8 @@ data class LibraryActions(
     val onFavourite: (DocumentId, Boolean) -> Unit,
     val onDuplicate: (DocumentId) -> Unit,
     val onOpenTrash: () -> Unit,
+    /** ROADMAP M3's frame-rate gate needs 500 notes. See `LibraryFixture`. */
+    val onFillForMeasurement: () -> Unit,
     val thumbnail: suspend (NoteSummary) -> androidx.compose.ui.graphics.ImageBitmap?,
     /** A folder's cover picture, or null when it shows its icon (SPEC §9). */
     val folderCover: suspend (Folder) -> androidx.compose.ui.graphics.ImageBitmap?,
@@ -441,4 +444,32 @@ private fun rememberFolderCover(folder: Folder, actions: LibraryActions): ImageB
         image = actions.folderCover(folder)
     }
     return image
+}
+
+/**
+ * The measurement tool, behind a menu so it is not mistaken for a feature.
+ *
+ * The library-scale twin of the ink toolbar's Measure panel, and there for the same reason:
+ * ROADMAP M3's frame-rate criterion needs 500 notes across 50 nested folders, and generating
+ * them is the only honest way to get there.
+ *
+ * There is deliberately no "remove the fixture" item. That would be a hard delete with a
+ * wildcard's blast radius, which is the one thing this milestone rules out. The generated
+ * notes are ordinary notes: select them and move them to the trash.
+ */
+@Composable
+private fun MeasureMenu(actions: LibraryActions) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        TextButton(onClick = { open = true }) { Text("Measure") }
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(
+                text = { Text("Fill library (500 notes, 50 folders)") },
+                onClick = {
+                    actions.onFillForMeasurement()
+                    open = false
+                },
+            )
+        }
+    }
 }

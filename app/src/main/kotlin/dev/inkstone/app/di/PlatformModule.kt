@@ -101,13 +101,23 @@ object PlatformProvidersModule {
      */
     @Provides
     @Singleton
-    fun providePageThumbnailRenderer(@ApplicationContext context: Context): PageThumbnailRenderer {
+    fun providePageThumbnailRenderer(brushes: InkBrushFactory): PageThumbnailRenderer =
+        InkPageThumbnailRenderer(brushes)
+
+    /**
+     * The brush factory, shared by the thumbnail renderer and the measurement fixture.
+     *
+     * Built from the display's real metrics: a stored stroke's width is in page points and
+     * the epsilon controlling its tessellation is a fraction of a physical pixel, so a wrong
+     * density would draw the library's pictures at a different tolerance from the editor's.
+     */
+    @Provides
+    @Singleton
+    fun provideInkBrushFactory(@ApplicationContext context: Context): InkBrushFactory {
         val metrics = context.resources.displayMetrics
-        return InkPageThumbnailRenderer(
-            InkBrushFactory(
-                displayDensity = metrics.density,
-                pixelsPerPoint = metrics.densityDpi / POINTS_PER_INCH,
-            ),
+        return InkBrushFactory(
+            displayDensity = metrics.density,
+            pixelsPerPoint = metrics.densityDpi / POINTS_PER_INCH,
         )
     }
 
