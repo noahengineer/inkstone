@@ -174,8 +174,12 @@ public class InkBrushFactory(
      * samples use 0.1 with stroke space in pixels; this is half that, because
      * unlike those samples this app zooms, and a stroke tessellated once at
      * 100% is still on screen at 1600%.
+     *
+     * Internal rather than private since M4: a stroke rebuilt from a PDF
+     * ([InkStrokeRebuilder]) has no captured epsilon to restore, and the display's
+     * is the right default for one — the same one a stroke drawn here would get.
      */
-    private val epsilonPt: Float = EPSILON_PX / pixelsPerPoint
+    internal val epsilonPt: Float = EPSILON_PX / pixelsPerPoint
 
     private companion object {
         const val EPSILON_PX = 0.05f

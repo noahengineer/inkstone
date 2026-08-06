@@ -3,6 +3,7 @@ package dev.inkstone.app.note
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.IdFactory
@@ -82,6 +83,15 @@ class NoteEditor(
      * of the files and never the truth.
      */
     private val library: LibraryUpdates? = null,
+    /**
+     * SPEC §5.2 — what turns the bundle into `document.pdf` (M4).
+     *
+     * Null in tests, and in that case the note is materialized as far as its bundle
+     * and no further. That is a real and safe state, not a degraded one: the bundle
+     * is the lossless truth (SPEC §5.3) and the PDF is the *published* form, so a
+     * missing publisher costs interoperability, never data.
+     */
+    private val materializer: DocumentMaterializer? = null,
 ) {
 
     /**
@@ -279,7 +289,15 @@ class NoteEditor(
                     cover = session.page(first.id),
                 )
             }
-            publish()
+            // SPEC §5.1/§5.2 — and strictly after the bundle: the published PDF embeds
+            // those exact bytes and records their hash, so publishing first would write
+            // a marker describing a bundle that no longer exists (SPEC §5.6).
+            //
+            // Failure here is reported and does not undo the save. The bundle is already
+            // on disk and is the truth; a note whose PDF could not be written is a note
+            // that opens perfectly and cannot yet be read elsewhere.
+            val published = materializer?.let { runCatching { it.materialize(session.document.id) } }
+            publish(message = if (published?.isFailure == true) PUBLISH_FAILED else null)
         }
     }
 
@@ -488,6 +506,13 @@ class NoteEditor(
         const val AUTOSAVE_INTERVAL_MS = 2_000L
         const val DEFAULT_TITLE = "Notebook"
         const val CANNOT_DELETE_LAST_PAGE = "A note needs at least one page."
+
+        /**
+         * Deliberately not "save failed" — the save succeeded. Only the *published*
+         * form did not, and the distinction is the one the user needs: their writing
+         * is safe, and the file other apps read is one session behind.
+         */
+        const val PUBLISH_FAILED = "Saved. Could not update the shareable PDF this time."
 
         /** Ops built only to update the screen; never journaled. See `reconcile`. */
         val REPLAY_CLOCK = LamportClock(0, "replay")

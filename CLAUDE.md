@@ -176,6 +176,7 @@ A milestone is done when:
 | Merge test matrix (21 rows) | SPEC §13.2 |
 | Out of scope | SPEC §12 |
 | Open spikes + owning milestone | SPEC Appendix B |
+| **M4.0 spike result + PDF decisions** | `docs/M4-PDF.md` |
 
 ---
 
@@ -198,7 +199,12 @@ Collected during research so they don't get reintroduced from stale training dat
 - A file's ETag does **not** change when it moves. Same `oc:id` + same ETag + new path = a move.
 - `notify_push` is **not** bundled and **not** commonly available. Poll by default; push is an optimisation only.
 - Nextcloud **full-text search is not in a default install** — it needs the `fulltextsearch` app plus a search backend. `pdfgrep` is the reliable test.
+- **`androidx.pdf` does not write `/Ink` annotations, and cannot.** (M4.0 spike, SPEC §6.1.) `androidx.pdf.ink` converts every stroke into a **`/Stamp`** holding a filled path, because the framework type it targets — `android.graphics.pdf.component.PdfAnnotationType` — has only `UNKNOWN`, `FREETEXT`, `HIGHLIGHT`, `STAMP`. There is no ink annotation in the platform API. It also **cannot set `/NM`** (annotation identity there is the integer index on the page — the thing rule "identity is never array position" exists to prevent), and its save is a full PDFium re-serialisation via `PdfRenderer.write`, which makes SPEC §5.2's incremental update impossible. **`androidx.pdf` is not a dependency of this project.** Don't reintroduce it for rendering either: it would force compileSdk 37 or an ext-19 platform package for one bitmap call, and framework `PdfRenderer` does the job from plain `android-36`.
+- **PdfBox-Android 2.0.27.0 has no `PDAnnotationInk` and does not bundle `xmpbox`** (M4). SPEC §6.3's table said otherwise and has been corrected. `/Ink` is written at the COS level and the XMP marker as a raw `/Metadata` stream; both work, neither has a typed helper.
+- **PDFBox's `saveIncremental` writes only objects marked `setNeedToBeUpdated(true)` — including ones you just created — and the mark must be on the whole parent chain.** A marked page hanging off an unmarked `/Pages` node is never reached. The output is a valid PDF, opens everywhere, has the right page count, and contains no ink. Found in M4 by a test that parsed the output; see `PdfBoxWriter.markParentChain`.
+- **`PdfRendererPreV` needs S extension level ≥ 13, not just API 30.** It ships in the mainline PDF module (M4). Check at runtime.
 - PDF `/Ink` **cannot** express variable stroke width. Pressure goes in an `/AP` appearance stream.
+- **An erased stroke cannot be subtracted with even-odd or reversed-winding fills.** Both re-fill wherever two eraser capsules overlap, which is what every scribbled erase produces. The subtraction happens in `:android:ink` via Skia's `Path.op(DIFFERENCE)` and what crosses into `:android:pdf` is what is left (M4, SPEC §3.5).
 - PDF page size comes from **CropBox with `/Rotate` applied**, not MediaBox. Viewers display CropBox.
 - ML Kit's recogniser assumes **one line of text**. Segment first or the output is garbage.
 - ML Kit GenAI and Gemini Nano do **not** do handwriting recognition. There is no successor to Digital Ink Recognition.

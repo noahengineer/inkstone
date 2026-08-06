@@ -73,3 +73,29 @@ public fun pdfUserToPage(p: PdfPoint, box: PdfBox, rotate: Int): PagePoint = whe
     HALF_TURN -> PagePoint(box.x1 - p.x, p.y - box.y0)
     else -> PagePoint(box.y1 - p.y, box.x1 - p.x)
 }
+
+/**
+ * One source page's coordinate system: the box a viewer displays, and the
+ * quarter-turn it displays it through.
+ *
+ * *Added in M4.* The two conversions above take `(box, rotate)` as loose
+ * arguments, which is fine for a unit test and wrong for a materializer that
+ * converts a few thousand points per page — the pair travels together, must come
+ * from the same page, and is exactly the thing SPEC §4.4 warns gets mismatched.
+ *
+ * **This is not persisted.** The note stores the resulting [PageSize] and a
+ * [Background.SourcePdfPage] index; the box and the rotation are re-read from the
+ * source PDF at materialization time, because the source PDF *is* the front of
+ * `document.pdf` verbatim (SPEC §5.2) and so cannot disagree with itself. A copy
+ * in the bundle would be a second source of truth for the one value the whole
+ * "annotations are 3mm off" bug class comes from.
+ */
+public data class PdfPageGeometry(val cropBox: PdfBox, val rotate: Int) {
+
+    /** SPEC §4.4 rule 3 — CropBox **with `/Rotate` applied**. */
+    public val pageSize: PageSize get() = pageSizeOf(cropBox, rotate)
+
+    public fun toPdfUser(p: PagePoint): PdfPoint = pageToPdfUser(p, cropBox, rotate)
+
+    public fun toPage(p: PdfPoint): PagePoint = pdfUserToPage(p, cropBox, rotate)
+}

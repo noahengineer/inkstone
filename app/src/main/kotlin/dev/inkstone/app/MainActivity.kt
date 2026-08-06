@@ -169,6 +169,10 @@ class MainActivity : ComponentActivity() {
         onOpenFolder = library::openFolder,
         onGoUp = { library.goUp() },
         onNewNote = { library.createNote(::openNote) },
+        // Opened only on a clean import. A recovery reports what it lost first
+        // (SPEC §5.6 point 4), and jumping into the editor is how that gets dismissed
+        // unread — `importPdf` decides, not this.
+        onImportPdf = { uri -> library.importPdf(uri, ::openNote) },
         onNewFolder = library::createFolder,
         onQueryChange = library::setQuery,
         onSort = library::setSort,

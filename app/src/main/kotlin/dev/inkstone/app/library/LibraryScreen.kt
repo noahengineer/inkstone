@@ -1,6 +1,9 @@
 package dev.inkstone.app.library
 
+import android.net.Uri
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -64,6 +67,13 @@ import androidx.compose.foundation.lazy.grid.items as gridItems
 fun LibraryScreen(state: LibraryUiState, actions: LibraryActions, modifier: Modifier = Modifier) {
     val dialogs = remember { LibraryDialogState() }
 
+    // `OpenDocument` rather than `GetContent`: it returns a URI to the file the user
+    // actually picked, which is what lets the import read a 200 MB lecture out of
+    // Drive or an SD card instead of making the system copy it into a cache first.
+    val importPdf = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(actions.onImportPdf)
+    }
+
     // Back goes up a folder before it leaves the app, which is what the breadcrumb implies.
     BackHandler(enabled = state.breadcrumb.isNotEmpty() || state.selection.isNotEmpty()) {
         if (state.selection.isNotEmpty()) actions.onClearSelection() else actions.onGoUp()
@@ -93,12 +103,25 @@ fun LibraryScreen(state: LibraryUiState, actions: LibraryActions, modifier: Modi
             }
         }
 
-        ExtendedFloatingActionButton(
-            onClick = actions.onNewNote,
+        Row(
             modifier = Modifier.align(Alignment.BottomEnd).padding(24.dp),
-            text = { Text("New note") },
-            icon = { Text("✎") },
-        )
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            // ROADMAP M4 — PDF import, beside "New note" rather than buried in the
+            // toolbar. Importing a lecture is half of what this app is for, and a note
+            // started from a PDF is not a different kind of note.
+            ExtendedFloatingActionButton(
+                onClick = { importPdf.launch(arrayOf(PDF_MIME)) },
+                text = { Text("Import PDF") },
+                icon = { Text("⇩") },
+            )
+            ExtendedFloatingActionButton(
+                onClick = actions.onNewNote,
+                text = { Text("New note") },
+                icon = { Text("✎") },
+            )
+        }
     }
 
     LibraryDialogHost(state = state, actions = actions, dialogs = dialogs)
@@ -392,6 +415,8 @@ data class LibraryActions(
     val onOpenFolder: (FolderId?) -> Unit,
     val onGoUp: () -> Unit,
     val onNewNote: () -> Unit,
+    /** ROADMAP M4 — the PDF the user picked. What it *is* is SPEC §5.6's decision, not this one's. */
+    val onImportPdf: (Uri) -> Unit,
     val onNewFolder: (String) -> Unit,
     val onQueryChange: (String) -> Unit,
     val onSort: (LibrarySort) -> Unit,
@@ -473,3 +498,12 @@ private fun MeasureMenu(actions: LibraryActions) {
         }
     }
 }
+
+/**
+ * The only MIME type the picker offers.
+ *
+ * Narrow on purpose. SPEC §6.2 is about importing PDFs, and a picker that accepted
+ * anything would let a user choose a file the import can only reject — which reads
+ * as the app being broken rather than as the file being the wrong kind.
+ */
+private const val PDF_MIME = "application/pdf"

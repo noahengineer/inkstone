@@ -66,11 +66,8 @@ class WorkManagerScheduler @Inject constructor(@Suppress("unused") private val w
     override fun enqueueMaterialization(noteId: DocumentId): Unit = TODO("M4 — PDF materialization")
 }
 
-/**
- * M4 fills this in, delegating to `:android:pdf`. Materialization never runs on
- * the ink path (SPEC §5.1) — document close, before upload, or idle-while-charging.
+/*
+ * The M4 materializer is `:android:pdf`'s `InkstonePdfMaterializer`, provided in
+ * `PlatformProvidersModule`. There is no stub here any more — the milestone that
+ * was going to fill it in has.
  */
-@Singleton
-class PdfDocumentMaterializer @Inject constructor() : DocumentMaterializer {
-    override suspend fun materialize(noteId: DocumentId): MaterializedFile = TODO("M4 — PDF incremental update")
-}

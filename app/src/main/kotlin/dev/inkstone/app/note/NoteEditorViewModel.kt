@@ -6,11 +6,14 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.inkstone.app.library.LibraryRepository
 import dev.inkstone.app.library.Thumbnails
+import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.PageId
+import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
 import kotlinx.coroutines.flow.StateFlow
 import javax.inject.Inject
@@ -37,6 +40,8 @@ class NoteEditorViewModel @Inject constructor(
     clock: Clock,
     private val library: LibraryRepository,
     private val thumbnails: Thumbnails,
+    private val sourcePages: SourcePages,
+    materializer: DocumentMaterializer,
     savedState: SavedStateHandle,
 ) : ViewModel() {
 
@@ -52,6 +57,7 @@ class NoteEditorViewModel @Inject constructor(
             override suspend fun onMaterialized(id: DocumentId, localRev: Long, pageCount: Int, cover: FoldedPage) =
                 library.noteMaterialized(id, localRev, pageCount, cover)
         },
+        materializer = materializer,
     )
 
     val state: StateFlow<NoteEditorState> = editor.state
@@ -99,7 +105,18 @@ class NoteEditorViewModel @Inject constructor(
      */
     fun materialize() = editor.materialize()
 
+    /**
+     * SPEC §6.2 — the imported page this note page was drawn on, rendered.
+     *
+     * Suspends, and is called *after* the ink is already on screen: a note that
+     * waited for a 200-page scan to rasterise before showing anything would feel
+     * slower than one that draws the strokes and fills the paper in behind them.
+     */
+    suspend fun sourcePage(background: Background, size: PageSize) =
+        state.value.documentId?.let { sourcePages.render(it, background, size) }
+
     override fun onCleared() {
+        sourcePages.clear()
         // Ends the autosave loop. Not a substitute for `materialize()` from the Activity —
         // `onCleared` is not guaranteed to run before the process dies, which is why the journal
         // exists at all (SPEC §5.1).

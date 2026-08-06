@@ -69,7 +69,7 @@ Pin these. Verified 5 Aug 2026.
 
 - **Hilt**: 2.59+ needs AGP 9.x. Pinned **2.58**, the last AGP-8 release.
 - **androidx** "latest stable": `core-ktx` 1.19.0, `lifecycle` 2.11.0 and `hilt-navigation-compose` 1.4.0 all require compileSdk 37 + AGP 9.1.0. Pinned **1.18.0 / 2.10.0 / 1.3.0**. Wherever this table says "latest stable at M0", read it as **latest stable that works with the pinned AGP**.
-- **`androidx.pdf` 1.0.0-alpha19** requires compile SDK **extension level ≥ 19**. The API 36 platform ships extension level 17; API 37 ships 22. **`compileSdk = 36` alone cannot consume this pin.** M4 must choose between an ext-19 platform package and moving to compileSdk 37 — decide it deliberately. Until then `:android:pdf` leaves the dependency undeclared and `verifyCatalogCoordinates` proves the coordinate resolves.
+- **`androidx.pdf` 1.0.0-alpha19** requires compile SDK **extension level ≥ 19**. The API 36 platform ships extension level 17; API 37 ships 22. **`compileSdk = 36` alone cannot consume this pin.** ~~M4 must choose between an ext-19 platform package and moving to compileSdk 37~~ — **decided in M4: neither.** The M4.0 spike ruled `androidx.pdf` out for writing (§6.1), and the only thing left to want from it was one bitmap call, which §6.1's own fallback provides from plain `android-36`. `:android:pdf` leaves the dependency undeclared permanently, **compileSdk stays 36, the AGP 8.13.0 pin is untouched**, and `verifyCatalogCoordinates` still proves the coordinate resolves. (Both options were real — `platforms;android-36-ext19` exists — so this is a choice, not a limitation.)
 
 Before bumping any Android library, read its `aar-metadata.properties`.
 
@@ -418,8 +418,8 @@ Underspecified coordinate handling is the most reliable source of "annotations a
 1. **All persisted geometry is in page space.** Ink arrives in view space and is converted on stroke finish. Never persist view coordinates.
 2. Page size comes from **CropBox, not MediaBox.** Viewers display CropBox; sizing from MediaBox puts annotations wrong on any PDF where they differ. Fall back to MediaBox only when CropBox is absent.
 3. **Apply `/Rotate` when computing page space.** `/Rotate 90` is extremely common in scanned lecture PDFs. A page with `/Rotate 90` and a 612×792 CropBox has a page space of **792×612**.
-4. `pageToPdfUser(p) = (cropBox.x0 + p.x, cropBox.y1 - p.y)` **before** rotation compensation; the rotation is then folded into the annotation's `/Matrix`.
-5. `/AP` form XObjects need a `/BBox` in form space plus a `/Matrix` — do not assume identity.
+4. `pageToPdfUser(p) = (cropBox.x0 + p.x, cropBox.y1 - p.y)` **before** rotation compensation; ~~the rotation is then folded into the annotation's `/Matrix`~~ — *revised in M4.* The rotation is folded into the **coordinates**, one step earlier, by `pageToPdfUser` itself: all four quadrants are handled there, so by the time a point reaches the writer it is already in unrotated PDF user space and there is no rotation left for a matrix to express.
+5. `/AP` form XObjects need a `/BBox` in form space plus a `/Matrix` — do not assume identity. *M4 does not assume it; it chooses it, having removed the reason for anything else.* With rule 4 applied, the appearance content, its `/BBox` and the annotation's `/Rect` are all in the same space, so `/BBox == /Rect` with an identity `/Matrix` is the only self-consistent combination — and it is safer than a rotated matrix, which has to agree with a `/BBox` computed in form space. The two disagreeing is precisely the failure this section exists to prevent. See `docs/M4-PDF.md` §7.1.
 
 ```kotlin
 // :core:model — single source of truth, unit-tested against real PDFs
@@ -499,7 +499,7 @@ overwrite each other.
 
 - **Autosave = append to `journal.ops`.** Cheap, bounded, crash-safe. This is what runs every 2 seconds.
 - **Materialization = rewrite `document.pdf`.** Runs on: document close, before upload, and on idle-while-charging. Never on the ink path.
-- **Open = load the embedded bundle from `document.pdf`, then replay `journal.ops` on top.**
+- **Open = load the bundle, then replay `journal.ops` on top.** *Refined in M4:* the bundle stays a file of its own, `note.inkstone`, and `document.pdf` carries a **copy** of it. Opening reads the file, not the PDF. ~~"load the embedded bundle from `document.pdf`"~~ reads well and would cost a full PDF parse plus a stream decode on every open, which defeats §5.3's whole lazy-loading design — that depends on random access into the ZIP's central directory, and a bundle inflated out of a `/EmbeddedFile` has to be materialised whole first. The published copy is what *travels*; the local file is what is *read*. The marker's `bundleSha256` is what keeps the two honest: it always describes the copy inside the PDF, so a mismatch means something outside this app touched it (§5.6). The duplication is a few hundred KB of op metadata beside a 20 MB PDF — and it is the second copy §5.2 was careful about, `source.pdf`, that would have been the expensive one.
 - **Invariant: `document.pdf` is never more than one editing session stale.** State this in the code as an assertion.
 
 **All file writes are write-temp-then-atomic-rename.** The upload worker must never read a file mid-write — that produces a torn ZIP inside a PDF, which is exactly the corruption class this design exists to prevent.
@@ -596,12 +596,36 @@ Result: `pdfgrep` finds your handwriting. So does Acrobat, Preview, and (if conf
 **The marker.** Write to the PDF's XMP metadata (survives more tools than `/Info`):
 
 ```
-inkstone:documentId    UUIDv7
-inkstone:schemaVersion int
-inkstone:bundleSha256  hex
+inkstone:documentId     UUIDv7
+inkstone:schemaVersion  int
+inkstone:bundleSha256   hex
+inkstone:originalLength long   ← added in M4
+inkstone:originalSha256 hex    ← added in M4
 ```
 
+*The last two were added in M4 and are load-bearing, not bookkeeping.*
+**`originalLength`** is what makes the published file stop growing: §5.2's update is
+appended to the *original*, and without knowing where the original ends every
+materialization appends to the previous update instead — a note re-published a hundred
+times would carry a hundred annotation sets. **`originalSha256`** is what makes §5.2's
+contract checkable rather than merely asserted, and it is the only way Recovered mode can
+report "the pristine original is gone" as a fact — the bundle it would otherwise consult
+being exactly the thing that went missing.
+
 Plus `/NM` on every ink annotation carrying its `ObjectId`.
+
+**And page identity — added in M4.** `documentId` plus `/NM` covers documents and strokes
+and misses **pages**. A recovered import with no page identity invents a `PageId` per page,
+and a peer merging that order keeps *both* the old page and its replacement, because §4.3
+says *"any page not present in a merged order is appended at the end, never dropped"*. The
+note silently doubles its page count — the stroke-duplication failure, one level up. So
+every published page dictionary carries private keys:
+
+```
+/INKS_PageId     the PageId
+/INKS_SortKey    its fractional key, so a recovered page keeps its place
+/INKS_Flattened  true where §6.4's density rule applied, so recovery can say so
+```
 
 **Three-way detection on open:**
 
@@ -610,6 +634,14 @@ Plus `/NM` on every ink annotation carrying its `ObjectId`.
 | ✅ | ✅, sha matches | **Normal.** Full fidelity. |
 | ✅ | ❌ or sha mismatch | **Recovered.** See below. |
 | ❌ | — | **Foreign PDF.** Import as a new document with a new `documentId`. |
+| ✅, newer `schemaVersion` | — | **Too new.** *Added in M4.* Do not open, and above all do not re-save. |
+
+*Why the fourth row.* The three rows above assume every marker found is one this build
+understands. Recovering a file from a newer schema would rewrite it in *this* build's
+vocabulary, under the original `documentId`, with the Lamport counter deliberately bumped
+past everything (point 5 below) — so it would win the next sync and take the newer data with
+it. §5.8 already forbids re-saving a file from the future; this is that rule reaching the one
+path that was about to break it.
 
 **Recovered mode is a REPLACE, never a union:**
 
@@ -650,16 +682,36 @@ The invalidation is **the same SQL statement** that bumps `local_rev`, so there 
 
 ### 6.1 Rendering
 
-**Use `androidx.pdf` (`1.0.0-alpha19`) for rendering.** Since alpha13 it also ships `EditablePdfViewerFragment` with pen/highlighter/eraser built on `androidx.ink`, and alpha19 made the annotation classes public.
+~~**Use `androidx.pdf` (`1.0.0-alpha19`) for rendering.**~~ **Corrected in M4 — `androidx.pdf` is not used at all.**
 
-⚠️ **Two things are undocumented and must be spiked (M4.0):**
+The M4.0 spike (Appendix B #1) answered both questions **no**, and decisively:
 
-1. Does its saved ink write **standard `/Ink` annotations** readable by Acrobat, or a private representation?
-2. Does variable width survive a save → reload cycle?
+1. **It does not write `/Ink`.** `androidx.pdf.ink` turns every stroke into a `/Stamp`
+   annotation holding a filled path object — and that is not the library's choice to
+   reverse, because the framework type it converts into,
+   `android.graphics.pdf.component.PdfAnnotationType`, has exactly four values:
+   `UNKNOWN`, `FREETEXT`, `HIGHLIGHT`, `STAMP`. There is no ink annotation in the platform
+   API. It also cannot set `/NM` — annotation identity there is the **integer index on the
+   page** — and its save is a whole-document PDFium re-serialisation via
+   `PdfRenderer.write`, which forecloses §5.2's incremental update outright.
+2. **Variable width survives outbound and not inbound.** The written path is the filled
+   outline (so it looks right); reading it back yields a flattened polygon with no pressure,
+   no inputs and no brush.
 
-**Both yes** → use it for annotation. **Either no** → rendering only, write annotations yourself (§6.3). This is a real fork; report the result before building on it.
+**So annotations are written with PdfBox-Android behind a `PdfWriter` interface (§6.3), and
+rendering uses the fallback below.** Once writing is gone the only thing left to want from
+`androidx.pdf` is a bitmap, and every 1.0.0-alpha19 artifact demands compile SDK extension
+level ≥ 19 while the API 36 platform ships 17 (§0.2) — a toolchain change for one method,
+plus a `PdfViewerFragment` whose gestures would fight `InkSurfaceView`. **compileSdk stays
+36.** Full report: `docs/M4-PDF.md` §1–2.
 
-Fallback for rendering: framework `PdfRenderer` (expanded in API 35; `PdfRendererPreV` backports to 30–34).
+**Rendering: framework `PdfRenderer`** (expanded in API 35; `PdfRendererPreV` covers 30–34).
+
+⚠️ *Corrected in M4:* `PdfRendererPreV` is delivered by the **mainline PDF module** and
+requires **S extension level ≥ 13**, not merely API 30. A device on 30–34 that never took
+that update does not have the class, so the renderer checks at runtime and falls back to
+white paper — the ink still draws in the right place, because its geometry never came from
+the renderer.
 
 ### 6.2 Import
 
@@ -672,12 +724,12 @@ Fallback for rendering: framework `PdfRenderer` (expanded in API 35; `PdfRendere
 
 | Option | License | Verdict |
 |---|---|---|
-| **PdfBox-Android** `2.0.27.0` | Apache 2.0 | Can create `PDAnnotationInk` + content streams. **No release since Jan 2023**; ports PDFBox 2.0.x (upstream is on 3.0.x). Works, unmaintained. |
+| **PdfBox-Android** `2.0.27.0` | Apache 2.0 | ~~Can create `PDAnnotationInk`~~ — **corrected in M4: there is no such class in 2.0.x.** The annotation package stops at `PDAnnotationRubberStamp` / `PDAnnotationTextMarkup`. `/Ink` is still entirely writable at the COS level (subtype, `/InkList`, `/AP`, `/NM`), just without a typed helper. Likewise **`xmpbox` is not bundled**, so the §5.6 marker is a raw uncompressed `/Metadata` stream — which is what Adobe's XMP spec asks for anyway. **No release since Jan 2023**; ports PDFBox 2.0.x (upstream is on 3.0.x), and 2.0.x is the line that has `saveIncremental`, which is the feature §5.2 turns on. Works, unmaintained. |
 | Apache PDFBox 3.0.x | Apache 2.0 | Not Android-compatible (AWT deps) — which is why PdfBox-Android exists. |
 | iText 7/8/9 | **AGPLv3 or commercial** | AGPL means publishing your app's full source. |
 | Nutrient (ex-PSPDFKit) | Commercial | Priced for companies. |
 
-**Plan:** `androidx.pdf` if M4.0 passes, else PdfBox-Android behind a `PdfWriter` interface. No PdfBox types outside `:android:pdf`.
+**Plan:** ~~`androidx.pdf` if M4.0 passes, else~~ **PdfBox-Android behind a `PdfWriter` interface** — M4.0 did not pass (§6.1). No PdfBox types outside `:android:pdf`, and `PdfWriter` is `internal` to that module: the interface exists so PdfBox can be *replaced*, not so `:app` can choose a backend.
 
 ### 6.4 Ink → PDF, and the annotation-count decision ⭐
 
@@ -1123,7 +1175,7 @@ Verified 5 Aug 2026:
 
 | # | Question | Milestone | If the answer is bad |
 |---|---|---|---|
-| 1 | Does `androidx.pdf` write standard `/Ink` readable by Acrobat, and does variable width survive save→reload? | **M4.0** | Use PdfBox-Android behind `PdfWriter` (§6.3) |
+| 1 | ~~Does `androidx.pdf` write standard `/Ink` readable by Acrobat, and does variable width survive save→reload?~~ **CLOSED in M4.0: no, and no.** It writes `/Stamp` annotations holding filled paths — the platform's `PdfAnnotationType` has no ink type at all — cannot set `/NM`, and saves by full PDFium re-serialisation, which forecloses §5.2. Width survives outbound only; reading it back gives a polygon. PdfBox-Android behind `PdfWriter` it is, and `androidx.pdf` is dropped entirely, so compileSdk stays 36. See §6.1 and `docs/M4-PDF.md` §1. | M4 ✅ | — |
 | 2 | ~~Does `androidx.ink` 1.0.0 apply motion prediction internally?~~ **CLOSED in M1: no.** `input-motionprediction` kept; it is the only predictor in the pipeline. Ink takes prediction as an explicit parameter and un-draws the predicted tail itself. See §3.1 and `docs/M1-INK.md` §1. | M1 ✅ | — |
 | 3 | Does `If-Match` work on the chunked-assembly `MOVE`? | Only if chunking is added (post-v1) | Treat chunked uploads as unprotected; verify by checksum after |
 | 4 | Does a PDF incremental update survive Nextcloud's storage and any server-side processing intact? | **M5** | Fall back to full rewrite; re-add `assets/source.pdf` to the bundle and accept the size |

@@ -76,7 +76,7 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     }
 
     DisposableEffect(surface) {
-        surface?.let { editor.onSurfaceAttached(it.asNoteSurface()) }
+        surface?.let { editor.onSurfaceAttached(it.asNoteSurface(scope, editor)) }
         onDispose { editor.onSurfaceDetached() }
     }
 
@@ -169,16 +169,28 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
  * module boundaries, and `:app`'s own classes taking ink types is the same leak in a different
  * direction. So the editor declares an interface and this satisfies it.
  */
-private fun InkSurfaceView.asNoteSurface(): NoteEditor.NoteSurface = object : NoteEditor.NoteSurface {
-    override fun bindPage(nextObjectId: () -> ObjectId, nextOpId: () -> String, nextClock: () -> LamportClock) =
-        this@asNoteSurface.bindPage(nextObjectId, nextOpId, nextClock)
+private fun InkSurfaceView.asNoteSurface(scope: CoroutineScope, editor: NoteEditorViewModel): NoteEditor.NoteSurface =
+    object : NoteEditor.NoteSurface {
+        override fun bindPage(nextObjectId: () -> ObjectId, nextOpId: () -> String, nextClock: () -> LamportClock) =
+            this@asNoteSurface.bindPage(nextObjectId, nextOpId, nextClock)
 
-    override fun loadPage(page: FoldedPage) = this@asNoteSurface.loadPage(page)
+        /**
+         * SPEC §6.2 — the ink first, then the paper it was drawn on.
+         *
+         * Two steps rather than one, and in this order deliberately: folding a page is
+         * immediate, rasterising a page of a 200-page scan is not, and a note that waited
+         * for its background would feel slower than one that draws the strokes and fills
+         * the paper in behind them. A page with no source PDF gets a null and stays white.
+         */
+        override fun loadPage(page: FoldedPage) {
+            this@asNoteSurface.loadPage(page)
+            scope.launch { sourcePage = editor.sourcePage(page.background, page.size) }
+        }
 
-    override fun drainOps(): List<List<PageOp>> = this@asNoteSurface.drainOps()
+        override fun drainOps(): List<List<PageOp>> = this@asNoteSurface.drainOps()
 
-    override fun applyOps(ops: List<PageOp>, record: Boolean) = this@asNoteSurface.applyOps(ops, record)
-}
+        override fun applyOps(ops: List<PageOp>, record: Boolean) = this@asNoteSurface.applyOps(ops, record)
+    }
 
 /**
  * Builds the page the SPEC §3.6 frame-rate gate needs.

@@ -1,5 +1,6 @@
 package dev.inkstone.app.di
 
+import android.content.ContentResolver
 import android.content.Context
 import androidx.work.WorkManager
 import dagger.Binds
@@ -10,9 +11,13 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import dev.inkstone.android.ink.InkBrushFactory
 import dev.inkstone.android.ink.InkPageThumbnailRenderer
+import dev.inkstone.android.ink.InkStrokeOutliner
+import dev.inkstone.android.ink.InkStrokeRebuilder
+import dev.inkstone.android.pdf.InkstonePdfMaterializer
+import dev.inkstone.android.pdf.PdfGateway
+import dev.inkstone.android.pdf.PdfPageRasterizer
 import dev.inkstone.app.platform.AndroidFileSystem
 import dev.inkstone.app.platform.KeystoreCredentialStore
-import dev.inkstone.app.platform.PdfDocumentMaterializer
 import dev.inkstone.app.platform.SystemClock
 import dev.inkstone.app.platform.WorkManagerScheduler
 import dev.inkstone.core.database.AndroidDatabaseDriverFactory
@@ -24,8 +29,11 @@ import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.CredentialStore
 import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
+import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.PageThumbnailRenderer
 import dev.inkstone.core.model.WorkScheduler
+import dev.inkstone.core.storage.NoteStore
+import dev.inkstone.core.storage.NoteTrash
 import dev.inkstone.core.storage.ThumbnailCache
 import kotlinx.coroutines.Dispatchers
 import javax.inject.Singleton
@@ -53,10 +61,6 @@ abstract class PlatformBindingsModule {
     @Binds
     @Singleton
     abstract fun bindWorkScheduler(impl: WorkManagerScheduler): WorkScheduler
-
-    @Binds
-    @Singleton
-    abstract fun bindDocumentMaterializer(impl: PdfDocumentMaterializer): DocumentMaterializer
 }
 
 @Module
@@ -89,6 +93,55 @@ object PlatformProvidersModule {
     @Provides
     @Singleton
     fun provideThumbnailCache(fs: FileSystem): ThumbnailCache = ThumbnailCache(fs)
+
+    /**
+     * SPEC §5.2 (M4) — the published PDF.
+     *
+     * Three modules meet here and none of them knows about the others: `:core:storage`
+     * holds the note, `:android:ink` can outline a stroke because it owns the
+     * tessellator, and `:android:pdf` can write a PDF because it owns PdfBox. The
+     * dependency graph stays one-way (SPEC §2.1) precisely because this wiring is
+     * `:app`'s job and not theirs.
+     */
+    @Provides
+    @Singleton
+    fun provideDocumentMaterializer(fs: FileSystem, clock: Clock, brushes: InkBrushFactory): DocumentMaterializer =
+        InkstonePdfMaterializer(
+            fs = fs,
+            store = NoteStore(fs, clock, IdFactory(clock)),
+            outliner = InkStrokeOutliner(brushes),
+        )
+
+    @Provides
+    @Singleton
+    fun providePdfPageRasterizer(): PdfPageRasterizer = PdfPageRasterizer()
+
+    /**
+     * For reading the PDF the document picker returned (M4).
+     *
+     * The resolver stops at `:app`. A `Uri` is only readable while this process holds
+     * the grant the picker made, so everything below is handed bytes.
+     */
+    @Provides
+    @Singleton
+    fun provideContentResolver(@ApplicationContext context: Context): ContentResolver = context.contentResolver
+
+    /**
+     * SPEC §5.6 — the three-way open (M4). Every PDF the user picks comes through here.
+     */
+    @Provides
+    @Singleton
+    fun providePdfGateway(fs: FileSystem, clock: Clock, brushes: InkBrushFactory): PdfGateway {
+        val ids = IdFactory(clock)
+        return PdfGateway(
+            fs = fs,
+            store = NoteStore(fs, clock, ids),
+            trash = NoteTrash(fs, clock),
+            ids = ids,
+            clock = clock,
+            rebuilder = InkStrokeRebuilder(brushes),
+        )
+    }
 
     /**
      * SPEC §5.7 — the thumbnail renderer, which is `:android:ink`'s because drawing a

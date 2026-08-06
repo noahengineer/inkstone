@@ -1,5 +1,6 @@
 package dev.inkstone.android.ink
 
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
@@ -82,9 +83,40 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
 
     private val layerBounds = RectF()
 
-    /** White paper and the template rules. Everything under the ink. */
-    fun paintBackground(canvas: Canvas, pageSize: PageSize, background: Background) {
+    /** Reused every frame — `onDraw` must not allocate (CLAUDE.md rule 7). */
+    private val pageBounds = RectF()
+
+    /**
+     * Filtered, because a source page is rasterised once at a fixed width and then
+     * scaled by the camera; unfiltered it goes to visible pixel blocks the moment
+     * anyone zooms in, which is most of the time on a tablet.
+     */
+    private val imagePaint = Paint().apply {
+        isFilterBitmap = true
+        isAntiAlias = false
+    }
+
+    /**
+     * White paper, the imported page if there is one, and the template rules.
+     * Everything under the ink.
+     *
+     * @param sourcePage a rasterised [Background.SourcePdfPage], or null. Passed in
+     *   rather than fetched: rendering a PDF page is `:android:pdf`'s job (SPEC §6.1)
+     *   and it is not work to do inside `onDraw`. A null is a page whose source could
+     *   not be rendered — the ink still draws, on white paper, which is the honest
+     *   failure. It is never a reason not to show a note.
+     *
+     *   Drawn into the page's own rectangle in **page space**, so it lands under the
+     *   strokes at every zoom by construction: the canvas already carries the camera,
+     *   and page space is defined as the CropBox with `/Rotate` applied (SPEC §4.4) —
+     *   which is exactly the rectangle a rendered page fills.
+     */
+    fun paintBackground(canvas: Canvas, pageSize: PageSize, background: Background, sourcePage: Bitmap? = null) {
         canvas.drawRect(0f, 0f, pageSize.widthPt, pageSize.heightPt, paperPaint)
+        if (sourcePage != null && !sourcePage.isRecycled) {
+            pageBounds.set(0f, 0f, pageSize.widthPt, pageSize.heightPt)
+            canvas.drawBitmap(sourcePage, null, pageBounds, imagePaint)
+        }
         // Under the ink, over the paper. Culling it would mean clipping every rule to the
         // viewport, and a page's worth of lines is a rounding error next to 5,000 strokes.
         template.draw(canvas, background, pageSize)

@@ -1,8 +1,11 @@
 package dev.inkstone.app.library
 
+import android.content.ContentResolver
+import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.inkstone.android.pdf.PdfOpenResult
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.Folder
 import dev.inkstone.core.model.FolderCover
@@ -12,12 +15,16 @@ import dev.inkstone.core.model.FolderTree
 import dev.inkstone.core.model.LibraryLayout
 import dev.inkstone.core.model.LibrarySort
 import dev.inkstone.core.model.NoteSummary
+import dev.inkstone.core.storage.PdfOpenMode
+import dev.inkstone.core.storage.RecoveryLoss
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 /**
@@ -46,6 +53,12 @@ import javax.inject.Inject
 class LibraryViewModel @Inject constructor(
     private val repository: LibraryRepository,
     private val fixture: LibraryFixture,
+    /**
+     * Read here and nowhere deeper. A `Uri` is only readable while this process holds
+     * the grant the picker made, and neither `:core:storage` nor `:android:pdf` may
+     * learn what a `ContentResolver` is.
+     */
+    private val resolver: ContentResolver,
 ) : ViewModel() {
 
     private val controls = MutableStateFlow(LibraryControls())
@@ -131,6 +144,78 @@ class LibraryViewModel @Inject constructor(
     fun createFolder(name: String) = viewModelScope.launch {
         repository.createFolder(controls.value.folderId, name)
     }
+
+    /**
+     * ROADMAP M4 — import a PDF the user picked.
+     *
+     * The file is read here and the bytes handed on, rather than a `Uri` being passed
+     * down: `:android:pdf` must not learn what a `ContentResolver` is, and a `Uri` is
+     * only readable while this process holds the grant the picker just made.
+     *
+     * @param onOpened invoked with the note so the caller can open it — but only for a
+     *   clean import. A **recovery** is deliberately not opened: SPEC §5.6 requires the
+     *   user to be told what was lost first, and dropping them into the editor is how
+     *   that message gets dismissed without being read.
+     */
+    fun importPdf(uri: Uri, onOpened: (DocumentId) -> Unit) = viewModelScope.launch {
+        val bytes = withContext(Dispatchers.IO) {
+            runCatching { resolver.openInputStream(uri)?.use { it.readBytes() } }.getOrNull()
+        }
+        if (bytes == null) {
+            message.value = "That file could not be read."
+            return@launch
+        }
+
+        when (val result = repository.importPdf(bytes, titleFor(uri))) {
+            is PdfOpenResult.Opened -> when (val mode = result.mode) {
+                is PdfOpenMode.Recovered -> message.value = recoveryMessage(mode, result)
+                else -> onOpened(result.documentId)
+            }
+
+            // SPEC §5.8 / §5.6 — a file from a newer schema is not opened and above all
+            // is not re-saved, because re-saving it in this build's vocabulary is how the
+            // newer version's data gets destroyed.
+            is PdfOpenResult.Refused -> message.value = when (result.mode) {
+                is PdfOpenMode.TooNew -> "That note was written by a newer version of Inkstone. Update first."
+                else -> "There was nothing in that PDF to recover."
+            }
+        }
+    }
+
+    /**
+     * SPEC §5.6 point 4 — *"warn explicitly, and say what was lost."*
+     *
+     * Every loss is named, and the one that is a *decision* rather than a condolence —
+     * ink that could not be identified, and so will appear twice if the other tablet
+     * still has it — is said last and said plainly.
+     */
+    private fun recoveryMessage(mode: PdfOpenMode.Recovered, result: PdfOpenResult.Opened): String {
+        val lost = mode.losses.mapNotNull { loss ->
+            when (loss) {
+                RecoveryLoss.PRESSURE_AND_WIDTH -> "pen pressure and stroke width"
+                RecoveryLoss.OP_HISTORY -> "edit history"
+                RecoveryLoss.UNDO_STACK -> "undo"
+                RecoveryLoss.PRISTINE_ORIGINAL -> "the untouched original PDF"
+                RecoveryLoss.FLATTENED_PAGE -> "per-stroke detail on dense pages"
+                RecoveryLoss.UNIDENTIFIED_OBJECTS -> null
+            }
+        }
+        return buildString {
+            append("Recovered from the PDF — the embedded note data was missing or damaged. Lost: ")
+            append(lost.joinToString(", "))
+            append(".")
+            if (result.unidentifiedStrokes > 0 || result.unidentifiedPages > 0) {
+                append(
+                    " ${result.unidentifiedStrokes} strokes and ${result.unidentifiedPages} pages could not be " +
+                        "identified; if another device still has this note they will appear twice after syncing.",
+                )
+            }
+        }
+    }
+
+    /** The picked file's display name, minus the extension. A title the user will recognise. */
+    private fun titleFor(uri: Uri): String =
+        uri.lastPathSegment?.substringAfterLast('/')?.removeSuffix(".pdf").orEmpty().ifEmpty { "Imported PDF" }
 
     fun renameNote(id: DocumentId, title: String) = viewModelScope.launch { repository.renameNote(id, title) }
 

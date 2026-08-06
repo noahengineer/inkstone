@@ -50,22 +50,42 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
     // Create
     // -----------------------------------------------------------------------
 
-    /** A new note with [pageCount] blank pages, written to disk before it returns. */
+    /** A new note with [pageCount] identical blank pages, written to disk before it returns. */
     public suspend fun create(
         title: String,
         deviceId: String,
         pageCount: Int = 1,
         size: PageSize = PageSize.Letter,
         background: Background = Background.Blank,
+    ): OpenNote = create(title, deviceId, List(pageCount) { NewPage(size, background) })
+
+    /**
+     * A new note whose pages differ — which is what a PDF import is (SPEC §6.2).
+     *
+     * *Added in M4.* Every page of an imported PDF has its own size, because every
+     * page has its own CropBox and its own `/Rotate` (SPEC §4.4), and a scan with
+     * one landscape page among ninety-nine portrait ones is entirely ordinary. The
+     * uniform-page [create] above is this with the same page repeated.
+     *
+     * @param id the document's identity. Supplied only by a **Normal**-mode reopen
+     *   of a published PDF, which must keep the id the file already claims; every
+     *   other caller lets it be minted, because a document id chosen by anything
+     *   other than the device creating the note is how two notes end up as one.
+     */
+    public suspend fun create(
+        title: String,
+        deviceId: String,
+        pages: List<NewPage>,
+        id: DocumentId? = null,
     ): OpenNote {
-        require(pageCount >= 1) { "a note needs at least one page" }
+        require(pages.isNotEmpty()) { "a note needs at least one page" }
         val now = clock.nowEpochMillis()
-        val keys = FractionalKey.sequence(pageCount)
-        val pages = List(pageCount) { PageRef(ids.newPageId(), keys[it]) }
+        val keys = FractionalKey.sequence(pages.size)
+        val refs = pages.indices.map { PageRef(ids.newPageId(), keys[it]) }
         val document = Document(
-            id = ids.newDocumentId(),
+            id = id ?: ids.newDocumentId(),
             title = title,
-            pages = pages,
+            pages = refs,
             localRev = 1L,
             deviceId = deviceId,
             createdEpochMillis = now,
@@ -73,7 +93,9 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
         )
         val contents = BundleContents(
             document = document,
-            pages = pages.associate { it.id to PageContents(size, background, emptyList()) },
+            pages = refs.indices.associate { index ->
+                refs[index].id to PageContents(pages[index].size, pages[index].background, emptyList())
+            },
             highestClockCounter = 0L,
         )
 
@@ -249,6 +271,61 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
             journalWasTruncated = false,
             reader = reader,
         )
+    }
+
+    /**
+     * SPEC §5.6 Normal mode — install a bundle lifted out of a published PDF.
+     *
+     * The bundle *is* the note, so this is a write and a fresh journal header and
+     * nothing else. A journal is deliberately not preserved: everything a note
+     * knows is in the bundle it was materialized with, and replaying a journal on
+     * top would apply ops that are already folded into it.
+     *
+     * @return the note, opened from what was written, or null when [bundle] is not
+     *   a readable bundle after all — a state the caller has to be able to see,
+     *   because it is the difference between Normal and Recovered (SPEC §5.6).
+     */
+    public suspend fun installBundle(id: DocumentId, bundle: ByteArray): OpenNote? {
+        if (BundleReader.open(MemoryByteSource(bundle)) == null) return null
+        fs.createDirectories(NoteLayout.noteDir(id))
+        fs.writeBytesAtomically(NoteLayout.bundle(id), bundle)
+        fs.writeBytesAtomically(NoteLayout.journal(id), Journal.header())
+        return open(id)
+    }
+
+    /**
+     * SPEC §5.6 — install a recovered note, **replacing** whatever was there.
+     *
+     * The order is the whole safety argument and is not negotiable:
+     *
+     * 1. **Trash the pre-recovery version first** (SPEC §5.6 point 3). Recovery is
+     *    lossy by definition — pressure, op history, undo — so the thing it replaces
+     *    has to still exist afterwards. This is CLAUDE.md rule 1 at its most literal:
+     *    the only operation in the app that deliberately supersedes a whole note.
+     * 2. Write the new bundle, then reset the journal. A crash between them replays
+     *    a journal whose ops are already in the bundle, which is harmless; the other
+     *    order would lose them.
+     *
+     * There is deliberately no merge parameter. A recovered log **supersedes** the
+     * previous one and the type offers no way to say otherwise — see [RecoveredImport].
+     *
+     * @return the note, reopened from what was just written.
+     */
+    public suspend fun replaceWithRecovered(trash: NoteTrash, recovered: RecoveredNote): OpenNote {
+        val id = recovered.contents.document.id
+        if (fs.exists(NoteLayout.noteDir(id))) trash.trash(id)
+
+        fs.createDirectories(NoteLayout.noteDir(id))
+        fs.writeBytesAtomically(NoteLayout.bundle(id), BundleWriter.write(recovered.contents))
+        fs.writeBytesAtomically(NoteLayout.journal(id), Journal.header())
+        // The local undo stack described ops that no longer exist. Keeping it would
+        // let an undo write back a register for an object the recovered log never
+        // introduced (SPEC §4.6 — undo is local, per device, and this device's
+        // history did not survive).
+        if (fs.exists(NoteLayout.undo(id))) fs.delete(NoteLayout.undo(id))
+        discardSnapshot(id)
+
+        return checkNotNull(open(id)) { "recovered note ${id.value} did not reopen" }
     }
 
     /**
@@ -443,5 +520,14 @@ public data class OpenNote(
 
 /** One page's log, ready to fold. */
 public data class LoadedPage(val pageId: PageId, val size: PageSize, val background: Background, val ops: List<PageOp>)
+
+/**
+ * A page a note is being created with.
+ *
+ * [size] is already **CropBox with `/Rotate` applied** when the page came from a
+ * PDF (SPEC §4.4 rule 3) — nothing downstream re-derives it, because the one place
+ * that conversion happens is the import.
+ */
+public data class NewPage(val size: PageSize, val background: Background)
 
 private fun JsonObject.getValue(key: String) = requireNotNull(this[key]) { "record has no '$key'" }

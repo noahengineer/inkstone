@@ -1,6 +1,7 @@
 package dev.inkstone.android.ink
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.view.View
 import androidx.ink.brush.TextureBitmapStore
@@ -73,6 +74,21 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
             invalidate()
         }
 
+    /**
+     * The rasterised source page, when this page came from an imported PDF
+     * (SPEC §6.2). Null until `:android:pdf` has rendered it, and null forever for
+     * a page that never had one.
+     *
+     * Held, not owned: whoever rendered it also recycles it, and does so only after
+     * clearing this. A recycled bitmap is checked for rather than trusted, because
+     * the alternative is a crash in `onDraw` if a page is scrolled away mid-render.
+     */
+    var sourcePage: Bitmap? = null
+        set(value) {
+            field = value
+            invalidate()
+        }
+
     private var drawnRevision = -1L
 
     /** Called by the owner when [store] has changed under it. */
@@ -86,7 +102,7 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
         val pageToView = cameraMatrix.pageToView(camera)
         val saved = canvas.save()
         canvas.concat(pageToView)
-        painter.paintBackground(canvas, pageSize, pageBackground)
+        painter.paintBackground(canvas, pageSize, pageBackground, sourcePage)
         painter.paintStrokes(canvas, store, pageToView, visibleBoundsInPageSpace())
         painter.paintBorder(canvas, pageSize)
         canvas.restoreToCount(saved)

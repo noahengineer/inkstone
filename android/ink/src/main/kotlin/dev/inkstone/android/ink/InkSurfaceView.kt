@@ -2,6 +2,7 @@ package dev.inkstone.android.ink
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.os.Build
 import android.util.AttributeSet
@@ -265,6 +266,9 @@ public class InkSurfaceView @JvmOverloads constructor(
         strokes.reset()
         pageSize = page.size
         dryView.pageBackground = page.background
+        // Cleared, not kept: the next page's paper is not this one's, and leaving the
+        // old bitmap up means an imported page briefly shows the previous page's scan.
+        dryView.sourcePage = null
         strokes.applyOps(
             ops = page.objects.filterIsInstance<StrokeObject>().map { obj ->
                 // A synthetic AddObject: `applyOps` is the one path into the render state, so
@@ -277,6 +281,20 @@ public class InkSurfaceView @JvmOverloads constructor(
         dryView.onStoreChanged()
         onStrokeCountChanged?.invoke(strokes.size)
     }
+
+    /**
+     * SPEC §6.2 — the imported PDF page this note page was made from, rasterised.
+     *
+     * Set after [loadPage], by whatever rendered it (`:android:pdf`). Separate from
+     * [loadPage] on purpose: folding a page is immediate and rasterising a page of a
+     * 200-page scan is not, and a note that waited for its paper before showing its
+     * ink would feel slower than one that draws the ink and fills the paper in behind.
+     */
+    public var sourcePage: Bitmap?
+        get() = dryView.sourcePage
+        set(value) {
+            dryView.sourcePage = value
+        }
 
     /**
      * Take everything recorded since the last call, one list per gesture.

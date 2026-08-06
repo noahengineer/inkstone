@@ -1,6 +1,8 @@
 package dev.inkstone.app.library
 
 import androidx.compose.ui.graphics.ImageBitmap
+import dev.inkstone.android.pdf.PdfGateway
+import dev.inkstone.android.pdf.PdfOpenResult
 import dev.inkstone.core.database.library.LibraryIndex
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
@@ -64,6 +66,8 @@ class LibraryRepository @Inject constructor(
     private val index: LibraryIndex,
     private val thumbnails: Thumbnails,
     private val thumbnailCache: ThumbnailCache,
+    /** SPEC §5.6 (M4) — the only way a PDF gets into the library. */
+    private val gateway: PdfGateway,
 ) {
 
     private val ids = IdFactory(clock)
@@ -225,6 +229,50 @@ class LibraryRepository @Inject constructor(
             ),
         )
         return note.document.id
+    }
+
+    /**
+     * SPEC §6.2 / §5.6 — bring a PDF in, whatever it turns out to be.
+     *
+     * Every PDF goes through [PdfGateway], which makes SPEC §5.6's three-way
+     * decision: a stranger's file becomes a **new** note with a new `documentId`, one
+     * of ours arrives with the identity it already had, and one of ours whose bundle
+     * did not survive is **recovered** — replaced, and reported.
+     *
+     * The library index is updated to match whichever happened. A Normal or Recovered
+     * open of a note the index already knows about updates the existing row rather
+     * than inserting a second one, because the note is the same note; it is the
+     * `documentId` that says so, not the file it arrived in.
+     *
+     * @return what the gateway decided, so the UI can warn if it has to.
+     */
+    suspend fun importPdf(bytes: ByteArray, title: String, folderId: FolderId? = null): PdfOpenResult {
+        val result = gateway.open(bytes = bytes, title = title.trim().ifEmpty { UNTITLED }, deviceId = deviceId)
+        if (result !is PdfOpenResult.Opened) return result
+
+        val document = result.note.document
+        val now = clock.nowEpochMillis()
+        val existing = index.note(document.id)
+        if (existing == null) {
+            index.insertNote(
+                NoteSummary(
+                    id = document.id,
+                    title = document.title.ifEmpty { title },
+                    folderId = folderId,
+                    pageCount = document.livePages.size,
+                    localRev = document.localRev,
+                    createdEpochMillis = now,
+                    modifiedEpochMillis = now,
+                ),
+            )
+        } else {
+            // Recovery replaced the note's contents, so every cached picture of it is
+            // of something that no longer exists. Bumping `local_rev` is what invalidates
+            // them — the same SQL statement, so there is no window in between (SPEC §5.7).
+            index.recordSave(document.id, document.localRev, document.livePages.size, now)
+            thumbnails.invalidate(document.id)
+        }
+        return result
     }
 
     suspend fun renameNote(id: DocumentId, title: String) {
