@@ -25,10 +25,12 @@ sqldelight {
     databases {
         create("InkstoneDatabase") {
             packageName.set("dev.inkstone.core.database")
-            // TODO(M2): turn on verifyMigrations together with the first real
-            // schema. SPEC §5.8 requires versioned, one-way migrations tested
-            // against committed fixtures; enabling it now would just fail the
-            // build for want of a baseline .db to compare against.
+            // TODO(M3): turn on verifyMigrations together with the first real
+            // schema — the library index. M2 came and went without one: a note's
+            // truth is its bundle and journal on disk (SPEC §5.1), not a table.
+            // SPEC §5.8 requires versioned, one-way migrations tested against
+            // committed fixtures; enabling it now would just fail the build for
+            // want of a baseline .db to compare against.
         }
     }
 }

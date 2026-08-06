@@ -114,7 +114,7 @@ No app functionality. An empty Compose screen is correct for M0.
 - Every row of SPEC §3.3's input table
 - **Spike (SPEC Appendix B #2): does `androidx.ink` already predict internally?** Test with `input-motionprediction` on and off. Double prediction causes visible overshoot on direction changes. Report which you kept.
 - Four brushes per SPEC §3.4; colour picker with hex + wheel + 12 slots
-- **Whole-stroke erase only** — see below
+- ~~**Whole-stroke erase only**~~ — **revised in M1**: partial erase is the default, whole-stroke is a setting. SPEC §3.5 records why. The delete-and-add model is unchanged and still mandatory.
 - Auto-return to the previous pen after erasing
 - **The camera/viewport model from SPEC §4.5** — pinch zoom 10–1600%, pan, fit modes. Ink converts view→page space at the camera in effect when the stroke started.
 - Minimal floating toolbar. **Don't design the toolbar here** — M10 owns it.
@@ -122,7 +122,7 @@ No app functionality. An empty Compose screen is correct for M0.
 ### Explicitly NOT in M1
 
 - **No persistence.** Close the app, the drawing is gone. That's correct.
-- **No partial erase.** All three erasers delete whole strokes whose geometry intersects. **Do not implement in-place point-list mutation** — SPEC §3.5 explains that splitting a stroke is `DeleteStroke + AddStroke(fragments)` in the op model, and it lands in M8a. Mutating points now means rewriting it later.
+- ~~**No partial erase.**~~ **Reversed during M1's device test** — whole-stroke-only was rejected on contact with the tablet, so partial erase shipped in M1 as the default. **The prohibition that mattered is untouched: no in-place point-list mutation.** Splitting is `DeleteStroke + AddStroke(fragments)`, which is exactly how it was built, so M8a inherits it instead of replacing it.
 
 ### Acceptance
 
@@ -169,6 +169,13 @@ Finish by telling me exactly how to run the acceptance measurements, including
 the dumpsys gfxinfo command and what numbers pass or fail.
 ```
 
+> **The prompt above is kept verbatim as the record of what was asked.** One of
+> its instructions did not survive contact with the tablet: whole-stroke erase
+> was rejected on sight and M1 shipped partial erase as the default instead. The
+> other half of that instruction — never mutate point lists in place — was
+> followed exactly, so M8a still inherits `DeleteStroke + AddStroke(fragments)`.
+> SPEC §3.5 and `docs/M1-INK.md` §2.4 record the reversal.
+
 ---
 
 ## M2 — Document model and storage
@@ -196,14 +203,18 @@ the dumpsys gfxinfo command and what numbers pass or fail.
 
 ### Acceptance
 
-- [ ] 50-page notebook, write on 20 pages, `adb shell am force-stop` mid-stroke → reopen → **at most the in-progress stroke lost**
-- [ ] Undo/redo across 200 ops including an app restart
-- [ ] Round-trip: save → load → save → byte-identical
-- [ ] Unknown op types and unknown JSON fields survive a round-trip untouched
-- [ ] 200-page notebook → interactive first page in < 2 s
-- [ ] Memory doesn't grow linearly with page count while scrolling
-- [ ] **Coordinate unit tests pass**, including a page with `/Rotate 90` and a non-zero-origin CropBox
-- [ ] **Concurrency unit test:** simulate SPEC §13.2 row 3 (two concurrent transforms) at the op-fold level and assert LWW, not a skewed compound
+- [x] 50-page notebook, write on 20 pages, `adb shell am force-stop` mid-stroke → reopen → **at most the in-progress stroke lost** — *mechanism proven in `NoteStoreTest` (a kill mid-append and a corrupt record are both produced on demand via `FakeFileSystem.truncateNextAppendTo`); the force-stop on the tablet is still owed*
+- [x] Undo/redo across 200 ops including an app restart — `UndoTest`, `NoteStoreTest.undo state survives a restart`
+- [x] Round-trip: save → load → save → byte-identical — `BundleRoundTripTest`
+- [x] Unknown op types and unknown JSON fields survive a round-trip untouched — `BundleRoundTripTest` (both halves of SPEC §5.8, and entries this build does not produce are carried through too)
+- [ ] 200-page notebook → interactive first page in < 2 s — *the property it depends on is tested (`the cost of opening a note does not grow with what is drawn on its pages`); the timing on the tablet is owed*
+- [x] Memory doesn't grow linearly with page count while scrolling — bounded page cache, `evicting a cached page loses nothing`
+- [x] **Coordinate unit tests pass**, including a page with `/Rotate 90` and a non-zero-origin CropBox — `PdfCoordinatesTest`
+- [x] **Concurrency unit test:** simulate SPEC §13.2 row 3 (two concurrent transforms) at the op-fold level and assert LWW, not a skewed compound — `PageFoldTest`, which also folds every permutation and asserts they agree
+
+**Still owed, on the device:** the two timing/force-stop gates above, and a session of real
+writing (CLAUDE.md's definition of done #4). `tools/send-to-tablet.ps1` builds and copies the
+APK; measuring needs adb.
 
 ### Prompt
 

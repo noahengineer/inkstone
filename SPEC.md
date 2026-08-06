@@ -172,7 +172,11 @@ androidx.ink InProgressStrokesView     → front-buffered wet ink
 Stroke → journal append → dry rendering
 ```
 
-⚠️ **Spike in M1:** it is not documented whether `androidx.ink` 1.0.0 already applies motion prediction internally. If it does and you also add `input-motionprediction`, you get double-prediction artifacts — visible overshoot on direction changes. Test with prediction on and off before committing.
+✅ **Spike resolved in M1 (see `docs/M1-INK.md`): `androidx.ink` 1.0.0 does NOT predict internally. `input-motionprediction` is kept, and is the only predictor in the pipeline.**
+
+Three pieces of evidence from the shipped artifacts: `ink-authoring-android`'s POM declares no dependency on `androidx.input:input-motionprediction`; the ink stack contains no Kalman filter, extrapolator, or class with `predict` in its name; and prediction is an explicit caller-supplied parameter at both levels — `InProgressStrokesView.addToStroke(event, pointerId, strokeId, prediction)` and `InProgressStroke.enqueueInputs(realInputs, predictedInputs)`.
+
+**Corollary that saves work later:** ink tracks real and predicted inputs separately (`getRealInputCount` / `getPredictedInputCount`), so it un-draws the predicted tail itself when the next real event arrives. §3.3's "un-draw them when real events arrive" is ink's job, not the app's — do not implement it a second time.
 
 ### 3.2 Compose interop
 
@@ -205,7 +209,9 @@ Mandatory, each with a specific failure mode:
 | Palm rejection | `ACTION_CANCEL` + `FLAG_CANCELED` (API 33+), identify via `getPointerId(getActionIndex())` | Stray palm marks |
 | Hover preview | `AXIS_DISTANCE` | Minor — deferred to M10 |
 
-Predicted segments are speculative; un-draw them when real events arrive. Verify no predicted tail survives into the dry layer.
+Predicted segments are speculative; un-draw them when real events arrive. Verify no predicted tail survives into the dry layer. *(M1: `androidx.ink` does this itself — see §3.1.)*
+
+*Clarified in M1.* Every row from Pressure to Orientation is satisfied by **passing the whole `MotionEvent` to `addToStroke`**, because ink reads them off the event itself (`StrokeInputPool.obtainAllHistoryForMotionEvent` walks `getHistorySize()`, `getHistoricalAxisValue()`, `getToolType()` and normalises orientation). The way to fail these rows is to synthesise `StrokeInput`s by hand: it compiles, it draws, and it silently drops pressure, tilt, orientation and every historical point.
 
 ### 3.4 Brushes for v1
 
@@ -213,18 +219,56 @@ Predicted segments are speculative; un-draw them when real events arrive. Verify
 |---|---|
 | **Fountain** | Pressure → width. Slight velocity taper. Default. |
 | **Ballpoint** | Uniform width, no pressure response. |
-| **Pencil** | Pressure + tilt → opacity and width. Grain texture. |
+| **Pencil** | Pressure + tilt → opacity and width. ~~Grain texture.~~ **Deferred to M10** — see below. |
 | **Highlighter** | Uniform width, multiply blend, draws *behind* ink, stroke-stabilization slider. |
 
-Per-brush: colour (hex + wheel + eyedropper), width, 12 saved slots.
+Per-brush: colour (hex + wheel + eyedropper), width, 12 saved slots. *(M1 ships hex + wheel + 12 slots, which is what ROADMAP M1's scope line asks for. The eyedropper needs to sample the rendered canvas and belongs with M10's toolbar work.)*
+
+⚠️ **Corrected in M1 — Inkstone defines its own brush families; `StockBrushes` is not used.** Two independent findings forced this, both measured against the shipped artifact on 5 Aug 2026.
+
+**1. There is no usable stock pencil.** Of the stock families (`marker`, `pressurePen`, `highlighter`, `dashedLine`, `emojiHighlighter`, `pencilUnstable`), only `pencilUnstable` responds to tilt, and it is `@RestrictTo(LIBRARY_GROUP)`.
+
+**2. The stock brushes cannot be cut.** They wire `DISTANCE_TRAVELED_IN_MULTIPLES_OF_BRUSH_SIZE` and `DISTANCE_REMAINING_IN_MULTIPLES_OF_BRUSH_SIZE` into `SIZE_MULTIPLIER` and `OPACITY_MULTIPLIER` — ten behaviour entries across the set. Those are the start/end tapers, and they are parameterised **along the stroke**. Since a partial erase rebuilds each surviving piece as a new `Stroke` (§3.5), every cut end re-ran the taper and faded to a point instead of ending bluntly.
+
+**The rule Inkstone's families are built around: no behaviour may depend on distance or time along the stroke.** Everything is driven by an instantaneous property of the input — pressure, tilt, speed — so a fragment renders exactly as that part of the original did. A fountain pen still starts thin, for the physical reason: pressure ramps as the nib lands.
+
+**Every `BrushFamily` constructor is `@RestrictTo(LIBRARY_GROUP)`** on top of `@ExperimentalInkCustomBrushApi`, so this widens that suppression to the whole brush layer. It was taken deliberately, and what it buys is the reason `androidx.ink` was chosen at all: `BrushBehavior` in 1.0.0 is a **dataflow graph** (`SourceNode`, `ConstantNode`, `NoiseNode`, `BinaryOpNode`, `InterpolationNode`, `DampingNode`, `ResponseNode`, `FallbackFilterNode`, `ToolTypeFilterNode`, `PolarTargetNode`) over ~38 sources, with targets including hue, saturation, luminosity and lateral position offset, and `BrushPaint` supplying texture layers, blend modes and particle stamping. That is an art-application brush engine; `StockBrushes` is a thin sample on top of it.
+
+**Added in M1: the input model is a setting.** `BrushFamily` takes `SPRING_MODEL` (default — spring dynamics, smoother, slightly laggier) or `EXPERIMENTAL_NAIVE_MODEL` (tracks samples more literally). This is the "does it follow the nib or chase a spline" knob, it is pure taste, and it cannot be settled off-device — so it is exposed in the toolbar's Measure panel rather than decided here.
+
+Still not delivered: the Pencil **grain texture**. It needs a texture asset of ours; `BrushPaint.TextureLayer` is where it goes. Not an M1 acceptance criterion. Noted for M10.
+
+**Revisit both this and the latency-callback suppression whenever the `androidxInk` pin moves** (`docs/M1-INK.md` §2 lists every restricted member and what M1 does instead).
 
 **Steal this from Goodnotes:** after erasing, auto-return to the previously selected pen. Two lines, and their founder cited it as exemplifying the whole product strategy.
 
 ### 3.5 Erasing — scope note
 
-**M1 and M2 implement whole-stroke erase only** (precision, stroke, and area erasers all delete entire strokes whose geometry intersects). **Partial/precision erase that splits a stroke lands in M8**, and is modelled as `DeleteStroke(original) + AddStroke(fragment₁) + AddStroke(fragment₂)` — never as in-place point-list mutation, which would break the op-log.
+~~**M1 and M2 implement whole-stroke erase only**~~ — **revised twice in M1, both times on the tablet.**
 
-State this in M1 so the agent doesn't implement mutation and force a rewrite.
+The original rule deferred stroke-splitting to M8a and made whole-stroke erase M1's behaviour. That was rejected on contact: an eraser that deletes an entire line because you clipped its tail is startling, and no other note app on the device does it.
+
+The replacement — rebuilding each surviving piece from the input samples that were not erased — was **also** wrong, and wrong in a way worth recording because it looked right for a while:
+
+> **Sample-based erasing cannot erase part of a line, only cut it.** It removes whole input samples, so it always takes the full width of the stroke, and only at whatever granularity the stylus happened to sample. You cannot shave the side off a thick stroke or take a bite out of one, because neither is expressible as "these samples are gone".
+
+**M1 therefore erases an *area*.** The eraser records the region it swept, per stroke, and that region is subtracted at draw time (`DST_OUT` into a bounded layer, so the cut edge is antialiased exactly like the stroke's own edge). The eraser's precision is its own geometry rather than the input sampling rate, and partial-width erasing simply works.
+
+**The stroke itself is never modified.** Its inputs and its mesh are exactly as drawn; erasing only ever appends to a region beside them. This is strictly stronger than the "never mutate a point list" rule it replaces — it satisfies §1's *never lose user data* at the stroke level, and makes un-erasing a matter of dropping region entries rather than reconstructing geometry that no longer exists.
+
+`WHOLE_STROKE` remains as a setting. It is cheaper — it records no region — and some people prefer it.
+
+⚠️ **This adds an op to §4.2, and M2 owes it.** The vocabulary has no way to say "part of this object is erased". The addition is:
+
+```kotlin
+data class SetErasedRegion(val target: ObjectId, val absolute: List<EraseCapsule>) : PageOp
+```
+
+**Absolute, not a delta** — the whole region every time, resolved last-writer-wins, exactly like `SetTransform` carries a whole matrix and for the same reason (rule 8: deltas break silently under concurrency). A region op targeting a tombstoned object is a trivial no-op, which is the property the rest of the vocabulary is built on.
+
+§4.2 says to define the complete vocabulary in M2 *precisely so that it is never extended once sync is live*. This is that instruction paying off: the op is identified before M2 instead of after M6. Each capsule is a segment plus a tip radius in page space — five floats, resolution-independent, replayable on any device. The flattened path is a render-time cache and is never what gets written down.
+
+M8a's "partial erase splits a stroke into fragments" is **superseded**. Nothing splits.
 
 ### 3.6 Latency verification (M1 gate)
 
@@ -234,6 +278,8 @@ Do not declare M1 done on vibes:
 2. Sustained 60fps (120 on a 120Hz panel) with 5,000 dry strokes on-page, via `dumpsys gfxinfo`.
 
 **Exit condition:** if after three serious attempts you are within one frame of Samsung Notes, **accept and proceed**. Samsung uses vendor-private low-latency paths that public APIs may not match. Do not deadlock the project at milestone one.
+
+*Added in M1.* Ink reports its own end-to-end latency per input — `LatencyData.osDetectsEvent` → `estimatedPixelPresentationTime` — surfaced in the toolbar's **Measure** panel. It does **not** replace the camera test (Samsung's number is not measurable from inside our process); it is the instrument you need *while* making the three attempts, and it makes the prediction A/B a ten-second check. The exact procedure for both measurements, including the `dumpsys gfxinfo` command and the pass/fail numbers, is in **`docs/M1-INK.md` §4**.
 
 ---
 
@@ -259,15 +305,34 @@ data class Document(
     val schemaVersion: Int,
 )
 
-data class PageRef(val id: PageId, val sortKey: FractionalKey)
+// Deleting a page is a TOMBSTONE, not a removal (corrected in M2 — see below).
+data class PageRef(
+    val id: PageId,
+    val sortKey: FractionalKey,
+    val deleted: Boolean = false,
+    val deletedEpochMillis: Long? = null,
+)
 
 data class Page(
     val id: PageId,
     val size: PageSize,                // page space, see §4.4
-    val background: Background,        // Template(ref) | SourcePdfPage(index) | Blank
+    val background: Background,        // Template(PageTemplate) | SourcePdfPage(index) | Blank
     val ops: List<PageOp>,             // the op-log
 )
 ```
+
+**Corrected in M2 — page deletion is a tombstone.** Dropping a `PageRef` loses the page's
+data outright, and it also lets the page come back: §4.3's merge rule is *"any page not
+present in a merged order is appended, never dropped"*, so a peer that still lists the page
+re-adds it on the next sync. Deleting is therefore a flag and a timestamp, restoring is
+clearing them, and the page's ops stay in the bundle either way (CLAUDE.md rule 1).
+
+**Corrected in M2 — `Background.Template` carries a typed enum, not a `ref` string.** A
+string reference implies a registry of user-supplied templates, which §12 keeps out of v1 and
+which would have to sync: a note referencing a template file that is on the other tablet is a
+blank page with no explanation. The five built-ins (blank, ruled, grid, dot grid, Cornell) are
+a closed set with their metrics in the model, so a page rules identically on screen, in a
+thumbnail and in the published PDF.
 
 ### 4.2 The op vocabulary — complete, from M2
 
@@ -277,19 +342,46 @@ data class Page(
 sealed interface PageOp {
     val opId: String                   // UUIDv7
     val clock: LamportClock
+    val extras: OpExtras               // unrecognised JSON members, kept verbatim (§5.8)
 
-    // --- Grow-only set + tombstones ---
+    // --- Grow-only payload + presence ---
     data class AddObject(val obj: InkObject) : PageOp        // stroke, image, textbox, shape
     data class DeleteObject(val target: ObjectId) : PageOp   // tombstone, never a removal
 
-    // --- LWW registers, keyed by (ObjectId, field) ---
+    // --- LWW registers, keyed by (ObjectId, field). All ABSOLUTE. ---
     data class SetTransform(val target: ObjectId, val absolute: Matrix3) : PageOp
-    data class SetStyle(val target: ObjectId, val style: StyleDelta) : PageOp   // colour, width, opacity
+    data class SetStyle(val target: ObjectId, val style: ObjectStyle) : PageOp  // colour, width, opacity
     data class SetZOrder(val target: ObjectId, val z: FractionalKey) : PageOp
     data class SetTextContent(val target: ObjectId, val text: String) : PageOp
+    data class SetErasedRegion(val target: ObjectId, val absolute: ErasedArea) : PageOp
     data class SetPageMeta(val background: Background?, val size: PageSize?) : PageOp
+
+    // --- Forward compatibility (§5.8) ---
+    data class Unknown(val type: String, val rawJson: ByteArray) : PageOp
 }
 ```
+
+**Three corrections from M2, all of which the original section implied but did not say:**
+
+1. **`StyleDelta` is `ObjectStyle`, and it is absolute.** The old name contradicted the rule
+   this section states two paragraphs down, and a type called `Delta` is exactly what a future
+   contributor would implement as one.
+2. **`SetErasedRegion` is part of the vocabulary.** §3.5 was revised in M1 to erase an *area*
+   rather than input samples, and §4.2 as written could not express that. It is absolute like
+   every other register here, plus one reason of its own: undo writes back the region as it
+   was, which a difference cannot describe (CLAUDE.md rule 8).
+3. **`Unknown` exists**, because §5.8 requires unknown op types to survive a round-trip
+   untouched, and something has to hold them while they do.
+
+**Presence is an LWW register, not a monotone flag.** This section says a delete is *"a
+tombstone, never a removal"* and §4.6 says undo of a delete is an `AddObject`. Both are only
+true if presence is a register: a monotone tombstone can never be undone, so the second
+statement would be unimplementable. That is safe here in a way it would not be in a general
+CRDT, because `ObjectId`s are UUIDv7 minted by the device that creates the object — two
+devices cannot concurrently add the same id, so the only writer that can ever *un*-delete is
+the device that deleted it, undoing itself. "Tombstone, never a removal" stays exactly true of
+the data: the `AddObject` and its geometry remain in the log forever, and only visibility
+moves.
 
 **⭐ `SetTransform` carries an ABSOLUTE matrix, not a delta.** This is not a style preference — deltas are broken under concurrency:
 
@@ -345,7 +437,8 @@ data class Camera(val translate: Offset, val scale: Float)   // page space → v
 ```
 
 - Zoom range **10%–1600%**, pinch and double-tap
-- Fit modes: fit-width (default), fit-page, actual size
+- Fit modes: fit-width (default), fit-page, actual size — these **centre** the page; nothing else does
+- **Panning is free.** ~~The page is kept inside the viewport~~ — *revised in M1.* Pinning the page to the viewport, and centring it whenever it fitted, was rejected on the tablet for fighting the user: zoomed out the page could not be moved at all, and zoomed in it stopped dead at the margins. The page may now sit anywhere, off-centre, mostly off-screen, at any zoom. The **only** bound is a leash: at least ~64 dp of page stays on screen on each axis, so no gesture can strand the user on a blank screen with no edge to grab. `Camera.leashedTo` is the whole rule.
 - **Ink is captured in view space and converted at the camera in effect when the stroke started.** A camera change mid-stroke does not retroactively alter the stroke.
 - Dry-layer re-render is debounced on scale change; the front buffer is not scaled, it is re-created
 
@@ -358,6 +451,14 @@ Undo is a **new op appended to the log**, never a pop:
 - `SetStyle` ↔ `SetStyle(previous style)`
 
 Undo is **local-only and per-device.** An incoming remote op does not enter your undo stack, and undoing does not undo someone else's work.
+
+*Added in M1, ahead of the op-log.* One entry per **gesture** — a whole stroke, or a whole erase drag however many samples it contained. Bound to a **two-finger tap (undo)** and **three-finger tap (redo)** as well as toolbar buttons.
+
+M1 has no log to append to, so `EditHistory` is a plain stack: the honest implementation of §4.6's model when there is nothing to append to. **M2 replaces the mechanism, not the behaviour** — `Added` becomes `DeleteObject`, `Removed` becomes `AddObject`, and an erasure becomes `SetErasedRegion(previous absolute region)`.
+
+*Done in M2.* `EditHistory` is gone; `UndoStack` holds gesture-grained entries and the session appends their inverses. Two consequences worth knowing: the entries are **persisted** to `undo.json`, because "undo across an app restart" otherwise means re-folding the log once per undo step; and both directions replay by **re-stamping with a fresh clock**, which is only sound because every op is absolute — replaying `SetTransform(M)` writes `M` whatever is currently there. A delta log could not do this at all.
+
+That last one is why §3.5's new op **must** be absolute rather than a delta (rule 8): undo writes back the region as it was, and cannot do that if the op only carries a difference. Erasing an area rather than destroying geometry is also what makes undo cheap here — an erase is undone by dropping capsules, because nothing was thrown away.
 
 ### 4.7 Compaction
 
@@ -385,6 +486,14 @@ notes/<documentId>/
 ├── journal.ops         append-only op log since the last materialization. Flushed ~2s.
 └── snapshot.bundle     optional compaction snapshot (§4.7)
 ```
+
+**Where these files actually are in M2.** PDF materialization is M4's, so until then the
+bundle is a file of its own — `notes/<documentId>/note.inkstone` — and there is nothing to
+embed it in (ROADMAP M2: *"for M2 the materialized artifact is just the bundle"*). M4 moves
+where those bytes live, not what they are. There is also a fourth file, `undo.json`: the
+undo/redo stacks are local and per-device (§4.6), so putting them in a bundle that syncs would
+ship one tablet's undo history to the other, where it means nothing and where the two would
+overwrite each other.
 
 - **Autosave = append to `journal.ops`.** Cheap, bounded, crash-safe. This is what runs every 2 seconds.
 - **Materialization = rewrite `document.pdf`.** Runs on: document close, before upload, and on idle-while-charging. Never on the ink path.
@@ -440,6 +549,31 @@ One file per page gives **lazy loading** — you can open a 500-page notebook wi
 **Do not store stroke points as JSON.** At ~60–80 bytes/point of text, with dense pages holding thousands of strokes sampled at ~200 Hz, you'd be parsing megabytes of JSON per page — against a stated NFR of opening a 200-page notebook in under 2 seconds.
 
 **Instead:** `:android:ink` serializes strokes using `androidx.ink:ink-storage` and hands `:core:storage` a `ByteArray`. Core stores and syncs it as opaque bytes and never interprets it. Core stays Android-free; you get Google's compact format for free; and there's no point-by-point conversion between `androidx.ink.Stroke` and a core type on every save and load.
+
+**⚠️ Corrected in M2 — `ink-storage` 1.0.0 has no stroke serializer.** Its entire public
+surface is `StrokeInputBatchSerialization.encode`/`decode` and `BrushFamilySerialization`.
+There is no `Stroke.encode`, no `decodeStroke`, and no container format. Verified against the
+shipped artifact: `ink-storage.aar` holds thirteen classes and none of them mentions `Stroke`.
+
+So the blob is a small container written by `StrokeGeometryCodec`:
+
+```
+"INKS" | version u8 | brushVersion u8 | brushKind u8 | inputModel u8
+       | colorArgb i32 | sizePt f32 | epsilonPt f32
+       | inputBatch (ink-storage bytes, to the end of the blob)
+```
+
+The brush is four bytes and three floats rather than a serialized `BrushFamily`, deliberately.
+Inkstone's families are code (`InkstoneBrushFamilies.kt`) and re-derivable, so a family blob
+would be a second copy of them inside every stroke on disk; every `BrushFamily` constructor in
+1.0.0 is `@RestrictTo(LIBRARY_GROUP)` and lint fails the build on them (§3.4); and the
+families' ban on distance- or time-driven behaviour — the thing that makes partial erase
+correct — lives in the source, where a blob carrying its own family could not undo it.
+`brushVersion` records which generation of the families a stroke was captured with, so if one
+ever changes shape a future build can reconstruct the historical one instead of silently
+re-rendering old ink with new geometry. `inputModel` is recorded for the same reason: a stroke
+captured with spring smoothing must not be re-tessellated with the naive model because the
+setting changed afterwards.
 
 **The deliberate tradeoff:** a future iOS renderer cannot decode `ink-storage`'s format. That's an accepted, explicit cost — recorded here so it's a decision, not a discovery at M11. The iOS options at that point are to write a decoder, or to add a portable secondary encoding then. Merge and sync are unaffected either way, because merge operates on op metadata (ids and clocks), never on geometry.
 
@@ -940,7 +1074,7 @@ Instrumented process kill during: stroke capture · journal flush · materializa
 
 Verified 5 Aug 2026:
 
-- androidx.ink 1.0.0 stable; Compose modules only at 1.1.0-alpha06 → [releases/ink](https://developer.android.com/jetpack/androidx/releases/ink)
+- androidx.ink 1.0.0 stable; Compose modules only at 1.1.0-alpha06 → [releases/ink](https://developer.android.com/jetpack/androidx/releases/ink) — *corrected in M0 (§3.2: the 1.0.0 Compose set is incomplete, not absent) and extended in M1 (§3.4: much of the brush-authoring surface is `@RestrictTo(LIBRARY_GROUP)`). Both verified against the shipped artifacts, not the release notes.*
 - graphics-core 1.0.4; input-motionprediction 1.0.0 → [releases/graphics](https://developer.android.com/jetpack/androidx/releases/graphics), [releases/input](https://developer.android.com/jetpack/androidx/releases/input)
 - Stylus MotionEvent APIs → [advanced stylus features](https://developer.android.com/develop/ui/views/touch-and-input/stylus-input/advanced-stylus-features)
 - S Pen Remote SDK 1.0.2 (Sep 2019); BLE removed from S Pen on Tab S11 → developer.samsung.com/galaxy-spen-remote
@@ -962,6 +1096,6 @@ Verified 5 Aug 2026:
 | # | Question | Milestone | If the answer is bad |
 |---|---|---|---|
 | 1 | Does `androidx.pdf` write standard `/Ink` readable by Acrobat, and does variable width survive save→reload? | **M4.0** | Use PdfBox-Android behind `PdfWriter` (§6.3) |
-| 2 | Does `androidx.ink` 1.0.0 apply motion prediction internally? | **M1** | If yes, drop `input-motionprediction` — double prediction causes visible overshoot |
+| 2 | ~~Does `androidx.ink` 1.0.0 apply motion prediction internally?~~ **CLOSED in M1: no.** `input-motionprediction` kept; it is the only predictor in the pipeline. Ink takes prediction as an explicit parameter and un-draws the predicted tail itself. See §3.1 and `docs/M1-INK.md` §1. | M1 ✅ | — |
 | 3 | Does `If-Match` work on the chunked-assembly `MOVE`? | Only if chunking is added (post-v1) | Treat chunked uploads as unprotected; verify by checksum after |
 | 4 | Does a PDF incremental update survive Nextcloud's storage and any server-side processing intact? | **M5** | Fall back to full rewrite; re-add `assets/source.pdf` to the bundle and accept the size |

@@ -82,13 +82,45 @@ public interface WorkScheduler {
 public interface FileSystem {
     public suspend fun exists(path: String): Boolean
 
+    /** The file's length in bytes, or -1 if it does not exist. */
+    public suspend fun size(path: String): Long
+
     public suspend fun readBytes(path: String): ByteArray
+
+    /**
+     * [length] bytes from [offset], or fewer at end of file.
+     *
+     * This is what makes SPEC §5.3's *"one file per page gives lazy loading"* real: a
+     * 200-page notebook is opened by reading the bundle's central directory and then
+     * exactly the pages being drawn, not by inflating 200 pages to reach the first.
+     */
+    public suspend fun readRange(path: String, offset: Long, length: Int): ByteArray
 
     public suspend fun writeBytesAtomically(path: String, bytes: ByteArray)
 
     public suspend fun appendBytes(path: String, bytes: ByteArray)
 
     public suspend fun createDirectories(path: String)
+
+    /**
+     * Rename [from] to [to], atomically when they share a filesystem.
+     *
+     * Used to move a note into the trash. Not a copy-then-delete: a crash between the
+     * two leaves the note in both places or neither.
+     */
+    public suspend fun move(from: String, to: String)
+
+    /**
+     * Delete a file or an empty-able directory tree.
+     *
+     * The only caller is trash expiry (30-day retention) and the removal of a
+     * superseded temp file. **Nothing in this app deletes user data through this
+     * without it having been in the trash first** (CLAUDE.md rule 1).
+     */
+    public suspend fun delete(path: String)
+
+    /** Immediate children of [path], names only, empty when [path] is not a directory. */
+    public suspend fun list(path: String): List<String>
 }
 
 /**

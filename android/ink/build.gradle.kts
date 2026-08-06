@@ -20,14 +20,24 @@ dependencies {
 
     implementation(libs.graphics.core)
 
-    // Kept behind the M1 spike (SPEC Appendix B #2): if androidx.ink already
-    // predicts internally, adding this produces double prediction and visible
-    // overshoot on direction changes. Declared now so M1 starts from a
-    // resolvable state and the spike is a code change, not a dependency hunt.
+    // SPEC Appendix B #2 — spike RESOLVED in M1: androidx.ink 1.0.0 does NOT
+    // predict internally. `ink-authoring-android`'s POM declares no dependency
+    // on this artifact, the ink stack contains no predictor of its own, and
+    // `addToStroke`/`enqueueInputs` take predicted input as an explicit
+    // caller-supplied parameter. So this is KEPT, and it is the only predictor
+    // in the pipeline — there is no double prediction to remove.
+    // See docs/M1-INK.md.
     implementation(libs.input.motionprediction)
 
     implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.annotation)
 
     testImplementation(libs.junit)
+
+    // Erase and render-order semantics are instrumented, not unit-tested:
+    // androidx.ink's geometry is native, so a Stroke cannot be tessellated —
+    // and therefore cannot be hit-tested — off a device.
+    androidTestImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.junit)
+    androidTestImplementation(libs.androidx.test.core)
 }

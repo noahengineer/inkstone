@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Inkstone</string>
-    <string name="m0_skeleton_headline">Inkstone</string>
-    <string name="m0_skeleton_body">M0 — skeleton and guardrails. No functionality yet, by design.</string>
+    <!-- Shown when the journal ended in a torn record — a crash mid-stroke (SPEC §5.1). -->
+    <string name="recovered_from_crash">Recovered after an unexpected close. At most the stroke in progress was lost.</string>
 </resources>

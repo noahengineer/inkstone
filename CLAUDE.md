@@ -64,7 +64,7 @@ Conflicts resolve automatically and non-destructively, then appear in a "Needs a
 
 `SetTransform`, `SetStyle`, `SetZOrder` carry **absolute values** as LWW registers. Deltas break silently under concurrency — SPEC §4.2 has the worked example where a concurrent scale, rotate, and undo produce a skewed object on both devices, consistently, with no error.
 
-Corollary: **never mutate a stroke's point list in place.** Splitting a stroke is `DeleteObject + AddObject(fragments)`.
+Corollary: **never mutate a stroke's point list in place.** M1 went further: partial erase never touches the stroke at all. It records the *area* the eraser swept beside it and subtracts that at draw time (SPEC §3.5, revised twice). Sample-based erasing cannot erase part of a line — only cut it — because it removes whole samples at full stroke width. The op this needs, `SetErasedRegion`, is **absolute** like every other register here.
 
 ### 9. Re-fold, never patch
 
@@ -129,7 +129,7 @@ A milestone is done when:
 1. Every acceptance criterion in `ROADMAP.md` passes — including the manual ones
 2. New logic has tests
 3. `./gradlew build` is green, including the `:core` guardrail
-4. It has been used on the actual Galaxy Tab, not just an emulator
+4. It has been used on the actual Galaxy Tab, not just an emulator — `tools/send-to-tablet.ps1` builds and copies the APK over MTP, which works when `adb install` can't because USB debugging is unauthorized. Measuring still needs adb; see the README.
 5. `SPEC.md` has been updated if anything in it turned out to be wrong
 
 ---
@@ -156,7 +156,7 @@ A milestone is done when:
 | Module graph | SPEC §2.1 |
 | Interfaces core needs from the platform | SPEC §2.2 |
 | Ink input requirements | SPEC §3.3 |
-| Erase scope (whole-stroke until M8a) | SPEC §3.5 |
+| Erase model (area-based since M1) | SPEC §3.5 |
 | Op vocabulary + absolute transforms | SPEC §4.2 |
 | Convergence / re-folding | SPEC §4.3 |
 | **Coordinate spaces** | SPEC §4.4 |
@@ -184,6 +184,12 @@ A milestone is done when:
 Collected during research so they don't get reintroduced from stale training data:
 
 - The Samsung S Pen SDK does **not** work on current Galaxy Tabs. Plain `MotionEvent` covers everything a note app needs.
+- **`androidx.ink` 1.0.0 does not apply motion prediction.** It *takes* prediction as a parameter and tracks it separately from real input, so `input-motionprediction` is required, not redundant — and un-drawing the predicted tail is ink's job, not the app's. (M1 spike, SPEC §3.1.)
+- **Much of `androidx.ink` 1.0.0's brush-authoring surface is `@RestrictTo(LIBRARY_GROUP)`** despite the library being stable: every `BrushFamily` constructor, `StockBrushes.pencilUnstable`, every `toImmutable()`, `StockTextureBitmapStore`, and the whole latency package. Lint fails the build on all of them. This is a standing pressure to move the ink stack to 1.1.0-alpha — **don't**. SPEC §3.4 and `docs/M1-INK.md` §2 record what M1 does instead.
+- **`StockBrushes` is not used, and must not be reintroduced.** Its brushes taper by distance-along-stroke, which makes a stroke impossible to cut cleanly — every partial-erase fragment re-runs the taper. Inkstone's own families (`InkstoneBrushFamilies.kt`) forbid any behaviour driven by distance or time along the stroke. That constraint is what keeps erasing correct.
+- **`androidx.ink:ink-storage` 1.0.0 cannot serialize a `Stroke`.** It offers `StrokeInputBatchSerialization` and `BrushFamilySerialization` and nothing else — no `Stroke.encode`, no `decodeStroke`, no container format. SPEC §5.4 said otherwise and has been corrected. M2's blob is a small container written by `StrokeGeometryCodec`: brush kind, colour, size, epsilon and input model in a fixed header, then the input batch. Do **not** serialize the `BrushFamily` — the families are code, and every constructor for one is `@RestrictTo(LIBRARY_GROUP)`.
+- **A stroke's colour and width live in two places, and only one is the truth.** The geometry blob holds what it was captured with; `SetStyle` is an override that starts null. Duplicating capture-time style into a register would give two sources that drift.
+- **`addToStroke` must be given the whole `MotionEvent`.** Ink reads pressure, tilt, orientation, tool type and every historical point off it. Hand-built `StrokeInput`s compile, draw, and silently drop all of them.
 - **OkHttp and dav4jvm are JVM-only.** They cannot go in `:core:*`. Ktor can.
 - **`EncryptedSharedPreferences` was deprecated in 2025.** Keystore AES-GCM directly.
 - Nextcloud's `loginName` is **not** the WebDAV path segment. Fetch the UID from `/ocs/v2.php/cloud/user`.

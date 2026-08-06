@@ -7,7 +7,6 @@ import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.CredentialStore
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.DocumentMaterializer
-import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.MaterializedFile
 import dev.inkstone.core.model.NextcloudCredential
 import dev.inkstone.core.model.WorkScheduler
@@ -30,27 +29,6 @@ import javax.inject.Singleton
 class SystemClock @Inject constructor() : Clock {
     // Display only. Sync ordering uses Lamport clocks — device clocks disagree.
     override fun nowEpochMillis(): Long = System.currentTimeMillis()
-}
-
-/**
- * M2 fills this in.
- *
- * [writeBytesAtomically] is write-to-`<name>.tmp`-then-`rename` (CLAUDE.md rule
- * 10). The rename must be on the same filesystem to be atomic, so the temp file
- * goes in the destination's own directory — not in a cache dir.
- */
-@Singleton
-class AndroidFileSystem @Inject constructor(@ApplicationContext @Suppress("unused") private val context: Context) :
-    FileSystem {
-    override suspend fun exists(path: String): Boolean = TODO("M2 — storage")
-
-    override suspend fun readBytes(path: String): ByteArray = TODO("M2 — storage")
-
-    override suspend fun writeBytesAtomically(path: String, bytes: ByteArray): Unit = TODO("M2 — storage")
-
-    override suspend fun appendBytes(path: String, bytes: ByteArray): Unit = TODO("M2 — journal append")
-
-    override suspend fun createDirectories(path: String): Unit = TODO("M2 — storage")
 }
 
 /**

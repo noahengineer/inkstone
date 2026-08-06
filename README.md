@@ -4,9 +4,13 @@ A handwriting-first note-taking app for Android tablets, storing notes as ordina
 
 `SPEC.md` is the technical specification. `ROADMAP.md` is the build order. `CLAUDE.md` is the repo rules. `START-HERE.md` explains how the three fit together.
 
-**Current state: M0 — skeleton and guardrails.** One empty Compose screen. That is the whole intended functionality of this milestone.
+**Current state: M1 — ink.** Write with the S Pen on a zoomable page: four brushes, a colour picker, whole-stroke erase, pinch/pan. **No persistence** — closing the app loses the drawing, which is what ROADMAP M1 asks for.
 
-**Verified green locally:** `./gradlew build` (964 tasks, both APKs), all 58 pinned coordinates resolving, `spotlessCheck` + `detekt` on all 9 modules, and **both guardrails including their planted-violation tests**. Outstanding: the real iOS *framework link* (needs macOS) and CI-green-on-a-branch (needs a remote). See [docs/M0-VERIFICATION.md](docs/M0-VERIFICATION.md).
+`./gradlew build` is green, including `detekt`, Android lint and both `:core` guardrails. The measurements that actually gate M1 — the `dumpsys gfxinfo` frame-rate run and the 240 fps comparison against Samsung Notes — are **manual and outstanding**; [docs/M1-INK.md](docs/M1-INK.md) §4 gives the exact commands and the numbers that pass or fail.
+
+That document also records the M1 spike result (**`androidx.ink` does not predict internally — `input-motionprediction` is kept**) and three places `androidx.ink` 1.0.0 turned out not to match SPEC.
+
+Earlier: [docs/M0-VERIFICATION.md](docs/M0-VERIFICATION.md) — skeleton, pinned coordinates, and both guardrails with their planted-violation tests.
 
 ---
 
@@ -47,6 +51,42 @@ The wrapper is committed, so there is nothing to bootstrap:
 ```
 
 (`tools/bootstrap-wrapper.ps1` regenerates the wrapper if it is ever lost, and checks your JDK first.)
+
+---
+
+## Getting a build onto the tablet
+
+CLAUDE.md's definition of done includes *"it has been used on the actual Galaxy
+Tab, not just an emulator"*, so this happens at the end of every milestone.
+
+```bash
+powershell -ExecutionPolicy Bypass -File tools\send-to-tablet.ps1
+```
+
+Builds `:app:assembleDebug` and copies the APK to the tablet's **Download**
+folder over MTP. Then on the tablet: **My Files → Download → tap it.** Android
+asks once for permission to install unknown apps from My Files.
+
+Requirements: the tablet plugged in, **unlocked**, with its USB mode set to
+**File transfer** — not *Charging only*, which hides the filesystem entirely.
+`-NoBuild` skips Gradle; `-Device <name>` picks one when several are plugged in.
+
+**Why not `adb install`?** Use it when you can — it is one command:
+
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
+
+But it needs USB debugging *authorized*, and `adb devices` will say
+`unauthorized` until the "Allow USB debugging?" dialog is accepted **on the
+tablet**. That dialog only appears in File transfer mode, has to be re-accepted
+after a Revoke, and cannot be dismissed from the desktop. When it does not show
+up, the MTP script is the way through — it is a plain file copy and needs no
+debugging at all.
+
+⚠️ **Measuring still needs adb.** `dumpsys gfxinfo` — the M1 frame-rate gate —
+has no MTP equivalent. Getting a build onto the tablet and measuring it are
+different problems, and the script only solves the first.
 
 ---
 
@@ -106,3 +146,9 @@ Dependency direction is one-way: `:app` → `:android:*` → `:core:*`.
 | `spotlessApply` | Formats Kotlin with ktlint |
 | `detekt` | Static analysis |
 | `build` | Assemble + all checks |
+
+| Script | What it does |
+|---|---|
+| `tools\send-to-tablet.ps1` | Build the debug APK and copy it to the tablet over MTP |
+| `tools/verify-guardrails.sh` | Plant a real violation of each guardrail, assert the right one fails, revert |
+| `tools\bootstrap-wrapper.ps1` | Regenerate the Gradle wrapper if it is ever lost |
