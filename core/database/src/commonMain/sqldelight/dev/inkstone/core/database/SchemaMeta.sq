@@ -1,12 +1,14 @@
--- M0: the schema is deliberately near-empty.
+-- M0's table. The schema was deliberately near-empty until something needed it.
 --
--- The real tables arrive with their owning milestones:
---   M2  document / page / op-log metadata (SPEC §4, §5)
---   M3  folders, favourites, trash        (ROADMAP M3)
---   M5  note / remote_binding / outbox    (SPEC §7.6)
+--   M2  nothing — a note's truth is its bundle and journal on disk (SPEC §5.1),
+--       not a table, so M2 came and went without one.
+--   M3  folder / note — the library index. See Library.sq and 1.sqm.
+--   M5  remote_binding / outbox (SPEC §7.6). `note` already has its columns.
 --
--- One table exists now so the generated InkstoneDatabase is real rather than
--- degenerate, and so the M2 migration has something to migrate from.
+-- This table predates the library index and is kept because dropping it would be a
+-- migration that buys nothing. `InkstoneDatabase.Schema.version` — not this row — is
+-- what SQLDelight migrates on; this is the *bundle* schema version (SPEC §5.8), which
+-- is a different number about a different format.
 
 CREATE TABLE schemaMeta (
     id INTEGER NOT NULL PRIMARY KEY,

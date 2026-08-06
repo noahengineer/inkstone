@@ -4,13 +4,18 @@ A handwriting-first note-taking app for Android tablets, storing notes as ordina
 
 `SPEC.md` is the technical specification. `ROADMAP.md` is the build order. `CLAUDE.md` is the repo rules. `START-HERE.md` explains how the three fit together.
 
-**Current state: M1 — ink.** Write with the S Pen on a zoomable page: four brushes, a colour picker, whole-stroke erase, pinch/pan. **No persistence** — closing the app loses the drawing, which is what ROADMAP M1 asks for.
+**Current state: M3 — the library.** The app opens on a grid of notes with page-one thumbnails: folders with arbitrary nesting, colour and icon; favourites; title and folder search as you type; sort by name/modified/created; grid or list; rename, move, duplicate, multi-select; and a trash with 30-day retention and **no hard delete anywhere in the UI**. Tapping a note opens M1's ink surface on M2's document model.
 
-`./gradlew build` is green, including `detekt`, Android lint and both `:core` guardrails. The measurements that actually gate M1 — the `dumpsys gfxinfo` frame-rate run and the 240 fps comparison against Samsung Notes — are **manual and outstanding**; [docs/M1-INK.md](docs/M1-INK.md) §4 gives the exact commands and the numbers that pass or fail.
+`./gradlew build` is green, including `detekt`, Android lint, both `:core` guardrails, and — new in M3 — SQLDelight migration verification against a committed schema fixture.
 
-That document also records the M1 spike result (**`androidx.ink` does not predict internally — `input-motionprediction` is kept**) and three places `androidx.ink` 1.0.0 turned out not to match SPEC.
+What is **outstanding** and needs the tablet: M3's two performance criteria (500 notes at 60fps, no jank while thumbnails generate), the instrumented `:core:database` test, and M1's latency gates. [docs/M3-LIBRARY.md](docs/M3-LIBRARY.md) §9 lists them.
 
-Earlier: [docs/M0-VERIFICATION.md](docs/M0-VERIFICATION.md) — skeleton, pinned coordinates, and both guardrails with their planted-violation tests.
+Milestone notes, newest first:
+
+- [docs/M3-LIBRARY.md](docs/M3-LIBRARY.md) — why thumbnail invalidation is keyed by `local_rev` and not a timestamp, what the folder model owes M5's Nextcloud mirror, and why title search is not FTS5 yet.
+- [docs/M2-MODEL.md](docs/M2-MODEL.md) — the op log, the journal, and the binding bug that made the app record nothing on the tablet.
+- [docs/M1-INK.md](docs/M1-INK.md) — the spike result (**`androidx.ink` does not predict internally — `input-motionprediction` is kept**), three places `androidx.ink` 1.0.0 did not match SPEC, and §4's exact measurement commands.
+- [docs/M0-VERIFICATION.md](docs/M0-VERIFICATION.md) — skeleton, pinned coordinates, and both guardrails with their planted-violation tests.
 
 ---
 

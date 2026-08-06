@@ -1,6 +1,8 @@
 package dev.inkstone.core.storage
 
 import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.FileSystem
+import dev.inkstone.core.model.PageId
 
 /**
  * SPEC §5.1 — the working format.
@@ -50,8 +52,38 @@ public object NoteLayout {
     /** Local, per-device undo/redo stacks (SPEC §4.6). Never uploaded. */
     public const val UNDO_JSON: String = "undo.json"
 
-    /** SPEC §5.7 — thumbnails are a cache, not bundle content. */
+    /**
+     * SPEC §5.7 — thumbnails are a cache, not bundle content.
+     *
+     * ```
+     * cache/thumbs/<documentId>.webp             the library thumbnail
+     * cache/thumbs/<documentId>/<pageId>.webp    page thumbnails (reorder UI, search jump)
+     * ```
+     *
+     * **Never inside the bundle inside the PDF.** SPEC §5.7 states the reason and M3's
+     * acceptance criterion is the consequence: drawing a 500-note library would mean
+     * opening 500 PDFs and extracting 500 ZIPs, and 60 fps is not reachable from there.
+     *
+     * Under the same root as `notes/` rather than the platform cache directory. The
+     * platform one gets cleared by the OS, which for a *cache* is correct — but it is also
+     * a different filesystem on some devices, and [FileSystem] is single-rooted precisely
+     * so that write-temp-then-rename is always a rename (CLAUDE.md rule 10). Losing the
+     * whole thumbnail cache to a storage sweep is a worse trade than the disk it costs, and
+     * [ThumbnailCache] bounds the size itself.
+     */
     public const val THUMBNAIL_CACHE_DIR: String = "cache/thumbs"
+
+    /** Image format for thumbnails. WebP: a third of PNG at the same visual quality. */
+    public const val THUMBNAIL_EXTENSION: String = ".webp"
+
+    /** The library thumbnail — page one of the note. */
+    public fun coverThumbnail(id: DocumentId): String = "$THUMBNAIL_CACHE_DIR/${id.value}$THUMBNAIL_EXTENSION"
+
+    /** Where a note's page thumbnails live. Deleted wholesale when the note changes. */
+    public fun pageThumbnailDir(id: DocumentId): String = "$THUMBNAIL_CACHE_DIR/${id.value}"
+
+    public fun pageThumbnail(id: DocumentId, pageId: PageId): String =
+        "${pageThumbnailDir(id)}/${pageId.value}$THUMBNAIL_EXTENSION"
 
     /** CLAUDE.md rule 1 — no hard deletes. 30-day retention, see [NoteTrash]. */
     public const val TRASH_DIR: String = "trash"

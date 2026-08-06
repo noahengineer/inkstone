@@ -264,10 +264,12 @@ both break naive implementations.
 
 ### Acceptance
 
-- [ ] 500 notes across 50 nested folders → library scrolls at 60fps
-- [ ] Thumbnails generate off the main thread; no jank while scrolling
-- [ ] Delete → restore from trash → content intact
-- [ ] Title search returns results as you type
+- [ ] 500 notes across 50 nested folders → library scrolls at 60fps — **outstanding, device gate.** Needs a fixture generator and `dumpsys gfxinfo`, same instrument as M1's frame-rate gate
+- [ ] Thumbnails generate off the main thread; no jank while scrolling — **rendering is off-thread and bounded to two concurrent renders; "no jank" is still a measurement, outstanding**
+- [x] Delete → restore from trash → content intact — notes and whole folders, files-before-rows, `LibraryIndexTest` (instrumented) covers the cascade and the partial-restore case
+- [x] Title search returns results as you type — Unicode-case-folded, searches every folder, `LibraryFilteringTest`
+
+See [docs/M3-LIBRARY.md](docs/M3-LIBRARY.md) for the revision-keyed thumbnail invalidation, what the folder model owes M5, and the two places SPEC turned out to be wrong.
 
 ### Prompt
 

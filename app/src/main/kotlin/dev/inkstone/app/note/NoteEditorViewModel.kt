@@ -1,28 +1,58 @@
 package dev.inkstone.app.note
 
+import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.inkstone.app.library.LibraryRepository
+import dev.inkstone.app.library.Thumbnails
 import dev.inkstone.core.model.Clock
+import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FileSystem
+import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageTemplate
 import kotlinx.coroutines.flow.StateFlow
 import javax.inject.Inject
 
 /**
- * A shell around [NoteEditor], supplying it with `viewModelScope`.
+ * A shell around [NoteEditor], supplying it with `viewModelScope` — and, since M3, the note
+ * the library asked for.
  *
  * There is deliberately no logic here. It used to be the other way round — the editor *was* the
  * view model — and that is how the binding bug in [NoteEditor.bindSurface] reached the tablet:
  * `viewModelScope` is wired to `Dispatchers.Main` and its autosave loop is only cancelled by
  * `onCleared`, so nothing about the editor could be driven from a unit test. Everything the
  * editor does is now a plain class taking a scope, and this holds the Android lifecycle.
+ *
+ * ## Which note
+ *
+ * From [SavedStateHandle], so the note survives process death and a rotation. Passing it
+ * through the constructor instead would mean the library had to still be on screen to say
+ * which note this is, which after a process kill it is not.
  */
 @HiltViewModel
-class NoteEditorViewModel @Inject constructor(fs: FileSystem, clock: Clock) : ViewModel() {
+class NoteEditorViewModel @Inject constructor(
+    fs: FileSystem,
+    clock: Clock,
+    private val library: LibraryRepository,
+    private val thumbnails: Thumbnails,
+    savedState: SavedStateHandle,
+) : ViewModel() {
 
-    private val editor = NoteEditor(fs, clock, viewModelScope)
+    private val editor = NoteEditor(
+        fs = fs,
+        clock = clock,
+        scope = viewModelScope,
+        documentId = savedState.get<String>(ARG_NOTE_ID)?.let(::DocumentId),
+        library = object : NoteEditor.LibraryUpdates {
+            override suspend fun onSaved(id: DocumentId, localRev: Long, pageCount: Int) =
+                library.noteSaved(id, localRev, pageCount)
+
+            override suspend fun onMaterialized(id: DocumentId, localRev: Long, pageCount: Int, cover: FoldedPage) =
+                library.noteMaterialized(id, localRev, pageCount, cover)
+        },
+    )
 
     val state: StateFlow<NoteEditorState> = editor.state
 
@@ -48,7 +78,20 @@ class NoteEditorViewModel @Inject constructor(fs: FileSystem, clock: Clock) : Vi
 
     fun setTemplate(template: PageTemplate) = editor.setTemplate(template)
 
+    fun rename(title: String) = editor.rename(title)
+
     fun dismissMessage() = editor.dismissMessage()
+
+    /**
+     * A page thumbnail, folded from the **open session** rather than from disk.
+     *
+     * The session is the newest state there is — the journal has ops the bundle does not —
+     * so a page drawn on two seconds ago would otherwise show its previous contents in the
+     * overview. Cached and rendered by [Thumbnails]; this only supplies the fold.
+     */
+    suspend fun pageThumbnail(pageId: PageId) = state.value.documentId?.let { id ->
+        thumbnails.page(id, pageId) { editor.foldedPage(pageId) }
+    }
 
     /**
      * SPEC §5.1 — fold the journal into the bundle. Called from `Activity.onStop`, which is the
@@ -62,5 +105,10 @@ class NoteEditorViewModel @Inject constructor(fs: FileSystem, clock: Clock) : Vi
         // exists at all (SPEC §5.1).
         editor.close()
         super.onCleared()
+    }
+
+    companion object {
+        /** The note to open, as a [SavedStateHandle] key. */
+        const val ARG_NOTE_ID: String = "noteId"
     }
 }

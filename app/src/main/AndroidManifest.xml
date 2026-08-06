@@ -26,6 +26,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          The editor (M3). Its own activity so that "which note" survives a process kill
+          through the intent extras, and so that leaving a note is an onStop — which is
+          where SPEC §5.1 materializes and where §5.7 redraws the thumbnail.
+        -->
+        <activity
+            android:name=".note.NoteActivity"
+            android:exported="false"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
+            android:parentActivityName=".MainActivity"
+            android:theme="@style/Theme.Inkstone" />
     </application>
 
 </manifest>

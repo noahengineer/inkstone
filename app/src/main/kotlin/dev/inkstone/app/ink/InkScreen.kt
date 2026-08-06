@@ -20,9 +20,11 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import dev.inkstone.android.ink.InkSurfaceView
 import dev.inkstone.android.ink.SyntheticInk
 import dev.inkstone.app.note.NoteEditor
+import dev.inkstone.app.note.NoteEditorState
 import dev.inkstone.app.note.NoteEditorViewModel
 import dev.inkstone.app.note.PageBar
 import dev.inkstone.app.note.PageBarActions
+import dev.inkstone.app.note.PageOverviewSheet
 import dev.inkstone.core.model.FitMode
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
@@ -50,6 +52,7 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     val scope = rememberCoroutineScope()
     val note by editor.state.collectAsState()
     var surface by remember { mutableStateOf<InkSurfaceView?>(null) }
+    var pageOverviewOpen by remember { mutableStateOf(false) }
 
     // The latency HUD (SPEC §3.6). Polled rather than pushed: ink reports a LatencyData for
     // every input, and turning 240 of those a second into recompositions would be measuring the
@@ -95,19 +98,33 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
         PageBar(
             state = note,
             modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp),
-            actions = PageBarActions(
-                onPrevious = { editor.goToPage(note.pageIndex - 1) },
-                onNext = { editor.goToPage(note.pageIndex + 1) },
-                onAddPage = { editor.addPage(note.template) },
-                onDuplicatePage = { editor.duplicateCurrentPage() },
-                onDeletePage = { editor.deleteCurrentPage() },
-                onMoveLeft = { editor.movePage(note.pageIndex - 1) },
-                onMoveRight = { editor.movePage(note.pageIndex + 1) },
-                onTemplate = { template -> editor.setTemplate(template) },
-            ),
+            actions = pageBarActions(editor, note) { pageOverviewOpen = true },
+        )
+    }
+
+    if (pageOverviewOpen) {
+        PageOverviewSheet(
+            note = note,
+            thumbnail = { pageId -> editor.pageThumbnail(pageId) },
+            onGoToPage = { index -> editor.goToPage(index) },
+            onMovePage = { _, to -> editor.movePage(to) },
+            onDismiss = { pageOverviewOpen = false },
         )
     }
 }
+
+private fun pageBarActions(editor: NoteEditorViewModel, note: NoteEditorState, onShowPages: () -> Unit) =
+    PageBarActions(
+        onPrevious = { editor.goToPage(note.pageIndex - 1) },
+        onNext = { editor.goToPage(note.pageIndex + 1) },
+        onAddPage = { editor.addPage(note.template) },
+        onDuplicatePage = { editor.duplicateCurrentPage() },
+        onDeletePage = { editor.deleteCurrentPage() },
+        onMoveLeft = { editor.movePage(note.pageIndex - 1) },
+        onMoveRight = { editor.movePage(note.pageIndex + 1) },
+        onTemplate = { template -> editor.setTemplate(template) },
+        onShowPages = onShowPages,
+    )
 
 /**
  * The ink surface itself — SPEC §3.2's `AndroidView` seam.

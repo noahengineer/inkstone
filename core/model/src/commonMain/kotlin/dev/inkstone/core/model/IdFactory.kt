@@ -41,6 +41,8 @@ public class IdFactory(private val clock: Clock, private val random: Random = Ra
 
     public fun newObjectId(): ObjectId = ObjectId(newUuid7())
 
+    public fun newFolderId(): FolderId = FolderId(newUuid7())
+
     /** SPEC §4.2 — every op carries one. A plain [String]; ops are never looked up by id. */
     public fun newOpId(): String = newUuid7()
 

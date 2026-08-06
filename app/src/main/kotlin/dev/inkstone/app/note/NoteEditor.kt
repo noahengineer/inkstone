@@ -14,7 +14,6 @@ import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.storage.NoteLayout
 import dev.inkstone.core.storage.NoteSession
 import dev.inkstone.core.storage.NoteStore
-import dev.inkstone.core.storage.NoteTrash
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -70,6 +69,19 @@ class NoteEditor(
     private val scope: CoroutineScope,
     private val drainDispatcher: CoroutineDispatcher = Dispatchers.Default,
     private val autosaveIntervalMs: Long = AUTOSAVE_INTERVAL_MS,
+    /**
+     * Which note to open. M3 made this a question with an answer — the library picks.
+     *
+     * Null keeps M2's behaviour (first note on disk, or a new one), which is what the tests
+     * use and what a launch with no library state falls back to.
+     */
+    private val documentId: DocumentId? = null,
+    /**
+     * Where saves are reported (M3). Null in tests, and in that case the editor simply does
+     * not maintain an index — the note itself is unaffected, because the index is a cache
+     * of the files and never the truth.
+     */
+    private val library: LibraryUpdates? = null,
 ) {
 
     /**
@@ -83,7 +95,6 @@ class NoteEditor(
 
     private val ids = IdFactory(clock)
     private val store = NoteStore(fs, clock, ids)
-    private val trash = NoteTrash(fs, clock)
 
     private val _state = MutableStateFlow(NoteEditorState())
     val state: StateFlow<NoteEditorState> = _state.asStateFlow()
@@ -108,6 +119,24 @@ class NoteEditor(
      */
     private var deviceId: String = ""
 
+    /**
+     * What the editor tells the library (SPEC §5.7, §9).
+     *
+     * An interface rather than a direct dependency on `LibraryRepository` for the reason the
+     * editor is not a `ViewModel` any more: everything here has to be drivable from a unit
+     * test, and a repository drags in a database.
+     */
+    interface LibraryUpdates {
+        /** Autosave committed. Bump the index row; invalidate the thumbnail. */
+        suspend fun onSaved(id: DocumentId, localRev: Long, pageCount: Int)
+
+        /**
+         * The note closed and its bundle was rewritten (SPEC §5.1) — so the library's
+         * picture of it is now wrong, and [cover] is the page to redraw it from.
+         */
+        suspend fun onMaterialized(id: DocumentId, localRev: Long, pageCount: Int, cover: FoldedPage)
+    }
+
     /** What the editor needs from the ink surface. Keeps `androidx.ink` out of this class. */
     interface NoteSurface {
         fun bindPage(nextObjectId: () -> ObjectId, nextOpId: () -> String, nextClock: () -> LamportClock)
@@ -131,25 +160,21 @@ class NoteEditor(
     // -----------------------------------------------------------------------
 
     /**
-     * Open the note on disk, or create one.
+     * Open the note the library asked for — or, with no id, M2's fallback.
      *
-     * M3 owns the library, so "which note" is not a question this milestone answers: it takes
-     * the first note in `notes/` and makes one if there is none. Reading the directory rather
-     * than storing a "last opened" pointer means there is no second source of truth to get out
-     * of step with the files.
+     * The fallback is not dead code: it is what a launch with an empty or unreadable library
+     * index gets, and it is what the unit tests drive. It takes the first note in `notes/`
+     * and makes one if there is none, which is the same rule `LibraryRepository.reconcile`
+     * uses to adopt an orphaned directory — the files are the truth in both.
      */
     private suspend fun openOrCreate() {
-        trash.purgeExpired()
-        val existing = fs.list(NoteLayout.NOTES_DIR).firstOrNull()
-        val note = if (existing != null) {
-            store.open(DocumentId(existing))
-        } else {
-            null
-        } ?: store.create(
-            title = DEFAULT_TITLE,
-            deviceId = ids.newDeviceId(),
-            background = Background.Template(PageTemplate.RULED),
-        )
+        val requested = documentId ?: fs.list(NoteLayout.NOTES_DIR).firstOrNull()?.let(::DocumentId)
+        val note = requested?.let { store.open(it) }
+            ?: store.create(
+                title = DEFAULT_TITLE,
+                deviceId = ids.newDeviceId(),
+                background = Background.Template(PageTemplate.RULED),
+            )
 
         deviceId = note.document.deviceId.ifEmpty { ids.newDeviceId() }
         val opened = NoteSession.open(store, ids, clock, note, deviceId)
@@ -224,6 +249,10 @@ class NoteEditor(
         }
         if (gestures.isNotEmpty() || session.hasUnflushedWork) {
             session.flush()
+            // SPEC §5.7 — the note changed, so the library's picture of it is stale. Told,
+            // not redrawn: rendering a page on the two-second autosave timer is exactly the
+            // kind of work CLAUDE.md rule 7 keeps off this path.
+            library?.onSaved(session.document.id, session.document.localRev, session.pageCount)
             publish()
         }
     }
@@ -239,9 +268,34 @@ class NoteEditor(
         work.launch {
             save()
             session.close()
+            // The bundle has just been rewritten, so this fold is what the note now *is* —
+            // which makes it the only honest moment to redraw the library's thumbnail. The
+            // published PDF cannot be the source: it may be one session stale (SPEC §5.1).
+            session.document.livePages.firstOrNull()?.let { first ->
+                library?.onMaterialized(
+                    id = session.document.id,
+                    localRev = session.document.localRev,
+                    pageCount = session.pageCount,
+                    cover = session.page(first.id),
+                )
+            }
             publish()
         }
     }
+
+    /** ROADMAP M3 — rename from inside the editor. The library sees it through [LibraryUpdates]. */
+    fun rename(title: String) {
+        val session = this.session ?: return
+        work.launch {
+            session.rename(title)
+            session.flush()
+            library?.onSaved(session.document.id, session.document.localRev, session.pageCount)
+            publish()
+        }
+    }
+
+    /** One page's fold, for a page thumbnail. Null before the note is open. */
+    suspend fun foldedPage(pageId: PageId): FoldedPage? = session?.page(pageId)
 
     // -----------------------------------------------------------------------
     // Undo / redo (SPEC §4.6)
@@ -401,9 +455,11 @@ class NoteEditor(
     private fun publish(recovered: Boolean = _state.value.recoveredFromCrash, message: String? = null) {
         val session = this.session ?: return
         _state.value = NoteEditorState(
+            documentId = session.document.id,
             title = session.document.title,
             pageIndex = currentPageIndex(),
             pageCount = session.pageCount,
+            pageIds = session.document.livePages.map { it.id },
             canUndo = session.canUndo,
             canRedo = session.canRedo,
             localRev = session.document.localRev,
@@ -440,9 +496,12 @@ class NoteEditor(
 
 /** Everything the note UI shows. */
 data class NoteEditorState(
+    val documentId: DocumentId? = null,
     val title: String = "",
     val pageIndex: Int = 0,
     val pageCount: Int = 0,
+    /** The live pages, in order — what the page overview draws a thumbnail for (M3). */
+    val pageIds: List<PageId> = emptyList(),
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
     val localRev: Long = 0,

@@ -30,6 +30,26 @@ public fun interface DocumentMaterializer {
 public data class MaterializedFile(val path: String, val sizeBytes: Long, val sha256: String, val localRev: Long)
 
 /**
+ * SPEC §5.7 — renders one folded page to a thumbnail image. Implemented in M3 by
+ * `:android:ink`, because drawing a stroke needs `androidx.ink` and a `Canvas`.
+ *
+ * Returns encoded image bytes (WebP) rather than a bitmap: a bitmap is a platform type,
+ * and the only thing the caller does with the result is write it to the cache directory.
+ *
+ * **Called off the main thread, always** (CLAUDE.md rule 7). A 500-note library is 500 of
+ * these, and the frame budget has no room for one.
+ */
+public fun interface PageThumbnailRenderer {
+    /**
+     * @param widthPx the thumbnail's width. Height follows from the page's aspect ratio,
+     *   so a thumbnail is never letterboxed and never distorted.
+     * @return the encoded image, or null when the page could not be rendered — a decode
+     *   failure is a missing thumbnail, never a crash in the library.
+     */
+    public suspend fun render(page: FoldedPage, widthPx: Int): ByteArray?
+}
+
+/**
  * SPEC §7.1 — [loginName] and [uid] are not interchangeable.
  *
  * [loginName] authenticates (Basic auth); [uid] is the WebDAV path segment,

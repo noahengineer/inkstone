@@ -32,6 +32,10 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.annotation)
 
+    // M3 — the thumbnail renderer hops off the main thread itself rather than trusting
+    // every caller to remember (CLAUDE.md rule 7).
+    implementation(libs.kotlinx.coroutines.core)
+
     testImplementation(libs.junit)
 
     // Erase and render-order semantics are instrumented, not unit-tested:

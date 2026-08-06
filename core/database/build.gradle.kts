@@ -7,8 +7,27 @@ kotlin {
     sourceSets {
         commonMain.dependencies {
             api(project(":core:model"))
-            implementation(libs.sqldelight.runtime)
-            implementation(libs.sqldelight.coroutines)
+            api(libs.sqldelight.runtime)
+            api(libs.sqldelight.coroutines)
+            implementation(libs.kotlinx.coroutines.core)
+        }
+        commonTest.dependencies {
+            implementation(libs.kotlinx.coroutines.test)
+        }
+        androidInstrumentedTest.dependencies {
+            // Instrumented, not a JVM unit test, and for the same reason :android:ink's
+            // erase tests are: the thing under test is the real engine. The trash cascade is
+            // a transaction across two tables and thumbnail invalidation is one UPDATE that
+            // must not be splittable — a fake index would be testing the fake.
+            //
+            // The JVM alternative (`sqldelight-driver-sqlite` + xerial) would run on the
+            // desktop but against a *different* SQLite build from the one on the tablet,
+            // which is the gap SPEC §13 refuses to accept for sync tests either.
+            // `inkstone.kmp-core` puts kotlin("test") on commonTest only.
+            implementation(kotlin("test"))
+            implementation(libs.kotlinx.coroutines.test)
+            implementation(libs.androidx.test.junit)
+            implementation(libs.androidx.test.core)
         }
         androidMain.dependencies {
             implementation(libs.sqldelight.driver.android)
@@ -21,16 +40,35 @@ kotlin {
     }
 }
 
+android {
+    // `inkstone.kmp-core` leaves this out because no other :core module has instrumented
+    // tests. This one does — see the androidInstrumentedTest note above.
+    defaultConfig {
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+}
+
 sqldelight {
     databases {
         create("InkstoneDatabase") {
             packageName.set("dev.inkstone.core.database")
-            // TODO(M3): turn on verifyMigrations together with the first real
-            // schema — the library index. M2 came and went without one: a note's
-            // truth is its bundle and journal on disk (SPEC §5.1), not a table.
-            // SPEC §5.8 requires versioned, one-way migrations tested against
-            // committed fixtures; enabling it now would just fail the build for
-            // want of a baseline .db to compare against.
+            // On since M3, which brought the first real schema — the library index.
+            //
+            // SPEC §5.8 requires versioned, one-way migrations. This is the check that
+            // makes that true rather than intended: it applies every .sqm in order to an
+            // empty database and asserts the result matches the CREATE statements in the
+            // .sq files. A column added to the schema without a migration fails the build
+            // here, instead of crashing on the one device that has the old database.
+            verifyMigrations.set(true)
+            // Where `generateCommonMainInkstoneDatabaseSchema` writes the `<version>.db`
+            // snapshots, and where the verify task reads them from. Setting it is also
+            // what *registers* the generate task — it does not exist otherwise, which is
+            // a surprise worth writing down.
+            //
+            // The committed `1.db` is the pre-M3 schema. It is a fixture, so it is in git:
+            // without it the verifier can only check that the migrations parse, and the
+            // whole point is to check they land on the same schema a fresh install gets.
+            schemaOutputDirectory.set(file("src/commonMain/sqldelight/databases"))
         }
     }
 }

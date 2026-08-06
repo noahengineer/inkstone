@@ -240,6 +240,8 @@ Still not delivered: the Pencil **grain texture**. It needs a texture asset of o
 
 **Revisit both this and the latency-callback suppression whenever the `androidxInk` pin moves** (`docs/M1-INK.md` §2 lists every restricted member and what M1 does instead).
 
+**Added in M3, same category:** `CanvasStrokeRenderer.create(forcePathRendering, textureStore)` is `@RestrictTo(LIBRARY_GROUP)` too, and lint fails the build on it. That overload is exactly what a `Bitmap`-backed canvas wants — thumbnails (§5.7) draw onto one, where ink's `drawMesh` fast path is unavailable. Nothing is lost: the single-argument `create` is public, and the renderer picks the path renderer per draw call from the canvas it is handed.
+
 **Steal this from Goodnotes:** after erasing, auto-return to the previously selected pen. Two lines, and their founder cited it as exemplifying the whole product strategy.
 
 ### 3.5 Erasing — scope note
@@ -628,6 +630,14 @@ cache/thumbs/<documentId>/<pageId>.webp   page thumbnails for reorder UI and sea
 
 Generated off the main thread, LRU-evicted, regenerated on demand. A bound-but-not-yet-downloaded note shows a placeholder with a sync badge.
 
+**Invalidation is keyed by `local_rev`, not by a timestamp** (added in M3). The index stores the `local_rev` a thumbnail was rendered from; fresh means the two are equal. A file timestamp is the obvious mechanism and is wrong in three ways that each show up only occasionally: a render that starts before an edit and finishes after it writes a *newer* file showing older content; two saves inside one filesystem tick are indistinguishable; and a clock that steps backwards makes every cached image look fresh forever.
+
+The invalidation is **the same SQL statement** that bumps `local_rev`, so there is no window in which the index reports a fresh thumbnail for content that has changed. `ThumbnailCache.invalidate` deletes rather than overwrites, so a crash between "the note changed" and "the picture was redrawn" is a miss (which costs a render), never a hit on the wrong picture.
+
+**The source is the folded page, not `document.pdf`.** The published file is materialized on close and §5.1 allows it to be one editing session stale, so rendering a thumbnail from it would show the wrong picture after a crash with nothing to reveal it. `:android:ink` renders the same `FoldedPage` the editor draws, through the same painter — so the library's picture cannot drift from the editor's.
+
+**Eviction is by least-recently-modified**, which the library index already knows, rather than by a separate LRU table that would have to be kept in step with the files it describes. A thumbnail is a cache of something still on disk, so evicting one costs a render, not data.
+
 ### 5.8 Format rules
 
 - `schemaVersion` checked on every open
@@ -957,6 +967,24 @@ SQLite FTS5 over recognised text + titles + folder names. Results carry note + p
 **Deferred:** tags, backlinks, page-level linking. *(Goodnotes has had a tagging request open ~10 years; their official workaround is "handwrite the tag and search." Doing it properly later is a real differentiator — but not at the cost of shipping M1–M6.)*
 
 **Folders mirror Nextcloud both directions.** An app folder maps to a remote folder; a move in either place is reflected in the other (§7.4 rule 2). Same mental model in both places — the point of the feature.
+
+#### What that requires of the folder model (settled in M3)
+
+A folder is a **synced entity**, so three things are fixed now rather than at M5, because changing any of them later means rewriting the user's library rather than changing code:
+
+1. **Identity is a `FolderId`, never a path.** A folder renamed in the Nextcloud web UI is the same folder at a different path; keyed on path that is a delete plus a create, which is how a sync loses a hundred notes to a rename. Same rule as §4.1 for notes and pages.
+2. **Order is a fractional key** (§4.3). Two devices that each create a folder offline must both keep theirs.
+3. **Names are sanitised at creation** by §7.8's strict ruleset, not at upload. A folder created today has to be nameable on a server the app has not met yet; discovering otherwise after a hundred folders exist means renaming the user's library for them. The UI shows the sanitised name as it is typed.
+
+The tree must tolerate a **missing parent, a trashed parent, and a cycle** — M5 pulls folders one PROPFIND level at a time, and all three are reachable. A cycle that hangs the library is a worse outcome than a folder that shows up at the root.
+
+**Trashing a folder** moves every contained note's directory first, then marks the folder, its descendant folders and those notes in one index transaction. That order is the recoverable one: a crash leaves a note that visibly fails to open (and is repaired by reconciling against the filesystem), rather than a "trashed" row whose directory is still live and which the next purge would quietly destroy. Descendants are marked with the folder they went down with, so the trash shows one entry and restore is one action.
+
+#### Title search in v1
+
+Title and folder search is an indexed prefix/substring match over a **Unicode-case-folded column**, not FTS5 — folding cannot be done in SQL, because SQLite's `lower()` and `COLLATE NOCASE` are ASCII-only and would miss `Übung` for `übung`.
+
+§8.4's FTS5 index is still the plan for **recognised handwriting**, and it arrives with M7 that owns it. It is not built early because its row grain is different — `(noteId, pageId, text, bbox)`, so a tap can scroll to the word — so a note-grain index built in M3 would have to be thrown away rather than extended.
 
 ---
 

@@ -1,0 +1,208 @@
+-- M3 — the library index (SPEC §9, ROADMAP M3).
+--
+-- WHAT THIS IS, AND WHAT IT IS NOT
+--
+-- This is an *index*, not the truth. A note's truth is its bundle and journal on disk
+-- (SPEC §5.1); these rows exist so that drawing a 500-note library does not mean opening
+-- 500 notes to find out what they are called. Every column here is either derivable from
+-- the note directory (title, pageCount, localRev) or is library-only metadata that has
+-- nowhere else to live (folderId, favourite, trash state).
+--
+-- The consequence, stated so it is not rediscovered later: if this database is lost, the
+-- notes are not. `LibraryRepository.reconcile` rebuilds the rows by walking `notes/`, and
+-- the only thing that cannot be recovered is folder membership — which is why M5 mirrors
+-- folders to Nextcloud, where they become a second copy that survives a reinstall.
+--
+-- NO FOREIGN KEYS, DELIBERATELY
+--
+-- `folder.parentId` and `note.folderId` are unconstrained. SQLite does not enforce FKs
+-- unless `PRAGMA foreign_keys = ON`, so a constraint here would be documentation that
+-- looks like a guarantee — and worse, M5 pulls folders from a server one PROPFIND level
+-- at a time, where a child legitimately arrives before its parent. `FolderTree` tolerates
+-- a dangling parent by showing the folder at the root, which is a recoverable outcome; a
+-- failed insert during a sync is not.
+--
+-- CASE FOLDING
+--
+-- `titleFold` / `nameFold` hold the value lowercased **in Kotlin**, which is Unicode-aware.
+-- SQLite's own `lower()` and `COLLATE NOCASE` are ASCII-only, so a search for "ÜBUNG"
+-- would miss "Übung" if this were done in SQL. Sorting by name uses the same column, for
+-- the same reason.
+--
+-- M7 replaces title search with FTS5 over recognised handwriting (SPEC §8.4). It is not
+-- built here because its row grain is different — `(noteId, pageId, text, bbox)`, so a tap
+-- can scroll to the word — and a note-grain FTS table built now would have to be thrown
+-- away rather than extended.
+
+CREATE TABLE folder (
+    id                  TEXT    NOT NULL PRIMARY KEY,
+    parentId            TEXT,
+    name                TEXT    NOT NULL,
+    nameFold            TEXT    NOT NULL,
+    sortKey             TEXT    NOT NULL,
+    colorArgb           INTEGER,
+    icon                TEXT    NOT NULL,
+    createdAt           INTEGER NOT NULL,
+    modifiedAt          INTEGER NOT NULL,
+    -- Non-null means trashed. A tombstone, never a removal (CLAUDE.md rule 1).
+    deletedAt           INTEGER,
+    -- Set on every descendant when an ancestor is trashed, so the trash shows one entry
+    -- for a deleted folder of fifty notes and restore puts the whole subtree back.
+    deletedWithFolderId TEXT
+);
+
+CREATE INDEX folderByParent  ON folder(parentId);
+CREATE INDEX folderByDeleted ON folder(deletedAt);
+
+-- SPEC §7.6's `note` table, in full. `syncState`, `localRev` and `lastError` are M5's,
+-- and they are here now because adding a column to a table the library reads on every
+-- launch is a migration, and this is the milestone that can afford one.
+CREATE TABLE note (
+    id                  TEXT    NOT NULL PRIMARY KEY,
+    title               TEXT    NOT NULL,
+    titleFold           TEXT    NOT NULL,
+    folderId            TEXT,
+    favourite           INTEGER NOT NULL DEFAULT 0,
+    pageCount           INTEGER NOT NULL DEFAULT 1,
+    syncState           TEXT    NOT NULL DEFAULT 'LOCAL_ONLY',
+    -- SPEC §7.6 — bumped on every committed change. Also the thumbnail's freshness key.
+    localRev            INTEGER NOT NULL DEFAULT 0,
+    -- The localRev the cached thumbnail was rendered from; NULL when there is none.
+    -- Equality with localRev is the whole invalidation rule (SPEC §5.7).
+    thumbnailRev        INTEGER,
+    lastError           TEXT,
+    createdAt           INTEGER NOT NULL,
+    modifiedAt          INTEGER NOT NULL,
+    deletedAt           INTEGER,
+    deletedWithFolderId TEXT,
+    -- Where `NoteTrash` moved the note's directory, so restore does not have to guess.
+    trashPath           TEXT
+);
+
+CREATE INDEX noteByFolder   ON note(folderId);
+CREATE INDEX noteByDeleted  ON note(deletedAt);
+CREATE INDEX noteByModified ON note(modifiedAt);
+
+-- ---------------------------------------------------------------------------
+-- Folders
+-- ---------------------------------------------------------------------------
+
+selectAllFolders:
+SELECT * FROM folder;
+
+selectFolder:
+SELECT * FROM folder WHERE id = ?;
+
+-- `deletedAt >= 0` and not `IS NOT NULL`, throughout. They select the same rows —
+-- `deletedAt` is epoch millis and cannot be negative, and SQLite's `NULL >= 0` is NULL,
+-- so a live row is excluded either way. The difference is on the Kotlin side: SQLDelight
+-- reads `IS NOT NULL` as proof the column is non-null *in this result*, and generates a
+-- whole separate row type for the query. Six queries would mean six near-identical row
+-- types and six mappers that must be kept in step by hand.
+selectTrashedFolders:
+SELECT * FROM folder WHERE deletedAt >= 0 AND deletedWithFolderId IS NULL
+ORDER BY deletedAt DESC;
+
+insertFolder:
+INSERT INTO folder(id, parentId, name, nameFold, sortKey, colorArgb, icon, createdAt, modifiedAt)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+updateFolderName:
+UPDATE folder SET name = :name, nameFold = :nameFold, modifiedAt = :modifiedAt WHERE id = :id;
+
+updateFolderAppearance:
+UPDATE folder SET colorArgb = :colorArgb, icon = :icon, modifiedAt = :modifiedAt WHERE id = :id;
+
+updateFolderParent:
+UPDATE folder SET parentId = :parentId, sortKey = :sortKey, modifiedAt = :modifiedAt WHERE id = :id;
+
+-- The explicitly trashed folder: `deletedWithFolderId` stays NULL, which is what marks it
+-- as the entry the trash list shows.
+trashFolder:
+UPDATE folder SET deletedAt = :deletedAt, deletedWithFolderId = NULL WHERE id = :id;
+
+trashFoldersWithAncestor:
+UPDATE folder SET deletedAt = :deletedAt, deletedWithFolderId = :rootId WHERE id IN :ids;
+
+-- Folders only. The notes that went down with the folder are restored one at a time,
+-- because each one's *directory* has to move back first and that can fail — a live note of
+-- the same id already exists, say. Clearing all their flags in one statement would restore
+-- rows pointing at directories still sitting in the trash.
+restoreFolderSubtree:
+UPDATE folder SET deletedAt = NULL, deletedWithFolderId = NULL
+WHERE id = :id OR deletedWithFolderId = :id;
+
+selectExpiredFolders:
+SELECT * FROM folder WHERE deletedAt >= 0 AND deletedAt <= :cutoff;
+
+deleteFolderRow:
+DELETE FROM folder WHERE id = ?;
+
+-- ---------------------------------------------------------------------------
+-- Notes
+-- ---------------------------------------------------------------------------
+
+selectAllNotes:
+SELECT * FROM note WHERE deletedAt IS NULL;
+
+-- Trashed ones too. `reconcile` needs it — a directory under `trash/` must not be adopted
+-- back into the library as a note the index "lost", and a trashed note's thumbnails must
+-- not be swept as orphaned.
+selectEveryNote:
+SELECT * FROM note;
+
+selectNote:
+SELECT * FROM note WHERE id = ?;
+
+selectTrashedNotes:
+SELECT * FROM note WHERE deletedAt >= 0 AND deletedWithFolderId IS NULL
+ORDER BY deletedAt DESC;
+
+selectNotesTrashedWithFolder:
+SELECT * FROM note WHERE deletedWithFolderId = ?;
+
+insertNote:
+INSERT INTO note(id, title, titleFold, folderId, pageCount, localRev, createdAt, modifiedAt)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+
+updateNoteTitle:
+UPDATE note SET title = :title, titleFold = :titleFold, modifiedAt = :modifiedAt WHERE id = :id;
+
+updateNoteFolder:
+UPDATE note SET folderId = :folderId, modifiedAt = :modifiedAt WHERE id = :id;
+
+updateNoteFavourite:
+UPDATE note SET favourite = :favourite WHERE id = :id;
+
+-- Autosave's index write. Clearing `thumbnailRev` here rather than in a separate statement
+-- is the point: a revision bump *is* the invalidation (SPEC §5.7), and splitting the two
+-- would leave a window in which a stale thumbnail looked fresh.
+updateNoteRevision:
+UPDATE note SET localRev = :localRev, pageCount = :pageCount, modifiedAt = :modifiedAt,
+                thumbnailRev = NULL
+WHERE id = :id;
+
+updateNoteThumbnailRev:
+UPDATE note SET thumbnailRev = :thumbnailRev WHERE id = :id;
+
+updateNoteSyncState:
+UPDATE note SET syncState = :syncState, lastError = :lastError WHERE id = :id;
+
+trashNote:
+UPDATE note SET deletedAt = :deletedAt, deletedWithFolderId = :deletedWithFolderId, trashPath = :trashPath
+WHERE id = :id;
+
+restoreNote:
+UPDATE note SET deletedAt = NULL, deletedWithFolderId = NULL, trashPath = NULL WHERE id = :id;
+
+selectExpiredNotes:
+SELECT * FROM note WHERE deletedAt >= 0 AND deletedAt <= :cutoff;
+
+deleteNoteRow:
+DELETE FROM note WHERE id = ?;
+
+-- Notes whose thumbnails may be evicted: everything outside the most recently modified
+-- `:keep` notes. SPEC §5.7 calls for LRU eviction; "least recently modified" is the same
+-- ordering without a second table to keep in step with the files it describes.
+selectThumbnailEvictionCandidates:
+SELECT id FROM note ORDER BY modifiedAt DESC LIMIT -1 OFFSET :keep;

@@ -1,0 +1,51 @@
+-- Migration 1 → 2: the M3 library index.
+--
+-- SPEC §5.8 — "migrations are one-way, versioned, and tested". `verifyMigrations` is on
+-- from this milestone: it applies this file to an empty database and asserts the result
+-- matches the CREATE statements in the .sq files, so the classic failure — a column added
+-- to the schema and forgotten here, which only shows up as a crash on a device that has
+-- the old database — cannot reach a build.
+--
+-- The statements below are byte-identical to Library.sq's on purpose. They are not shared
+-- from one source, because a migration must describe what version 2 looked like *at the
+-- time it was written*; when M5 adds `remote_binding`, Library.sq changes and this file
+-- must not.
+
+CREATE TABLE folder (
+    id                  TEXT    NOT NULL PRIMARY KEY,
+    parentId            TEXT,
+    name                TEXT    NOT NULL,
+    nameFold            TEXT    NOT NULL,
+    sortKey             TEXT    NOT NULL,
+    colorArgb           INTEGER,
+    icon                TEXT    NOT NULL,
+    createdAt           INTEGER NOT NULL,
+    modifiedAt          INTEGER NOT NULL,
+    deletedAt           INTEGER,
+    deletedWithFolderId TEXT
+);
+
+CREATE INDEX folderByParent  ON folder(parentId);
+CREATE INDEX folderByDeleted ON folder(deletedAt);
+
+CREATE TABLE note (
+    id                  TEXT    NOT NULL PRIMARY KEY,
+    title               TEXT    NOT NULL,
+    titleFold           TEXT    NOT NULL,
+    folderId            TEXT,
+    favourite           INTEGER NOT NULL DEFAULT 0,
+    pageCount           INTEGER NOT NULL DEFAULT 1,
+    syncState           TEXT    NOT NULL DEFAULT 'LOCAL_ONLY',
+    localRev            INTEGER NOT NULL DEFAULT 0,
+    thumbnailRev        INTEGER,
+    lastError           TEXT,
+    createdAt           INTEGER NOT NULL,
+    modifiedAt          INTEGER NOT NULL,
+    deletedAt           INTEGER,
+    deletedWithFolderId TEXT,
+    trashPath           TEXT
+);
+
+CREATE INDEX noteByFolder   ON note(folderId);
+CREATE INDEX noteByDeleted  ON note(deletedAt);
+CREATE INDEX noteByModified ON note(modifiedAt);

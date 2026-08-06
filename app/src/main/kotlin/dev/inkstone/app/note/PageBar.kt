@@ -39,10 +39,14 @@ fun PageBar(state: NoteEditorState, actions: PageBarActions, modifier: Modifier 
             horizontalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             TextButton(onClick = actions.onPrevious, enabled = state.pageIndex > 0) { Text("‹") }
-            Text(
-                text = "${state.pageIndex + 1} / ${state.pageCount}",
-                style = MaterialTheme.typography.labelLarge,
-            )
+            // The page counter is the overview's handle. M3 gave that sheet thumbnails, and
+            // "tap the page number to see the pages" needs no extra button to explain.
+            TextButton(onClick = actions.onShowPages) {
+                Text(
+                    text = "${state.pageIndex + 1} / ${state.pageCount}",
+                    style = MaterialTheme.typography.labelLarge,
+                )
+            }
             TextButton(
                 onClick = actions.onNext,
                 enabled = state.pageIndex < state.pageCount - 1,
@@ -106,4 +110,6 @@ data class PageBarActions(
     val onMoveLeft: () -> Unit,
     val onMoveRight: () -> Unit,
     val onTemplate: (PageTemplate) -> Unit,
+    /** ROADMAP M3 — the page overview, with a thumbnail per page. */
+    val onShowPages: () -> Unit,
 )

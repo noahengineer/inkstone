@@ -20,6 +20,18 @@ public value class DocumentId(public val value: String)
 @JvmInline
 public value class PageId(public val value: String)
 
+/**
+ * A library folder (SPEC §9).
+ *
+ * An id and not a path, for the same reason a note has one: SPEC §9 says folders
+ * *"mirror Nextcloud both directions"*, and a folder renamed or moved in the
+ * Nextcloud web UI is the same folder at a different path. Keying on the path
+ * would make that a delete plus a create, which is how a sync loses a hundred
+ * notes to a rename.
+ */
+@JvmInline
+public value class FolderId(public val value: String)
+
 /** Strokes, images, text boxes, shapes — anything an op can target. */
 @JvmInline
 public value class ObjectId(public val value: String)
