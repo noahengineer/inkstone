@@ -273,8 +273,18 @@ private fun highlighter(model: BrushFamily.InputModel) = BrushFamily(
 // Every one of these is a feel decision, and every one is meant to be argued
 // with on the tablet rather than defended on a desk.
 
-/** Fountain width at the lightest touch, as a fraction of full-pressure width. */
-private const val LIGHTEST_NIB = 0.35f
+/**
+ * Fountain width at the lightest touch, as a fraction of full-pressure width.
+ *
+ * Was 0.35, which is roughly what a fountain pen does on paper and which was reported from
+ * the tablet as not reacting to pressure at all. 0.18 is more than a real nib varies, and
+ * that is the point: a line that visibly thins and swells is the thing people mean by
+ * "pressure sensitive", and a physically faithful 3× range reads as uniform next to it.
+ *
+ * If the Measure panel shows pressure **not varying** on this device, this constant is not
+ * the problem and no value of it will be — see [StylusStats].
+ */
+private const val LIGHTEST_NIB = 0.18f
 
 /** Speed at which the velocity taper reaches full effect. */
 private const val FAST_CM_PER_SECOND = 40f

@@ -124,6 +124,7 @@ private fun MeasurementPanel(state: InkUiState, actions: InkToolbarActions) {
             },
             style = MaterialTheme.typography.labelSmall,
         )
+        PressureReadout(state)
         state.busyMessage?.let { Text(it, style = MaterialTheme.typography.labelSmall) }
     }
 }
@@ -195,4 +196,39 @@ private fun ToolRow(state: InkUiState, onToggleColorPanel: () -> Unit) {
             modifier = Modifier.width(120.dp),
         )
     }
+}
+
+/**
+ * What the digitiser reports for pressure — the readout that answers "why doesn't the pen
+ * react to how hard I press?"
+ *
+ * A stylus with real pressure spans a wide band within one written word. One that reports a
+ * constant shows the same number for min and max however hard you press, and no brush tuning
+ * will ever help it — the fix in that case is to drive width from speed and tilt instead.
+ *
+ * Deliberately blunt wording. This is a diagnostic, not a feature.
+ */
+@Composable
+private fun PressureReadout(state: InkUiState) {
+    val stylus = state.stylus
+    Text(
+        text = when {
+            stylus.sampleCount == 0L -> "Pressure: no samples yet — draw a stroke"
+
+            stylus.varies -> "Pressure: %.2f (range %.2f–%.2f) · %s%s — reported ✓".format(
+                stylus.lastPressure,
+                stylus.minPressure,
+                stylus.maxPressure,
+                stylus.toolName,
+                if (stylus.reportsTilt) " · tilt ✓" else " · no tilt",
+            )
+
+            else -> "Pressure: FLAT at %.2f over %d samples · %s — this stylus reports no pressure".format(
+                stylus.lastPressure,
+                stylus.sampleCount,
+                stylus.toolName,
+            )
+        },
+        style = MaterialTheme.typography.labelSmall,
+    )
 }

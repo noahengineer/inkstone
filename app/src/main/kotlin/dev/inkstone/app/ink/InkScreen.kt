@@ -61,6 +61,7 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
         val view = surface ?: return@LaunchedEffect
         while (true) {
             ui.latency = view.latency.snapshot()
+            ui.stylus = view.stylus.snapshot()
             delay(LATENCY_POLL_MS)
         }
     }
@@ -91,7 +92,10 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
                 onRedo = { editor.redo() },
                 onClear = { surface?.clearPage() },
                 onLoadSyntheticPage = { count -> loadSyntheticPage(scope, surface, ui, count) },
-                onResetLatency = { surface?.latency?.reset() },
+                onResetLatency = {
+                    surface?.latency?.reset()
+                    surface?.stylus?.reset()
+                },
             ),
         )
 

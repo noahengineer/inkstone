@@ -13,6 +13,7 @@ import dev.inkstone.android.ink.InkBrushKind
 import dev.inkstone.android.ink.InkInputModel
 import dev.inkstone.android.ink.LatencyStats
 import dev.inkstone.android.ink.PenConfig
+import dev.inkstone.android.ink.StylusStats
 
 /**
  * Everything the M1 toolbar can change, and nothing else.
@@ -61,6 +62,9 @@ class InkUiState {
     var fingerDrawingEnabled by mutableStateOf(false)
 
     var latency by mutableStateOf(LatencyStats.Snapshot(0, 0f, 0f))
+
+    /** SPEC §3.3 — what the digitiser reports. See [StylusStats]; polled with [latency]. */
+    var stylus by mutableStateOf(StylusStats.Snapshot(0, 0f, 0f, 0f, 0f, 0))
 
     var busyMessage by mutableStateOf<String?>(null)
 

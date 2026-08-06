@@ -132,6 +132,16 @@ public class InkSurfaceView @JvmOverloads constructor(
     /** SPEC §3.6 — a measurable end-to-end latency number, not vibes. */
     public val latency: LatencyStats = LatencyStats()
 
+    /**
+     * What the digitiser reports for pressure and tilt (SPEC §3.3).
+     *
+     * Measurement scaffolding, like [latency]. It exists because "the pen doesn't react to
+     * how hard you press" is a report the app could not previously answer: a stylus that
+     * reports no pressure and a brush whose response is too weak look identical from the
+     * outside and need opposite fixes.
+     */
+    public val stylus: StylusStats = StylusStats()
+
     // --- Configuration ------------------------------------------------------
 
     public var pen: PenConfig = PenConfig.Default
@@ -520,6 +530,8 @@ public class InkSurfaceView @JvmOverloads constructor(
         val strokeId = activeStrokeId
         if (strokeId != null) {
             palmGuard.noteStylusEvent(event)
+            // Four float compares. See StylusStats on why this is allowed here.
+            event.findPointerIndex(strokePointerId).takeIf { it >= 0 }?.let { stylus.record(event, it) }
             // The whole MotionEvent goes in, historical samples and all —
             // androidx.ink walks getHistorySize()/getHistoricalAxisValue()
             // itself, and also reads pressure, tilt, orientation and tool type
