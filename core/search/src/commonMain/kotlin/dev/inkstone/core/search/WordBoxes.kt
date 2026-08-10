@@ -54,10 +54,19 @@ public object WordBoxes {
      * furthest right anything in the cluster reached — the *furthest right*, not the previous
      * stroke's right, because a `t` is crossed after the word is finished and its bar starts
      * to the left of where the pen had got to.
+     *
+     * ⚠️ **The line's height is the MEDIAN stroke height, not the tallest.** It was the tallest
+     * until this file gained tests, and one bracket, integral sign or ascender-plus-descender
+     * raised the word-gap threshold for the whole line by a third — merging words that were
+     * properly spaced, and only on the lines that happen to contain a tall letter. `LineSegmenter`
+     * already refuses the same mistake one level up (*"scale is taken from the writing and not
+     * from a diagram sharing the page"*), and the two files measuring a line differently was the
+     * kind of disagreement that stays invisible until someone writes an `f`.
      */
     private fun clustersOf(strokes: List<SampledStroke>): List<PageRect> {
         val ordered = strokes.sortedBy { it.bounds.left }
-        val height = ordered.maxOf { it.bounds.height }.coerceAtLeast(MIN_HEIGHT_PT)
+        val heights = ordered.map { it.bounds.height }.sorted()
+        val height = heights[heights.size / 2].coerceAtLeast(MIN_HEIGHT_PT)
         val gap = height * WORD_GAP_FACTOR
 
         val clusters = ArrayList<PageRect>()
@@ -95,7 +104,19 @@ public object WordBoxes {
 
     private val WHITESPACE = Regex("\\s+")
 
-    /** A quarter of a point, so a line of full stops cannot make every gap a word break. */
+    /**
+     * A floor on the measured line height, so the threshold cannot become zero.
+     *
+     * ⚠️ **It does not do what it used to claim.** The KDoc here said it stopped *"a line of full
+     * stops making every gap a word break"*, and it does no such thing: a full stop is around a
+     * point tall, well above this floor, so the threshold is a third of a point and every gap
+     * between stops is still a break. The floor engages only for strokes with no measurable
+     * height at all, where its job is to keep `height * WORD_GAP_FACTOR` off zero.
+     *
+     * The full-stop case is handled, but by [assign]'s fallback rather than here: the cluster
+     * count will not match the recogniser's word count, so the line is apportioned. Which is the
+     * right outcome — it simply is not this constant's doing.
+     */
     private const val MIN_HEIGHT_PT = 0.25f
 
     /**

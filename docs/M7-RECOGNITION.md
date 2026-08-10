@@ -218,15 +218,27 @@ Per CLAUDE.md's definition of done #6, each feature says **which** check reached
 | Recognition is reachable from the app | drawn with `adb shell input stylus`, read out of `pageWord` with `run-as` | **driven over adb** |
 | Search finds handwriting and jumps to it | typed `III` in the app, tapped the hit, screenshotted the highlight | **driven over adb** |
 | Model-absent degradation | fresh install, searched, read the offer off the screen | **driven over adb** |
-| Schema migration to v7 | `PRAGMA user_version` = 7 on the device after upgrade | **run on a device** |
+| Schema migration to v7 | `MigrationOnDeviceTest` — a v4 and a v5 database with real rows, upgraded | **run on a device** |
+| `WordBoxes` places a word on its own ink | `WordBoxesTest` (8), including the t-crossing case | automated |
+| The search index stores, replaces, scopes and escapes | `SqlSearchIndexTest` (8), real SQLite | **run on a device** |
+| Recognition skips current pages and stops when unavailable | `NoteRecogniserTest` (8), real `NoteSession` | automated |
 
 **Not done: the Galaxy Tab.** Definition of done #4 is unmet — everything above is an x86_64
 emulator. Ink feel, latency and frame timing are unmeasured, and `:android:ink`'s instrumented
 suite still fails 10 of 15 on x86_64 for M1's reasons.
 
-**JVM suite: 592 tests per variant, 0 failures** (`testDebugUnitTest`, forced with
-`--rerun-tasks`; M6 shipped 539). `./gradlew build` is green including `checkCoreIsPlatformFree`
-and the iOS **klib compile** — the macOS framework link is `SKIPPED` on Windows, as always.
+**JVM suite: 608 tests per variant, 0 failures** (`testDebugUnitTest`, forced with
+`--rerun-tasks --no-build-cache`; M6 shipped 539). `./gradlew build` is green including
+`checkCoreIsPlatformFree` and the iOS **klib compile** — the macOS framework link is `SKIPPED` on
+Windows, as always.
+
+**Instrumented, all on `emulator-5554` after the milestone's code was final:** `:core:database`
+**58 tests, 0 failures** (migration, library index, both sync-store suites, FTS availability,
+search index); `:app` **10 tests, 0 failures** (crash safety, live page-meta, wet-ink merge);
+`:android:ink` **15 tests, 10 failures — the documented baseline, unchanged**. Those ten are M1's
+`SyntheticInk` orientations (nine) and one arm64-tuned float tolerance; none touches the render
+path M7 modified. Counted rather than assumed, because "10 failures" and "10 *pre-existing*
+failures" look identical in a summary line.
 
 ⚠️ Guardrail 2 earned its keep this milestone: `SqlSearchIndex` used `Map.putIfAbsent`, which is
 JVM-only. It compiled for Android and failed `compileKotlinIosArm64`.
@@ -247,3 +259,19 @@ JVM-only. It compiled for Android and failed `compileKotlinIosArm64`.
 - **`WordBoxes` falls back to apportioning a line's box by character count** when the gap-derived
   word count disagrees with the recogniser's. The box is then within a word or two along the
   right line rather than exact.
+
+### Two things the closing audit found in `WordBoxes`, both fixed
+
+Writing the tests that should have existed during the milestone found the bugs that only tests
+find — which is the argument for definition-of-done #2 stated once more, at this project's own
+expense.
+
+- **The line height was the *tallest* stroke, not the median.** One bracket, integral sign or
+  ascender-plus-descender raised the word-gap threshold for the whole line by a third, merging
+  words that were properly spaced — and only on lines containing a tall letter, which is the
+  hardest kind of bug to notice. `LineSegmenter` already refuses exactly this one level up. Now a
+  median in both places.
+- **A constant's KDoc claimed a guarantee it did not provide.** `MIN_HEIGHT_PT` said it stopped a
+  line of full stops breaking at every gap; it does not, because a full stop is far taller than
+  the floor. The real protection is `assign`'s count-mismatch fallback. The comment now says what
+  the constant does rather than what someone hoped it did.

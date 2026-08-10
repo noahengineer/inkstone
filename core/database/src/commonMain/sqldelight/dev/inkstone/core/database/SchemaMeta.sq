@@ -8,6 +8,10 @@
 --       syncAttention / folderBinding / peerClock, plus one column on remoteBinding.
 --       See Sync.sq and 4.sqm. Then foreignRemote and syncCursor.refusedUntil, added by
 --       M6's own review (5.sqm) — the two answers nothing was remembering.
+--   M7  pageWord — SPEC §8.4's search index over recognised handwriting. See Search.sq and
+--       6.sqm. The first purely additive migration: a new table and two indices, nothing
+--       altered, so no existing row can be mis-defaulted. NOT an FTS table — Android has no
+--       FTS5, and no FTS module of any version stores the page-space box a hit has to carry.
 --
 -- This table predates the library index and is kept because dropping it would be a
 -- migration that buys nothing. `InkstoneDatabase.Schema.version` — not this row — is

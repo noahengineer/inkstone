@@ -56,6 +56,17 @@ import kotlin.test.assertTrue
  * like, for the same reason a `.sqm` is never re-synced: the whole point is to start from what is
  * on a device that has not been updated yet.
  *
+ * ⚠️ **The test name says "the current schema", not a number, deliberately.** It said "the
+ * upgrade to 6" until M7 added `6.sqm` and made it 7 — at which point the name was false while
+ * the assertions were still right, because they compare against `InkstoneDatabase.Schema.version`
+ * rather than a literal. A name that has to be edited by every migration is a name that
+ * eventually is not.
+ *
+ * M7's `6.sqm` is the first purely additive one: a `CREATE TABLE` and two indices, no `ALTER` on
+ * a table holding user data. So it cannot mis-default an existing row the way `4.sqm` and
+ * `5.sqm` could — which is the failure `verifyMigrations` is blind to and this file exists for.
+ * It is still run here, because "cannot" is a claim and this is the thing that checks it.
+ *
  * ```
  * ./gradlew :core:database:connectedDebugAndroidTest
  * ```
@@ -75,7 +86,7 @@ class MigrationOnDeviceTest {
     }
 
     @Test
-    fun `a version 4 database with real data survives the upgrade to 6`() = runTest(dispatcher) {
+    fun `a version 4 database with real data survives the upgrade to the current schema`() = runTest(dispatcher) {
         writeVersion4WithData()
 
         val database = upgradeInPlace()
