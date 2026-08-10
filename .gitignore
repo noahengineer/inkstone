@@ -32,3 +32,7 @@ nextcloud-test.local.properties
 # working tree; these patterns are the belt to that braces, for anyone who unpacks it here.
 IAMonDo-db-1.0/
 IAMonDo-db-1.0.tar.gz
+
+# Python bytecode from tools/m7.
+__pycache__/
+*.pyc
