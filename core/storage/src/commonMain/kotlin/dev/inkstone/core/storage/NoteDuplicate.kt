@@ -6,6 +6,7 @@ import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.InkObject
+import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.ShapeObject
@@ -73,12 +74,13 @@ public suspend fun NoteStore.duplicateNote(
                 obj = obj.withRegisters().withCopiedId(ids.newObjectId()),
             )
         }
-        // Not undoable: the copy has no history to undo *into*, and an undo stack seeded
-        // with "everything on every page" is a stack whose first undo empties the note.
-        session.apply(target, ops, undoable = false)
+        // `replay`, not `apply`: the copy has no history to undo *into*, and an undo stack
+        // seeded with "everything on every page" is a stack whose first undo empties the note.
+        session.replay(target, ops)
     }
 
-    session.close()
+    // A duplicate has never been near a server, whatever its original's state was.
+    session.close(NoteSyncState.LOCAL_ONLY)
     return session.document
 }
 
@@ -89,8 +91,13 @@ public suspend fun NoteStore.duplicateNote(
  * that one is reachable from a session and this one from a store, and hoisting either onto
  * [InkObject] would advertise re-identification as something an editor may do. An object
  * that changes id mid-life is unmergeable.
+ *
+ * `internal` rather than private since M6, for the second store-level copy — SPEC §7.7 layer
+ * 3's [conflictedCopyOf]. The two callers want the identical operation for the identical
+ * reason, and a third hand-written `when` over the four object kinds is a place for a future
+ * fifth kind to be forgotten.
  */
-private fun InkObject.withCopiedId(id: ObjectId): InkObject = when (this) {
+internal fun InkObject.withCopiedId(id: ObjectId): InkObject = when (this) {
     is StrokeObject -> copy(id = id)
     is ImageObject -> copy(id = id)
     is TextBoxObject -> copy(id = id)

@@ -125,6 +125,19 @@ No real-time collaboration. No AI. No infinite canvas. No audio recording. See �
 
 *Added in M5.* Within `:core:*` there is now one edge: **`:core:database` → `:core:sync`**. The outbox's semantics — coalescing, annihilation, backoff inheritance, the mid-flight `local_rev` guard — are the part of §7.6 that fails quietly, so they live in `:core:sync` behind ports (`OutboxStore`, `BindingStore`, `AccountStore`, `SyncNotes`) that `:core:database` implements. The reverse edge would have put the rules in the module that owns SQLDelight and made *"500 offline edits produce one upload"* an instrumented test. Acyclic, and the one-way rule above is untouched. There is also a **test-only** `:android:pdf` → `:core:sync` edge, for Appendix B #4's spike only.
 
+*Added in M6.* One more edge inside `:core:*`: **`:core:sync` → `:core:storage`**, so the graph is
+`:core:database → :core:sync → :core:storage → :core:model`. Still acyclic, still platform-free on
+both sides, so the iOS link is unaffected. Without it the reconciler could not name §5.6's open
+verdict or a `BundleReader`, and the only alternative was a **second four-way copy of §5.6's
+decision enum** inside `:core:sync` — a second source of truth for the one decision this project
+has already spent a milestone getting right.
+
+`:core:model` gains a matching interface pair to §2.2's materializer: `RemoteBundleExtractor`, which
+is materialization read backwards — a downloaded PDF in, the embedded bundle and §5.6's verdict out
+— implemented in `:android:pdf` because PdfBox does not leave that module. Paths in, paths out, no
+bytes: a 40 MB lecture must not cross the boundary in memory inside a WorkManager job on the 4 GB
+device §10 names.
+
 **Ktor is a third-party type too.** `:core:sync` exposes `NextcloudTransport`, which is opaque outside the module — so `:app` cannot name an `HttpClient`, and therefore has nothing to make a request *with* outside the outbox (§7.6). Added in M5, when Hilt asked `:app` to name a provider's return type.
 
 ### 2.2 Interfaces core needs from the platform
@@ -318,7 +331,8 @@ data class LamportClock(val counter: Long, val deviceId: String) : Comparable<La
 
 data class Document(
     val id: DocumentId,
-    val title: String,                 // LWW register
+    val title: String,                 // LWW register — resolved by titleClock, added in M6 (§7.7)
+    val titleClock: LamportClock?,     // when `title` was last written. null = never renamed
     val pages: List<PageRef>,          // ordered by (sortKey, pageId) — see 4.3
     val schemaVersion: Int,
 )
@@ -351,6 +365,31 @@ which would have to sync: a note referencing a template file that is on the othe
 blank page with no explanation. The five built-ins (blank, ruled, grid, dot grid, Cornell) are
 a closed set with their metrics in the model, so a page rules identically on screen, in a
 thumbnail and in the published PDF.
+
+⚠️ **Corrected in M6 — `deviceId` is a property of the *install*, and until M6 it was not.**
+The comparator above is only total if the two `deviceId`s differ, and
+`Register.write`'s correctness argument says so in as many words. But the editor took the id
+from `note.document.deviceId` — out of the manifest, i.e. from whichever device *created* the
+note — so two tablets editing one note stamped every op with the **same** id. Two concurrent
+ops at counter 47 then compare **equal**, `Register.write` keeps the incumbent, the incumbent
+is whichever op that device's fold absorbed first, and the two devices hold different values
+**forever, with every op present, in the same total order, and no error anywhere.** That is
+§13.2 row 3 failing underneath every other row. The library index separately minted an id per
+*process*, so one tablet broke ties differently after every restart.
+
+It is now `:core:storage`'s `DeviceIdentity`: one id per install, in a plain file beside
+`notes/` (§5.1), read once. A file rather than a database row because §13.1's
+disaster-recovery story deletes the database — and a rebuild that re-minted this device's
+identity would re-open every tie in every note it had ever contributed to. M2 recorded the
+note-derived id as temporary and named M5 as the fix; M5 did not do it, and M6 is the first
+milestone in which a second device exists to expose it.
+
+⚠️ **`Document.localRev` is never adopted from a peer** (M6). It is this device's count of
+this device's commits and the value §7.6's mid-flight check compares against, so taking
+`maxOf(local, remote)` across devices — which is right when replaying a note's own journal
+onto its own bundle — jumps the counter past what the outbox recorded and makes the merged
+work invisible to sync forever. `mergeDocument` copies page order, title and title clock, and
+nothing else.
 
 ### 4.2 The op vocabulary — complete, from M2
 
@@ -417,6 +456,43 @@ Not a CRDT in the fancy sense. **Total-order state-machine replication:** sort t
 
 **Page ordering** uses fractional keys (`sortKey`), resolved by `(sortKey, pageId)`. This means two devices adding a page offline both keep their page — a plain LWW list would silently drop one device's page while orphaning its file. **Any page not present in a merged order is appended at the end, never dropped.**
 
+*Made structural in M6.* Three things this section describes as rules are now properties of
+the types, because each was a rule a caller could silently break:
+
+- **The re-fold is enforced by the return value, not by the caller.** `NoteSession.merge`
+  delegates to `PageLog.applyAll`, which answers `APPENDED` / `REFOLDED` / `SNAPSHOT_STALE`
+  and offers no way to patch state in place. A merge that folded a union itself and assigned
+  the result would bypass the snapshot signal, and §13.2 row 8 would fail in a way no local
+  test reproduces.
+- **`merge` is the only door a peer's ops come through**, and it is the only one that cannot
+  reach the undo stack (§4.6).
+- **The document is merged before any page's ops are.** `merge` will accept ops for a page the
+  document has never heard of and journal them; `BundleWriter` then skips any page absent from
+  `document.pages`, and `materialize` resets the journal immediately afterwards. Remote ops
+  journaled without their `PageRef` present are **destroyed, permanently, with no error** — the
+  output is a valid PDF with the right page count and a page missing. Merging page order first
+  is what makes "appended, never dropped" true of the *file* and not only of the list.
+
+**Page-order merges must be repaired, not just merged** (M6). `mergePageOrder` takes the
+lexicographically smaller key and does not validate well-formedness, so a malformed `sortKey`
+in a peer's file survives the merge and surfaces much later at `keyForInsert`, whose fallback
+silently appends at the end instead of inserting where the user asked. `PageOrder.repair` runs
+on every merged order.
+
+⚠️ **A page restored from trash does not propagate, and cannot yet** (M6, corrected at close-out).
+A tombstone beats a live entry — deliberately, because the alternative is a page the user deleted
+on one device reappearing on the other on every sync — and `PageOrder.reconcile` implements that as
+`a.deleted || b.deleted`, with no clock anywhere near it. So once a peer holds the tombstone it
+keeps it, and the *next* merge in the other direction re-deletes the page locally: the restore is
+undone by sync, silently. Earlier text here claimed a restore propagates "with a fresh entry"; that
+was never true of any `PageRef` shape, because freshness is not something an unconditional OR can
+see. **Nothing is lost** — the page's whole op log survives under the tombstone (rule 1) and
+restoring again works until the next sync — so this is a visible-correctness gap, not a data one.
+The fix is `deleted` as a Lamport register per page (rule 8), which means a new member inside the
+manifest's `pages[]` array, where §5.8's carry-unknown-fields rule does **not** reach: an older
+build would drop it on the next rewrite and silently return to OR semantics. It therefore needs a
+bundle schema decision, and it is owed by whichever milestone makes one.
+
 ### 4.4 Coordinate spaces ⭐
 
 Underspecified coordinate handling is the most reliable source of "annotations are 3mm off and rotated" bugs. Define it once, in `:core:model`, with unit tests.
@@ -436,6 +512,12 @@ Underspecified coordinate handling is the most reliable source of "annotations a
 3. **Apply `/Rotate` when computing page space.** `/Rotate 90` is extremely common in scanned lecture PDFs. A page with `/Rotate 90` and a 612×792 CropBox has a page space of **792×612**.
 4. `pageToPdfUser(p) = (cropBox.x0 + p.x, cropBox.y1 - p.y)` **before** rotation compensation; ~~the rotation is then folded into the annotation's `/Matrix`~~ — *revised in M4.* The rotation is folded into the **coordinates**, one step earlier, by `pageToPdfUser` itself: all four quadrants are handled there, so by the time a point reaches the writer it is already in unrotated PDF user space and there is no rotation left for a matrix to express.
 5. `/AP` form XObjects need a `/BBox` in form space plus a `/Matrix` — do not assume identity. *M4 does not assume it; it chooses it, having removed the reason for anything else.* With rule 4 applied, the appearance content, its `/BBox` and the annotation's `/Rect` are all in the same space, so `/BBox == /Rect` with an identity `/Matrix` is the only self-consistent combination — and it is safer than a rotated matrix, which has to agree with a `/BBox` computed in form space. The two disagreeing is precisely the failure this section exists to prevent. See `docs/M4-PDF.md` §7.1.
+
+⚠️ **Rules 2 and 3 read a page size that a later write can take away** (found in M6). `/MediaBox`,
+`/CropBox` and `/Rotate` are *inheritable* page attributes, so a page can be sized entirely by a
+`/Pages` node above it — and the writer flattens the page tree when it reorders pages, which cuts
+that node out. The geometry is read before the reorder and the page loses its size after it, so the
+ink lands on paper of a different size with nothing reporting an error. See §6.4.
 
 ```kotlin
 // :core:model — single source of truth, unit-tested against real PDFs
@@ -478,6 +560,21 @@ M1 has no log to append to, so `EditHistory` is a plain stack: the honest implem
 
 That last one is why §3.5's new op **must** be absolute rather than a delta (rule 8): undo writes back the region as it was, and cannot do that if the op only carries a difference. Erasing an area rather than destroying geometry is also what makes undo cheap here — an erase is undone by dropping capsules, because nothing was thrown away.
 
+⚠️ **"An incoming remote op does not enter your undo stack" is now unrepresentable, and in M6
+it was one forgotten argument away** (§7.7). The session's ingest method was
+`apply(pageId, ops, undoable: Boolean = true)` — and the default was the dangerous one. A
+caller that meant to absorb a peer's ops and omitted the third argument put a collaborator's
+strokes on the *local* undo stack, `flush()` persisted that to `undo.json`, and the user's next
+two-finger tap deleted work they had never made — durably, surviving a restart. Nothing in
+`UndoStack` could catch it, because it was a property of the call site alone.
+
+The boolean is gone. Three named methods replace it: **`apply`** (a local gesture, always
+undoable), **`replay`** (undo/redo/duplicate — ops whose inverses are already on the stack),
+and **`merge`** (a peer's ops: subtracted by `opId`, never near `undoStack`). "Forgot an
+argument" is no longer a reachable state. It also removed an O(n·m) trap — `Undo.inverseOf`
+does a linear scan of the fold per op, so merging thousands of remote ops through the undoable
+path was quadratic before it was wrong.
+
 ### 4.7 Compaction
 
 **The naive rule ("compact when SYNCED") is wrong twice:** it would never compact a `LOCAL_ONLY` note (i.e. most notes, and all notes before M5), and "SYNCED" means "this device uploaded", not "every peer has seen these ops" — compacting while your other tablet holds older ops offline leaves them nowhere to reintegrate.
@@ -487,6 +584,44 @@ That last one is why §3.5's new op **must** be absolute rather than a delta (ru
 - Compact when `syncState ∈ {LOCAL_ONLY, SYNCED}` **and** all ops being folded are older than the **causal-stability horizon**: 30 days, or the oldest clock any known device has acked, whichever is more conservative. For a personal 1–2 device setup, 30 days is fine.
 - Threshold in **bytes** (≈2 MB of journal), not op count. "2,000 ops" is about one page of dense handwriting.
 - **The snapshot is a cache, not the truth.** Keep the raw log. If an op older than the snapshot ever arrives, discard the snapshot and re-fold.
+
+⚠️ **Corrected in M6 — the snapshot is per page, and the gate was mostly dead.** Four separate
+things, and the first two meant this section described behaviour the code did not have.
+
+1. **`snapshot.bundle` was one file per *document*.** `compactIfDue` loops every live page
+   writing a snapshot, and every write went to the same path — so on a multi-page note each
+   page overwrote the previous one and `readSnapshot` answered null for every page but the
+   last. Nothing failed, because a missing snapshot is a full re-fold, which is correct and
+   merely slower. It became load-bearing in M6: §13.2 row 8 asserts that an older op discards
+   the snapshot and re-folds, and with one snapshot per document that row passed or failed
+   according to which page the test happened to pick. A green result would have proven
+   nothing. It is now `snapshot/<pageId>.bundle` (§5.1).
+2. **Every caller took `close()`'s `LOCAL_ONLY` default**, so the first and most important
+   refusal above had never fired in production: a `CONFLICTED` or `PENDING_UPLOAD` note was
+   compacted as though the server had never heard of it. The default is gone — the parameter
+   is required, so a call site cannot omit it.
+3. **The horizon was measured from the document's *creation* date**, not from the oldest op
+   being folded. On any note older than 30 days the causal-stability gate therefore passed for
+   ops written seconds ago — the guard inverted, on exactly the long-lived notebooks it exists
+   to protect. The last materialization is the honest floor: every op in the journal was
+   written after it, and erring later costs disk, never data.
+4. **`oldestAckedCounter` was always null.** The parameter has existed since M2 and no caller
+   could fill it, because nothing knew what a peer had seen — so 30 days of wall clock was the
+   whole guard. M6 is the first milestone where a peer exists: every downloaded bundle reports
+   its `highestClockCounter` and its `document.deviceId`, which is recorded per
+   `(noteId, peerDeviceId)` and passed as the `min` across peers.
+
+**A fifth refusal, added in M6: `PAUSED`** — a note whose account is signed out (§7.6). Its
+binding survives and it may hold edits the server has never seen, which is precisely this
+section's *"compacting while your other tablet holds older ops offline leaves them nowhere to
+reintegrate"* with the server as the other tablet.
+
+And one guard that is defensive rather than corrective: **compaction refuses while the session
+has unflushed work.** A snapshot is a cache *of the log*, so folding one over ops that exist
+only in memory produces a cache holding state the log does not — and discarding it, which rule
+9 requires the moment an older op arrives, would then lose that work outright. `close()`
+materializes first so it cannot happen today; a caller reaching `compactIfDue` directly is one
+refactor away and the cost of being wrong is silent.
 
 ---
 
@@ -499,11 +634,32 @@ That last one is why §3.5's new op **must** be absolute rather than a delta (ru
 **On disk, per note:**
 
 ```
+device.id               this install's deviceId (§4.1). A sibling of notes/, added in M6.
+download/<id>.pdf       a pulled remote file, staged for merge. Added in M6.
 notes/<documentId>/
 ├── document.pdf        the materialized, publishable file. May be up to one session stale.
 ├── journal.ops         append-only op log since the last materialization. Flushed ~2s.
-└── snapshot.bundle     optional compaction snapshot (§4.7)
+└── snapshot/<pageId>.bundle   optional compaction snapshot, per page (§4.7)
 ```
+
+*Both top-level entries were added in M6 and neither is incidental.* `device.id` must not
+travel with a note that is copied, duplicated, published or synced, which is why it is not
+inside `notes/` (§4.1).
+
+⚠️ **A downloaded file is never written over `notes/<id>/document.pdf`.** Three failures
+collapse into that one rule, and the first is the corruption class this design exists to
+prevent:
+
+1. `writeBytesAtomically` writes through a temp file whose name is *derived from the
+   destination*, so two writers aimed at one path share one temp file and then atomically
+   rename a **torn PDF** into place. The reconciler downloading while the materialize worker
+   republishes is exactly two writers aimed at one path, and there is no lock anywhere.
+2. The downloaded file's XMP `bundleSha256` describes the **remote** bundle. Written over
+   `document.pdf` it disagrees with the merged `note.inkstone` beside it, and the next open
+   reads `Recovered(BUNDLE_HASH_MISMATCH)` on a note that is perfectly intact (§5.6).
+3. Materialization truncates back to `originalLength` from the marker *in whatever file is
+   there* (§5.2), so the next local publish would silently rebase this note on a peer's base
+   bytes.
 
 **Where these files actually are in M2.** PDF materialization is M4's, so until then the
 bundle is a file of its own — `notes/<documentId>/note.inkstone` — and there is nothing to
@@ -603,6 +759,21 @@ PDF text rendering mode **`3 Tr`** (neither fill nor stroke) — the "sandwich" 
 
 Result: `pdfgrep` finds your handwriting. So does Acrobat, Preview, and (if configured) Nextcloud full-text search. **This is the thing Goodnotes structurally cannot do.**
 
+⚠️ **Before M7 writes the first `text/<pageId>.json`, carried bundle entries have to be ordered.**
+A merge unions the peer's carried entries with the local ones **local-wins** (§7.7, `NoteStore.materialize`),
+and that rule is symmetric: for an entry name *both* devices produce, each keeps its own value, neither
+is told, and no clock exists to order the two. Nothing produces a clashing name today — which is the
+only reason M6 left it — and this file is named per *page*, so every device writes the same name and a
+clash becomes the normal case the day recognition ships. Recognised text is derived data, so the cheap
+answer is a clock or a "regenerate rather than merge" rule; what is not available is leaving it.
+
+⚠️ **The font this layer names has to be in the *page's* `/Resources`, not the stream's**
+(corrected in M6 — see §6.4, where the same defect had a more visible effect). M4 put it on the
+content stream, so `/InkstoneF0 Tf` was an undefined name in every file this app published. A
+text layer whose font is undefined is a text layer a viewer may decline to draw *and decline to
+extract* — which is the whole feature — while `pdfgrep` on the app's own output, and every test
+that read the stream back with the library that wrote it, said it was there.
+
 ### 5.6 Document identity and Recovered mode ⭐
 
 **The problem:** "a PDF with ink annotations but no embedded bundle" also describes any PDF someone annotated in Acrobat. Without a marker, the app cannot distinguish *our file, mangled* from *a stranger's file*.
@@ -692,6 +863,21 @@ The invalidation is **the same SQL statement** that bumps `local_rev`, so there 
 - **Forward compatibility:** unknown op types and unknown JSON fields are **preserved verbatim** on round-trip. A newer app version must be able to write a file an older version opens without destroying data.
 - Migrations are one-way, versioned, and tested against fixture files committed to the repo — **including an on-device test** that a real app update migrates real data (§13)
 
+⚠️ **Corrected in M6 — the forward-compatibility rule was honoured for ops and not for the
+manifest.** Unknown members of an *op* were kept (`OpExtras`, M2), but `BundleReader` rebuilt
+the manifest field by field from a fixed list, so any member it did not recognise was **dropped
+on every round trip**. A newer build's document-level metadata therefore did not survive an
+older build opening and saving the note — the exact failure this rule is written to prevent,
+one level up from where it was being checked. Unknown manifest members are now carried through
+verbatim, sorted so that identical content still produces identical bytes.
+
+That fix is what lets `titleClock` (§7.7) be an **additive field with `schemaVersion` still 1**.
+Bumping to 2 would make an older build refuse to open the note at all, and M6's acceptance gate
+is a week of two-device use where the two devices are very likely on different builds. An older
+build that *preserves* an unknown `titleClock` degrades — it cannot stamp its own renames, so it
+may lose a later one, which is a wrong title that the next rename heals. Dropping the field
+corrupts the register for every device, which is a wrong title that never heals.
+
 ---
 
 ## 6. PDF handling
@@ -765,6 +951,47 @@ the renderer.
 
 ---
 
+⚠️ **Found in M6: `/Resources` do not live in the same place twice, and M4 put them in the
+wrong one.** A **form XObject** — which is what an annotation's `/AP /N` is — is a stream *with*
+its own `/Resources`. A **page content stream** has none: it resolves every name it uses through
+the *page dictionary* (PDF 32000-1 §7.8.3, `/Resources`, *"Required; inheritable"*). M4 set them
+on the stream in both cases, so two things were undefined names in **every file this app has ever
+published**:
+
+- the flattened overlay's `/GS… gs`, above the 500-stroke threshold; and
+- §5.5's invisible text layer's `/InkstoneF0 Tf`, on every page that had recognised text.
+
+**What a viewer does with an undefined `gs` is up to the viewer, and both answers are bad.**
+PDF.js — Nextcloud's own viewer — warns and continues with the *default* graphics state, so a
+translucent highlighter came out fully opaque and covering the writing underneath it. A stricter
+reader abandons the rest of the content stream, and the rest of the stream is the overlay, so the
+page's ink is simply not drawn. Neither reports an error to the user.
+
+**Nothing local noticed, and that is the part worth keeping.** PdfBox re-parses the file happily,
+`PdfReader` finds the ink, `detectOpenMode` says `Normal`, the page count is right, and M4's
+acceptance tests asserted on the content stream's *text* — which was correct. The file was valid,
+parseable, and blank. It took a test that asked *"what does a renderer that is not the library
+that wrote this need?"* (`PdfViewerCompatTest`) to see it.
+
+⚠️ **`/Resources` is inheritable, so absent on the page does not mean absent.** A source PDF may
+keep one dictionary on a `/Pages` node for every page beneath it, and writing a fresh one on the
+page **shadows** it — trading our one missing name for all of theirs. The inherited dictionary is
+copied down first, and our entries merged into a *copy*, because a source PDF's resource
+dictionaries are routinely shared between pages.
+
+**The same inheritance rule caught a second, worse bug on the way past.** `/Resources`,
+`/MediaBox`, `/CropBox` and `/Rotate` are the four inheritable page attributes (PDF 32000-1
+§7.7.3.4), and the writer **flattens the page tree** when it reorders pages — which cuts the
+intermediate node out of the `/Parent` chain. A page that inherited its `/MediaBox` from that node
+was left with **no page size at all**: a viewer either refuses the page or falls back to US
+Letter, and the ink — written against the geometry read *before* the reorder — is then on paper of
+a different size, which is §4.4's failure arriving by a route §4.4 does not mention. `PDDocument`
+and `PdfReader` report the same page count they always did. All four attributes are now copied
+down *before* `/Parent` is rewritten, because what a page inherits has to be read through the
+chain that is about to be shortened.
+
+---
+
 ## 7. Nextcloud integration
 
 ### 7.1 Authentication — Login Flow v2
@@ -809,6 +1036,16 @@ Nextcloud's brute-force protection is on by default: escalating delays to 25 s, 
 - On 429 honour `Retry-After`, else exponential backoff with jitter.
 - `capabilities.bruteforce.delay` non-zero means you're already throttled.
 
+⚠️ **The pull side has to obey this too, and it is where the rule is easiest to break** (M6).
+A reconciler that iterated every account and tried anyway would make one request per halted
+account **per poll** — and the poll floor is sixty seconds (§7.6), so that is a brute-force
+pattern against the user's own server, from inside their own app, on the credential the server
+has already refused. An unusable account gets **zero** requests, not one polite probe per pass;
+the account-level "your notes have stopped syncing" comes from the stored state, not from asking.
+`capabilities.bruteforce.delay` is now acted on rather than merely surfaced: it *widens* the poll
+interval, because a non-zero value means this client is already in the penalty box and the only
+useful response is to slow down.
+
 ### 7.3 WebDAV
 
 **Base:** `<server>/remote.php/dav/files/<uid>/`. No v2 exists. Don't use legacy `/remote.php/webdav`.
@@ -829,6 +1066,12 @@ Nextcloud's brute-force protection is on by default: escalating delays to 25 s, 
   </d:prop>
 </d:propfind>
 ```
+
+⚠️ **`nc:data-fingerprint` always comes back as a 404 propstat** on Nextcloud 32.0.13, even with
+the value set. Keep asking for it — one unrequested-but-harmless property costs nothing and a
+future server version may answer — but do not build a behaviour that depends on the answer
+arriving. Measured in M6; see §7.6 step 4 for what that costs and what protects against a
+restored backup instead.
 
 ⚠️ **Always send an explicit `Depth`.** Sabre's default when omitted is `infinity` — a self-inflicted DoS on a large tree.
 
@@ -903,6 +1146,70 @@ outbox(note_id, op_type, local_rev_at_enqueue, attempts, next_attempt_at, create
 
 *M5:* the enum is `NoteSyncState` in `:core:model` (it lives there because §4.7's compaction rule needs it). It spells the fifth state `CONFLICTED`, and **`ERROR` was missing until M5 added it** — it is where a 507, a forbidden folder and a non-retryable 4xx land, and it has to be distinct from `CONFLICTED` (which needs a merge) and from `NEEDS_REAUTH` (where the credential is fine).
 
+**`PENDING_DOWNLOAD` means "bytes are on disk and a merge is owed"** — the same thing the
+`pendingDownload` row means, so the two are written in the same moment and neither is a claim about
+the future (M6, close-out). Set ahead of the GET it was exactly that, and nothing on the failure
+path took it back: a dropped connection or a 503 left the note stuck in it until some later pass
+happened to succeed, which shows a permanent "downloading" badge and — because the state is not
+`SYNCED` or `LOCAL_ONLY` — stops the note compacting for as long as it lasts (§4.7). A failed
+download reports itself and leaves the note's standing exactly as the last completed pass left it.
+
+*M6 adds an eighth: **`PAUSED`** — bound, but its account is signed out.* It exists because the
+alternative was `LOCAL_ONLY`, and that is a lie the user can see: `LOCAL_ONLY` means *"never bound
+to a server"*, so the library showed **no sync badge at all** on a note that is sitting on
+Nextcloud right now, and "is this one actually up there?" is the question the badge exists to
+answer. It is also **not compactable**, unlike `LOCAL_ONLY` and `SYNCED` (§4.7).
+
+The account states gain a matching one: **`SIGNED_OUT`**. M5's sign-out deleted the account row
+*and every binding*, so signing back in meant re-typing a URL and then re-binding **every note,
+one at a time, choosing its folder again** — because `remote_binding` was the only record of which
+note lived where. None of that was needed: the row holds a URL, a login name, a uid, a default
+folder and a cached capabilities document, and the one secret — the app password — is exactly what
+this state does not keep (§14). So the account row and the bindings survive, `isUsable` is false so
+no request can be made with it, and signing in again resumes every note where it left off. What
+distinguishes it from `NEEDS_REAUTH` is **whose decision it was**: a reauth is the server refusing
+us and warrants a warning, this is the user doing what they asked for and warrants no alarm at all.
+The outbox rows *are* dropped, because work queued for an account that cannot send it is M5's
+silent stall.
+
+**New tables in M6** (`4.sqm`, schema version 5), all additive, no BLOB column and no foreign key:
+`remoteDirectory` (§7.4 rule 1's ETag cache), `syncCursor` (the per-account root ETag and
+`nc:data-fingerprint`), `pendingDownload` (a marker for a download not yet merged — a path, never
+bytes), `syncAttention` (§7.7's list), `folderBinding` (§9's mirror), `peerClock` (§4.7's
+causal-stability horizon), plus one column on `remote_binding`:
+
+```sql
+lastSeenRemoteAt   INTEGER NOT NULL DEFAULT 0   -- stamped only on a directory that was WALKED
+```
+
+⚠️ **`lastSeenRemoteAt` must be carried forward by every binding write, not passed in.**
+`INSERT OR REPLACE` deletes the conflicting row and inserts a new one, so a column omitted from
+the statement comes back as its default of 0 — *"never seen"*. Every ordinary binding write (an
+upload stamping an ETag, a MOVE recording a path) would therefore reset it, and the next reconcile
+pass would read **the whole library as absent remotely and trash it**. The upsert reads the old
+value back through a subquery; one statement changes it.
+
+**Two more, added by M6's own review** (`5.sqm`, schema version 6 — both additive, both defaults
+meaning what the code did before them; `docs/M6-SYNC.md` §5.5 has the failures):
+
+```sql
+CREATE TABLE foreignRemote (...)                             -- "this remote PDF is not one of ours"
+ALTER TABLE syncCursor ADD COLUMN refusedUntil INTEGER ...   -- when a refused 401 may be met again
+```
+
+⚠️ **`foreignRemote` is not an optimisation.** Identity lives in the file (§5.6) and the marker is in
+the PDF catalog, so *"is this ours"* costs a whole download — and a directory's ETag moves on every
+note upload into it. Without the row, each unrecognised PDF beside the notes is re-fetched on every
+save **and spends one unit of the pass budget**, so `limit` of them ahead of the notes in listing
+order starves the pass permanently while the poll reports success. The row answers for a *version*
+(ETag plus `OC-Checksum`), never for a path: a path that held a stranger's scan yesterday can hold a
+peer's note today.
+
+⚠️ **`refusedUntil` is CLAUDE.md rule 5.** §7.2's confirmation call has three answers and only *"the
+credential is dead"* halts the account; the other two leave it ACTIVE, and an ACTIVE account is one
+the sixty-second poll walks again. Persisted rather than held in memory because WorkManager restarts
+the process, and a cooldown cleared by every wake-up is not a cooldown.
+
 #### Outbox semantics ⭐
 
 **Op types:** `UPLOAD`, `MOVE`, `DELETE`, `MKCOL`.
@@ -934,6 +1241,17 @@ The core user-facing feature:
 
 **Deleting a bound note:** local trash immediately + enqueue remote `DELETE` (which lands in Nextcloud's trash). Restoring from local trash within 30 days re-enqueues an `UPLOAD` — note that a Nextcloud trash-restore **changes the fileid**, so re-bind by path and repair `remote_oc_id` from the PUT response.
 
+⚠️ **A note the *server* deleted takes a different path, and confusing the two is destructive**
+(M6). The obvious call is the one above — and a DELETE **annihilates the pending UPLOAD**, which
+is correct when the user deletes a note and catastrophic here: §13.2 row 14's premise is a note
+with *local unsynced edits* whose remote copy was deleted from another device, and annihilating
+that UPLOAD destroys the only queued route those edits had to the server. Every comment on that
+path reads correct while it happens. There is also nothing to delete — the file is already in
+Nextcloud's own trash, put there by whoever removed it, so a DELETE is a 404 at best. So: the
+queued rows go, the local note goes to **local trash** (never a hard delete, rule 1), and the
+binding **stays with its remote identity cleared** — which is what makes a restore re-upload as a
+*create*, and what stops the next pass concluding the same deletion again.
+
 #### The reconciler (pull)
 
 ```
@@ -953,11 +1271,143 @@ The core user-facing feature:
    and full-reconcile rather than trusting them.
 ```
 
+⚠️ **Step 4 does not work against a real Nextcloud, and M6 measured that rather than assuming
+it.** `nc:data-fingerprint` is **not retrievable over WebDAV** on Nextcloud 32.0.13 — not even
+when the value is set. With `occ maintenance:data-fingerprint` having just reported *"Updated
+data-fingerprint to e137b2ff…"*, the property comes back as a **404 propstat** from every
+endpoint it could plausibly live on, and is absent from the two documents that might carry it
+instead:
+
+```
+PROPFIND /remote.php/dav/files/<uid>/   →  <nc:data-fingerprint/>  404 Not Found
+PROPFIND /remote.php/webdav/            →  404
+PROPFIND /remote.php/dav/               →  404
+GET      /ocs/v2.php/cloud/capabilities →  absent
+GET      /status.php                    →  absent
+```
+
+So the backup-restore safety net this step describes **has no trigger in production.** The
+`fingerprintMoved` branch in `Reconciler` is retained — it is correct if a server ever does
+report the property, and costs one nullable comparison — but it must not be counted as the
+protection against a restored backup.
+
+**What actually protects against it** is `syncCursor.lastFullAtEpochMillis`: a periodic
+*unpruned* walk, which is the backstop for every way ETag pruning can lie, restores included.
+That is the mechanism to strengthen if this matters, not the fingerprint.
+
+**And absent must never mean changed.** The comparison requires *both* the cached and the
+reported value to be non-null. Reading "no property" as "it changed" would force an unpruned
+walk on **every poll against every real Nextcloud** — permanent request amplification, which is
+the failure §7.2 exists to prevent. SPEC §13.2 row 15's live half therefore asserts the
+asymmetry (an absent fingerprint clears no cache, downloads nothing and trashes nothing) and
+skips the change-detection half loudly, naming this defect as the reason.
+
+#### What the four steps above leave unsaid — filled in by M6
+
+Each of these fails **silently**: the poll reports success and a note simply stops syncing.
+
+- **A weak root ETag never short-circuits.** A false *"unchanged"* means the pull never happens;
+  a false *"changed"* costs one request. Take the expensive direction (§7.3).
+- **Step 3's fourth branch is only decidable for a directory that was walked *and settled*.** A
+  pruned subtree leaves its bindings unstamped exactly as a deleted file does, so "known id absent
+  remotely" must be intersected with the set of directories this pass actually descended into —
+  and must additionally require that the note was **ever uploaded**. Without the intersection,
+  one lucky ETag match puts a hundred notes in the trash.
+
+  ⚠️ *"Walked"* alone is **not enough**, and M6 shipped it that way — this sentence is the repair.
+  A listing coming back says nothing about whether its *files* were looked at. Three ways a
+  directory is walked with its files unread, and all three trashed live notes: the pass **limit**
+  cut the file loop short (so any library bigger than the limit lost its tail on the first poll), a
+  **404** was recorded as an empty listing (so renaming a bound folder in the web UI — §7.4 rule 2's
+  *move* — trashed everything under it), and a file in it failed. The guard is
+  `walked − unfinished`, and being over-conservative here only ever *keeps* a note.
+- **The trash is not reachable while an editor holds the note.** `NoteTrash.trash` moves
+  `notes/<id>/`, a live session is not told, and its next autosave recreates the directory with a
+  journal and no bundle — after which the note is unrestorable, unopenable, and destroyed by the
+  30-day sweeper. The pull-side trash therefore has an answer meaning *"not now"*, and the binding
+  is left unstamped so a later pass concludes it again. (`NoteTrash.restore` also tells a stub from
+  a live note, and sets the stub aside into the trash rather than deleting it — rule 1.)
+- **A 401 is neither a failure nor a deferral.** §7.2's confirmation call has three answers and only
+  *"the credential is dead"* halts the account; the other two leave it ACTIVE. Counting the 401 as a
+  failure therefore reports *"run again"* with nothing halted, and WorkManager's exponential backoff
+  becomes the credential retry loop rule 5 forbids. It needs its own counter, an unread-but-not-owed
+  subtree, one confirmation call **per pass** (a 401 abandons the whole tree, downloads included),
+  and a per-account cooldown — or the sixty-second poll is the ladder's slower half.
+- **A directory's cached ETag is written only when everything under it finished.** The row means
+  *"fully reconciled at this version"*. Writing one over an unmerged download prunes that subtree
+  on every later pass until something else in it happens to change.
+- **Exactly one pass runs at a time, and only the reconciler can promise that** (M6). Three unique
+  WorkManager names run the same whole-account pass — the foreground poll, the periodic job, and one
+  per note a 412 refused — and a unique-work policy deduplicates only *within* a name. Two passes
+  share the staging directory and the ETag cache, and every way that sharing goes wrong is a
+  **conflict** and not an error: two GETs of one note interleave into one fixed temp filename and
+  rename a torn PDF into place (rule 10), one pass's `discard` deletes the bundle the other is about
+  to merge, and a cache row written over the other's unmerged download prunes that subtree. The
+  result is a conflicted copy minted from a race, with both copies identical. A pass that finds
+  another in flight must make **zero requests** and report that it did nothing — never wait, or a
+  thundering herd of workers each holds a thread for the length of somebody else's pass.
+- **A merge into an *open* note must be serialized against the editor, not merely handed to it.**
+  Delivering the merge into the editor's coroutine scope keeps the one-session-per-note rule and
+  still lets it interleave with the two-second autosave at every suspension point — and
+  `materialize` snapshots every page *before* it resets the journal, so a stroke flushed in between
+  is in no journal, no bundle and no cache, with `local_rev` regressing over the flush's so that the
+  index and the binding both agree nothing is owed. The editor holds one lock across each of its
+  operations; it is taken **from construction until the note is open**, so a pull that arrives
+  during the note-open I/O waits for that session instead of being told there is none — which is
+  what made a second session, and a stale byte-offset reader, reachable at all.
+- **The walk starts at the notes roots, not the DAV root.** `Depth:1` from `/` crawls the user's
+  photo library.
+- **Step 2's `nc:data-fingerprint` check comes before the root-ETag check**, or a restored backup
+  is short-circuited away by a cached ETag that is no longer about the same bytes.
+
+#### ⭐ What the reconciler does with the outbox — the ETag ping-pong's termination argument
+
+The reconciler performs **no remote writes** (CLAUDE.md rule 4 has no pull-side exemption). What
+it *does* is decide whether the merge leaves this device owing the server an upload, and the
+decision is a three-row table:
+
+| local had novel ops | remote had novel ops | Action |
+|---|---|---|
+| no | no | advance `last_synced_etag`, stamp seen, `SYNCED`. **No UPLOAD.** |
+| no | yes | fast-forward: advance the ETag *and* `last_synced_rev`, `SYNCED`. **No UPLOAD** — re-uploading a note that only absorbed the remote's work churns the ETag and tells the peer to pull again. |
+| yes | — | advance `last_synced_etag` **first**, then enqueue one UPLOAD, which carries `If-Match: <the ETag just downloaded>`. |
+
+**This table is the whole reason two devices stop talking.** The obvious wiring — report a merge
+through the same path a local save takes — ends in an unconditional upload, which changes the
+remote ETag, which the peer sees as a remote change on its next poll, forever, at the poll
+interval, looking exactly like healthy sync. With the table: both devices upload once after a true
+merge, the loser's PUT 412s, the 412 triggers a reconcile of that one note, and *that* pass finds
+no novel local ops and stops. **Bounded at two round trips per real conflict** — and worth an
+automated test of its own, because an echo loop is invisible until it is hammering a real server.
+
+⚠️ **A 412 parks the UPLOAD for a day, and a completed merge is what un-parks it.** Coalescing
+deliberately *inherits* `next_attempt_at` (resetting it per save is the hot loop this section
+warns about), so without an explicit un-park the merge that resolves the conflict inherits the
+day-long park and the union never uploads. The distinction is that a backoff is about the
+transport and a park is about a conflict; only the merge knows the conflict is over. `attempts` is
+carried over rather than cleared — that history is still true, and the pass has just proved the
+server is reachable.
+
+⚠️ **A note the reconciler *downloads* is bound at the version it downloaded, and owes nothing.**
+Binding it the way the "Save to Nextcloud…" flow does always enqueues MKCOL then UPLOAD — and that
+binding has no ETag and no `oc:id`, so *"was this ever uploaded"* is false, so the next PUT sends
+`If-None-Match: *` at the very file it was created from: a **permanent 412**, a day-long park, and
+the note flagged `CONFLICTED`. A note that has just arrived byte-identical to the server's copy
+reads as a conflict, and because a park is inherited, the next real edit to it never uploads
+either.
+
 #### Polling and push
 
 **Assume `notify_push` is absent** — separate app + Rust daemon + Redis + reverse proxy. Default installs don't have it.
 
 - **Baseline: poll.** Honour `capabilities.core.pollinterval` (default 60 s) as the floor. Foreground: that interval. Background: WorkManager periodic ≥15 min.
+  ⚠️ **The floor is on the interval between requests, not on the interval inside one loop** (M6,
+  close-out). The foreground ticker is alive only while a screen is, and Android's lifecycle
+  stops and starts screens far more often than a minute: a rotation is `onStop` then `onStart`
+  with nothing in front, so the loop is cancelled and a new one begins. A loop that polls and
+  *then* sleeps keeps its pacing in its own stack frame, which the cancellation discards — so ten
+  rotations were ten passes inside a minute. The last-poll instant is remembered across the
+  cancellation and the wait is computed at the head of the loop.
 - **If push exists** (`capabilities.notify_push.endpoints.websocket`), use it as an optimisation only. Nextcloud's README states notifications are **best-effort** — updates can occur without one, and one can fire without an update. Push never replaces polling; it lets you drop background polling to ~1 h as a safety net.
 - Push auth is a bespoke handshake: connect the WebSocket, then send **two separate text frames** (username, then app password); server replies `"authenticated"`. Then send `listen notify_file_id` to receive changed file IDs and skip the tree walk.
 
@@ -967,7 +1417,115 @@ The core user-facing feature:
 
 **Layer 2 — structural.** `pageOrder` merges by fractional key (§4.3); pages missing from the winning order are appended, never dropped. Title and other document metadata are LWW with the override recorded in history.
 
+⚠️ **"LWW" had nothing to resolve with until M6.** A title was a bare `String`, so two devices
+renaming one note offline gave a merge no way to tell which rename was later. Both available
+answers were wrong: order by `modifiedEpochMillis`, which CLAUDE.md forbids outright because
+device clocks disagree (§4.7's `nowEpochMillis` is documented as the *one* legitimate exception);
+or take the lexicographically smaller string, which is deterministic and converges and **silently
+discards whichever rename the user actually meant** — the same trap §4.3 rejects for page order,
+where the fix was to keep both, and a title cannot be kept twice.
+
+So `Document.titleClock: LamportClock?` (§4.1), stamped by `rename` from the same generator every
+op uses, resolved by the same `Register` semantics: the remote wins only on a **strictly later**
+clock, which is what makes the merge give the same answer in either direction rather than
+oscillating. Null means *"never renamed, or renamed by a build older than M6"*, and null loses to
+any recorded clock — a device that knows when it renamed something knows more than one that does
+not. It is an additive manifest field with `schemaVersion` still 1; §5.8 explains why that is safe
+and what had to be fixed first.
+
+When the local title loses, the string the user typed goes into the "Needs attention" list as a
+`TITLE_OVERRIDDEN` item — that is this section's *"with the override recorded in history"*, and
+dropping it is the one place layer 2 could quietly discard something somebody wrote. Page-order
+merges stay silent: there is nothing for a user to decide about a fractional key.
+
+⚠️ **Three things had to be connected before any of the above did anything**, and M6 shipped
+without them — the mechanism was complete and unreachable at both ends, which is the failure mode
+this milestone hit three times:
+
+- **A writer.** The only thing that stamps `titleClock` is `NoteSession.rename`, and the production
+  rename was the library's, which renamed an index row and moved a file. A rename therefore goes
+  through the note's **one session** (`NoteSessionHost.renameNote`, handing off to a live editor if
+  one holds the note), and it **materializes**: a published PDF embeds `note.inkstone` as it is on
+  disk, so a title that reached only the journal is a title no peer receives.
+- **A reader.** The resolved title is written back to the library index by
+  `LibraryRepository.notePulled`. `recordSave` has no title column, so without it a peer's rename
+  landed in the bundle and the library tile — the only place a user sees a title — kept the old
+  string permanently.
+- **The counter.** A rename consumes a Lamport counter, and a bundle's `highestClockCounter` was
+  computed over page ops only, so the session after a close re-issued it. Two devices then held two
+  titles at one *identical* clock; `Register` needs strictly later, so each refused the other's
+  rename forever with `titleOverridden` false and nothing in the attention list. The invariant now
+  lives on `BundleContents`, which every bundle writer goes through, and `NoteStore.open` folds in a
+  rename that has only been flushed.
+
+And because a rename changes the filename outside the bundle as well as the title inside it, the
+peer's pull sees **a new ETag at a new href** — the ordinary case, not an edge one. `RemoteVersion`
+carries no path, so the binding has to follow the file itself (`Reconciler`); a binding left on the
+old href queues its next MOVE from a file that no longer exists, which 404s, parks for a day, and
+takes every later upload of that note with it because MOVE drains before UPLOAD.
+
 **Layer 3 — unmergeable.** Write `Lecture Notes (conflicted copy 2026-08-05 143012).pdf` alongside. Keep both. Surface in "Needs attention".
+
+*M6 fixes the triggers, the contents and the name.* **Exactly three things reach layer 3**, and
+they are the only three: a remote file whose bundle schema is **too new** (§5.6 row 4); a remote
+file that opens **Recovered** (a peer's file lost its bundle — auto-recovering it would let a
+lossy REPLACE stamped past every clock it has seen overwrite this device's full-fidelity note, and
+look like a successful sync while doing it); and a **412 that survives a merge attempt**.
+
+**A conflicted copy is the remote bytes, verbatim.** Nothing is re-written and no PDF is
+generated — which is rule 1 taken literally, needs no new PDF code, and is only sound because M5
+proved a published PDF round-trips a Nextcloud PUT byte-identically. The local note keeps its
+`DocumentId`, its journal, its undo stack and its binding; **nothing local is superseded.**
+
+**The copy gets a new `DocumentId` and new `ObjectId`s, and all three reasons are independent:**
+`notes/<id>/` is one directory and the index's primary key, so a copy sharing the id would *be*
+the original, overwritten; the XMP marker carries `documentId`, so a copy keeping it is
+indistinguishable from the original to the next reconcile, which would merge the two back together
+— and the copy exists precisely because merging was impossible; and keeping `ObjectId`s puts two
+objects under one identity in a grow-only union, where the fold's first-write-wins payload rule
+makes one copy's geometry silently win on both notes.
+
+**The name has three constraints and each is a bug if missed.** No `:` in the time, because
+sanitisation rewrites it and two devices spelling the time differently then land on *different*
+paths for one conflict, each creating its own copy. **UTC**, or two tablets in different timezones
+do the same thing. And the title gives way to the 250-byte limit, never the stamp — a copy whose
+name equals the original's is not a copy.
+
+**And it is stamped exactly once per conflict** (M6, close-out). The same string is the local copy's
+title *and* the remote path the verbatim bytes are PUT to, so a second call to `RemoteName.conflictedCopy`
+for one conflict is a second reading of the clock. `Reconciler` stamps it from the pass's own
+`passStartedAt`; `NoteStore.conflictedCopyOf` takes the finished name and stamps nothing. It used to
+stamp its own, separated from the reconciler's by the length of the download, which gave one conflict
+two names — the same failure as the `:` above, reached from the opposite end.
+
+**"Too new" is decided in two places, because the schema version is written in two.** The XMP marker
+carries one (§5.6) and the bundle's `manifest.json` carries one, and the marker is read first: a
+`TOO_NEW` verdict there never extracts a bundle at all, which is what §5.8 requires. The manifest's is
+the fallback for a file where the two disagree, and it has to be read *without* opening the bundle,
+because `BundleReader.open` refuses a schema from the future by throwing. `NoteMerge.mergeBundle` owns
+that decision — before M6's close-out the check sat behind the open, where no input could reach it, and
+every unreadable pull was reported to the user as an unmergeable conflict instead.
+
+⚠️ **One copy per conflict, not one per poll** (M6). Layer 3 deliberately does *not* advance the
+file's ETag — that is what makes the pending upload park instead of overwriting a file this build
+cannot read, and what lets a later pass find out whether the condition cleared. So the same file is
+fetched and refused again on every poll for as long as it lasts, and a directory's ETag moves every
+time any note in it uploads, so "every poll" is the ordinary case rather than a rare one. Since a copy
+*must* get a new `DocumentId`, an unkeyed layer 3 therefore produced one new local note **and one new
+bound remote file per poll** from a single unresolved condition. The identity of a conflict is the pair
+(local note, remote file, by `oc:id`), and the record of it is the note's "Needs attention" row, which
+is read before anything is minted.
+
+**Dismissing an item is a tombstone, and the dedup has to read through it.** The row stays with a
+timestamp (rule 1 has no exception for metadata), and it now carries a second load: it is what
+remembers that a conflicted copy already exists, so deleting an acknowledged row would start the
+minting again. A rediscovery must therefore compare against **every** row for the id and not only the
+open ones — an acknowledged row is by definition not "open", so an open-rows guard passes and the
+UPSERT puts the dismissal back to zero. The user could not put an item away for longer than one poll
+interval, for conditions like *"the peer's file lost its bundle"* that may never clear on their own.
+Something genuinely new still reaches the list, by whichever route applies: a different problem is a
+different id and its own row, and the same problem with a different **payload** — the peer's schema
+version moved, a copy now exists — is rewritten and re-opened.
 
 **Hard rules:**
 
@@ -977,6 +1535,27 @@ The core user-facing feature:
 4. Before any destructive local operation, the previous version goes to local trash (30-day retention).
 
 **Live editing during a remote change:** if a page is open in the editor when a remote op arrives, re-fold and re-render the page, preserving the camera and any in-progress stroke. **Incoming remote ops never enter the local undo stack** (§4.6).
+
+⚠️ **"Preserving the camera" is a rule about what the re-render must *not* call** (M6). Reloading
+the page is two indirections from anything camera-shaped: `loadPage` sets `pageSize`, whose setter
+calls `resetCamera(FIT_WIDTH)` unconditionally, and also cancels unfinished strokes. The camera is
+persisted nowhere, so once refit the previous value is gone — both of this paragraph's forbidden
+outcomes, reached by a call that looks like a refresh, with every JVM test still passing. The
+supported route is to **diff the folds** and push only the delta with recording off, which is
+correct for an append and a re-fold alike and touches neither the camera nor the wet layer.
+
+⚠️ **Not yet true of page *metadata*.** A peer's `SetPageMeta` folds correctly, reaches the bundle,
+and does not appear on screen until the page is switched: changing the paper without moving the
+camera needs a method `:android:ink` does not have yet, and its `StrokeStore` drops the op besides.
+Data-safe, visibly late; recorded in `docs/M6-SYNC.md` and ROADMAP M6 rather than quietly worked
+around, because the available workaround is `loadPage`, which is worse.
+
+**One `NoteSession` per note, enforced outside the session.** Two sessions over one note each hold
+their own pending ops and their own folded pages, so whichever materializes **second** writes a
+bundle missing the other's work — silently, with a valid PDF and the right page count. The session
+is single-threaded by contract and deliberately has no lock; the exclusion is a per-note mutex plus
+a registry of live editors in `:app`, and when an editor holds the note the merge is handed to *it*
+rather than a second session being opened.
 
 **Server-side safety nets** (verify via capabilities, don't assume): Nextcloud `DELETE` is soft; versions live at `/remote.php/dav/versions/<uid>/versions/<FILEID>`, keyed by fileid.
 
@@ -1043,6 +1622,37 @@ SQLite FTS5 over recognised text + titles + folder names. Results carry note + p
 **Deferred:** tags, backlinks, page-level linking. *(Goodnotes has had a tagging request open ~10 years; their official workaround is "handwrite the tag and search." Doing it properly later is a real differentiator — but not at the cost of shipping M1–M6.)*
 
 **Folders mirror Nextcloud both directions.** An app folder maps to a remote folder; a move in either place is reflected in the other (§7.4 rule 2). Same mental model in both places — the point of the feature.
+
+#### The mapping, settled in M6
+
+*"An app folder maps to a remote folder"* left the mapping's shape open, and the shape decides
+whether the feature is usable. It is a **pin**: the user points one library folder at any path on
+the server, and everything beneath it follows. Pin `School` → `Documents/Uni`, and a note in
+`School / Physics / Term 1` lands at `Documents/Uni/Physics/Term 1/<note>.pdf` with nothing else
+configured. Five rules, each the answer to a way it goes wrong:
+
+1. **The deepest pinned ancestor wins.** Most-specific-wins is the only rule under which pinning a
+   subfolder means anything; "shallowest wins" makes the second pin silently dead.
+2. **Only folders *below* the pin contribute segments.** The pinned folder gives its *path*, not
+   its name — appending the library name on top yields `Documents/Uni/School`, which is not what
+   was asked for and cannot be corrected from the UI.
+3. **Nothing pinned → the account's default folder**, i.e. exactly the pre-M6 behaviour. This is a
+   generalisation, not a replacement, and an unpinned library keeps syncing where it did.
+4. **Every derived segment is sanitised; the pinned path is not.** A folder named `Physics / Term 2`
+   must become one legal segment rather than two accidental levels (§7.8) — whereas the pinned path
+   *is* a path, chosen against a real remote listing, and its slashes are meant.
+5. **A broken parent chain degrades to the default folder.** The tree tolerates a missing parent, a
+   trashed parent and a cycle (above), so a folder whose ancestry does not reach the root cannot see
+   a pin above the break; falling back puts the note somewhere real rather than at a path assembled
+   from half an ancestry.
+
+⚠️ **And *"always sync this folder"* is a statement about the notes, not about the mapping.**
+Recording the mapping is the easy half and accomplishes nothing on its own: the first cut stored
+the pin and bound nothing, so a user pinned a folder holding a note, watched their Nextcloud, and
+saw no folder and no upload. Every unit test passed, because the path resolver was right. A pin has
+to produce one step per note in the subtree — a *bind* for a note that has never been uploaded
+(which is what enqueues the `MKCOL` that creates the remote folder), a *move* for one that already
+has a binding.
 
 #### What that requires of the folder model (settled in M3)
 
@@ -1123,9 +1733,36 @@ Toolchain is ready: Kotlin 2.3.20, Compose Multiplatform iOS stable since 1.8.0,
 - **On-device migration test:** install version N with real data, upgrade to N+1, verify migration
 - **Library rebuild:** delete the SQLite database, rebuild the library by scanning a folder of PDFs. This is the disaster-recovery story for a design where PDFs are the truth and the DB is an index.
 
+⚠️ **Two of these are still unmet as of M6, and both look met.** No **bundle fixture** has ever been
+committed for any schema version, so "round-trip every schema version" is currently a round trip of
+whatever the current build writes. And there is still no **on-device migration test**: every
+instrumented database test opens an in-memory database (`name = null`), which calls `Schema.create`
+and therefore never runs `Schema.migrate` at all, while `verifyMigrations` compares DDL only — so a
+migration that is structurally right and mis-defaults existing rows passes both. M6 is the first
+milestone to migrate a table already holding real user sync state (`remote_binding`), which is
+exactly the case that needed it.
+
 ### 13.2 The merge matrix
 
 **All rows are automated tests, run against a real Nextcloud in Docker** — mocks won't reproduce weak ETags, fileid churn on restore, or brute-force lockout.
+
+*M6 wrote all 21, and this line needed one distinction it did not make: **automated** and
+**automated and run against a real server** are different claims.* Every row is automated and every
+row runs in `./gradlew build`. What it runs against by default is not Docker: it is a real
+HTTP/1.1 server on loopback, hand-rolled over `ServerSocket`, that speaks enough Nextcloud to put
+the production transport, the real WebDAV client, the real PROPFIND body and the real multistatus
+parser in the loop — only the storage behind the socket is fake, and directory ETags are derived
+from the subtree so rule 1's propagation is genuinely exercised rather than pruned correctly by
+accident. Each row *also* runs against a live account when one is configured, and skips **loudly**
+when one is not, printing per row what is proven without a server and what is not. Four rows
+(12's torn body, 15's fingerprint, 16's weak ETag, 20's revoked password) need something a healthy
+server will not do on request — `occ`, a proxy, or a killed socket — and the in-process server
+stands in for those switches; see `docs/M6-SYNC.md`.
+
+**Plus one row this table does not list and the design requires:** after any two-device merge, poll
+both devices repeatedly and assert the request count settles to one `PROPFIND Depth:0` each with no
+further ETag movement. That is §7.6's termination argument, and an echo loop is invisible until it
+is hammering somebody's server.
 
 | # | Scenario | Required outcome |
 |---|---|---|
@@ -1143,7 +1780,7 @@ Toolchain is ready: Kotlin 2.3.20, Compose Multiplatform iOS stable since 1.8.0,
 | 12 | Upload interrupted mid-PUT | Outbox retries. No partial remote file. |
 | 13 | 412 on `If-Match` | Merge attempted, then conflicted copy. Never a blind overwrite. |
 | 14 | Remote deleted while local has unsynced edits | Local → trash, not hard-deleted. User notified. |
-| 15 | Server ETags all change (backup restore) | `nc:data-fingerprint` triggers full reconcile, not mass re-download. |
+| 15 | Server ETags all change (backup restore) | `nc:data-fingerprint` triggers full reconcile, not mass re-download. ⚠️ **Not reachable on Nextcloud 32.0.13** — the property is a 404 propstat over WebDAV even when set (see §7.6 step 4). The live half asserts the asymmetry instead: an absent fingerprint clears no cache, downloads nothing, trashes nothing. |
 | 16 | Weak ETag (`W/"..."`) from a gzip proxy | No 412 loop. Falls back to checksum. |
 | 17 | 500 offline edits, then reconnect | **Exactly one** upload. |
 | 18 | Note edited while its PUT is in flight | Not marked SYNCED. Re-enqueued (`local_rev` check, §7.6). |

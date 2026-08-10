@@ -30,6 +30,122 @@ public fun interface DocumentMaterializer {
 public data class MaterializedFile(val path: String, val sizeBytes: Long, val sha256: String, val localRev: Long)
 
 /**
+ * SPEC §5.6 + §7.6 ⭐ — **[DocumentMaterializer] read backwards.** Implemented in M6 by
+ * `:android:pdf`.
+ *
+ * The reconciler has downloaded a peer's published PDF and needs two things out of it: the
+ * embedded `note.inkstone`, and SPEC §5.6's open decision about whether that file is ours,
+ * ours-but-mangled, a stranger's, or from a build newer than this one. Both require parsing
+ * a PDF, and PdfBox stays inside `:android:pdf` (CLAUDE.md — *"third-party types don't leak
+ * across module boundaries"*). So the same shape as materialization: an interface here, the
+ * one implementation over there, nothing of the library's vocabulary in between.
+ *
+ * ## Paths, not bytes
+ *
+ * Both parameters are paths on the [FileSystem] the app already uses, and the result carries
+ * no bytes either. A 40 MB lecture must not cross this boundary in memory: the caller runs
+ * inside a WorkManager job on the 4 GB device SPEC §10 names and is already holding the
+ * downloaded file, so handing the bundle back as a `ByteArray` would put a second copy of
+ * the largest object in the app beside the first.
+ *
+ * ## Why the verdict is a copy of SPEC §5.6's and not the type itself
+ *
+ * [RemoteBundleVerdict] mirrors `:core:storage`'s `PdfOpenMode` case for case because
+ * `:core:model` cannot depend on `:core:storage` — the dependency runs the other way, and
+ * always will. The mapping between the two lives in the `:android:pdf` implementation, in
+ * one place, so this is a second *spelling* of the decision rather than a second decision.
+ */
+public fun interface RemoteBundleExtractor {
+
+    /**
+     * @param pdfPath the downloaded published PDF, already on disk. **Never
+     *   `notes/<id>/document.pdf`** — the download lands in its own staging path so that a
+     *   materialization running concurrently on the same note cannot tear it (CLAUDE.md
+     *   rule 10; `AndroidFileSystem`'s temp name is derived from the destination, so two
+     *   writers to one path share one temp file).
+     * @param bundlePath where to write the extracted `note.inkstone`. Written atomically or
+     *   not at all — ask [ExtractedRemote.bundleWritten], never assume.
+     * @return what was found. Does **not** throw for a file it cannot make sense of: a
+     *   corrupt or truncated download is an ordinary outcome of a network pull, and this
+     *   codebase uses result types across module boundaries and exceptions only for genuine
+     *   programming errors. Anything unrecognisable is [RemoteBundleVerdict.FOREIGN], which
+     *   the reconciler already ignores — and because the binding's ETag is only advanced
+     *   after a successful merge, the next pass fetches the file again.
+     */
+    public suspend fun extract(pdfPath: String, bundlePath: String): ExtractedRemote
+}
+
+/**
+ * What [RemoteBundleExtractor] found in a downloaded file.
+ *
+ * @property verdict SPEC §5.6's open decision, and the only field the reconciler branches
+ *   on. All four cases are reachable from a perfectly healthy server, which is why none of
+ *   them may be treated as an error.
+ * @property documentId the `documentId` from the XMP marker, or null when the file carries
+ *   no marker. **Never derived from the filename or the remote path** — SPEC §5.6's whole
+ *   argument is that identity lives inside the file, and CLAUDE.md forbids deriving identity
+ *   from a path. A note renamed on the server is the same note; two notes can share a title.
+ * @property schemaVersion the marker's `schemaVersion`, or 0 when there is no marker. Kept
+ *   even for a file this build must refuse, because it is the difference between an
+ *   unactionable *"written by a newer build"* and *"written against bundle schema 3; this
+ *   build reads 1"* on the attention row (SPEC §7.7).
+ * @property bundleWritten true when [RemoteBundleExtractor.extract]'s `bundlePath` now holds
+ *   the embedded bundle. A flag rather than something inferred from [verdict], because the
+ *   two are different questions: a [RemoteBundleVerdict.TOO_NEW] file has a perfectly intact
+ *   bundle this build must not open, and a [RemoteBundleVerdict.NORMAL] extraction can still
+ *   fail on a full disk. **Never merge from a path this did not write.**
+ */
+public data class ExtractedRemote(
+    val verdict: RemoteBundleVerdict,
+    val documentId: DocumentId?,
+    val schemaVersion: Int,
+    val bundleWritten: Boolean,
+)
+
+/**
+ * SPEC §5.6's four-way open decision, spelled for `:core:model`.
+ *
+ * Case for case the same set as `:core:storage`'s `PdfOpenMode`; see [RemoteBundleExtractor]
+ * for why it is restated rather than imported. What is deliberately *not* carried across is
+ * `PdfOpenMode.Recovered`'s `RecoveryReason` and `RecoveryLoss` set: the reconciler's answer
+ * to [RECOVERED] is the same whatever the reason, and a pulled file is never recovered
+ * automatically (see below).
+ */
+public enum class RemoteBundleVerdict {
+
+    /** Marker and bundle both present and consistent. The only case that merges. */
+    NORMAL,
+
+    /**
+     * Ours, but the bundle is missing or does not hash to what the marker claims.
+     *
+     * SPEC §7.7 layer 3, always — **a pulled file is never recovered automatically.**
+     * Recovery replaces the op log rather than unioning with it and deliberately stamps
+     * everything past every clock it has seen, so a peer's lossy recovery folded into this
+     * device's note would win every LWW register against full-fidelity local data, and look
+     * like a successful sync while doing it. Keep both copies instead.
+     */
+    RECOVERED,
+
+    /**
+     * No marker. Not ours, and not adopted.
+     *
+     * A PDF with ink annotations and no marker is just as likely to be somebody's Acrobat
+     * markup that happens to live in the notes folder (SPEC §5.6). Adopting it would file a
+     * stranger's document under one of our document ids and then start merging into it.
+     */
+    FOREIGN,
+
+    /**
+     * Ours, written against a bundle schema this build does not understand.
+     *
+     * SPEC §5.8 — do not open it and above all do not re-save it. Layer 3, with
+     * [ExtractedRemote.schemaVersion] as the detail.
+     */
+    TOO_NEW,
+}
+
+/**
  * SPEC §5.7 — renders one folded page to a thumbnail image. Implemented in M3 by
  * `:android:ink`, because drawing a stroke needs `androidx.ink` and a `Canvas`.
  *
@@ -92,6 +208,59 @@ public interface WorkScheduler {
 
     /** Rewrite `document.pdf` off the ink path (SPEC §5.1). */
     public fun enqueueMaterialization(noteId: DocumentId)
+
+    /**
+     * SPEC §7.6 ⭐ — **the pull side.** Look for remote changes on every usable account.
+     * Added in M6.
+     *
+     * The cheap case is deliberately the common one: one `PROPFIND Depth:0` against the
+     * account root, and if its ETag matches the stored cursor, nothing else at all (SPEC
+     * §7.4 rule 1). So calling this often is not expensive, and there is no "am I online"
+     * question to ask first — the platform's own network constraint answers it, which is what
+     * keeps airplane-mode editing free of requests.
+     *
+     * ## Why the *periodic* registration is not on this interface
+     *
+     * The reconcile equivalent of `ensurePeriodicDrain` stays a concrete method on
+     * `WorkManagerScheduler`, following that precedent exactly. Its period is fifteen
+     * minutes, and that number is WorkManager's floor rather than a decision — a shorter one
+     * is silently clamped. Declaring it here would move an Android scheduling policy into
+     * `commonMain`, where the constant is unexplainable and an iOS implementation would be
+     * asked to honour a constraint its platform does not have. `:core:*` says *what* work is
+     * owed; *when* is the platform's business (SPEC §2.2).
+     *
+     * ## Why the default body is empty, and what it costs if it is left in place
+     *
+     * So the existing `WorkScheduler` test doubles keep compiling. An interface that grows a
+     * method breaks every fake at once, and a fake edited only to gain an empty body is a
+     * fake with nothing to say about the change.
+     *
+     * ⚠️ **The production scheduler must override both overloads.** One that inherits these
+     * turns every pull trigger into silence: the app looks healthy, the outbox keeps
+     * uploading, badges stay green — and nothing a peer writes ever arrives, with no error
+     * anywhere to notice it by.
+     */
+    public fun enqueueReconcile() {
+        // Empty on purpose; see the KDoc. Overridden by the real scheduler.
+    }
+
+    /**
+     * Reconcile **one** note as soon as constraints allow (SPEC §7.7).
+     *
+     * This is the 412 path. `If-Match` failed, which means somebody else changed the file,
+     * and SPEC §7.4 is explicit that a 412 is a conflict and not a retry (CLAUDE.md rule 1's
+     * *"never overwrite a remote file without `If-Match`"* has this as its other half). This
+     * is what turns the refusal back into a merge: pull that one file, union the op logs, and
+     * let the outbox re-upload against the ETag it just learned.
+     *
+     * Scoped to one note rather than reusing [enqueueReconcile] because a 412 on one file
+     * says nothing about the rest of the account, and a whole pass costs a `PROPFIND` per
+     * unpruned directory. It is also what bounds the exchange at two round trips per real
+     * conflict rather than leaving it to the next periodic wake-up.
+     */
+    public fun enqueueReconcile(noteId: DocumentId) {
+        // Empty on purpose; see [enqueueReconcile]. Overridden by the real scheduler.
+    }
 }
 
 /**

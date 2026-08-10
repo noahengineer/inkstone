@@ -1,0 +1,34 @@
+-- Migration 5 → 6: the two rows M6's review said were missing (CLAUDE.md rules 1 and 5).
+--
+-- Purely additive: one new table and one column, no backfill, no rewrite. An existing database
+-- migrates without touching a row, and both defaults mean what the code did before them.
+--
+-- `foreignRemote` is the negative half of SPEC §5.6's identity check — "this remote PDF has no
+-- Inkstone marker in it". Empty is the honest starting state: it says only that nothing has been
+-- checked yet, so the first pass after the upgrade looks inside each unrecognised file exactly once
+-- and then remembers. Before it, every non-Inkstone PDF beside the notes was downloaded in full
+-- whenever its folder's ETag moved — i.e. on every note save — and `Reconciler.DEFAULT_LIMIT` of
+-- them ahead of the notes in listing order starved the pass permanently.
+--
+-- `syncCursor.refusedUntil` is CLAUDE.md rule 5. 0 is "no 401 is outstanding", which is the truth
+-- for every row written before this migration, so nothing is left cooling down by the upgrade
+-- itself. It is **last** in `Sync.sq`'s CREATE TABLE syncCursor because `ALTER TABLE ADD COLUMN`
+-- appends and `verifyMigrations` diffs a migrated database against a fresh one — the same rule
+-- 4.sqm records for `remoteBinding.lastSeenRemoteAt` and 2.sqm for the folder-cover columns.
+--
+-- The column-by-column reasoning lives in Sync.sq. This file is the delta, and duplicating it would
+-- give two places to keep in step — which is also why it must never be re-synced from Sync.sq
+-- later: a migration records what version 6 looked like *when it was written*.
+
+CREATE TABLE foreignRemote (
+    accountId  TEXT    NOT NULL,
+    fileKey    TEXT    NOT NULL,
+    remotePath TEXT    NOT NULL,
+    etag       TEXT,
+    etagWeak   INTEGER NOT NULL DEFAULT 0,
+    checksum   TEXT,
+    seenAt     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (accountId, fileKey)
+);
+
+ALTER TABLE syncCursor ADD COLUMN refusedUntil INTEGER NOT NULL DEFAULT 0;

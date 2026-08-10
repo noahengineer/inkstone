@@ -82,7 +82,95 @@ public class SyncEngine(
         notes.setSyncState(noteId, NoteSyncState.LOCAL_ONLY, null)
     }
 
+    /**
+     * ⭐ Sign-out's local half: stop syncing every note on [accountId] **without forgetting
+     * where any of them lives.**
+     *
+     * This is [unbind] for a whole account minus the one destructive part — the binding rows
+     * survive. That difference is the whole of what makes signing back in one tap instead of
+     * re-binding a library by hand (see [AccountState.SIGNED_OUT]).
+     *
+     * What it does drop is the **outbox rows**, and that is not optional. M5 found this on a
+     * device: signing out left the rows behind, so the notes read `PENDING_UPLOAD` forever,
+     * `attempts` never incremented, and the drain worker returned success on every pass —
+     * a permanent, silent stall. Deleting the bindings was M5's fix for it, and it worked, but
+     * it treated the symptom: the real problem was that work stayed queued for an account
+     * that could no longer send it.
+     *
+     * @return how many notes were paused.
+     */
+    public suspend fun pauseAccount(accountId: String): Int {
+        val paused = bindings.forAccount(accountId)
+        for (binding in paused) {
+            for (opType in OutboxOpType.entries) outbox.remove(binding.noteId, opType)
+            // PAUSED, not LOCAL_ONLY: the binding is still there, so this note is not "never
+            // bound" — it is bound and dormant. Calling it LOCAL_ONLY would hide the sync badge
+            // on a note that is sitting on the server right now.
+            notes.setSyncState(binding.noteId, NoteSyncState.PAUSED, null)
+        }
+        return paused.size
+    }
+
+    /**
+     * ⭐ Signing in again to an account whose notes were paused by [pauseAccount].
+     *
+     * Every retained binding becomes live again. The stored `lastSyncedEtag` and `oc:id` are
+     * still valid — signing out did not touch the remote files — so a note that has not
+     * changed since it was last uploaded needs **no request at all**, and one that has
+     * changed re-uploads conditionally with `If-Match` rather than blindly (CLAUDE.md rule 1).
+     *
+     * That distinction is why this compares revisions rather than simply re-enqueuing
+     * everything: a library of 200 synced notes should cost zero uploads to come back to, not
+     * 200.
+     *
+     * @return how many notes actually owe the server an upload.
+     */
+    public suspend fun resumeAccount(accountId: String): Int {
+        val resumed = bindings.forAccount(accountId)
+        var owing = 0
+        val now = clock.nowEpochMillis()
+        for (binding in resumed) {
+            val localRev = notes.localRev(binding.noteId)
+            when {
+                // The note itself is gone — a binding the trash cascade left behind. Nothing to
+                // resume, and the drainer drops the row if one ever appears for it.
+                localRev == null -> Unit
+
+                // Unchanged since the last upload, and the remote copy was never touched, so
+                // this note is already in sync and costs no request to come back to.
+                localRev <= binding.lastSyncedRev -> notes.setSyncState(binding.noteId, NoteSyncState.SYNCED, null)
+
+                else -> {
+                    enqueue(binding.noteId, OutboxOpType.UPLOAD, localRev, binding.everUploaded, now)
+                    notes.setSyncState(binding.noteId, NoteSyncState.PENDING_UPLOAD, null)
+                    owing++
+                }
+            }
+        }
+        if (owing > 0) scheduler.enqueueOutboxDrain()
+        return owing
+    }
+
+    /**
+     * Whether [accountId] can be sent to at all.
+     *
+     * Consulted before every enqueue below. An outbox row for an account that cannot send it
+     * is the stall described in [pauseAccount] — so rather than trusting callers to check,
+     * the enqueue paths refuse. A missing account is also false, which covers the window
+     * between a sign-out and whatever notices it.
+     */
+    private suspend fun canSend(accountId: String): Boolean = accounts.find(accountId)?.isUsable == true
+
     public suspend fun bindingOf(noteId: DocumentId): RemoteBinding? = bindings.find(noteId)
+
+    /**
+     * The account, for callers that need its `defaultFolder` to resolve where a note belongs.
+     *
+     * Read-only on purpose. The library needs to *ask* where notes go by default; changing it
+     * is [dev.inkstone.app.sync.NextcloudAccounts]' business, and routing a write through here
+     * would give the outbox's owner an opinion about account settings.
+     */
+    public suspend fun accountOf(accountId: String): SyncAccount? = accounts.find(accountId)
 
     // -----------------------------------------------------------------------
     // What the rest of the app reports
@@ -99,6 +187,10 @@ public class SyncEngine(
      */
     public suspend fun noteChanged(noteId: DocumentId) {
         val binding = bindings.find(noteId) ?: return
+        // A bound note on a signed-out or halted account is editable exactly as before — it
+        // simply owes nothing yet, because nothing can be sent. Queuing here is what stranded
+        // notes in M5: the row never drains and the worker reports success forever.
+        if (!canSend(binding.accountId)) return
         val localRev = notes.localRev(noteId) ?: return
         if (localRev <= binding.lastSyncedRev && outbox.pendingFor(noteId).isEmpty()) return
         enqueue(noteId, OutboxOpType.UPLOAD, localRev, binding.everUploaded, clock.nowEpochMillis())
@@ -121,6 +213,9 @@ public class SyncEngine(
     public suspend fun notePathChanged(noteId: DocumentId, title: String, remoteFolder: String? = null) {
         val binding = bindings.find(noteId) ?: return
         val account = accounts.find(binding.accountId) ?: return
+        // The rename still happens locally; it just does not queue a MOVE that cannot be sent.
+        // Resuming re-derives the path from the note's current title, so nothing is lost.
+        if (!account.isUsable) return
         val folder = (remoteFolder ?: binding.remotePath.substringBeforeLast('/', "")).trim('/')
         val path = uniquePath(binding.accountId, folder, title, account, excluding = noteId)
         if (path == binding.remotePath && binding.movedFromPath == null) return
@@ -147,6 +242,10 @@ public class SyncEngine(
      */
     public suspend fun noteTrashed(noteId: DocumentId) {
         val binding = bindings.find(noteId) ?: return
+        // Trashing locally is unaffected. The remote DELETE is simply not owed to an account
+        // that cannot be reached — and enqueuing one would sit undrainable until sign-in, then
+        // delete a file the user may by then have decided to keep.
+        if (!canSend(binding.accountId)) return
         val localRev = notes.localRev(noteId) ?: binding.lastSyncedRev
         enqueue(noteId, OutboxOpType.DELETE, localRev, binding.everUploaded, clock.nowEpochMillis())
         scheduler.enqueueOutboxDrain()
@@ -182,7 +281,154 @@ public class SyncEngine(
         scheduler.enqueueOutboxDrain()
     }
 
+    /**
+     * ⭐ **The remote file is gone, and this device did not delete it** (M6, SPEC §7.6 step 3's
+     * fourth branch).
+     *
+     * ⚠️ **Not [noteTrashed], and the difference is destructive.** `noteTrashed` enqueues a remote
+     * `DELETE`, and [OutboxCoalescing] makes a DELETE **annihilate the pending UPLOAD** — which is
+     * correct when the user deletes a note and catastrophic here. SPEC §13.2 row 14's whole premise
+     * is a note with *local unsynced edits* whose remote copy was deleted from another device, and
+     * annihilating that UPLOAD destroys the only queued route those edits had to the server. The
+     * comments on that path all read correct while it happens.
+     *
+     * There is also nothing to delete: the file is already in Nextcloud's own trash, put there by
+     * whoever removed it. A DELETE would be a 404 at best.
+     *
+     * So: every queued row goes (a trashed note owes the server nothing), and the binding **stays**
+     * — with its remote identity cleared. Keeping the row is what makes a restore work: `restore`
+     * calls [noteRestored], which re-enqueues an UPLOAD as a *create*, and the note comes back on
+     * the server where it was. Clearing the identity is what makes that create legal
+     * (`If-None-Match: *` needs [RemoteBinding.everUploaded] to be false) and, just as importantly,
+     * is what stops the next reconcile pass concluding the same deletion all over again — the
+     * fourth branch requires `everUploaded`, and after this it is false.
+     *
+     * The local note itself is not touched here. Trashing it is `:app`'s, through
+     * `RemoteMergeGate.trashRemotelyDeleted` — 30-day retention, never a hard delete (rule 1).
+     */
+    public suspend fun noteDeletedRemotely(noteId: DocumentId) {
+        val binding = bindings.find(noteId) ?: return
+        for (opType in OutboxOpType.entries) outbox.remove(noteId, opType)
+        bindings.upsert(
+            binding.copy(
+                remoteOcId = null,
+                lastSyncedEtag = null,
+                lastChecksum = null,
+                lastUploadAtEpochMillis = 0L,
+                movedFromPath = null,
+            ),
+        )
+        notes.setSyncState(noteId, NoteSyncState.LOCAL_ONLY, null)
+    }
+
+    /**
+     * The reconciler saw a newer version of the remote file and merged it (M6).
+     *
+     * The one place `lastSyncedEtag` advances on the **pull** side, and it is separate from the
+     * drainer's write for a reason SPEC §7.6's decision table makes exact: whether
+     * [RemoteVersion.syncedRev] is set is the difference between *"the local note is now the
+     * server's superset and owes it an upload"* and *"the two agree"*. Passing the merged revision
+     * when the note is in fact ahead of the uploaded bytes is SPEC §7.6's mid-flight bug moved one
+     * layer up — the note would be marked as synced and its work would be invisible to sync
+     * forever.
+     *
+     * @param observed what the download reported. A null field means *"keep what is stored"* rather
+     *   than *"clear it"*: a reverse proxy that strips `OC-ETag` and `OC-FileId` must not be able to
+     *   erase identity we already have, and a server that publishes no `oc:checksums` must not be
+     *   able to disarm SPEC §7.3's weak-ETag fallback.
+     * @return the updated binding, or null when the note is not bound.
+     */
+    public suspend fun remoteAdvanced(noteId: DocumentId, observed: RemoteVersion): RemoteBinding? {
+        val binding = bindings.find(noteId) ?: return null
+        val updated = binding.copy(
+            remoteOcId = observed.ocId ?: binding.remoteOcId,
+            lastSyncedEtag = observed.etag ?: binding.lastSyncedEtag,
+            lastSyncedRev = observed.syncedRev ?: binding.lastSyncedRev,
+            lastChecksum = observed.checksum ?: binding.lastChecksum,
+        )
+        bindings.upsert(updated)
+        unparkUpload(noteId)
+        return updated
+    }
+
+    /**
+     * ⭐ **A pulled note is bound where it already is, and owes the server nothing.**
+     *
+     * *Added while writing SPEC §13.2's matrix, which found the alternative.* [bind] is *"the user
+     * asked to save this note to Nextcloud"* and therefore always enqueues MKCOL then UPLOAD. Using
+     * it for a note the reconciler has just **downloaded** produces a binding with no ETag and no
+     * `oc:id` — so [RemoteBinding.everUploaded] is false, so the drainer's very next PUT sends
+     * `If-None-Match: *` at the file it was created from, gets a **permanent 412**, parks the row
+     * for a day and flags the note `CONFLICTED`. A note that has just arrived, byte-identical to
+     * the server's copy, reads as a conflict; and because a park is inherited by coalescing, the
+     * next real edit to that note never uploads either.
+     *
+     * So this is the pull-side sibling of [bind]: same binding row, filled in with the version that
+     * was actually downloaded, and **no outbox row at all**. Nothing is owed, because the bytes came
+     * from the server.
+     *
+     * `lastUploadAtEpochMillis` is stamped even though nothing was uploaded, and the column's real
+     * meaning is why: it is *"we have confirmed this note's file exists on the server"* (see
+     * [RemoteBinding.everUploaded], which exists because a proxy can strip both validators from a
+     * successful PUT). A download confirms that at least as well as an upload does. The side effect
+     * is that the note's first *outgoing* upload waits out SPEC §7.6's 30 s floor, which is correct
+     * rather than merely harmless — it has just been written to by another device.
+     *
+     * @param localRev the revision the installed note is at, which becomes `lastSyncedRev`. Without
+     *   it the binding claims revision 0, the next pass reads the note as ahead of the server, and
+     *   an upload of bytes the server already has is enqueued on every poll.
+     * @return the binding, or null when the account is unknown.
+     */
+    public suspend fun bindPulled(
+        noteId: DocumentId,
+        accountId: String,
+        remotePath: String,
+        observed: RemoteVersion,
+        localRev: Long,
+    ): RemoteBinding? {
+        accounts.find(accountId) ?: return null
+        val binding = RemoteBinding(
+            noteId = noteId,
+            accountId = accountId,
+            remotePath = remotePath,
+            remoteOcId = observed.ocId,
+            lastSyncedEtag = observed.etag,
+            lastSyncedRev = localRev,
+            lastUploadAtEpochMillis = clock.nowEpochMillis(),
+            lastChecksum = observed.checksum,
+        )
+        bindings.upsert(binding)
+        notes.setSyncState(noteId, NoteSyncState.SYNCED, null)
+        return binding
+    }
+
     // -----------------------------------------------------------------------
+
+    /**
+     * ⚠️ A 412 parks the UPLOAD for a day. **A completed merge is what un-parks it.**
+     *
+     * SPEC §7.7 rule 3 parks a conflicted note's row rather than retrying it, which is right: the
+     * PUT was writing over a version this device had not seen, and repeating it changes nothing.
+     * What changes it is a reconcile that downloads and merges that version — after which the same
+     * upload carries the union and will succeed. Leaving the park in place makes SPEC §7.6's
+     * 412 → reconcile → merge → re-upload cycle stop one step short of finishing, and the note then
+     * looks like it is syncing while the server never sees the merge.
+     *
+     * Coalescing cannot do this: [OutboxCoalescing] deliberately *inherits* `next_attempt_at`,
+     * because resetting it on every save is a hot retry loop against the user's server. The
+     * distinction is that a backoff is about the transport and a park is about a conflict, and only
+     * this method knows the conflict is resolved.
+     *
+     * `attempts` is carried over rather than cleared. If the row also has transport failures behind
+     * it, that history is still true — and this pass has just proved the server is reachable, so
+     * being due immediately is not a risk.
+     */
+    private suspend fun unparkUpload(noteId: DocumentId) {
+        val row = outbox.pendingFor(noteId).firstOrNull { it.opType == OutboxOpType.UPLOAD } ?: return
+        val now = clock.nowEpochMillis()
+        if (row.nextAttemptAt <= now) return
+        outbox.reschedule(noteId, OutboxOpType.UPLOAD, row.attempts, now)
+    }
 
     private suspend fun enqueue(
         noteId: DocumentId,
@@ -237,3 +483,19 @@ public class SyncEngine(
         const val MAX_SUFFIX = 1000
     }
 }
+
+/**
+ * What a pull learned about the remote file (SPEC §7.6 step 3) — [SyncEngine.remoteAdvanced]'s
+ * input.
+ *
+ * Every field is nullable and null means **"keep what is stored"**. That is not laziness: each one
+ * has a real way of arriving absent, and in every case the stored value is better than nothing.
+ *
+ * @property etag the ETag of the bytes actually received, off the GET response. A weak one is
+ *   stored *as weak* — [ETag.asIfMatch] then returns null and the upload falls back to comparing
+ *   checksums, which is what keeps SPEC §7.3's permanent-412 trap unrepresentable rather than
+ *   merely remembered.
+ * @property syncedRev the local revision the merge produced, and **only** when the local note is
+ *   not ahead of the remote bytes. See the KDoc above.
+ */
+public data class RemoteVersion(val etag: ETag?, val ocId: String?, val checksum: String?, val syncedRev: Long?)

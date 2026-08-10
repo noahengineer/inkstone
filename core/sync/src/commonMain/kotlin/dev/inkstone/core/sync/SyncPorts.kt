@@ -67,6 +67,37 @@ public enum class AccountState {
      * on the next launch; unusable for WebDAV until it is (SPEC §0.1 #3).
      */
     NEEDS_UID,
+
+    /**
+     * ⭐ **The user signed out. The credential is gone; everything else is remembered.**
+     *
+     * *Added in M6, because signing out was effectively irreversible.* Sign-out has to do
+     * two things — revoke the app password server-side (SPEC §7.1) and delete the local
+     * credential (SPEC §14) — and it used to do two more that nothing asked for: delete the
+     * account row, and unbind every note on it.
+     *
+     * The cost of those two landed entirely on the user. Signing back in meant re-typing a
+     * server URL on a tablet, and then re-binding **every note, one at a time, choosing its
+     * folder again** — because `remote_binding` is the only record of which note lives where,
+     * and it had been thrown away. For a library of any size that is not a sign-in, it is a
+     * migration.
+     *
+     * None of it was needed. A row holding a server URL, a login name, a uid, a default
+     * folder and a cached capabilities document contains nothing secret — SPEC §14 is
+     * specific that the *app password* is the thing that must be protected, and it is the one
+     * thing this state does not keep. And the bindings are pure local metadata about files
+     * that are still sitting on the server exactly where they were left.
+     *
+     * So the row stays, the bindings stay, and signing in again is one tap that resumes
+     * every note where it left off.
+     *
+     * **Unusable, like every other non-ACTIVE state** — [SyncAccount.isUsable] is false, so
+     * no request can be made with it and `NextcloudSession` cannot be built from it. What
+     * makes it different from [NEEDS_REAUTH] is whose decision it was: a reauth is the
+     * server refusing us and needs a warning, whereas this is the user doing what they asked
+     * for and needs no alarm at all.
+     */
+    SIGNED_OUT,
 }
 
 /**
@@ -146,6 +177,20 @@ public interface AccountStore {
     public suspend fun remove(accountId: String)
 }
 
+/**
+ * A binding this reconcile pass did not stamp — a **candidate** for SPEC §7.6 step 3's fourth
+ * branch, and never a conclusion.
+ *
+ * ⚠️ A pruned subtree leaves its bindings unstamped too, and so does one whose PROPFIND failed,
+ * and so does one the pass limit stopped short of. The caller must intersect these with the
+ * directories it actually *walked* before trashing anything. Trashing the list as it stands is
+ * the hundred-notes-in-the-trash bug `remoteBinding.lastSeenRemoteAt` exists to prevent.
+ *
+ * Two columns rather than the whole binding, so that reading one new field does not require a
+ * second representation of a row that already has one.
+ */
+public data class StaleBinding(val noteId: DocumentId, val remotePath: String)
+
 public interface BindingStore {
     public suspend fun find(noteId: DocumentId): RemoteBinding?
 
@@ -157,6 +202,47 @@ public interface BindingStore {
     public suspend fun upsert(binding: RemoteBinding)
 
     public suspend fun remove(noteId: DocumentId)
+
+    // The four below are M6's — SPEC §7.6 step 3 needs to look a binding up by things other than
+    // its note, and needs one field of it that [RemoteBinding] deliberately does not carry.
+
+    /**
+     * The note bound to a remote file, by `oc:id` — SPEC §7.6 step 3's match.
+     *
+     * No account argument: `oc:id` is `<padded-fileid><instanceid>` and therefore globally unique
+     * (SPEC §7.3), which is the whole reason this project stores it rather than `oc:fileid`.
+     *
+     * A list rather than one row, because SPEC §7.4's caveats include one `oc:id` presented at two
+     * paths — a file shared in twice — and throwing in the middle of a pass is worse than
+     * answering with both.
+     */
+    public suspend fun findByOcId(remoteOcId: String): List<RemoteBinding>
+
+    /**
+     * The secondary key SPEC §7.4 requires: a Nextcloud trash-restore **changes the fileid**, so a
+     * restored note cannot be found by `oc:id` at all and is re-bound by path (SPEC §7.6).
+     *
+     * Also what repairs a binding whose `remoteOcId` a reverse proxy stripped from the PUT
+     * response — otherwise the reconciler would meet its own note as a stranger's and adopt a
+     * second copy of it.
+     */
+    public suspend fun findByPath(accountId: String, remotePath: String): List<RemoteBinding>
+
+    /**
+     * Mark these notes as seen by the pass that started at [seenAtEpochMillis].
+     *
+     * One statement for the whole pass rather than one per note: which notes were found is only
+     * known at the end of the walk, and a 500-note library would otherwise be 500 round trips.
+     * Empty must be a no-op — `IN ()` is a SQL syntax error.
+     *
+     * ⚠️ Stamp with the value the pass **started** at, and read it back with the same value, so
+     * that [notSeenSince] is its exact complement. A second clock reading here puts a note stamped
+     * mid-pass on the wrong side of that comparison, and the wrong side is the trash.
+     */
+    public suspend fun stampSeen(noteIds: Collection<DocumentId>, seenAtEpochMillis: Long)
+
+    /** Candidates for the deletion branch — read [StaleBinding] before acting on one. */
+    public suspend fun notSeenSince(accountId: String, sinceEpochMillis: Long): List<StaleBinding>
 }
 
 /**

@@ -30,11 +30,17 @@ import dagger.hilt.android.AndroidEntryPoint
 import dev.inkstone.app.library.FolderCoverImage
 import dev.inkstone.app.library.LibraryActions
 import dev.inkstone.app.library.LibraryScreen
+import dev.inkstone.app.library.LibraryUiState
 import dev.inkstone.app.library.LibraryViewModel
 import dev.inkstone.app.library.TrashScreen
 import dev.inkstone.app.note.NoteActivity
+import dev.inkstone.app.sync.AttentionActions
+import dev.inkstone.app.sync.AttentionViewModel
+import dev.inkstone.app.sync.NeedsAttentionScreen
+import dev.inkstone.app.sync.PollTicker
 import dev.inkstone.app.sync.SyncActions
 import dev.inkstone.app.sync.SyncScreen
+import dev.inkstone.app.sync.SyncUiState
 import dev.inkstone.app.sync.SyncViewModel
 import dev.inkstone.app.ui.InkstoneTheme
 import dev.inkstone.core.model.Clock
@@ -69,6 +75,19 @@ class MainActivity : ComponentActivity() {
 
     private val library: LibraryViewModel by viewModels()
     private val sync: SyncViewModel by viewModels()
+
+    /** SPEC §7.7's list. A third screen, not a dialog — see [NeedsAttentionScreen]. */
+    private val attention: AttentionViewModel by viewModels()
+
+    /**
+     * SPEC §7.6's foreground poll (M6).
+     *
+     * Retained while this screen is started and released when it stops. WorkManager's periodic floor
+     * is fifteen minutes, so the background job cannot be what makes a peer's edit appear while
+     * somebody is looking at their library; this is.
+     */
+    @Inject
+    lateinit var poll: PollTicker
 
     /** For the trash screen's "N days left", which is display-only time (SPEC §4.1). */
     @Inject
@@ -109,6 +128,18 @@ class MainActivity : ComponentActivity() {
         pickingCoverFor?.let { outState.putString(STATE_PICKING_COVER_FOR, it.value) }
     }
 
+    override fun onStart() {
+        super.onStart()
+        poll.retain()
+    }
+
+    override fun onStop() {
+        // Paired with `retain`, and counted rather than a plain stop: opening a note runs
+        // `NoteActivity.onStart` *before* this, so a boolean would leave the editor unpolled.
+        poll.release()
+        super.onStop()
+    }
+
     /**
      * Decode a picked image, downscale it, and hand the bytes to the library.
      *
@@ -134,15 +165,13 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun Content() {
-        val state by library.state.collectAsState()
-        val trash by library.trash.collectAsState()
+        val libraryState by library.state.collectAsState()
         val syncState by sync.state.collectAsState()
         val snackbars = remember { SnackbarHostState() }
-        var showingTrash by rememberSaveable { mutableStateOf(false) }
-        var showingSync by rememberSaveable { mutableStateOf(false) }
+        var showing by rememberSaveable { mutableStateOf(Showing.LIBRARY) }
 
-        LaunchedEffect(state.message) {
-            state.message?.let {
+        LaunchedEffect(libraryState.message) {
+            libraryState.message?.let {
                 snackbars.showSnackbar(it)
                 library.dismissMessage()
             }
@@ -162,35 +191,94 @@ class MainActivity : ComponentActivity() {
             modifier = Modifier.fillMaxSize(),
             snackbarHost = { SnackbarHost(snackbars) },
         ) { innerPadding ->
-            when {
-                showingTrash -> TrashScreen(
-                    state = trash,
-                    nowEpochMillis = clock.nowEpochMillis(),
-                    onRestoreNote = library::restoreNote,
-                    onRestoreFolder = library::restoreFolder,
-                    onBack = { showingTrash = false },
-                    modifier = Modifier.padding(innerPadding),
-                )
+            Screens(
+                padding = Modifier.padding(innerPadding),
+                showing = showing,
+                onShow = { showing = it },
+                libraryState = libraryState,
+                syncState = syncState,
+            )
+        }
+    }
 
-                showingSync -> SyncScreen(
-                    state = syncState,
-                    onBack = { showingSync = false },
-                    actions = syncActions(),
-                    modifier = Modifier.padding(innerPadding),
-                )
+    /**
+     * Which of the four screens is in front.
+     *
+     * ⭐ One value rather than three `Boolean`s (M6). Three independent flags describe eight states
+     * for four screens, and the `when` that reads them makes the extra four unreachable by *order* —
+     * so "show the trash" while the sync screen is up silently does nothing. It also means adding a
+     * fifth screen is one enum entry rather than a fourth flag and a fourth ordering decision.
+     *
+     * `rememberSaveable` keeps it across a rotation and across process death, which is why it is an
+     * enum and not a sealed class: an enum is `Serializable`, which Compose's default saver already
+     * accepts, so there is no custom `Saver` to keep in step with the cases.
+     */
+    private enum class Showing { LIBRARY, TRASH, SYNC, ATTENTION }
 
-                else -> LibraryScreen(
-                    state = state,
-                    modifier = Modifier.padding(innerPadding),
-                    actions = libraryActions(
-                        onOpenTrash = { showingTrash = true },
-                        onOpenSync = { noteId ->
-                            sync.open(noteId)
-                            showingSync = true
-                        },
-                    ),
-                )
-            }
+    /**
+     * The four screens, extracted so [Content] stays about *state* and this stays about *routing*.
+     *
+     * @param padding the `Scaffold`'s inner padding, already wrapped, because every arm applies it
+     *   and passing the raw values would let one of them forget.
+     */
+    @Composable
+    private fun Screens(
+        padding: Modifier,
+        showing: Showing,
+        onShow: (Showing) -> Unit,
+        libraryState: LibraryUiState,
+        syncState: SyncUiState,
+    ) {
+        // Collected here rather than in [Content] because only one arm of the `when` reads either,
+        // so a screen the user is not on costs no subscription.
+        val trash by library.trash.collectAsState()
+        val attentionState by attention.state.collectAsState()
+
+        when (showing) {
+            Showing.TRASH -> TrashScreen(
+                state = trash,
+                nowEpochMillis = clock.nowEpochMillis(),
+                onRestoreNote = library::restoreNote,
+                onRestoreFolder = library::restoreFolder,
+                onBack = { onShow(Showing.LIBRARY) },
+                modifier = padding,
+            )
+
+            Showing.SYNC -> SyncScreen(
+                state = syncState,
+                onBack = { onShow(Showing.LIBRARY) },
+                actions = syncActions(),
+                modifier = padding,
+            )
+
+            // SPEC §7.7's list, and CLAUDE.md rule 6's whole point: a *screen*, reached
+            // deliberately, never a dialog raised over whatever the user was doing.
+            Showing.ATTENTION -> NeedsAttentionScreen(
+                state = attentionState,
+                actions = AttentionActions(
+                    onAcknowledge = attention::acknowledge,
+                    onOpenNote = ::openNote,
+                    onBack = { onShow(Showing.LIBRARY) },
+                ),
+                modifier = padding,
+            )
+
+            Showing.LIBRARY -> LibraryScreen(
+                state = libraryState,
+                modifier = padding,
+                actions = libraryActions(
+                    onOpenTrash = { onShow(Showing.TRASH) },
+                    onOpenSync = { noteId ->
+                        sync.open(noteId)
+                        onShow(Showing.SYNC)
+                    },
+                    onOpenSyncForFolder = { folderId ->
+                        sync.openForFolder(folderId)
+                        onShow(Showing.SYNC)
+                    },
+                    onOpenAttention = { onShow(Showing.ATTENTION) },
+                ),
+            )
         }
     }
 
@@ -199,11 +287,15 @@ class MainActivity : ComponentActivity() {
         onStartLogin = sync::startLogin,
         onCancelLogin = sync::cancelLogin,
         onSignOut = sync::signOut,
+        onSignInAgain = sync::signInAgain,
+        onForgetAccount = sync::forgetAccount,
         onChooseAccount = sync::chooseAccount,
         onBrowseTo = sync::browseTo,
         onGoUp = sync::goUp,
         onCreateFolder = sync::createFolder,
+        onSetDefaultFolderHere = sync::setDefaultFolderHere,
         onBindHere = sync::bindHere,
+        onPinFolderHere = sync::pinFolderHere,
         onCancelBrowse = sync::cancelBrowse,
         onSyncNow = sync::syncNow,
     )
@@ -223,7 +315,13 @@ class MainActivity : ComponentActivity() {
             .onFailure { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
     }
 
-    private fun libraryActions(onOpenTrash: () -> Unit, onOpenSync: (DocumentId?) -> Unit) = LibraryActions(
+    private fun libraryActions(
+        onOpenTrash: () -> Unit,
+        onOpenSync: (DocumentId?) -> Unit,
+        onOpenSyncForFolder: (FolderId) -> Unit,
+        onOpenAttention: () -> Unit,
+    ) = LibraryActions(
+        onOpenAttention = onOpenAttention,
         onOpenNote = ::openNote,
         onOpenFolder = library::openFolder,
         onGoUp = { library.goUp() },
@@ -252,6 +350,7 @@ class MainActivity : ComponentActivity() {
         onDuplicate = library::duplicate,
         onOpenTrash = onOpenTrash,
         onSaveToNextcloud = { noteId -> onOpenSync(noteId) },
+        onSyncFolderToNextcloud = { folderId -> onOpenSyncForFolder(folderId) },
         onStopSyncing = sync::unbind,
         onOpenNextcloud = { onOpenSync(null) },
         onFillForMeasurement = library::fillForMeasurement,

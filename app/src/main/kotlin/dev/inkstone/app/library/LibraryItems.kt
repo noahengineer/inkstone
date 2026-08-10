@@ -32,6 +32,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.inkstone.core.model.Folder
@@ -62,6 +64,8 @@ fun NoteCard(
     actions: LibraryActions,
     onRename: () -> Unit,
     modifier: Modifier = Modifier,
+    /** SPEC §7.7 — this note has an open entry in the "Needs attention" list (M6). */
+    needsAttention: Boolean = false,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
     val thumbnail = rememberThumbnail(note, actions)
@@ -113,7 +117,7 @@ fun NoteCard(
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f),
             )
-            NoteRowControls(note, actions, menuOpen, { menuOpen = it }, onRename)
+            NoteRowControls(note, actions, menuOpen, { menuOpen = it }, onRename, needsAttention)
         }
     }
 }
@@ -127,6 +131,8 @@ fun NoteRow(
     actions: LibraryActions,
     onRename: () -> Unit,
     modifier: Modifier = Modifier,
+    /** SPEC §7.7 — this note has an open entry in the "Needs attention" list (M6). */
+    needsAttention: Boolean = false,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
 
@@ -156,7 +162,7 @@ fun NoteRow(
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-            NoteRowControls(note, actions, menuOpen, { menuOpen = it }, onRename)
+            NoteRowControls(note, actions, menuOpen, { menuOpen = it }, onRename, needsAttention)
         }
     }
 }
@@ -179,11 +185,22 @@ private fun NoteRowControls(
     menuOpen: Boolean,
     onMenuOpenChange: (Boolean) -> Unit,
     onRename: () -> Unit,
+    needsAttention: Boolean,
 ) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(CONTROL_GAP),
     ) {
+        // ⭐ SPEC §7.7's flag, beside the sync badge and deliberately not instead of it (M6). The
+        // two answer different questions — "is this on Nextcloud" and "did sync have to do something
+        // to it" — and a note can be perfectly synced *and* have a conflicted copy sitting next to
+        // it. Drawn from a set of ids the library already holds, so it costs no query per tile.
+        //
+        // Not a tap target, like the sync badge: the flag is information, and the list it refers to
+        // is one button away in the toolbar. Tapping a tile opens the note, which is what tapping a
+        // note should always do.
+        if (needsAttention) AttentionFlag()
+        SyncBadge(note.syncState)
         Box(
             modifier = Modifier
                 .size(CONTROL_SIZE)
@@ -279,6 +296,112 @@ private fun NoteMenu(
 }
 
 /**
+ * ⭐ Whether this note is on Nextcloud, at a glance (M6).
+ *
+ * The library previously said nothing at all about a note's sync state — you had to open the
+ * overflow menu and infer it from whether the item read "Save to Nextcloud…" or "Stop
+ * syncing". For an app whose whole premise is that notes live in your Nextcloud, "is this one
+ * actually up there?" is the first question a user has, and it had no answer.
+ *
+ * Drawn from [NoteSummary.syncState], which is already on the row — so this costs no query per
+ * tile, which is the constraint SPEC §5.7 exists to protect (a 500-note library at 60 fps).
+ *
+ * Glyphs rather than icons for the same reason the favourite star is one: an icon font
+ * dependency for six states is not worth the download, and these read correctly at tile size.
+ * Nothing here is a tap target — the state is information, and the actions are in the menu.
+ */
+@Composable
+private fun SyncBadge(state: NoteSyncState) {
+    // A note that was never bound is the ordinary case and gets no badge at all. Marking every
+    // local note would make the indicator noise rather than information.
+    if (state == NoteSyncState.LOCAL_ONLY) return
+
+    val (glyph, description, tint) = when (state) {
+        NoteSyncState.SYNCED -> Triple("☁", "Saved to Nextcloud", MaterialTheme.colorScheme.primary)
+
+        NoteSyncState.PENDING_UPLOAD -> Triple("↑", "Waiting to upload", MaterialTheme.colorScheme.onSurfaceVariant)
+
+        NoteSyncState.PENDING_DOWNLOAD -> Triple("↓", "Downloading changes", MaterialTheme.colorScheme.onSurfaceVariant)
+
+        // Not an error, and deliberately not red: SPEC §7.7 resolves conflicts automatically
+        // and non-destructively, so nothing has gone wrong and nothing is blocked. It is a
+        // "there is a second copy to look at when you feel like it" marker.
+        NoteSyncState.CONFLICTED -> Triple(
+            "⚑",
+            "Both versions kept — needs attention",
+            MaterialTheme.colorScheme.tertiary,
+        )
+
+        NoteSyncState.ERROR -> Triple("!", "The server refused this note", MaterialTheme.colorScheme.error)
+
+        NoteSyncState.NEEDS_REAUTH -> Triple("!", "Sign in again to resume syncing", MaterialTheme.colorScheme.error)
+
+        // Still on Nextcloud, just not being talked to. The same cloud as SYNCED, dimmed —
+        // "it is up there, nothing is happening right now" — rather than a different glyph,
+        // which would read as a different kind of thing.
+        NoteSyncState.PAUSED -> Triple(
+            "☁",
+            "Saved to Nextcloud — signed out",
+            MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        NoteSyncState.LOCAL_ONLY -> return
+    }
+
+    Box(
+        modifier = Modifier.size(BADGE_SIZE).semantics { contentDescription = description },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(glyph, style = MaterialTheme.typography.labelMedium, color = tint)
+    }
+}
+
+/**
+ * ⭐ SPEC §7.7 — this note has something in the "Needs attention" list (M6).
+ *
+ * The **tertiary** colour and not the error colour, deliberately, and this is the whole tone of
+ * M6's conflict story in one line: by the time this flag appears, the conflict has already been
+ * resolved and both versions have already been kept. Nothing is broken, nothing is blocked and
+ * nothing is waiting on the user. Drawing it in red would teach them to read a safe, automatic,
+ * non-destructive outcome as a failure — which is exactly the reflex CLAUDE.md rule 6 is trying to
+ * avoid by refusing to put a dialog here.
+ */
+@Composable
+private fun AttentionFlag() {
+    Box(
+        modifier = Modifier
+            .size(BADGE_SIZE)
+            .semantics { contentDescription = "Needs attention — both versions were kept" },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text("⚑", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.tertiary)
+    }
+}
+
+/**
+ * ⭐ The cloud on a folder that is pinned, or sits under one (M6).
+ *
+ * Deliberately the same glyph and colour as a synced note's, because it means the same thing to
+ * the person looking at it: *the things in here are in my Nextcloud*. A different mark would
+ * imply a different kind of state and invite the question of what the difference is.
+ *
+ * "Covered by a pin" rather than "pinned": a subfolder of a pinned folder syncs just as much as
+ * the folder that was pinned, and showing the cloud only on the one that happens to hold the
+ * mapping row would be describing the implementation rather than the outcome.
+ */
+@Composable
+private fun FolderSyncBadge() {
+    Box(
+        modifier = Modifier
+            .size(BADGE_SIZE)
+            .semantics { contentDescription = "Notes in this folder sync to Nextcloud" },
+        contentAlignment = Alignment.Center,
+    ) {
+        Text("☁", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.primary)
+    }
+}
+
+/**
  * What can be done to a folder from the library.
  *
  * A parameter object for the same reason [LibraryActions] is one: the card and the row take
@@ -291,6 +414,11 @@ data class FolderActions(
     val onMove: () -> Unit,
     val onStyle: () -> Unit,
     val onTrash: () -> Unit,
+    /**
+     * M6 — pin this folder to a path on the server, so everything in it (and in every folder
+     * beneath it) syncs there. SPEC §9's folder mirror.
+     */
+    val onSyncToFolder: () -> Unit,
 )
 
 @Composable
@@ -300,6 +428,8 @@ fun FolderCard(
     actions: FolderActions,
     modifier: Modifier = Modifier,
     cover: ImageBitmap? = null,
+    /** True when this folder is covered by a pin, so its notes sync (M6). */
+    synced: Boolean = false,
 ) {
     var menuOpen by remember { mutableStateOf(false) }
 
@@ -330,6 +460,7 @@ fun FolderCard(
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
+            if (synced) FolderSyncBadge()
             Box {
                 TextButton(onClick = { menuOpen = true }) { Text("⋯") }
                 FolderMenu(expanded = menuOpen, onDismiss = { menuOpen = false }, actions = actions)
@@ -339,7 +470,13 @@ fun FolderCard(
 }
 
 @Composable
-fun FolderRow(folder: Folder, actions: FolderActions, modifier: Modifier = Modifier, cover: ImageBitmap? = null) {
+fun FolderRow(
+    folder: Folder,
+    actions: FolderActions,
+    modifier: Modifier = Modifier,
+    cover: ImageBitmap? = null,
+    synced: Boolean = false,
+) {
     var menuOpen by remember { mutableStateOf(false) }
 
     Card(modifier = modifier.fillMaxWidth()) {
@@ -354,6 +491,7 @@ fun FolderRow(folder: Folder, actions: FolderActions, modifier: Modifier = Modif
                 modifier = Modifier.size(ROW_TILE_SIZE).clip(MaterialTheme.shapes.small),
             )
             Text(folder.name, style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+            if (synced) FolderSyncBadge()
             Box {
                 TextButton(onClick = { menuOpen = true }) { Text("⋯") }
                 FolderMenu(expanded = menuOpen, onDismiss = { menuOpen = false }, actions = actions)
@@ -376,6 +514,15 @@ private fun FolderMenu(expanded: Boolean, onDismiss: () -> Unit, actions: Folder
             text = { Text("Move to…") },
             onClick = {
                 actions.onMove()
+                onDismiss()
+            },
+        )
+        // SPEC §9's mirror. Worded as the outcome rather than as "pin" or "bind": what the
+        // user is choosing is where the notes in here end up.
+        DropdownMenuItem(
+            text = { Text("Always sync to…") },
+            onClick = {
+                actions.onSyncToFolder()
                 onDismiss()
             },
         )
@@ -417,9 +564,26 @@ private const val PAGE_ASPECT = 612f / 792f
 
 /**
  * The star and the overflow: square tap targets with nothing between them but [CONTROL_GAP].
+ *
+ * Tightened again in M6, after the sync badge made a row of three. 36 dp was already the
+ * smaller-than-default choice (a `TextButton` is wider still), but three of them plus gaps
+ * pushed the title's ellipsis in far enough to be reported as too spread out. 30 dp is still
+ * above the 24 dp Material calls the floor for a control with visible bounds, and the glyphs
+ * are centred in it so nothing looks cramped.
+ *
+ * The gap is **zero**: these are one group, and the visual separation comes from each glyph
+ * sitting in its own square rather than from space between the squares.
  */
-private val CONTROL_SIZE = 36.dp
-private val CONTROL_GAP = 2.dp
+private val CONTROL_SIZE = 30.dp
+private val CONTROL_GAP = 0.dp
+
+/**
+ * The sync badge is **not** a tap target, so it is not bound by a touch-target minimum.
+ *
+ * Sizing it like the star and the overflow spent 30 dp on something nobody can press, which is
+ * most of why the group read as spread out. It only has to be legible.
+ */
+private val BADGE_SIZE = 18.dp
 
 /** The folder's picture in the list layout. */
 private val ROW_TILE_SIZE = 44.dp

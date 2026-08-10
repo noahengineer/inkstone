@@ -25,6 +25,7 @@ import dev.inkstone.core.model.TextBoxObject
 import dev.inkstone.core.model.Undo
 import dev.inkstone.core.model.UndoEntry
 import dev.inkstone.core.model.UndoStack
+import kotlinx.serialization.json.JsonElement
 
 /**
  * An editing session over one note: ops in, journal out, pages folded on demand.
@@ -110,29 +111,94 @@ public class NoteSession(
     public fun nextOpId(): String = ids.newOpId()
 
     /**
-     * Apply a gesture's ops to [pageId] and record it as one undo entry.
+     * Apply a **local gesture's** ops to [pageId] and record it as one undo entry.
      *
      * The inverse is computed here, before the ops apply, because that is the only
      * moment the previous absolute values are in hand (SPEC §4.6). Doing it later would
      * mean re-folding the page.
      *
-     * @param undoable false for an edit that must not enter the undo stack — a remote op
-     *   (SPEC §4.6: *"an incoming remote op does not enter your undo stack"*), or a
-     *   replay of an op already on the stack.
+     * ⭐ **There is deliberately no `undoable` flag** — see [merge]. This used to be
+     * `apply(pageId, ops, undoable: Boolean = true)`, and the default was the dangerous
+     * one: a caller that meant to ingest a peer's ops and forgot the third argument put
+     * a collaborator's strokes on the *local* undo stack, [flush] persisted that to
+     * `undo.json`, and the user's next two-finger tap deleted work they had never made —
+     * durably, surviving a restart. SPEC §7.7 and §4.6 both forbid it, and nothing in
+     * `UndoStack` could enforce it because it was a property of the call site alone.
+     *
+     * Three named methods replace the flag, so "forgot an argument" is no longer a
+     * reachable state: [apply] for a local gesture, [replay] for an op that must not be
+     * recorded again, [merge] for anything from a peer.
      */
-    public suspend fun apply(pageId: PageId, ops: List<PageOp>, undoable: Boolean = true): FoldOutcome {
+    public suspend fun apply(pageId: PageId, ops: List<PageOp>): FoldOutcome {
         if (ops.isEmpty()) return FoldOutcome.APPENDED
         val log = pageLog(pageId)
-        val before = log.state
-        val inverse = if (undoable) Undo.inverseOf(ops, before, ::nextOpId, ::nextClock) else emptyList()
+        val inverse = Undo.inverseOf(ops, log.state, ::nextOpId, ::nextClock)
+        val outcome = absorb(log, pageId, ops)
+        undoStack.commit(UndoEntry(ops, inverse))
+        return outcome
+    }
 
+    /**
+     * Apply ops that must **not** produce a new undo entry, but are this device's own.
+     *
+     * Undo and redo (their inverses are already on the stack — SPEC §4.6: undo is *"a new
+     * op appended to the log, never a pop"*), a page duplication, and fixture seeding.
+     *
+     * **Not for remote ops.** It does not subtract by `opId`, so re-applying a peer's log
+     * would grow this note's journal by the whole of it every pull. Use [merge].
+     */
+    public suspend fun replay(pageId: PageId, ops: List<PageOp>): FoldOutcome {
+        if (ops.isEmpty()) return FoldOutcome.APPENDED
+        return absorb(pageLog(pageId), pageId, ops)
+    }
+
+    /**
+     * ⭐ **Ingest a peer's ops (SPEC §7.7 layer 1). The only door remote work comes through.**
+     *
+     * Three things distinguish this from [apply], and each is a rule from a different
+     * section of SPEC:
+     *
+     * 1. **Nothing reaches the undo stack.** SPEC §4.6: *"an incoming remote op does not
+     *    enter your undo stack, and undoing does not undo someone else's work."*
+     * 2. **Ops already in this page's log are subtracted by `opId`.** A pull delivers the
+     *    peer's *whole* page log, most of which is this device's own ops coming back. The
+     *    fold would survive the duplicates — every op is an absolute register and
+     *    `AddObject` is first-write-wins per `ObjectId`, so state is unaffected — but the
+     *    journal would grow by the size of the note on every poll, forever.
+     * 3. **The returned [FoldOutcome] is the caller's business.** `REFOLDED` means an op
+     *    sorted before state already applied and the page was re-derived from scratch
+     *    (CLAUDE.md rule 9 — never patch in place); `SNAPSHOT_STALE` additionally means the
+     *    compaction snapshot was not a valid base and has been discarded (SPEC §4.7). A
+     *    caller that folded a union itself and assigned the result would bypass both
+     *    signals, and SPEC §13.2 row 8 would fail in a way no local test reproduces.
+     *
+     * @return the worst outcome across [remoteOps], or [FoldOutcome.APPENDED] when every op
+     *   was already known.
+     */
+    public suspend fun merge(pageId: PageId, remoteOps: List<PageOp>): FoldOutcome {
+        if (remoteOps.isEmpty()) return FoldOutcome.APPENDED
+        val log = pageLog(pageId)
+        val known = log.ops.mapTo(HashSet()) { it.opId }
+        val novel = remoteOps.filterNot { it.opId in known }
+        if (novel.isEmpty()) return FoldOutcome.APPENDED
+        return absorb(log, pageId, novel)
+    }
+
+    /**
+     * The half [apply], [replay] and [merge] share: fold, journal, observe, and honour
+     * CLAUDE.md rule 9's snapshot signal.
+     *
+     * `clocks.observe` per op is not optional. A path that wrote ops straight to the
+     * journal without it would leave this device's counter behind the peer's, and then
+     * *every subsequent local op* would sort behind the peer's history and lose every
+     * conflict it took part in — silently, with all ops present (SPEC §4.1's `max + 1`).
+     */
+    private suspend fun absorb(log: PageLog, pageId: PageId, ops: List<PageOp>): FoldOutcome {
         val outcome = log.applyAll(ops)
         for (op in ops) {
             clocks.observe(op.clock)
             pending += PendingOp(op, pageId)
         }
-        if (undoable) undoStack.commit(UndoEntry(ops, inverse))
-
         if (log.snapshotStale) {
             // SPEC §4.7 — the snapshot is a cache, and an op older than it has arrived.
             store.discardSnapshot(document.id)
@@ -140,18 +206,21 @@ public class NoteSession(
         return outcome
     }
 
+    /** Every `opId` already in [pageId]'s log — what [merge] subtracts against. */
+    public suspend fun opIdsOn(pageId: PageId): Set<String> = pageLog(pageId).ops.mapTo(HashSet()) { it.opId }
+
     /** SPEC §4.6 — appends the inverse ops. Never pops, and never enters the stack again. */
     public suspend fun undo(pageId: PageId): Boolean {
         val ops = undoStack.undo(::nextOpId, ::nextClock)
         if (ops.isEmpty()) return false
-        apply(pageId, ops, undoable = false)
+        replay(pageId, ops)
         return true
     }
 
     public suspend fun redo(pageId: PageId): Boolean {
         val ops = undoStack.redo(::nextOpId, ::nextClock)
         if (ops.isEmpty()) return false
-        apply(pageId, ops, undoable = false)
+        replay(pageId, ops)
         return true
     }
 
@@ -241,6 +310,17 @@ public class NoteSession(
         return true
     }
 
+    /**
+     * Un-delete a page. **Local only — a restore does not reach the other device.**
+     *
+     * Clearing the flag in place is not the reason, and neither would a fresh [PageRef] be a fix:
+     * `PageOrder.reconcile` ORs the two `deleted` flags unconditionally, so once a peer holds the
+     * tombstone the peer keeps it and the next merge in the other direction re-deletes the page
+     * here. Ordering a delete against a restore needs a Lamport register on `deleted` (CLAUDE.md
+     * rule 8), which is a manifest change inside `pages[]` — see `PageOrder.mergePageOrder` and
+     * SPEC §4.3. Nothing is at risk in the meantime: the page's whole op log survives under the
+     * tombstone (CLAUDE.md rule 1), so restoring again works, and works until the next sync.
+     */
     public fun restorePage(pageId: PageId): Boolean {
         val ref = document.page(pageId) ?: return false
         if (!ref.deleted) return false
@@ -287,14 +367,72 @@ public class NoteSession(
                 obj = obj.withRegisters().withNewId(ids.newObjectId()),
             )
         }
-        apply(copyId, ops, undoable = false)
+        replay(copyId, ops)
         return copyId
     }
 
+    /**
+     * Rename the note, stamping the LWW clock SPEC §7.7 layer 2 resolves with.
+     *
+     * The clock is what makes "the title is LWW" mean anything across two devices — see
+     * [dev.inkstone.core.model.Document.titleClock]. Taking one from [nextClock] costs a
+     * counter increment and puts the rename in the same total order as every other edit,
+     * which is the only ordering this project trusts (SPEC §4.1).
+     */
     public fun rename(title: String) {
         if (title == document.title) return
-        document = document.copy(title = title)
+        document = document.copy(title = title, titleClock = nextClock())
         documentDirty = true
+    }
+
+    /**
+     * SPEC §7.7 layer 2 — merge a peer's document metadata into this one.
+     *
+     * ⚠️ **Call this BEFORE merging any page's ops, and this is the single worst failure
+     * mode available in this class.** [merge] will happily accept ops for a page the
+     * document has never heard of: [pageLog] falls through to `store.loadPage`, which
+     * answers with defaults for an unknown page, and the ops are journaled. Then
+     * `BundleWriter.write` iterates `document.pages` and skips any page not in it, and
+     * `NoteStore.materialize` resets the journal immediately afterwards. A remote page's
+     * ops journaled without its `PageRef` in [document] are therefore **destroyed,
+     * permanently, with no error** — and the result is a valid PDF with the right page
+     * count and a missing page.
+     *
+     * What is taken from [remote] is deliberately only two things:
+     *
+     * - **Page order**, through [PageOrder.mergePageOrder] then [PageOrder.repair]. Union,
+     *   never replacement (SPEC §4.3: *"any page not present in a merged order is appended
+     *   at the end, never dropped"*). `repair` is not optional: `mergePageOrder` does not
+     *   validate a key's well-formedness, so a malformed `sortKey` from a peer's file
+     *   survives the merge and only surfaces later at `keyForInsert`, which silently appends
+     *   at the end instead of inserting where the user asked.
+     * - **Title and its clock**, resolved by [Document.resolveTitle] — and the peer's clock is
+     *   *observed* whether or not it won, exactly as an absorbed op's is.
+     *
+     * Everything else stays local. In particular **`localRev` is never adopted** — see its
+     * KDoc; a peer's higher revision jumps this device's counter past what the outbox
+     * recorded and makes the merged work invisible to sync forever.
+     *
+     * @return true when the local title lost to the remote's, so the caller can record the
+     *   override for SPEC §7.7's *"Needs attention"* list rather than discarding it silently.
+     */
+    public fun mergeDocument(remote: Document): Boolean {
+        // ⭐ A peer's rename is a clock this device has now seen, so it is folded into the generator
+        // like any absorbed op's (see [absorb]) — **whether or not it won**. Without this the next
+        // rename made here is issued *behind* the peer's, the two clocks come out with equal
+        // counters, and which title survives is then settled by a lexicographic comparison of two
+        // UUIDv7 device ids: on the losing half of that coin flip the user's rename shows locally,
+        // is refused by the peer, and is reverted on the next pull. No error, every op present.
+        remote.titleClock?.let(clocks::observe)
+        val (title, titleClock) = document.resolveTitle(remote.title, remote.titleClock)
+        val titleOverridden = title != document.title
+        document = document.copy(
+            title = title,
+            titleClock = titleClock,
+            pages = PageOrder.repair(PageOrder.mergePageOrder(document.pages, remote.pages)),
+        )
+        documentDirty = true
+        return titleOverridden
     }
 
     // -----------------------------------------------------------------------
@@ -339,7 +477,10 @@ public class NoteSession(
      * would drop the pages nobody happened to look at. Pages that were never folded are
      * copied straight from the old bundle, which costs one read and no fold.
      */
-    public suspend fun materialize() {
+    public suspend fun materialize(
+        extraCarried: Map<String, ByteArray> = emptyMap(),
+        extraCarriedManifest: Map<String, JsonElement> = emptyMap(),
+    ) {
         flush()
         // Everything just flushed is on disk and *not* in the in-memory view of the journal,
         // and most pages of a large note are not in the cache either. Without this re-read,
@@ -359,7 +500,7 @@ public class NoteSession(
                 PageContents(loaded.size, loaded.background, loaded.ops)
             }
         }
-        note = store.materialize(note.copy(document = document), pages)
+        note = store.materialize(note.copy(document = document), pages, extraCarried, extraCarriedManifest)
         document = note.document
         journalBytes = note.journalBytes
         // The cached logs' ops are now in the bundle; keeping them would double-count
@@ -367,11 +508,26 @@ public class NoteSession(
         cache.clear()
     }
 
-    /** Materialize, assert SPEC §5.1's staleness invariant, and compact if it is due. */
-    public suspend fun close(syncState: NoteSyncState = NoteSyncState.LOCAL_ONLY) {
+    /**
+     * Materialize, assert SPEC §5.1's staleness invariant, and compact if it is due.
+     *
+     * ⚠️ **[syncState] has no default, deliberately.** It used to default to `LOCAL_ONLY`,
+     * and every caller took the default — so `Compaction.isAllowed`'s first and most
+     * important refusal was dead code in production: a `CONFLICTED` or `PENDING_UPLOAD`
+     * note was compacted as though it were a note the server had never heard of, which is
+     * exactly the case SPEC §4.7 wrote that check to prevent. Passing the note's real state
+     * is not something a call site can now forget to do.
+     */
+    public suspend fun close(syncState: NoteSyncState) {
         materialize()
         store.assertNotStale(document.id)
-        compactIfDue(syncState)
+        // Null, said out loud. A session cannot know what a peer has acked — that lives in
+        // the `peerClock` table behind `:app`'s `LibraryUpdates` — so this path is SPEC
+        // §4.7's 30-day horizon and nothing else. Which is the correct conservative answer
+        // for a single-device install, and *not* the correct one for the two-device case the
+        // horizon exists for: `NoteEditor.materializeNow` spells these three steps out
+        // instead of calling `close` precisely so it can supply the counter.
+        compactIfDue(syncState, oldestAckedCounter = null)
     }
 
     /**
@@ -379,13 +535,39 @@ public class NoteSession(
      *
      * Deliberately not called from [flush]. Compaction reads and folds a page's whole
      * log, which is not work to do on a two-second timer while someone is writing.
+     *
+     * ⚠️ **[oldestAckedCounter] has no default either, for the reason [close]'s
+     * [syncState] has none.** It defaulted to null until M6's review, which is the same
+     * trap one parameter to the right: every caller took the default, so the
+     * causal-stability half of SPEC §4.7's gate was thirty days of wall clock and nothing
+     * else. Null remains the right *value* wherever no peer clock is known — it is only
+     * the silence about it that was wrong.
      */
-    public suspend fun compactIfDue(syncState: NoteSyncState, oldestAckedCounter: Long? = null) {
+    public suspend fun compactIfDue(syncState: NoteSyncState, oldestAckedCounter: Long?) {
+        // ⚠️ A snapshot is a cache **of the log** (SPEC §4.7: *"keep the raw log"*). Folding
+        // one over work that is still only in `pending` would produce a cache containing
+        // state the log does not — and then discarding it, which CLAUDE.md rule 9 requires
+        // the moment an op older than it arrives, would lose that work outright.
+        //
+        // `close()` materializes first so this never fires in production. It is here because
+        // a caller reaching `compactIfDue` directly is one refactor away, the cost of being
+        // wrong is silent data loss, and the check is one field read. Found by an assertion
+        // added to `a snapshot is discarded when an op older than it arrives` in M6.
+        if (hasUnflushedWork) return
         val allowed = Compaction.isAllowed(
             syncState = syncState,
             journalBytes = journalBytes,
             nowEpochMillis = clock.nowEpochMillis(),
-            oldestOpEpochMillis = document.createdEpochMillis,
+            // ⚠️ The oldest op *being folded*, not the document's creation date. Passing
+            // `createdEpochMillis` meant that on any note older than 30 days the
+            // causal-stability horizon passed for ops written seconds ago — which is the
+            // whole guard SPEC §4.7 describes, inverted, on precisely the long-lived
+            // notebooks it exists to protect.
+            //
+            // The last materialization is the honest floor: every op in the journal was
+            // written after it, and it is the only timestamp this session actually knows.
+            // Erring later means refusing to compact, which costs disk and never data.
+            oldestOpEpochMillis = document.modifiedEpochMillis,
             oldestAckedCounter = oldestAckedCounter,
             highestFoldedCounter = clocks.highestSeen,
         )

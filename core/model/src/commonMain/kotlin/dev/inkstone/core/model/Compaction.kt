@@ -107,4 +107,23 @@ public enum class NoteSyncState {
 
     /** A 401. The worker halted and did **not** retry (CLAUDE.md rule 5). */
     NEEDS_REAUTH,
+
+    /**
+     * ⭐ **Bound, but its account is signed out** (M6).
+     *
+     * The note is still linked to a remote file — the binding survives a sign-out so that
+     * signing back in resumes it — but nothing will be sent until the user returns.
+     *
+     * It exists because the alternative was to call this [LOCAL_ONLY], and that is a lie the
+     * user can see: `LOCAL_ONLY` means *"never bound to a server"*, so the library showed no
+     * sync badge at all on a note that is sitting on Nextcloud right now. "Is this one
+     * actually up there?" is the question the badge exists to answer, and answering it
+     * "no" for a note that is up there is worse than not having a badge.
+     *
+     * **Not compactable**, unlike `LOCAL_ONLY` and `SYNCED`. A paused note may hold edits the
+     * server has never seen, and folding those into a snapshot is precisely SPEC §4.7's
+     * *"compacting while your other tablet holds older ops offline leaves them nowhere to
+     * reintegrate"* — the other tablet here being the server itself.
+     */
+    PAUSED,
 }

@@ -17,16 +17,20 @@ import dev.inkstone.core.model.FolderTree
 import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.NoteSummary
+import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.model.RemoteName
 import dev.inkstone.core.model.foldPage
+import dev.inkstone.core.storage.DeviceIdentity
 import dev.inkstone.core.storage.NoteLayout
 import dev.inkstone.core.storage.NoteStore
 import dev.inkstone.core.storage.NoteTrash
 import dev.inkstone.core.storage.ThumbnailCache
 import dev.inkstone.core.storage.duplicateNote
+import dev.inkstone.core.sync.FolderBinding
 import dev.inkstone.core.sync.RemoteBinding
+import dev.inkstone.core.sync.SyncAccount
 import dev.inkstone.core.sync.SyncEngine
 import kotlinx.coroutines.flow.Flow
 import javax.inject.Inject
@@ -78,6 +82,11 @@ class LibraryRepository @Inject constructor(
      * on, and it is why binding a note does not block editing it.
      */
     private val sync: SyncEngine,
+    /**
+     * The three sync tables the library reads directly (M6). See [LibrarySyncTables] for why they
+     * arrive as one parameter and why they are the concrete stores rather than `:core:sync`'s ports.
+     */
+    private val tables: LibrarySyncTables,
 ) {
 
     private val ids = IdFactory(clock)
@@ -89,19 +98,31 @@ class LibraryRepository @Inject constructor(
     val trashedNotes: Flow<List<NoteSummary>> = index.trashedNotes()
     val trashedFolders: Flow<List<Folder>> = index.trashedFolders()
 
+    /** Which folders are pinned to a remote path — the library's cloud badge watches this (M6). */
+    val pinnedFolders: Flow<Set<FolderId>> = tables.folders.pinnedFolderIds()
+
+    /** Notes with an open "Needs attention" entry — the library's flag on a tile (SPEC §7.7). */
+    val notesNeedingAttention: Flow<Set<DocumentId>> = tables.attention.noteIdsNeedingAttention()
+
+    /** How many entries are open, for the toolbar. Zero hides the button entirely. */
+    val openAttentionCount: Flow<Long> = tables.attention.openCount()
+
     /**
      * A per-install device identity for the Lamport tiebreak (SPEC §4.1).
      *
-     * M2 took this from whichever note happened to create it, with a note that M5 would
-     * make it per-install. M3 has to fix it early: the library creates notes now, and a
-     * device that stamped a different id into every note it made would break ties
-     * differently per note — so two tablets could disagree about op order in one notebook
-     * and agree in the next.
+     * ⭐ **Actually per install since M6.** M2 took it from whichever note happened to
+     * create it; M3 replaced that with one id per *process*, documented as temporary and
+     * "enough for a device with one library". It was not enough: a device whose id changes
+     * on every restart breaks every tie differently across restarts, so two tablets can
+     * disagree about the order of the same two ops — and the disagreement is permanent,
+     * silent, and invisible to every JVM test.
      *
-     * Still not the M5 version (Keystore-backed, one per install). This is one per process,
-     * which is enough for a device with one library and is honest about being temporary.
+     * [DeviceIdentity] persists it beside `notes/`, so it survives a restart *and* the
+     * database being deleted and rebuilt (SPEC §13.1's disaster-recovery story).
      */
-    private val deviceId: String by lazy { ids.newDeviceId() }
+    private val deviceIdentity = DeviceIdentity(fs, ids)
+
+    private suspend fun deviceId(): String = deviceIdentity.get()
 
     // -----------------------------------------------------------------------
     // Startup
@@ -223,7 +244,7 @@ class LibraryRepository @Inject constructor(
     ): DocumentId {
         val note = store.create(
             title = title,
-            deviceId = deviceId,
+            deviceId = deviceId(),
             background = Background.Template(template),
         )
         val now = clock.nowEpochMillis()
@@ -238,6 +259,9 @@ class LibraryRepository @Inject constructor(
                 modifiedEpochMillis = now,
             ),
         )
+        // A new note in a pinned folder syncs without being asked (SPEC §9's mirror). Without
+        // this, a pin would only ever apply to notes that already existed when it was set.
+        autoBindIfPinned(note.document.id, folderId)
         return note.document.id
     }
 
@@ -257,7 +281,7 @@ class LibraryRepository @Inject constructor(
      * @return what the gateway decided, so the UI can warn if it has to.
      */
     suspend fun importPdf(bytes: ByteArray, title: String, folderId: FolderId? = null): PdfOpenResult {
-        val result = gateway.open(bytes = bytes, title = title.trim().ifEmpty { UNTITLED }, deviceId = deviceId)
+        val result = gateway.open(bytes = bytes, title = title.trim().ifEmpty { UNTITLED }, deviceId = deviceId())
         if (result !is PdfOpenResult.Opened) return result
 
         val document = result.note.document
@@ -285,18 +309,75 @@ class LibraryRepository @Inject constructor(
         return result
     }
 
-    suspend fun renameNote(id: DocumentId, title: String) {
-        val legal = title.trim().ifEmpty { UNTITLED }
-        index.renameNote(id, legal, clock.nowEpochMillis())
+    /**
+     * ⭐ **The index and remote-path halves of a rename (SPEC §7.7 layer 2).**
+     *
+     * ⚠️ **Not the whole rename, and not an entry point.** The note's own `Document.title` and
+     * `Document.titleClock` are stamped first, in the note's single `NoteSession`, by
+     * `NoteSessionHost.renameNote` — which is what the library screen calls. This method *was* the
+     * whole rename (an `index.renameNote` and a `notePathChanged`), and that made SPEC §7.7 layer 2 a
+     * register with no writer: two devices renaming one note kept two titles indefinitely, with no
+     * clock to order them, no conflict, and each device MOVEing the server file back to its own name
+     * whenever anything made it re-derive the path.
+     *
+     * [localRev] is not decoration. `SyncEngine.noteChanged` compares the index's revision against
+     * `binding.lastSyncedRev` (SPEC §7.6), so a rename recorded without moving it is a change no
+     * upload is ever owed for — the title would sit in this device's bundle and reach no peer.
+     */
+    suspend fun noteRenamed(id: DocumentId, title: String, localRev: Long, pageCount: Int) {
+        val legal = legalTitle(title)
+        val now = clock.nowEpochMillis()
+        index.renameNote(id, legal, now)
+        index.recordSave(id, localRev, pageCount, now)
         // The remote file is named after the note, so a rename is a remote MOVE — which
         // SPEC §7.6 drains before that note's UPLOAD, so the bytes never land at the old
         // path and get shuffled afterwards. A no-op for an unbound note, which is most.
         sync.notePathChanged(id, legal)
+        // And the bundle itself changed, because the title and its clock are inside it. Unlike a
+        // pull, this *is* local novelty, so an upload is genuinely owed (SPEC §7.6's table).
+        sync.noteChanged(id)
     }
 
+    /**
+     * A note title as the index will store it: trimmed, never empty.
+     *
+     * Public because the note's own title register is stamped before this class sees the rename
+     * (`NoteSessionHost.renameNote`), and the two strings have to be identical — a document holding
+     * `"   "` beside a row saying "Untitled" is a note whose peer learns a name the library never
+     * shows, and neither side would look wrong on its own.
+     */
+    fun legalTitle(title: String): String = title.trim().ifEmpty { UNTITLED }
+
+    /**
+     * Move notes between library folders — and, since M6, move their remote files with them.
+     *
+     * `docs/M5-NEXTCLOUD.md` recorded the old behaviour as a deliberate gap: *"Moving a note
+     * between library folders does **not** move the remote file."* That was defensible while the
+     * remote folder was whatever the user picked once per note, and stops being defensible the
+     * moment a library folder can be pinned to a remote path — because then the library
+     * hierarchy genuinely does describe where things live on the server, and a note that moved
+     * here but not there is the mirror silently out of step.
+     *
+     * A note whose resolved path does not change (an unpinned library, or a move within one
+     * pinned subtree that maps to the same place) enqueues nothing: `notePathChanged` returns
+     * early when the path it computes matches the binding.
+     */
     suspend fun moveNotes(ids: Collection<DocumentId>, folderId: FolderId?) {
         val now = clock.nowEpochMillis()
         for (id in ids) index.moveNote(id, folderId, now)
+        // Resolved after the index write, so the new folder is what the resolver walks.
+        for (id in ids) {
+            val binding = sync.bindingOf(id)
+            val note = index.note(id)
+            when {
+                // Already bound: follow the note to where the destination folder says it belongs.
+                binding != null && note != null ->
+                    sync.notePathChanged(id, note.title, resolveRemoteFolder(binding.accountId, folderId))
+
+                // Unbound, dragged into a pinned folder: that folder's rule now covers it.
+                else -> autoBindIfPinned(id, folderId)
+            }
+        }
     }
 
     suspend fun setFavourite(id: DocumentId, favourite: Boolean) {
@@ -309,7 +390,7 @@ class LibraryRepository @Inject constructor(
         val copy = store.duplicateNote(
             sourceId = id,
             title = "${source.title} $COPY_SUFFIX",
-            deviceId = deviceId,
+            deviceId = deviceId(),
             ids = ids,
             clock = clock,
         ) ?: return null
@@ -439,7 +520,7 @@ class LibraryRepository @Inject constructor(
 
         val note = store.create(
             title = "$COVER_TITLE_PREFIX${folder.name}",
-            deviceId = deviceId,
+            deviceId = deviceId(),
             background = Background.Blank,
         )
         val now = clock.nowEpochMillis()
@@ -564,6 +645,16 @@ class LibraryRepository @Inject constructor(
         sync.noteChanged(id)
     }
 
+    /**
+     * The note's standing with the server, for SPEC §4.7's compaction gate.
+     *
+     * `LOCAL_ONLY` for a note the index has never heard of, which is the conservative
+     * answer in the only direction that matters: it is a state compaction *permits*, and a
+     * note absent from the index has no binding, so it genuinely has no ops the server is
+     * waiting for.
+     */
+    suspend fun syncStateOf(id: DocumentId): NoteSyncState = index.note(id)?.syncState ?: NoteSyncState.LOCAL_ONLY
+
     /** The note closed and its bundle was rewritten (SPEC §5.1). Redraw the library's picture. */
     suspend fun noteMaterialized(id: DocumentId, localRev: Long, pageCount: Int, cover: FoldedPage) {
         index.recordSave(id, localRev, pageCount, clock.nowEpochMillis())
@@ -586,6 +677,133 @@ class LibraryRepository @Inject constructor(
     }
 
     // -----------------------------------------------------------------------
+    // What the reconciler reports back (SPEC §7.6's pull side, M6)
+    // -----------------------------------------------------------------------
+
+    /**
+     * ⭐ A peer's edits were merged into a note this device already had (SPEC §7.6 step 3).
+     *
+     * ⚠️ **Deliberately not [noteSaved].** The obvious wiring — reporting a merge through the
+     * ordinary save path — ends in `sync.noteChanged(id)`, which enqueues an UPLOAD
+     * unconditionally. That changes the remote ETag, the peer sees a remote change on its next
+     * poll, merges nothing novel, and uploads back. Forever, at the poll interval, looking
+     * exactly like healthy sync. Whether an upload is owed is `Reconciler.apply`'s decision
+     * table and nothing else's.
+     *
+     * ⚠️ **[Thumbnails.invalidate], never `ThumbnailCache.invalidate`.** The decoded-bitmap
+     * memory tier is swept only by the wrapper (see its KDoc), so calling the `:core` class
+     * alone leaves the pre-merge picture on screen for the life of the process — which for a
+     * merge is the one moment the library's picture is provably wrong.
+     *
+     * The invalidation is only honest because `localRev` moved: `recordSave` clears
+     * `thumbnailRev` in the same SQL statement, so there is no window in which a stale image
+     * looks fresh (SPEC §5.7).
+     *
+     * @param title ⭐ **SPEC §7.7 layer 2's reader, added after M6's review.** `recordSave` has no
+     *   title column, so a peer's rename used to land in the bundle and stop there: the tile kept
+     *   the old string for good, and the LWW title was a register with nothing reading it. This is
+     *   the **resolved** title — the local one when the local one won — so it can be written back
+     *   without asking who won. Empty is left alone; a bundle with no title is not an instruction to
+     *   blank the row.
+     *
+     *   ⚠️ **No `sync.notePathChanged` here.** The remote file is already at the peer's name (that is
+     *   how the rename arrived), the reconciler owns the binding's path, and asking the server to
+     *   repeat a move it has already made is a pull turning itself into a push.
+     */
+    suspend fun notePulled(id: DocumentId, localRev: Long, pageCount: Int, title: String) {
+        val now = clock.nowEpochMillis()
+        if (title.isNotEmpty() && index.note(id)?.title != title) index.renameNote(id, title, now)
+        index.recordSave(id, localRev, pageCount, now)
+        thumbnails.invalidate(id)
+    }
+
+    /**
+     * ⭐ A note the reconciler created: a peer's note this device had never held, or SPEC §7.7
+     * layer 3's conflicted copy.
+     *
+     * Inserted if the index has never heard of it and refreshed if it has — an unbound note
+     * whose remote file reappeared is the same note, and a second row for it would be a
+     * duplicate the user has to reconcile by hand.
+     */
+    suspend fun noteInstalled(id: DocumentId, title: String, folderId: FolderId?, localRev: Long, pageCount: Int) {
+        val now = clock.nowEpochMillis()
+        val existing = index.note(id)
+        if (existing == null) {
+            index.insertNote(
+                NoteSummary(
+                    id = id,
+                    title = title.ifEmpty { UNTITLED },
+                    folderId = folderId,
+                    pageCount = pageCount,
+                    localRev = localRev,
+                    createdEpochMillis = now,
+                    modifiedEpochMillis = now,
+                ),
+            )
+        } else {
+            index.recordSave(id, localRev, pageCount, now)
+        }
+        thumbnails.invalidate(id)
+    }
+
+    /**
+     * ⚠️ **SPEC §7.6 step 3, fourth branch — the remote file is gone. Local trash, never a
+     * delete** (CLAUDE.md rule 1).
+     *
+     * Files first, then rows, for the reason the class KDoc gives. Thirty days of retention and
+     * one tap to restore, because "somebody deleted it on the server" and "the user wants it
+     * gone" are different statements and only one of them was made here.
+     *
+     * ⚠️ **Not [trashNotes].** That calls `sync.noteTrashed`, which enqueues a remote DELETE and
+     * *annihilates the pending UPLOAD* — and row 14's whole premise is a note with local edits
+     * still queued, so that would destroy the only route those edits had to the server, through
+     * a code path whose own comments read correct. The pull-side equivalent is
+     * `SyncEngine.noteDeletedRemotely`, and the **reconciler** calls it, along with writing the
+     * attention row: this method is only the local half.
+     *
+     * ⚠️ The reconciler's `reason` string is deliberately **not** carried into the index's
+     * `lastError`. `SyncEngine.noteDeletedRemotely` runs immediately after this and sets
+     * `(LOCAL_ONLY, lastError = null)`, so anything stored here would be cleared microseconds later
+     * by code that reads as correct at both ends. The durable place for the reason is the
+     * `syncAttention` row — which is what SPEC §7.7's table exists for, and which the reconciler
+     * writes in the same breath.
+     */
+    suspend fun trashRemotelyDeleted(id: DocumentId) {
+        if (index.note(id) == null) return
+        val path = trash.trash(id)
+        index.trashNote(id, path, clock.nowEpochMillis())
+        thumbnails.invalidate(id)
+    }
+
+    /**
+     * The note's remote file moved into a directory mirroring a different library folder
+     * (ROADMAP M6's folder mirroring, pull half).
+     *
+     * The index only; no remote work. The file is already where the binding now says it is —
+     * that is what made this call happen — so enqueuing a MOVE would be this device asking the
+     * server to repeat something it has already done.
+     */
+    suspend fun noteFolderChanged(id: DocumentId, folderId: FolderId) {
+        val note = index.note(id) ?: return
+        if (note.folderId == folderId) return
+        index.moveNote(id, folderId, clock.nowEpochMillis())
+    }
+
+    /**
+     * SPEC §4.7's causal-stability horizon for one note: the lowest counter every known peer has
+     * acknowledged, or null when no peer is known.
+     *
+     * ⭐ **Wired for the first time in M6.** `Compaction.isAllowed`'s `oldestAckedCounter`
+     * parameter has existed since M2 and has always been passed null, so thirty days of wall
+     * clock was the only guard against compacting away ops a peer still needs to reintegrate.
+     * A downloaded bundle is the first thing that has ever known what a peer has seen.
+     *
+     * Null for a one-device setup, which is the value the parameter documents as *"nothing is
+     * known"* and the correct conservative answer: it leaves the horizon gate to the clock.
+     */
+    suspend fun oldestAckedCounter(id: DocumentId): Long? = tables.peers.oldestAckedCounter(id)
+
+    // -----------------------------------------------------------------------
     // Nextcloud (SPEC §7.6)
     // -----------------------------------------------------------------------
 
@@ -598,7 +816,171 @@ class LibraryRepository @Inject constructor(
      */
     suspend fun bindToNextcloud(id: DocumentId, accountId: String, remoteFolder: String?): RemoteBinding? {
         val note = index.note(id) ?: return null
-        return sync.bind(noteId = id, accountId = accountId, title = note.title, remoteFolder = remoteFolder)
+        // A folder the user picked in the browser wins outright. Null means "work it out", which
+        // is where a pinned ancestor folder takes over (SPEC §9's mirror).
+        val folder = remoteFolder ?: resolveRemoteFolder(accountId, note.folderId)
+        return sync.bind(noteId = id, accountId = accountId, title = note.title, remoteFolder = folder)
+    }
+
+    /**
+     * ⭐ **Pin a library folder to a path on the server (M6).**
+     *
+     * Everything in it, and everything in every folder beneath it, syncs under that path from
+     * then on — one choice instead of one per note. SPEC §9's *"folders mirror Nextcloud both
+     * directions"*, ROADMAP M6's folder mirroring.
+     *
+     * Notes **already** bound keep the path they were bound with. Re-pointing them is a remote
+     * MOVE per note, and doing that silently from a settings change is exactly the kind of
+     * unrequested bulk operation on someone's files that CLAUDE.md rule 1 exists to rule out —
+     * so [repointFolder] is a separate, explicit action.
+     */
+    suspend fun pinFolderToRemote(folderId: FolderId, accountId: String, remotePath: String) {
+        tables.folders.upsert(
+            FolderBinding(folderId = folderId, accountId = accountId, remotePath = remotePath.trim('/')),
+        )
+    }
+
+    suspend fun unpinFolder(folderId: FolderId) {
+        tables.folders.remove(folderId)
+    }
+
+    suspend fun folderPin(folderId: FolderId): FolderBinding? = tables.folders.find(folderId)
+
+    /**
+     * What pinning a folder actually did, so the UI can say so.
+     *
+     * Reported because the first version of this feature was silent *and* inert, and a silent
+     * success is indistinguishable from the bug.
+     */
+    data class FolderSyncResult(val newlyBound: Int, val movedOnServer: Int, val folders: Int) {
+        val total: Int get() = newlyBound + movedOnServer
+    }
+
+    /**
+     * ⭐ **Pin a folder and make it true: bind and upload everything already inside it.**
+     *
+     * This is the whole feature, and the first version of it did not work. Pinning wrote one
+     * row and stopped — because a pin is only *consulted* when a note is bound, and nothing
+     * bound anything. So the user pinned a folder holding a note, watched their Nextcloud, and
+     * saw no folder appear and no note upload. Correct by every unit test and inert in the app.
+     *
+     * The lesson worth keeping: "always sync this folder" is a statement about the notes, not
+     * about a mapping. Recording the mapping is the easy half and does nothing on its own.
+     *
+     * Both halves are what the user asked for, so both happen here rather than behind a second
+     * confirmation:
+     *
+     * - An **unbound** note is bound and uploaded. `sync.bind` enqueues `MKCOL` then `UPLOAD`,
+     *   which is what creates the remote folder — nothing else in the app would have.
+     * - An **already-bound** note is re-pointed with a `MOVE`, which SPEC §7.6 drains before
+     *   that note's `UPLOAD` so the bytes never land at the old path and get shuffled after.
+     *
+     * Moving the already-bound ones is not an unrequested bulk operation (CLAUDE.md rule 1):
+     * the user chose *"always sync this folder to here"*, and a note in that folder sitting
+     * somewhere else afterwards is the instruction not being carried out. A `MOVE` also
+     * destroys nothing — `Overwrite: F`, and the bytes are never rewritten.
+     *
+     * Nothing here touches the network (CLAUDE.md rule 4). It is `n` outbox rows and returns
+     * immediately, online or off.
+     */
+    suspend fun syncFolderToRemote(folderId: FolderId, accountId: String, remotePath: String): FolderSyncResult {
+        pinFolderToRemote(folderId, accountId, remotePath)
+
+        val folders = index.allFolders()
+        val notes = index.allNotes(includeTrashed = false)
+        // The decision is `FolderTree.planFolderSync` — pure, and unit-tested, because the
+        // omission that made the first version of this inert lives exactly here and cannot be
+        // reached from a JVM test through this class.
+        val plan = FolderTree.planFolderSync(
+            root = folderId,
+            folders = folders,
+            notes = notes,
+            boundNotes = notes.filterTo(HashSet()) { sync.bindingOf(it.id) != null }.mapTo(HashSet()) { it.id },
+            pins = tables.folders.pathsForAccount(accountId),
+            accountRoot = accountOrDefaultRoot(accountId),
+        )
+
+        for (step in plan) {
+            if (step.alreadyBound) {
+                sync.notePathChanged(step.noteId, step.title, step.remoteFolder)
+            } else {
+                sync.bind(
+                    noteId = step.noteId,
+                    accountId = accountId,
+                    title = step.title,
+                    remoteFolder = step.remoteFolder,
+                )
+            }
+        }
+        return FolderSyncResult(
+            newlyBound = plan.count { !it.alreadyBound },
+            movedOnServer = plan.count { it.alreadyBound },
+            folders = FolderTree.subtreeOf(folderId, folders).size,
+        )
+    }
+
+    private suspend fun accountOrDefaultRoot(accountId: String): String =
+        sync.accountOf(accountId)?.defaultFolder ?: SyncAccount.DEFAULT_FOLDER
+
+    /**
+     * The pin governing [folderId], from the **deepest** pinned ancestor — or null when nothing
+     * above it is pinned.
+     *
+     * Deepest-first for the reason `FolderTree.remoteFolderFor` resolves that way: pinning a
+     * subfolder has to be able to override the pin above it, or the second pin is dead.
+     *
+     * A folder has at most one pin (it is the primary key), and the pin carries its own account
+     * — so this answers "which account, and is there one at all" in at most one lookup per level
+     * of depth, with no query that has to know the account first.
+     */
+    private suspend fun pinFor(folderId: FolderId?): FolderBinding? {
+        if (folderId == null) return null
+        val folders = index.allFolders().associateBy { it.id }
+        return FolderTree.pathOf(folderId, folders)
+            .asReversed()
+            .firstNotNullOfOrNull { tables.folders.find(it.id) }
+    }
+
+    /**
+     * Bind a note because the folder it is in (or an ancestor) is pinned.
+     *
+     * Called wherever a note *arrives* in a folder — created, imported, or moved. Without this
+     * a pin only ever applies to notes that existed when it was set, which is the same "nothing
+     * happens" bug one step later: pin a folder, make a note in it, and it stays local.
+     *
+     * A no-op for an unpinned folder and for a note that is already bound, so every caller can
+     * call it unconditionally.
+     */
+    private suspend fun autoBindIfPinned(noteId: DocumentId, folderId: FolderId?) {
+        val pin = pinFor(folderId) ?: return
+        if (sync.bindingOf(noteId) != null) return
+        // Unlike "Save to Nextcloud…", which the UI only offers for a usable account, this fires
+        // on its own — so it has to check. Binding against a signed-out or halted account would
+        // enqueue a row nothing can drain, which is the stall M5 found on a device.
+        if (sync.accountOf(pin.accountId)?.isUsable != true) return
+        val note = index.note(noteId) ?: return
+        sync.bind(
+            noteId = noteId,
+            accountId = pin.accountId,
+            title = note.title,
+            remoteFolder = resolveRemoteFolder(pin.accountId, folderId),
+        )
+    }
+
+    /**
+     * Where a note in [folderId] belongs on [accountId], honouring pinned ancestors.
+     *
+     * Falls back to the account's default folder when nothing above it is pinned, which is
+     * exactly the pre-M6 behaviour — so an unpinned library keeps syncing where it did.
+     */
+    private suspend fun resolveRemoteFolder(accountId: String, folderId: FolderId?): String {
+        val account = sync.accountOf(accountId) ?: return SyncAccount.DEFAULT_FOLDER
+        return FolderTree.remoteFolderFor(
+            folderId = folderId,
+            folders = index.allFolders().associateBy { it.id },
+            boundFolders = tables.folders.pathsForAccount(accountId),
+            accountRoot = account.defaultFolder,
+        )
     }
 
     /** Stop syncing a note. **Not** a remote delete — the copy on the server stays where it is. */

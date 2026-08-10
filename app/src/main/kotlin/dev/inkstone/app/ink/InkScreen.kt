@@ -26,11 +26,13 @@ import dev.inkstone.app.note.NoteEditorViewModel
 import dev.inkstone.app.note.PageBar
 import dev.inkstone.app.note.PageBarActions
 import dev.inkstone.app.note.PageOverviewSheet
+import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.FitMode
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PageSize
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -234,6 +236,27 @@ private fun InkSurfaceView.asNoteSurface(scope: CoroutineScope, editor: NoteEdit
         override fun drainOps(): List<List<PageOp>> = this@asNoteSurface.drainOps()
 
         override fun applyOps(ops: List<PageOp>, record: Boolean) = this@asNoteSurface.applyOps(ops, record)
+
+        /**
+         * ⚠️ **Not implemented on the real surface yet, and the reason is not an oversight.**
+         *
+         * The two things this has to do — change the paper and change the page geometry without
+         * moving the camera — are both out of reach from here. `InkSurfaceView` exposes the
+         * background only through `loadPage`, which cancels the in-progress stroke and calls
+         * `resetCamera(FIT_WIDTH)`; and its `pageSize` setter refits unconditionally. Both are
+         * exactly what SPEC §13.2 row 10 forbids, so doing either would trade a stale picture for
+         * an eaten stroke and a jumped view — the worse of the two.
+         *
+         * What `:android:ink` needs to add is one method that sets `dryView.pageBackground`, sets
+         * the size, **re-leashes** (`camera.leashedTo`) instead of refitting, and calls
+         * `dryView.onStoreChanged()`. That is the `InkSurfaceView` half of M6's ink work and is
+         * tracked there; `StrokeStore.applyOps`'s `else -> false` swallows a remote `SetPageMeta`
+         * today regardless, so nothing here is made worse by waiting.
+         *
+         * Until then a peer's paper change is folded correctly, is in the log and the bundle, and
+         * appears on screen at the next page switch. Data-safe, visibly late.
+         */
+        override fun setPageMeta(size: PageSize, background: Background) = Unit
     }
 
 /**

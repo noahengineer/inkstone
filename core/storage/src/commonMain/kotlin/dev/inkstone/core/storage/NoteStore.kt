@@ -8,6 +8,7 @@ import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.IdFactory
+import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageOrder
@@ -15,6 +16,7 @@ import dev.inkstone.core.model.PageRef
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.UndoEntry
 import dev.inkstone.core.model.foldPage
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
@@ -150,6 +152,14 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
             pages = PageOrder.repair(document.pages),
             localRev = maxOf(document.localRev, journal.revision),
         )
+        // ⭐ The title clock counts, and it is not an op. It comes out of the same generator as
+        // every op (SPEC §7.7 layer 2 needs it to, so a rename sits in the same total order as
+        // every other edit), and a rename that has only been *flushed* lives in the journal's
+        // document record and nowhere else. Without this the very next session issues that same
+        // counter again — and two devices then hold two titles at one clock, permanently, with
+        // every op present and no error. A *materialized* rename is already covered, by
+        // [BundleContents.highestClockCounter], which is where the invariant is kept.
+        highestCounter = maxOf(highestCounter, repaired.titleClock?.counter ?: 0L)
 
         return OpenNote(
             document = repaired,
@@ -246,9 +256,34 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
      * idempotent over absolute registers. A crash the other way round would lose them.
      *
      * @param pages every page's whole log, as it should appear in the new bundle.
+     * @param extraCarried bundle entries from somewhere other than this note's own
+     *   bundle — in practice a peer's, after a merge (M6).
+     *
+     *   ⚠️ **Without this, the first materialize after a merge silently deletes a peer's
+     *   data.** This method used to take `carried` from the *local* reader alone, so any
+     *   entry that existed only in the remote bundle — a peer's recognised text
+     *   (`text/<pageId>.json`, M7) or anything a newer build added — was dropped on the
+     *   floor. The lost entries are by definition the ones this build cannot render, so
+     *   nothing would ever have looked wrong (CLAUDE.md rule 1, SPEC §5.8).
+     *
+     *   Local wins a name clash: this note's own copy of an entry is the one it can
+     *   account for. ⚠️ **That rule is symmetric, so for a clashing name it does not converge** —
+     *   each device keeps its own entry, neither is told, and there is no clock to order the two.
+     *   It is a recorded concern rather than a live bug only because nothing writes a deterministic
+     *   entry name yet: SPEC §5.5's recognised text is `text/<pageId>.json`, named per *page*, so
+     *   once M7 writes it every device produces the same name and a clash is the normal case.
+     *   **Ordering carried entries is M7's prerequisite, not its cleanup** — `docs/M6-SYNC.md`.
+     * @param extraCarriedManifest the same, for unrecognised manifest members.
      */
-    public suspend fun materialize(note: OpenNote, pages: Map<PageId, PageContents>): OpenNote {
+    public suspend fun materialize(
+        note: OpenNote,
+        pages: Map<PageId, PageContents>,
+        extraCarried: Map<String, ByteArray> = emptyMap(),
+        extraCarriedManifest: Map<String, JsonElement> = emptyMap(),
+    ): OpenNote {
         val id = note.document.id
+        // Page ops only. The title clock is folded in by [BundleContents], for every writer at
+        // once — see its `highestClockCounter`. Doing it here instead is what M6 got wrong.
         val highest = pages.values.flatMap { it.ops }.maxOfOrNull { it.clock.counter }
             ?: note.highestClockCounter
         val document = note.document.copy(modifiedEpochMillis = clock.nowEpochMillis())
@@ -256,7 +291,8 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
             document = document,
             pages = pages,
             highestClockCounter = maxOf(highest, note.highestClockCounter),
-            carried = note.reader?.carried() ?: emptyMap(),
+            carried = extraCarried + (note.reader?.carried() ?: emptyMap()),
+            carriedManifest = extraCarriedManifest + (note.reader?.carriedManifest ?: emptyMap()),
         )
 
         fs.writeBytesAtomically(NoteLayout.bundle(id), BundleWriter.write(contents))
@@ -354,6 +390,10 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
      * live object — i.e. the fold re-expressed as the shortest log that produces it.
      * Reusing the bundle format means one serialiser, one set of format tests, and a
      * snapshot that is readable by anything that can read a note.
+     *
+     * **One file per page since M6.** This used to write every page of a note to one
+     * path, so on a multi-page note each page silently overwrote the last and only the
+     * final page had a readable snapshot. See [NoteLayout.SNAPSHOT_DIR].
      */
     public suspend fun writeSnapshot(id: DocumentId, page: FoldedPage, deviceId: String) {
         val clockValue = page.throughClock ?: return
@@ -371,20 +411,35 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
             pages = mapOf(page.pageId to PageContents(page.size, page.background, ops)),
             highestClockCounter = clockValue.counter,
         )
-        fs.writeBytesAtomically(NoteLayout.snapshot(id), BundleWriter.write(contents))
+        fs.createDirectories(NoteLayout.snapshotDir(id))
+        fs.writeBytesAtomically(NoteLayout.snapshot(id, page.pageId), BundleWriter.write(contents))
     }
 
     public suspend fun readSnapshot(id: DocumentId, pageId: PageId): FoldedPage? {
-        val path = NoteLayout.snapshot(id)
+        val path = NoteLayout.snapshot(id, pageId)
         if (!fs.exists(path)) return null
         val reader = BundleReader.open(FileByteSource(fs, path)) ?: return null
         val page = reader.page(pageId) ?: return null
         return foldPage(pageId, page.ops, defaultSize = page.size)
     }
 
-    /** SPEC §4.7 — *"if an op older than the snapshot ever arrives, discard the snapshot"*. */
+    /**
+     * SPEC §4.7 — *"if an op older than the snapshot ever arrives, discard the snapshot"*.
+     *
+     * Discards **every** page's snapshot, not just the page the late op landed on. That is
+     * deliberate and it is the conservative direction: a snapshot is a cache, throwing one
+     * away costs a re-fold, and an op that arrived out of order is evidence that this
+     * device's picture of what a peer has seen was wrong — which is a statement about the
+     * note, not about one page of it.
+     */
     public suspend fun discardSnapshot(id: DocumentId) {
-        val path = NoteLayout.snapshot(id)
+        val dir = NoteLayout.snapshotDir(id)
+        if (fs.exists(dir)) fs.delete(dir)
+    }
+
+    /** Drop one page's snapshot, leaving the rest. Used when only that page re-folded. */
+    public suspend fun discardSnapshot(id: DocumentId, pageId: PageId) {
+        val path = NoteLayout.snapshot(id, pageId)
         if (fs.exists(path)) fs.delete(path)
     }
 
@@ -470,7 +525,7 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
         }
     }
 
-    private fun decodeEntries(element: kotlinx.serialization.json.JsonElement?, geometry: GeometryReader) =
+    private fun decodeEntries(element: JsonElement?, geometry: GeometryReader) =
         element?.jsonArray.orEmpty().map { entry ->
             val obj = entry.jsonObject
             UndoEntry(
@@ -486,6 +541,14 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
     private fun documentRecord(document: Document): JsonObject = buildJsonObject {
         put(Bundle.F_TITLE, JsonPrimitive(document.title))
         put(Bundle.F_LOCAL_REV, JsonPrimitive(document.localRev))
+        // A rename's clock has to reach the journal, not just the bundle. The journal is what
+        // survives a crash between an autosave and the next materialization (SPEC §5.1), and a
+        // title recovered from it without its clock would be a rename that cannot win — or
+        // lose — a merge (SPEC §7.7 layer 2).
+        document.titleClock?.let { clock ->
+            put(Bundle.F_TITLE_CLOCK_COUNTER, JsonPrimitive(clock.counter))
+            put(Bundle.F_TITLE_CLOCK_DEVICE, JsonPrimitive(clock.deviceId))
+        }
         put(
             Bundle.F_PAGES,
             buildJsonArray {
@@ -515,8 +578,19 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
                 deletedEpochMillis = page[Bundle.F_DELETED_AT]?.jsonPrimitive?.long,
             )
         }
+        val journalClock = record[Bundle.F_TITLE_CLOCK_COUNTER]?.jsonPrimitive?.long?.let { counter ->
+            record[Bundle.F_TITLE_CLOCK_DEVICE]?.jsonPrimitive?.content
+                ?.takeIf { it.isNotEmpty() }
+                ?.let { device -> LamportClock(counter, device) }
+        }
+        val journalTitle = record[Bundle.F_TITLE]?.jsonPrimitive?.content
+        // The journal is newer than the manifest by construction — the manifest was written at
+        // the last materialization and the journal after it — so a journal record's title wins
+        // outright here. This is a note's own history replaying onto its own bundle, which is a
+        // different question from resolving two devices' titles (Document.resolveTitle).
         return base.copy(
-            title = record[Bundle.F_TITLE]?.jsonPrimitive?.content ?: base.title,
+            title = journalTitle ?: base.title,
+            titleClock = journalClock ?: base.titleClock,
             // Union, never replacement: a page the journal does not mention is one the
             // bundle knows about and this record simply did not change (SPEC §4.3).
             pages = if (pages.isEmpty()) base.pages else PageOrder.mergePageOrder(pages, base.pages),

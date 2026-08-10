@@ -8,18 +8,27 @@ import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
+import dev.inkstone.core.storage.BundleReader
+import dev.inkstone.core.storage.DeviceIdentity
+import dev.inkstone.core.storage.FileByteSource
+import dev.inkstone.core.storage.MergeReport
 import dev.inkstone.core.storage.NoteLayout
+import dev.inkstone.core.storage.NoteMerge
 import dev.inkstone.core.storage.NoteSession
 import dev.inkstone.core.storage.NoteStore
+import dev.inkstone.core.sync.MergeCommit
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -27,6 +36,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -64,6 +75,16 @@ import kotlinx.coroutines.withContext
  * @param drainDispatcher where stroke geometry is encoded — **never the UI thread** (CLAUDE.md
  *   rule 7). A parameter so a test can make it deterministic.
  */
+// One method per thing the note UI can do — open, save, materialize, rename, undo, redo, the six
+// page operations — plus the three the sync layer reaches in through, which have to be able to
+// *wait* for this editor's session rather than be told there isn't one. The count tracks the size of
+// the editor's surface, not the complexity of any part of it: none of these is longer than a dozen
+// lines, and everything with state of its own has already been extracted (the session, the store,
+// the surface, the device identity, the library reports). Collapsing them to satisfy a count would
+// put `save()`'s flush ordering and `absorbRemote`'s "never through display()" rule into the same
+// method, which are the two places in this file where being wrong is silent. Same judgement
+// `LibraryRepository` gets, for the same reason.
+@Suppress("TooManyFunctions")
 class NoteEditor(
     private val fs: FileSystem,
     private val clock: Clock,
@@ -103,8 +124,49 @@ class NoteEditor(
      */
     private val work = CoroutineScope(scope.coroutineContext + SupervisorJob(scope.coroutineContext[Job]))
 
+    /**
+     * ⭐ **The editor's operations run one at a time, and this is the only thing that makes them.**
+     *
+     * [work] is a scope, not a queue. It runs on `Dispatchers.Main.immediate`, so nothing here races
+     * for memory — but every coroutine launched into it interleaves freely at every suspension point,
+     * and the operations are full of them: a drain, a journal append, a whole-bundle write. The
+     * autosave loop is one long-lived coroutine in that scope, and since M6 a merge is another. That
+     * is two writers over one [NoteSession], which is the exact thing `NoteSessionHost`'s gate exists
+     * to prevent between two *sessions* and could not see between two *coroutines*:
+     *
+     * ```
+     * merge:     session.materialize()  — snapshots every page, then writes the bundle   ← suspends
+     * autosave:  save() → session.apply(gesture) → session.flush() → a journal record on disk
+     * merge:     ... and then resets the journal to a bare header
+     * ```
+     *
+     * The stroke the user drew during the merge is then in no journal, no bundle, no `pending` list
+     * and no page cache; `localRev` regresses over the flush's; and the output is a valid PDF with the
+     * right page count. Nothing reports anything. Downstream, `MergeCommit` carries the regressed
+     * revision, so the library index and the binding both agree that nothing is owed.
+     *
+     * [NoteSession] is single-threaded *by contract* and deliberately has no lock of its own — a lock
+     * on the ink path is a cost with no benefit (CLAUDE.md rule 7) — so the serialization belongs to
+     * whoever owns the session. That is this class.
+     *
+     * ⭐ **Created locked, released when the note is open** (see [init]). A merge that arrives while
+     * the note is still opening then *waits for the open* instead of being told there is no session
+     * here — which is what [mergeRemoteBundle] used to answer, and answering it made the host open a
+     * second session and rewrite `note.inkstone` under this editor's byte-offset [BundleReader].
+     *
+     * ⚠️ **Not re-entrant.** A [Mutex] never is: a locked function that calls another locked function
+     * *directly* deadlocks the editor for good. Everything shared between them is spelled `…Locked`
+     * and takes no lock of its own. Calling a locked entry point from inside another is safe only
+     * because they go through [work]`.launch`, where waiting for the lock suspends a *different*
+     * coroutine.
+     */
+    private val serial = Mutex(locked = true)
+
     private val ids = IdFactory(clock)
     private val store = NoteStore(fs, clock, ids)
+
+    /** SPEC §4.1's Lamport tiebreak — one id per install, persisted. See [DeviceIdentity]. */
+    private val deviceIdentity = DeviceIdentity(fs, ids)
 
     private val _state = MutableStateFlow(NoteEditorState())
     val state: StateFlow<NoteEditorState> = _state.asStateFlow()
@@ -122,10 +184,16 @@ class NoteEditor(
     /**
      * The device's identity for the Lamport tiebreak (SPEC §4.1).
      *
-     * Persisted with the note rather than generated per launch: a device whose id changes every
-     * start would break every tie differently, and two devices could then disagree about the
-     * order of the same two ops. M5 moves this to a proper per-install value; for now it comes
-     * from the note that created it.
+     * ⭐ **Per install, from [DeviceIdentity] — corrected in M6.** It used to be
+     * `note.document.deviceId`, i.e. read out of the manifest, i.e. the id of whichever
+     * device *created* the note. Two tablets editing one note therefore stamped their ops
+     * with the **same** deviceId, which collapses SPEC §4.1's tiebreak: two concurrent ops
+     * at the same counter compare *equal*, `Register.write` keeps the incumbent, and the
+     * incumbent is whichever op that device folded first. The two devices then hold
+     * different values permanently, with every op present and no error — SPEC §13.2 row 3.
+     *
+     * M2 wrote this as temporary and named M5 as the fix; M5 did not do it, and M6 is the
+     * first milestone where a second device exists to expose it.
      */
     private var deviceId: String = ""
 
@@ -145,6 +213,58 @@ class NoteEditor(
          * picture of it is now wrong, and [cover] is the page to redraw it from.
          */
         suspend fun onMaterialized(id: DocumentId, localRev: Long, pageCount: Int, cover: FoldedPage)
+
+        /**
+         * The note's standing with the server, for SPEC §4.7's compaction gate.
+         *
+         * Compaction may fold a page's log into a snapshot only when the note is
+         * `LOCAL_ONLY` or `SYNCED` — a note with pending or failed uploads has ops the
+         * server has not seen, and folding those away leaves a peer's older ops nowhere to
+         * reintegrate. The editor cannot know this itself; the library index owns
+         * `sync_state`.
+         *
+         * Defaulted to `LOCAL_ONLY` **only** for the no-library case (M2's fallback path and
+         * the unit tests), where there is genuinely no binding and no server.
+         */
+        suspend fun syncStateOf(id: DocumentId): NoteSyncState = NoteSyncState.LOCAL_ONLY
+
+        /**
+         * The note was renamed (SPEC §7.7 layer 2), so the library's *title* is stale and the
+         * remote file needs to move.
+         *
+         * Deliberately **not** [onSaved]: `recordSave` has no title column, so a rename reported
+         * that way bumps the revision and leaves the tile showing the old string. That is half of
+         * why layer 2 spent M6 unreachable — a register with no writer at one end and no reader at
+         * the other.
+         */
+        suspend fun onRenamed(id: DocumentId, title: String, localRev: Long, pageCount: Int) = Unit
+
+        /**
+         * A peer's edits were merged into this note while it was open (M6).
+         *
+         * Deliberately **not** [onSaved]: that path ends in `SyncEngine.noteChanged`, which
+         * enqueues an UPLOAD unconditionally and turns every merge into an ETag ping-pong the
+         * two devices sustain forever. Whether an upload is owed is the reconciler's decision
+         * table, so this only bumps the index row and invalidates the thumbnail.
+         *
+         * @param title the title the merge **resolved** to (SPEC §7.7 layer 2) — the local one when
+         *   the local one won, so the caller can write it back without asking who did. Without it a
+         *   peer's rename lands in the bundle and the library tile keeps the old string forever.
+         */
+        suspend fun onPulled(id: DocumentId, localRev: Long, pageCount: Int, title: String) = Unit
+
+        /**
+         * SPEC §4.7's causal-stability horizon: the lowest Lamport counter every known peer has
+         * been seen to hold, or null when no peer is known.
+         *
+         * ⭐ Wired for the first time in M6. `Compaction.isAllowed`'s parameter has existed since
+         * M2 and every caller passed null, so thirty days of wall clock was the only guard against
+         * folding away ops a peer still needs in order to reintegrate its own.
+         *
+         * Null in the no-library case *and* for a genuinely single-device note, which is the same
+         * conservative answer the parameter documents.
+         */
+        suspend fun oldestAckedCounter(id: DocumentId): Long? = null
     }
 
     /** What the editor needs from the ink surface. Keeps `androidx.ink` out of this class. */
@@ -156,11 +276,34 @@ class NoteEditor(
         fun drainOps(): List<List<PageOp>>
 
         fun applyOps(ops: List<PageOp>, record: Boolean)
+
+        /**
+         * The current page's size or paper changed **without** the page changing — a peer's
+         * `SetPageMeta`, or an undone template change (M6).
+         *
+         * Separate from [loadPage] because [loadPage] cancels the in-progress stroke and refits the
+         * camera, which are both of SPEC §13.2 row 10's forbidden outcomes. A page whose paper just
+         * changed under the user is still the page they are writing on.
+         */
+        fun setPageMeta(size: PageSize, background: Background)
     }
 
     init {
         work.launch {
-            openOrCreate()
+            // [serial] is already held — it is constructed locked — so this is the one operation that
+            // does not take it, and the one that releases it. Anything that arrives while the note is
+            // opening therefore queues behind the open rather than concluding there is no session
+            // here.
+            //
+            // `finally`, because an open that fails must not leave the editor holding its own lock
+            // forever. It leaves `session` null instead, which every entry point already treats as
+            // "nothing to do" and which `mergeRemoteBundle` answers with null — the honest answer, and
+            // the only case where the host opening its own session is correct.
+            try {
+                openOrCreate()
+            } finally {
+                serial.unlock()
+            }
             autosaveLoop()
         }
     }
@@ -178,15 +321,15 @@ class NoteEditor(
      * uses to adopt an orphaned directory — the files are the truth in both.
      */
     private suspend fun openOrCreate() {
+        deviceId = deviceIdentity.get()
         val requested = documentId ?: fs.list(NoteLayout.NOTES_DIR).firstOrNull()?.let(::DocumentId)
         val note = requested?.let { store.open(it) }
             ?: store.create(
                 title = DEFAULT_TITLE,
-                deviceId = ids.newDeviceId(),
+                deviceId = deviceId,
                 background = Background.Template(PageTemplate.RULED),
             )
 
-        deviceId = note.document.deviceId.ifEmpty { ids.newDeviceId() }
         val opened = NoteSession.open(store, ids, clock, note, deviceId)
         session = opened
         // Where this device left off, falling back to the first page. Checked against the live
@@ -234,7 +377,10 @@ class NoteEditor(
         if (boundSurface === surface) return
         boundSurface = surface
         surface.bindPage(ids::newObjectId, session::nextOpId, session::nextClock)
-        currentPage?.let { page -> work.launch { surface.loadPage(session.page(page)) } }
+        // Folding a page reads the journal and mutates the session's cache, so it queues with
+        // everything else. Called from inside the open — which holds [serial] — but only ever
+        // *launched*, so the wait suspends this new coroutine and not the open.
+        currentPage?.let { page -> work.launch { serial.withLock { surface.loadPage(session.page(page)) } } }
     }
 
     // -----------------------------------------------------------------------
@@ -251,11 +397,19 @@ class NoteEditor(
     /**
      * Drain the surface and append. Safe to call at any time; does nothing when idle.
      *
+     * Takes [serial], so an autosave tick that lands in the middle of a merge waits for it rather
+     * than flushing a journal the merge is about to reset.
+     */
+    suspend fun save(): Unit = serial.withLock { saveLocked() }
+
+    /**
+     * [save]'s body, for the operations that already hold [serial].
+     *
      * One `session.apply` per **gesture**, not per drain, so a drain that catches three strokes
      * produces three undo entries rather than one (SPEC §4.6). They still reach disk in a
      * single journal record, because the append happens once at the end.
      */
-    suspend fun save() {
+    private suspend fun saveLocked() {
         val session = this.session ?: return
         val page = currentPage ?: return
         val gestures = surface?.let { withContext(drainDispatcher) { it.drainOps() } }.orEmpty()
@@ -283,13 +437,60 @@ class NoteEditor(
      * the rewrite hands out a file SPEC §5.1 explicitly allows to be a session behind, and a
      * note exported without the ink just drawn on it looks exactly like data loss.
      *
+     * Takes [serial]: this rewrites the bundle and resets the journal, so a merge or an autosave tick
+     * running alongside it is the data loss that class of interleaving produces.
+     *
      * @return false when the PDF could not be written. The bundle is still saved — see the
      *   comment on the publish step — so this is "not publishable yet", never "lost".
      */
-    suspend fun materializeNow(): Boolean {
+    suspend fun materializeNow(): Boolean = serial.withLock { materializeLocked() }
+
+    /**
+     * ⭐ **The same materialize, for `MaterializeWorker` — which has to be able to *wait* for it.**
+     *
+     * `MaterializeWorker` republishes `document.pdf` for the notes the editor's `onStop` never
+     * covers: one bound from the library without being opened, and "idle while charging". It did so
+     * by calling `DocumentMaterializer` directly, which for an *open* note is a second writer with
+     * no ordering against this one — and the failure is not a torn file (writes are atomic and, since
+     * M6, uniquely named) but a **stale marker**. `InkstonePdfMaterializer` reads `note.inkstone`,
+     * embeds it and records its SHA-256; if this editor rewrites the bundle in between, the worker's
+     * `document.pdf` lands last carrying the hash of a bundle that no longer exists. The next library
+     * rebuild reads that as `Recovered(BUNDLE_HASH_MISMATCH)` — and recovery is REPLACE-not-union,
+     * stamped past every clock the note has seen (SPEC §5.6), so it wins the next sync. A lossy
+     * rewrite of a healthy note, arrived at by publishing it twice.
+     *
+     * So the worker goes through `NoteSessionHost`, which hands the job here when this editor holds
+     * the note. Taking [serial] is the whole of the fix; [materializeLocked] does strictly more than
+     * the worker asked for (it flushes the journal first), which is the right kind of more.
+     *
+     * @return false **only** when this editor can no longer run anything, or the PDF could not be
+     *   written. Both mean the host publishing through the materializer itself is correct.
+     */
+    internal suspend fun materializeInSession(): Boolean {
+        // `work.async` on a cancelled scope produces a cancelled `Deferred`, and awaiting one throws
+        // into the worker rather than answering it — the same contract [renameInSession] documents.
+        if (!work.isActive) return false
+        return work.async { serial.withLock { materializeLocked() } }.await()
+    }
+
+    private suspend fun materializeLocked(): Boolean {
         val session = this.session ?: return false
-        save()
-        session.close()
+        saveLocked()
+        // ⚠️ Deliberately **not** `session.close(syncState)`, which is `materialize` +
+        // `assertNotStale` + `compactIfDue(syncState, oldestAckedCounter = null)` — null because a
+        // session has no route to the peer table. Spelling the three steps out is the only way to
+        // supply SPEC §4.7's causal-stability horizon, which M6 is the first milestone to know:
+        // a downloaded bundle says what a peer holds, and without it thirty days of wall clock was
+        // the whole guard against compacting away ops a peer still needs to reintegrate.
+        //
+        // The note's real sync state, not the old `close()` default either. A CONFLICTED or
+        // PENDING_UPLOAD note must not be compacted at all (SPEC §4.7), and every call site used
+        // to take that default — so the first and most important refusal never fired.
+        val id = session.document.id
+        val syncState = library?.syncStateOf(id) ?: NoteSyncState.LOCAL_ONLY
+        session.materialize()
+        store.assertNotStale(id)
+        session.compactIfDue(syncState, library?.oldestAckedCounter(id))
         // The bundle has just been rewritten, so this fold is what the note now *is* —
         // which makes it the only honest moment to redraw the library's thumbnail. The
         // published PDF cannot be the source: it may be one session stale (SPEC §5.1).
@@ -313,19 +514,60 @@ class NoteEditor(
         return published?.isSuccess ?: false
     }
 
-    /** ROADMAP M3 — rename from inside the editor. The library sees it through [LibraryUpdates]. */
+    /**
+     * ROADMAP M3 / SPEC §7.7 layer 2 — rename the note. The library sees it through [LibraryUpdates].
+     *
+     * ⭐ **This is the only thing in the app that writes a title the sync layer can resolve**, and
+     * until M6's review nothing reached it. The production rename was the library's, which renamed an
+     * index row: `Document.title` and `Document.titleClock` were never touched, so two devices
+     * renaming one note kept two titles indefinitely with no clock to order them. Both paths now come
+     * through here or through `NoteStore.renameNote` — see `NoteSessionHost.renameNote`.
+     */
     fun rename(title: String) {
-        val session = this.session ?: return
-        work.launch {
-            session.rename(title)
-            session.flush()
-            library?.onSaved(session.document.id, session.document.localRev, session.pageCount)
-            publish()
-        }
+        work.launch { serial.withLock { renameLocked(title) } }
     }
 
-    /** One page's fold, for a page thumbnail. Null before the note is open. */
-    suspend fun foldedPage(pageId: PageId): FoldedPage? = session?.page(pageId)
+    /**
+     * The rename, for `NoteSessionHost` — which has to be able to *wait* for it.
+     *
+     * The same contract as [mergeRemoteBundle], for the same reason: this editor holds the note's one
+     * [NoteSession], so the host must not open a second one to stamp a title in.
+     *
+     * @return false **only** when this editor can no longer run anything — its scope is cancelled, or
+     *   its open failed and left no session. Both mean the host renaming through its own session is
+     *   correct, because there is no second writer to collide with.
+     */
+    internal suspend fun renameInSession(title: String): Boolean {
+        // `work.async` on a cancelled scope produces a cancelled `Deferred`, and awaiting one throws
+        // into the caller rather than answering it.
+        if (!work.isActive) return false
+        return work.async { serial.withLock { renameLocked(title) } }.await()
+    }
+
+    private suspend fun renameLocked(title: String): Boolean {
+        val session = this.session ?: return false
+        if (title != session.document.title) {
+            session.rename(title)
+            // ⚠️ **Materialized, not merely flushed.** The published PDF embeds `note.inkstone` as it
+            // is on disk, so a title that reached only the journal is one no peer can see until the
+            // note happens to close — the rename looks done here and is invisible everywhere else.
+            // `materializeLocked`, never `materializeNow`: [serial] is not re-entrant.
+            materializeLocked()
+        }
+        // Reported even when the document already said this. The *index* may not — a row whose title
+        // drifted from the note is exactly what this repairs — and the report is what moves the
+        // remote file, which a second attempt at the same rename may still owe.
+        library?.onRenamed(session.document.id, session.document.title, session.document.localRev, session.pageCount)
+        return true
+    }
+
+    /**
+     * One page's fold, for a page thumbnail. Null before the note is open.
+     *
+     * Under [serial] because folding is not read-only: it re-reads the journal and populates the
+     * session's page cache, which a concurrent [NoteSession.materialize] clears.
+     */
+    suspend fun foldedPage(pageId: PageId): FoldedPage? = serial.withLock { session?.page(pageId) }
 
     // -----------------------------------------------------------------------
     // Undo / redo (SPEC §4.6)
@@ -339,7 +581,7 @@ class NoteEditor(
      */
     fun undo() {
         withPage { session, page ->
-            save()
+            saveLocked()
             val before = session.page(page)
             if (!session.undo(page)) return@withPage
             reconcile(before, session.page(page))
@@ -349,12 +591,124 @@ class NoteEditor(
 
     fun redo() {
         withPage { session, page ->
-            save()
+            saveLocked()
             val before = session.page(page)
             if (!session.redo(page)) return@withPage
             reconcile(before, session.page(page))
             publish()
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // A peer's edits, while the note is open (SPEC §13.2 row 10)
+    // -----------------------------------------------------------------------
+
+    /**
+     * ⭐ **The reconciler's one door into an open note, through `NoteSessionHost`.**
+     *
+     * There must be exactly one [NoteSession] per note, so when this editor holds one the pull
+     * cannot open its own — whichever materialized second would write a bundle missing the other's
+     * work. The host asks; this runs the merge against the session already in hand, and brings the
+     * screen in line through [absorbRemote].
+     *
+     * ⭐ **One door, deliberately.** There was a second until M6's close-out — an
+     * `applyRemoteOps(pageId, ops)` shaped like [undo], written for the design in which the host
+     * merged in its own session and then *told* the editor through a bus. That is not how this
+     * shipped: the host hands the merge to the editor, so the ops are folded and the screen
+     * reconciled inside one critical section here, and the op-level door had no caller for the
+     * whole milestone. It could not be given a correct one either — after this method has run, the
+     * peer's ops are already in the log (a second delivery would subtract to nothing), and before
+     * it has, ops delivered on their own would go in through `NoteSession.merge` with **no
+     * `NoteMerge.mergeDocument` in front of them**. That is the trap SPEC §4.3 names: `merge`
+     * accepts ops for a page `document.pages` has never heard of and journals them, `BundleWriter`
+     * then skips the page it cannot find a `PageRef` for, and `materialize` resets the journal —
+     * so a peer's whole page is destroyed, permanently, leaving a valid PDF with the right page
+     * count. Deleting the door makes "forgot `mergeDocument`" unrepresentable instead of guarded,
+     * which is the same move the `undoable` boolean got.
+     *
+     * ⚠️ `materialize` is given `carried` and `carriedManifest`. Without them the rewrite deletes
+     * the peer's recognised text and every entry a newer build added — invisibly, because those are
+     * by definition the entries this build cannot render.
+     *
+     * ⚠️ **An unreadable bundle answers with a report, not null.** Null means *"no session here, do
+     * it yourself"*, and answering it for a truncated download would have the host open a second
+     * session on a note this editor holds — the one thing the whole gate exists to prevent.
+     * `NoteMerge.mergeBundle` never throws and never answers null: a schema from the future comes
+     * back as `TooNew` and anything else unreadable as `DifferentDocument`, both of which route to
+     * SPEC §7.7 layer 3, leave the ETag alone, and have the next pass fetch the file again.
+     *
+     * ⭐ **The session is read inside [serial], not before it** — and that one line of ordering is
+     * what closes the note-open window. `NoteEditorViewModel` registers this editor's handle in its
+     * `init`, which is *before* the open has read a byte, so a pull landing inside the note-open I/O
+     * used to find `session == null`, get null back, and open its own session: two sessions over one
+     * note, and the host's `materialize` then rewrote `note.inkstone` under the byte offsets this
+     * editor's [BundleReader] had already recorded. The editor's next read of that reader fails its
+     * local-header or CRC check and *throws* — out of `materializeNow`, out of
+     * `viewModelScope.launch`. Nothing is written and the journal survives, so no bytes are lost, but
+     * the claim that it "folds both" was wrong. Because [serial] is held from construction until the
+     * open finishes, waiting here is waiting for exactly the session the merge should run against.
+     *
+     * @return null **only** when this editor can no longer run anything — its scope is cancelled, or
+     *   the open failed and left no session. Both mean the host doing the merge itself is correct:
+     *   there is no second writer to collide with.
+     */
+    internal suspend fun mergeRemoteBundle(bundlePath: String): MergeCommit? {
+        // Cheap and honest: `work.async` on a cancelled scope produces a cancelled `Deferred`, and
+        // awaiting one throws into the reconcile pass rather than answering it.
+        if (!work.isActive) return null
+        return work.async {
+            serial.withLock {
+                val session = this@NoteEditor.session ?: return@withLock null
+                val report = absorbRemote(session) {
+                    NoteMerge.mergeBundle(session, FileByteSource(fs, bundlePath)).also { report ->
+                        if (report is MergeReport.Merged) {
+                            session.materialize(report.carried, report.carriedManifest)
+                            // The resolved title, so a peer's rename reaches the library tile and not
+                            // only the bundle (SPEC §7.7 layer 2's reader half).
+                            library?.onPulled(
+                                id = session.document.id,
+                                localRev = session.document.localRev,
+                                pageCount = session.pageCount,
+                                title = session.document.title,
+                            )
+                        }
+                    }
+                }
+                MergeCommit(report, session.document.localRev)
+            }
+        }.await()
+    }
+
+    /**
+     * [mergeRemoteBundle]'s tail: flush what the user has drawn, take the union, then bring the
+     * screen in line from the fold diff.
+     *
+     * ⚠️ **Never through [display].** `display` → `NoteSurface.loadPage` →
+     * `InkSurfaceView.pageSize`'s setter → `resetCamera(FIT_WIDTH)`, unconditionally, plus
+     * `cancelUnfinishedStrokes()`. The camera is persisted nowhere (`view.json` holds only the
+     * last-open page), so once refit the previous value is gone. That is *both* of SPEC §13.2 row
+     * 10's forbidden outcomes — the view jumps and the in-progress stroke is eaten — reached two
+     * indirections from anything camera-shaped, with every JVM test still passing. [reconcile] is
+     * correct for `APPENDED` and `REFOLDED` alike because it diffs the folds rather than replaying
+     * ops, which is why no reload is needed at all.
+     *
+     * `before` is captured for the **current page only** — the only page on screen. Every other page
+     * is folded fresh the next time it is shown.
+     */
+    private suspend fun <T> absorbRemote(session: NoteSession, ingest: suspend () -> T): T {
+        // Queued local ink has to reach the session before the union is taken. Otherwise the diff is
+        // computed against a page missing the last two seconds of writing, and `reconcile` would
+        // then push a "removed" op for a stroke that is on screen and in the log.
+        //
+        // `saveLocked`, because both callers hold [serial] — and they must, for the whole merge and
+        // not only for this flush.
+        saveLocked()
+        val page = currentPage
+        val before = page?.let { session.page(it) }
+        val result = ingest()
+        if (page != null && before != null) reconcile(before, session.page(page))
+        publish()
+        return result
     }
 
     /**
@@ -366,6 +720,14 @@ class NoteEditor(
      */
     private fun reconcile(before: FoldedPage, after: FoldedPage) {
         val surface = this.surface ?: return
+        // ⚠️ Page metadata is part of the diff since M6. A peer's `SetPageMeta` folds correctly and
+        // — before this — rendered not at all, so the screen and the log disagreed about the paper
+        // until the next page switch, with no error anywhere. Pushed through `setPageMeta` and not
+        // `loadPage`, because `loadPage` refits the camera and cancels the in-progress stroke.
+        if (after.size != before.size || after.background != before.background) {
+            currentTemplate = (after.background as? Background.Template)?.template ?: PageTemplate.BLANK
+            surface.setPageMeta(after.size, after.background)
+        }
         val beforeIds = before.objects.map { it.id }.toSet()
         val afterIds = after.objects.map { it.id }.toSet()
 
@@ -381,6 +743,12 @@ class NoteEditor(
         removed.forEach { ops += PageOp.DeleteObject("", REPLAY_CLOCK, it) }
         added.forEach { ops += PageOp.AddObject("", REPLAY_CLOCK, it) }
         reErased.forEach { ops += PageOp.SetErasedRegion("", REPLAY_CLOCK, it.id, it.erased) }
+        // An empty diff is the *common* case on the pull side, not an edge one: a poll re-delivers a
+        // peer's whole page log, `NoteSession.merge` subtracts nearly all of it by opId, and the
+        // folds come out identical. Reaching the surface with nothing to say would cost a call per
+        // poll on every open note. The deleted `applyRemoteOps` guarded this at its own entry point,
+        // which is not where the calls come from.
+        if (ops.isEmpty()) return
         // record = false: these ops are already in the log. Journaling them again would append
         // a duplicate of every undo.
         surface.applyOps(ops, record = false)
@@ -392,7 +760,7 @@ class NoteEditor(
 
     fun showPage(pageId: PageId) {
         withPage(pageId) { session, page ->
-            save()
+            saveLocked()
             display(session, page)
             publish()
         }
@@ -417,29 +785,37 @@ class NoteEditor(
         session.document.livePages.getOrNull(index)?.let { showPage(it.id) }
     }
 
+    // The three that create or remove a page finish by *showing* it with [display] rather than by
+    // calling [showPage], which would queue a second operation behind this one and leave the note
+    // between two states — the page in `document`, the old one still `currentPage` — for as long as
+    // whatever else is waiting on [serial] takes. They have already saved and flushed, which is the
+    // only thing [showPage] would add.
+
     fun addPage(template: PageTemplate) {
         withPage { session, _ ->
-            save()
+            saveLocked()
             val index = currentPageIndex() + 1
             val added = session.addPage(index, background = Background.Template(template))
             session.flush()
-            showPage(added)
+            display(session, added)
+            publish()
         }
     }
 
     fun duplicateCurrentPage() {
         withPage { session, page ->
-            save()
+            saveLocked()
             val copy = session.duplicatePage(page, currentPageIndex() + 1)
             session.flush()
-            copy?.let { showPage(it) }
+            copy?.let { display(session, it) }
+            publish()
         }
     }
 
     /** Delete the current page — a tombstone, and it goes nowhere near the file (rule 1). */
     fun deleteCurrentPage() {
         withPage { session, page ->
-            save()
+            saveLocked()
             val index = currentPageIndex()
             if (!session.deletePage(page)) {
                 publish(message = CANNOT_DELETE_LAST_PAGE)
@@ -447,13 +823,14 @@ class NoteEditor(
             }
             session.flush()
             val next = session.document.livePages.getOrNull(index) ?: session.document.livePages.last()
-            showPage(next.id)
+            display(session, next.id)
+            publish()
         }
     }
 
     fun movePage(toIndex: Int) {
         withPage { session, page ->
-            save()
+            saveLocked()
             session.movePage(page, toIndex)
             session.flush()
             publish()
@@ -462,7 +839,7 @@ class NoteEditor(
 
     fun setTemplate(template: PageTemplate) {
         withPage { session, page ->
-            save()
+            saveLocked()
             val background = Background.Template(template)
             session.apply(
                 page,
@@ -483,10 +860,18 @@ class NoteEditor(
     // Plumbing
     // -----------------------------------------------------------------------
 
+    /**
+     * Every user-driven operation on the open note, queued behind whatever else is running.
+     *
+     * The blocks handed here call [saveLocked] and [session]`.flush()`, so they must hold [serial]
+     * for their whole length rather than around each step: an operation that took the lock twice
+     * would let a merge land in the gap between its `save` and its `flush`, which is the interleaving
+     * [serial] exists to remove.
+     */
     private fun withPage(pageId: PageId? = null, block: suspend (NoteSession, PageId) -> Unit) {
         val session = this.session ?: return
         val page = pageId ?: currentPage ?: return
-        work.launch { block(session, page) }
+        work.launch { serial.withLock { block(session, page) } }
     }
 
     private fun publish(recovered: Boolean = _state.value.recoveredFromCrash, message: String? = null) {

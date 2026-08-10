@@ -9,6 +9,30 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+android {
+    testOptions {
+        // M6. SPEC §13.2's merge matrix lives in this module's unit tests, because :app is the
+        // only source set that sees :core:sync, :core:storage and :android:pdf at once — the
+        // three halves one pull passes through. Getting there needs Android's stubs to return
+        // defaults rather than throwing: OkHttp's platform detection reads
+        // `android.os.Build.VERSION.SDK_INT` the first time a client is built, so without this
+        // every request the real `WebDavClient` makes dies in `Platform.get()` before a socket
+        // is opened. :android:pdf set the same flag in M4 for PdfBox's one `android.util.Log`
+        // reference, and that is almost certainly why its live spike is the only one that has
+        // ever run.
+        unitTests.isReturnDefaultValues = true
+    }
+}
+
+// ⚠️ Which test task is running, so the matrix can refuse to drive a *live* server twice.
+// `check` runs testDebugUnitTest AND testReleaseUnitTest, and M5's live PDF spike already
+// round-trips twice for it. Doubling that across 21 rows is bad enough; two runs racing on the
+// same remote paths would manufacture a conflict in the milestone whose subject is conflicts.
+// The in-process server has no such problem — it is per-JVM — so only the live half is gated.
+tasks.withType<Test>().configureEach {
+    systemProperty("inkstone.test.variant", name)
+}
+
 dependencies {
     // SPEC §2.1 — :app is the only module allowed to depend on everything.
     implementation(project(":core:model"))
@@ -44,9 +68,32 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
 
     testImplementation(libs.junit)
+    // `kotlin.test` over bare JUnit 4, so an assertion in the merge matrix reads the same as
+    // the one in `:core:storage`'s `NoteMergeTest` that backs it up. The two are the same
+    // argument in two modules and diverging assertion vocabularies made that hard to see.
+    testImplementation(kotlin("test"))
     testImplementation(libs.kotlinx.coroutines.test)
+    // M6, TEST ONLY. SPEC §13.2's matrix runs the *real* SQL stores, because two of the claims
+    // it makes are claims about SQLite: `upsertBinding` carrying `lastSeenRemoteAt` forward
+    // across an INSERT OR REPLACE, and `notSeenSince` being the exact complement of
+    // `stampBindingSeen`. A fake would hide both — and getting them wrong is a hundred notes in
+    // the trash. :core:database refuses this driver for *its* tests on the grounds that testing
+    // SQLite against a different SQLite build proves nothing, and that is right; this suite
+    // tests sync semantics and needs a database, not a SQLite.
+    testImplementation(libs.sqldelight.driver.sqlite)
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.androidx.test.core)
     androidTestImplementation(libs.espresso.core)
     androidTestImplementation(platform(libs.compose.bom))
+    // ⚠️ M6. The class `testInstrumentationRunner` names (set by `inkstone.android-application`).
+    // It is NOT transitive from androidx.test.ext:junit, and without it every instrumented test
+    // in this module dies with ClassNotFoundException before one of them runs. These three lines
+    // are the whole reason :core:database and :android:ink each sat with zero *working*
+    // instrumented tests for two milestones: `check` compiles an androidTest source set but does
+    // not dex or run it, so a broken classpath looks exactly like coverage.
+    androidTestImplementation(libs.androidx.test.runner)
+    // The assertion vocabulary the rest of the repo uses. `inkstone.android-application` puts
+    // kotlin("test") on unitTests only.
+    androidTestImplementation(kotlin("test"))
+    androidTestImplementation(libs.kotlinx.coroutines.test)
 }

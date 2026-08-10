@@ -4,10 +4,15 @@ import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.CredentialStore
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.DocumentMaterializer
+import dev.inkstone.core.model.ExtractedRemote
 import dev.inkstone.core.model.FileSystem
+import dev.inkstone.core.model.FoldOutcome
+import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.MaterializedFile
 import dev.inkstone.core.model.NextcloudCredential
 import dev.inkstone.core.model.NoteSyncState
+import dev.inkstone.core.model.RemoteBundleExtractor
+import dev.inkstone.core.storage.MergeReport
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.mock.MockEngine
 import io.ktor.client.engine.mock.MockRequestHandleScope
@@ -71,10 +76,19 @@ internal class FakeOutboxStore : OutboxStore {
     fun upload(noteId: DocumentId): OutboxEntry? = rows[noteId.value to OutboxOpType.UPLOAD]
 }
 
+/**
+ * ⚠️ `lastSeenRemoteAt` is a **second map**, not a field on [RemoteBinding], because that is how
+ * the real table works: the column is carried forward inside `upsertBinding` and `stampBindingSeen`
+ * is its only writer (Sync.sq). A fake that put it on the row would let an ordinary binding write
+ * reset it to zero, and every note would then look absent remotely on the next pass — which is a
+ * bug the fake would be hiding rather than reproducing.
+ */
 internal class FakeBindingStore(vararg initial: RemoteBinding) : BindingStore {
     val rows = LinkedHashMap<String, RemoteBinding>().apply {
         initial.forEach { put(it.noteId.value, it) }
     }
+
+    private val seenAt = LinkedHashMap<String, Long>()
 
     override suspend fun find(noteId: DocumentId): RemoteBinding? = rows[noteId.value]
 
@@ -90,7 +104,22 @@ internal class FakeBindingStore(vararg initial: RemoteBinding) : BindingStore {
 
     override suspend fun remove(noteId: DocumentId) {
         rows.remove(noteId.value)
+        seenAt.remove(noteId.value)
     }
+
+    override suspend fun findByOcId(remoteOcId: String): List<RemoteBinding> =
+        rows.values.filter { it.remoteOcId == remoteOcId }
+
+    override suspend fun findByPath(accountId: String, remotePath: String): List<RemoteBinding> =
+        rows.values.filter { it.accountId == accountId && it.remotePath == remotePath }
+
+    override suspend fun stampSeen(noteIds: Collection<DocumentId>, seenAtEpochMillis: Long) {
+        for (noteId in noteIds) seenAt[noteId.value] = seenAtEpochMillis
+    }
+
+    override suspend fun notSeenSince(accountId: String, sinceEpochMillis: Long): List<StaleBinding> = rows.values
+        .filter { it.accountId == accountId && (seenAt[it.noteId.value] ?: 0L) < sinceEpochMillis }
+        .map { StaleBinding(it.noteId, it.remotePath) }
 }
 
 internal class FakeAccountStore(vararg initial: SyncAccount) : AccountStore {
@@ -200,6 +229,263 @@ internal class FakeMaterializer(
         val bytes = bytesFor(noteId, rev)
         fs.writeBytesAtomically(path, bytes)
         return MaterializedFile(path = path, sizeBytes = bytes.size.toLong(), sha256 = "", localRev = rev)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M6 — the pull side
+// ---------------------------------------------------------------------------
+
+internal class FakeDirectoryCache(vararg initial: RemoteDirectory) : DirectoryCache {
+    val rows = LinkedHashMap<Pair<String, String>, RemoteDirectory>().apply {
+        initial.forEach { put(it.accountId to it.path, it) }
+    }
+
+    var clears = 0
+        private set
+
+    override suspend fun forAccount(accountId: String): List<RemoteDirectory> =
+        rows.values.filter { it.accountId == accountId }
+
+    override suspend fun upsert(directory: RemoteDirectory) {
+        rows[directory.accountId to directory.path] = directory
+    }
+
+    override suspend fun upsertAll(directories: Collection<RemoteDirectory>) {
+        for (directory in directories) upsert(directory)
+    }
+
+    override suspend fun clearFor(accountId: String) {
+        clears++
+        rows.keys.filter { it.first == accountId }.forEach { rows.remove(it) }
+    }
+}
+
+internal class FakeSyncCursorStore(vararg initial: SyncCursor) : SyncCursorStore {
+    val rows = LinkedHashMap<String, SyncCursor>().apply { initial.forEach { put(it.accountId, it) } }
+
+    override suspend fun find(accountId: String): SyncCursor? = rows[accountId]
+
+    override suspend fun upsert(cursor: SyncCursor) {
+        rows[cursor.accountId] = cursor
+    }
+}
+
+internal class FakePendingDownloadStore : PendingDownloadStore {
+    val rows = LinkedHashMap<String, PendingDownload>()
+
+    override suspend fun find(noteId: DocumentId): PendingDownload? = rows[noteId.value]
+
+    override suspend fun upsert(download: PendingDownload) {
+        rows[download.noteId.value] = download
+    }
+
+    override suspend fun remove(noteId: DocumentId) {
+        rows.remove(noteId.value)
+    }
+}
+
+/** SPEC §5.6, negatively: the remote PDFs a pass has already looked inside and rejected. */
+internal class FakeForeignRemoteCache : ForeignRemoteCache {
+    val rows = LinkedHashMap<Pair<String, String>, ForeignRemote>()
+
+    override suspend fun forAccount(accountId: String): List<ForeignRemote> =
+        rows.values.filter { it.accountId == accountId }
+
+    override suspend fun upsert(file: ForeignRemote) {
+        rows[file.accountId to file.fileKey] = file
+    }
+}
+
+internal class FakeAttentionLog : AttentionLog {
+    val rows = LinkedHashMap<String, AttentionEntry>()
+
+    override suspend fun open(): List<AttentionEntry> = rows.values.filter { it.isOpen }
+
+    /**
+     * ⚠️ Acknowledged rows included, like the real `SELECT … WHERE id = ?`. A fake that filtered
+     * them out here would let the dismissal bug pass its own test.
+     */
+    override suspend fun find(id: String): AttentionEntry? = rows[id]
+
+    /** REPLACE, like `insertAttention` — including over an acknowledgement. */
+    override suspend fun add(entry: AttentionEntry) {
+        rows[entry.id] = entry
+    }
+
+    override suspend fun acknowledge(id: String, acknowledgedAtEpochMillis: Long) {
+        rows[id]?.let { rows[id] = it.copy(acknowledgedAtEpochMillis = acknowledgedAtEpochMillis) }
+    }
+
+    fun kinds(): List<AttentionKind?> = rows.values.map { it.kindOrNull }
+}
+
+internal class FakeFolderBindingStore(vararg initial: FolderBinding) : FolderBindingStore {
+    val rows = LinkedHashMap<String, FolderBinding>().apply { initial.forEach { put(it.folderId.value, it) } }
+
+    override suspend fun find(folderId: FolderId): FolderBinding? = rows[folderId.value]
+
+    override suspend fun findByOcId(accountId: String, remoteOcId: String): List<FolderBinding> =
+        rows.values.filter { it.accountId == accountId && it.remoteOcId == remoteOcId }
+
+    override suspend fun pathsForAccount(accountId: String): Map<FolderId, String> =
+        rows.values.filter { it.accountId == accountId }.associate { it.folderId to it.remotePath }
+
+    override suspend fun upsert(binding: FolderBinding) {
+        rows[binding.folderId.value] = binding
+    }
+
+    override suspend fun remove(folderId: FolderId) {
+        rows.remove(folderId.value)
+    }
+}
+
+internal class FakePeerClockStore : PeerClockStore {
+    val rows = LinkedHashMap<Pair<String, String>, PeerClock>()
+
+    override suspend fun forNote(noteId: DocumentId): List<PeerClock> = rows.values.filter { it.noteId == noteId }
+
+    override suspend fun record(
+        noteId: DocumentId,
+        peerDeviceId: String,
+        highestCounter: Long,
+        seenAtEpochMillis: Long,
+    ) {
+        val key = noteId.value to peerDeviceId
+        val existing = rows[key]
+        // Monotonic, like the real UPSERT. A fake that let the counter fall would make SPEC §4.7's
+        // horizon look safe in a test and unsafe on a device.
+        rows[key] = PeerClock(
+            noteId = noteId,
+            peerDeviceId = peerDeviceId,
+            highestCounter = maxOf(existing?.highestCounter ?: 0L, highestCounter),
+            seenAtEpochMillis = seenAtEpochMillis,
+        )
+    }
+
+    override suspend fun oldestAckedCounter(noteId: DocumentId): Long? =
+        forNote(noteId).minOfOrNull { it.highestCounter }
+}
+
+/**
+ * The extractor, scripted per staged path.
+ *
+ * `:android:pdf` owns the real one and it needs PdfBox and a real published PDF. What the
+ * reconciler's own logic turns on is only *which of the four verdicts came back*, and every one of
+ * them is reachable from a healthy server — so scripting them is the honest unit under test here.
+ */
+internal class FakeExtractor(
+    private val bundleBytes: ByteArray = "bundle".encodeToByteArray(),
+    private val fs: FakeFileSystem? = null,
+    private val verdictFor: (String) -> ExtractedRemote,
+) : RemoteBundleExtractor {
+    val calls = mutableListOf<String>()
+
+    override suspend fun extract(pdfPath: String, bundlePath: String): ExtractedRemote {
+        calls += pdfPath
+        val verdict = verdictFor(pdfPath)
+        if (verdict.bundleWritten) fs?.writeBytesAtomically(bundlePath, bundleBytes)
+        return verdict
+    }
+}
+
+/**
+ * `:app`'s single-writer merge gate, recorded.
+ *
+ * Every method is scripted rather than simulated: this fake stands in for `NoteSession`,
+ * `NoteMerge`, `NoteStore` and `LibraryRepository` at once, and simulating any of them here would
+ * be testing the simulation. What the reconciler must get right is *which* method it calls, with
+ * what, and in what order relative to the binding writes — which is exactly what a recorder shows.
+ */
+internal class FakeMergeGate(
+    private val report: (DocumentId) -> MergeReport = { defaultMerged() },
+    private val localRev: Long = 2L,
+    private val installs: (RemoteInstall) -> DocumentId? = { it.noteId },
+    /**
+     * Which id a copy gets, given how many this gate has been asked for including this one.
+     *
+     * ⚠️ The default mints a **fresh** id per call because the real `conflictedCopyOf` does — a new
+     * `DocumentId` is mandatory (SPEC §5.6 inverted: a copy that kept the id would be merged straight
+     * back into the note it could not merge with). A fake that answered the same id twice made a
+     * second copy indistinguishable from the first, which is precisely how layer 3 minting one per
+     * poll looked correct.
+     */
+    private val copies: (ConflictedCopy, Int) -> DocumentId? = { copy, ordinal ->
+        DocumentId("copy-$ordinal-of-${copy.localNoteId?.value ?: "peer"}")
+    },
+    /**
+     * Whether the trash succeeded. False is `NoteSessionHost`'s answer while a live editor holds the
+     * note — trashing it then leaves it **unrestorable** (see [RemoteMergeGate.trashRemotelyDeleted]),
+     * so the reconciler has to treat a refusal as "later" and not as "done".
+     */
+    private val trashes: (DocumentId) -> Boolean = { true },
+    /**
+     * Runs inside [merge], before it answers. The seam a test parks a pass in.
+     *
+     * A suspending hook rather than a scripted delay because what needs testing is what a *second*
+     * pass does while the first one is mid-merge — holding a staged bundle, holding a
+     * `pendingDownload` row, and not yet having written a cache row. There is no shorter way to
+     * reach that state, and it is the state two overlapping passes corrupt.
+     */
+    private val onMerge: suspend (DocumentId) -> Unit = {},
+) : RemoteMergeGate {
+    val merges = mutableListOf<Pair<DocumentId, String>>()
+    val installed = mutableListOf<RemoteInstall>()
+    val conflicted = mutableListOf<ConflictedCopy>()
+
+    /**
+     * The ids handed back, one per copy that was actually made.
+     *
+     * The count is the assertion for layer 3's idempotence: `conflicted` says how many times the gate
+     * was *asked*, and this says how many notes the user ended up with.
+     */
+    val minted = mutableListOf<DocumentId>()
+    val trashed = mutableListOf<DocumentId>()
+
+    /** Asked for, refused. The reconciler must treat these as "not yet", never as "done". */
+    val refusedTrash = mutableListOf<DocumentId>()
+    val refoldered = mutableListOf<Pair<DocumentId, FolderId>>()
+
+    override suspend fun merge(noteId: DocumentId, bundlePath: String): MergeCommit {
+        merges += noteId to bundlePath
+        onMerge(noteId)
+        return MergeCommit(report(noteId), localRev)
+    }
+
+    override suspend fun install(install: RemoteInstall): DocumentId? {
+        installed += install
+        return installs(install)
+    }
+
+    override suspend fun conflictedCopy(copy: ConflictedCopy): DocumentId? {
+        conflicted += copy
+        return copies(copy, conflicted.size)?.also { minted += it }
+    }
+
+    override suspend fun trashRemotelyDeleted(noteId: DocumentId, reason: String): Boolean {
+        val trashed = trashes(noteId)
+        if (trashed) this.trashed += noteId else refusedTrash += noteId
+        return trashed
+    }
+
+    override suspend fun noteFolderChanged(noteId: DocumentId, folderId: FolderId) {
+        refoldered += noteId to folderId
+    }
+
+    companion object {
+        /** A merge that found nothing novel — the common case, and the one that must not upload. */
+        fun defaultMerged(remoteNovelOps: Int = 0, overriddenTitle: String? = null): MergeReport.Merged =
+            MergeReport.Merged(
+                remoteNovelOps = remoteNovelOps,
+                pagesTouched = emptyList(),
+                outcome = FoldOutcome.APPENDED,
+                titleOverridden = overriddenTitle != null,
+                overriddenTitle = overriddenTitle,
+                carried = emptyMap(),
+                carriedManifest = emptyMap(),
+                peerDeviceId = "peer-device",
+                peerHighestCounter = 41L,
+            )
     }
 }
 

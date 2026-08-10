@@ -85,6 +85,12 @@ public class OutboxDrainer(
      * ways a row can be skipped before any request is made are as much a part of SPEC
      * §7.6 as the request itself, and they were burying it.
      */
+    @Suppress("ReturnCount")
+    // Five ways a row is not sent, each a different fact about the account and each ending the
+    // row's life differently: no binding, account gone, account signed out, account unusable,
+    // account already halted this pass. Telling them apart is the point — M5 shipped two of
+    // them collapsed into one and a signed-out user's notes stalled silently for it. Nesting
+    // them would bury the one line that actually performs the op.
     private suspend fun drainOne(
         entry: OutboxEntry,
         sessions: MutableMap<String, NextcloudSession?>,
@@ -109,11 +115,31 @@ public class OutboxDrainer(
         // So the binding is dropped and the note goes back to LOCAL_ONLY — which is what
         // it now is. Nothing local is destroyed and nothing remote is touched; the copy
         // on the server stays exactly where it is (CLAUDE.md rule 1).
-        if (accounts.find(binding.accountId) == null) {
+        val account = accounts.find(binding.accountId)
+        if (account == null) {
             outbox.remove(entry.noteId, entry.opType)
             bindings.remove(entry.noteId)
             notes.setSyncState(entry.noteId, NoteSyncState.LOCAL_ONLY, null)
             return report.copy(orphaned = report.orphaned + 1)
+        }
+
+        // ⭐ Signed out — a third case, and it is neither of the two either side of it (M6).
+        //
+        // Not "gone": the account row is deliberately still there, and so is this binding,
+        // because that is what lets one tap resume every note where it left off rather than
+        // re-binding a library by hand (see [AccountState.SIGNED_OUT]).
+        //
+        // Not "a wait" either: falling through to the unusable-account branch below would
+        // keep the row queued and flag the note NEEDS_REAUTH, which is both a lie — nobody
+        // refused us, the user signed out — and the M5 stall, because the row would sit due
+        // forever while the worker reported success.
+        //
+        // So the row goes and the binding stays. `pauseAccount` already clears these at
+        // sign-out; this is for a row that raced it, which is one autosave away.
+        if (account.state == AccountState.SIGNED_OUT) {
+            outbox.remove(entry.noteId, entry.opType)
+            notes.setSyncState(entry.noteId, NoteSyncState.PAUSED, null)
+            return report.copy(paused = report.paused + 1)
         }
 
         // SPEC §7.2 — once an account is halted, nothing else is sent to it this pass.
@@ -173,7 +199,23 @@ public class OutboxDrainer(
             // keeps syncing." The row stays so M6 can resolve it; it stops being due.
             outbox.reschedule(entry.noteId, entry.opType, entry.attempts, now + PARK_MILLIS)
             notes.setSyncState(entry.noteId, outcome.state, outcome.reason)
-            report.copy(parked = report.parked + 1)
+            report.copy(
+                parked = report.parked + 1,
+                // ⭐ Only a **412** goes here, not every park. SPEC §7.6's cycle is
+                // 412 → reconcile → merge → re-upload, and the reconcile is the step the
+                // drainer cannot take itself: it has no scheduler, deliberately, because a
+                // `:core:sync` class that could wake work would be one that could decide to
+                // retry a credential. So the note id is reported and the *worker* asks.
+                //
+                // Without this the note still converges — the periodic pass finds the moved
+                // root ETag eventually — but "eventually" is fifteen minutes with the note
+                // showing `CONFLICTED` the whole time, and the park is a day long.
+                conflicted = if (outcome.state == NoteSyncState.CONFLICTED) {
+                    report.conflicted + entry.noteId
+                } else {
+                    report.conflicted
+                },
+            )
         }
 
         is OpOutcome.HaltAccount -> {
@@ -460,12 +502,33 @@ public data class DrainReport(
     val parked: Int = 0,
     val skipped: Int = 0,
     /**
-     * Rows dropped because their account no longer exists — a sign-out, or a Keystore key
-     * that can no longer decrypt. Their notes are back to `LOCAL_ONLY`; nothing was lost
-     * locally and nothing was touched remotely.
+     * Rows dropped because their account no longer exists — a Keystore key that can no
+     * longer decrypt, or a row that outlived its account. Their notes are back to
+     * `LOCAL_ONLY` and their bindings are gone; nothing was lost locally and nothing was
+     * touched remotely.
      */
     val orphaned: Int = 0,
+    /**
+     * Rows dropped because the user signed out of their account (M6).
+     *
+     * Distinct from [orphaned] because the **binding survives** — which is what makes
+     * signing back in resume every note instead of re-binding them by hand.
+     */
+    val paused: Int = 0,
     val haltedAccounts: Set<String> = emptySet(),
+    /**
+     * ⭐ Notes whose PUT came back **412** (M6).
+     *
+     * SPEC §7.7's resolution for one of these is a reconcile of that note: download the version
+     * this device has not seen, merge it, and let the same UPLOAD row carry the union. The
+     * drainer cannot schedule that itself — see the `Parked` branch — so it names the notes and
+     * `OutboxDrainWorker` asks `WorkScheduler.enqueueReconcile(noteId)` for each.
+     *
+     * ⚠️ Deliberately **not** part of [shouldRunAgain]. A 412 is not something a retry of the
+     * *same* PUT can fix, and folding it in would put the conflict on WorkManager's backoff
+     * ladder — which is the shape CLAUDE.md rule 5 forbids for credentials and is no better here.
+     */
+    val conflicted: Set<DocumentId> = emptySet(),
 ) {
     /** True when something is still owed and running again later would help. */
     public val shouldRunAgain: Boolean get() = deferred > 0 || failed > 0 || requeued > 0

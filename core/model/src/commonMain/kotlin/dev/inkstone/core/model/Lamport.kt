@@ -88,6 +88,15 @@ public data class Register<T>(val value: T, val clock: LamportClock) {
      * tiebreak) and impossible on one device (the counter only increases), so
      * "not later" resolving to the incumbent is a defensive choice with no
      * observable behaviour rather than a policy.
+     *
+     * ⚠️ **The same-device half of that rests on every clock [LamportClockGenerator.next]
+     * issues being folded back into what the *next* generator is seeded with.** M6 broke
+     * exactly that for `Document.titleClock`: the counter came from this generator and was
+     * left out of the bundle's `highestClockCounter`, so the session after a close re-issued
+     * it — and two devices then held two different titles at one identical clock, permanently,
+     * with every op present and nothing reported. Anything that stamps a register from [next]
+     * and stores it somewhere other than a page op has to be added to `BundleContents`
+     * (which is where the invariant now lives) at the same time.
      */
     public fun write(value: T, clock: LamportClock): Register<T> =
         if (clock > this.clock) Register(value, clock) else this

@@ -6,7 +6,6 @@ import com.tom_roush.pdfbox.cos.COSFloat
 import com.tom_roush.pdfbox.cos.COSInteger
 import com.tom_roush.pdfbox.cos.COSName
 import com.tom_roush.pdfbox.cos.COSStream
-import com.tom_roush.pdfbox.cos.COSUpdateInfo
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDDocumentCatalog
 import com.tom_roush.pdfbox.pdmodel.PDDocumentNameDictionary
@@ -138,6 +137,9 @@ internal class PdfBoxWriter : PdfWriter {
         val kids = COSArray()
         for (page in pages) {
             kids.add(page.cosObject)
+            // Before the /Parent changes, not after: what the page inherits is read through
+            // the chain this line is about to shorten.
+            PdfResources.inheritDown(page.cosObject)
             // A flattened tree means every page's parent is the root. Pages that were
             // in a nested node have to be told, or a reader following /Parent walks
             // into a node that no longer lists them.
@@ -180,12 +182,19 @@ internal class PdfBoxWriter : PdfWriter {
 
             PageAnnotationMode.FLATTENED -> {
                 dict.setBoolean(COSName.getPDFName(PdfPageKeys.FLATTENED), true)
-                if (drawable.isNotEmpty()) appendContent(doc, page, flattened(doc, drawable, geometry))
+                if (drawable.isNotEmpty()) {
+                    // ⚠️ The **page's** resources, not the stream's — see PdfResources.
+                    PdfResources.addToPage(dict, COSName.EXT_G_STATE, extGStates(drawable))
+                    appendContent(doc, page, flateStream(doc, PdfContent.flattenedOverlay(drawable, geometry)))
+                }
             }
         }
 
         val text = PdfContent.invisibleText(plan.words, geometry, TEXT_FONT_NAME)
-        if (text.isNotEmpty()) appendContent(doc, page, textContent(doc, text))
+        if (text.isNotEmpty()) {
+            PdfResources.addToPage(dict, COSName.FONT, invisibleFont())
+            appendContent(doc, page, flateStream(doc, text))
+        }
 
         markUpdated(dict)
         markParentChain(dict)
@@ -325,46 +334,38 @@ internal class PdfBoxWriter : PdfWriter {
         stream.setItem(COSName.SUBTYPE, COSName.FORM)
         stream.setItem(COSName.BBOX, rect.toCosArray())
         stream.setItem(COSName.MATRIX, identityMatrix())
-        stream.setItem(COSName.RESOURCES, graphicsStates(listOf(outline)))
+        // A form XObject is the one kind of stream that legitimately carries its own
+        // `/Resources`, and this is the only place in this writer that may set them.
+        stream.setItem(COSName.RESOURCES, PdfResources.form(COSName.EXT_G_STATE, extGStates(listOf(outline))))
         markUpdated(stream)
         return stream
     }
 
-    private fun flattened(doc: PDDocument, outlines: List<StrokeOutline>, geometry: PdfPageGeometry): COSStream {
-        val content = PdfContent.flattenedOverlay(outlines, geometry)
+    private fun flateStream(doc: PDDocument, content: ByteArray): COSStream {
         val stream = PDStream(doc, ByteArrayInputStream(content), COSName.FLATE_DECODE).cosObject
-        stream.setItem(COSName.RESOURCES, graphicsStates(outlines))
         markUpdated(stream)
         return stream
     }
 
-    private fun textContent(doc: PDDocument, content: ByteArray): COSStream {
-        val stream = PDStream(doc, ByteArrayInputStream(content), COSName.FLATE_DECODE).cosObject
-        // A standard-14 font dictionary, written by hand. Going through PDFBox's font
-        // stack would pull in PDFBoxResourceLoader and a Context for an AFM file that
-        // describes metrics nothing here measures — the text is invisible.
+    /**
+     * The standard-14 font the invisible text layer names (SPEC §5.5), as a `/Font` entry.
+     *
+     * Written by hand rather than through PDFBox's font stack, which would pull in
+     * `PDFBoxResourceLoader` and a `Context` for an AFM file describing metrics nothing
+     * here measures — the text is invisible.
+     */
+    private fun invisibleFont(): COSDictionary {
         val font = COSDictionary().apply {
-            setItem(COSName.TYPE, COSName.getPDFName("Font"))
+            setItem(COSName.TYPE, COSName.FONT)
             setItem(COSName.SUBTYPE, COSName.getPDFName("Type1"))
             setItem(COSName.getPDFName("BaseFont"), COSName.getPDFName("Helvetica"))
             setItem(COSName.getPDFName("Encoding"), COSName.getPDFName("WinAnsiEncoding"))
             markUpdated(this)
         }
-        stream.setItem(
-            COSName.RESOURCES,
-            COSDictionary().apply {
-                setItem(
-                    COSName.getPDFName("Font"),
-                    COSDictionary().apply {
-                        setItem(COSName.getPDFName(TEXT_FONT_NAME), font)
-                        markUpdated(this)
-                    },
-                )
-                markUpdated(this)
-            },
-        )
-        markUpdated(stream)
-        return stream
+        return COSDictionary().apply {
+            setItem(COSName.getPDFName(TEXT_FONT_NAME), font)
+            markUpdated(this)
+        }
     }
 
     /**
@@ -452,17 +453,6 @@ internal class PdfBoxWriter : PdfWriter {
     // COS helpers
     // -----------------------------------------------------------------------
 
-    /**
-     * Mark an object to be written into the update section.
-     *
-     * The one call that must never be forgotten — see the class KDoc. It is a
-     * function rather than an inline `setNeedToBeUpdated(true)` so that every site
-     * that creates an object has a single, greppable thing to have done.
-     */
-    private fun markUpdated(value: Any?) {
-        (value as? COSUpdateInfo)?.isNeedToBeUpdated = true
-    }
-
     private fun boundsOf(outline: StrokeOutline, geometry: PdfPageGeometry): PdfBox {
         var minX = Float.MAX_VALUE
         var minY = Float.MAX_VALUE
@@ -506,7 +496,7 @@ internal class PdfBoxWriter : PdfWriter {
     }
 
     /**
-     * `/Resources /ExtGState` for the compositing the strokes on a page use.
+     * The `/ExtGState` entries for the compositing the strokes on a page use.
      *
      * Plain alpha, `/Normal` blending — the same compositing [PagePainter] does on screen.
      *
@@ -515,7 +505,7 @@ internal class PdfBoxWriter : PdfWriter {
      * thing SPEC §3.4 stopped doing. What keeps the published file honest is that it
      * matches the editor, not that it is physically faithful.
      */
-    private fun graphicsStates(outlines: List<StrokeOutline>): COSDictionary {
+    private fun extGStates(outlines: List<StrokeOutline>): COSDictionary {
         val extGState = COSDictionary()
         for (outline in outlines.distinctBy { PdfContent.stateNameFor(it) }) {
             val alpha = PdfContent.alphaValue(outline.colorArgb)
@@ -529,10 +519,7 @@ internal class PdfBoxWriter : PdfWriter {
             )
         }
         markUpdated(extGState)
-        return COSDictionary().apply {
-            setItem(COSName.EXT_G_STATE, extGState)
-            markUpdated(this)
-        }
+        return extGState
     }
 
     private fun PdfBox.toCosArray(): COSArray = COSArray().apply {

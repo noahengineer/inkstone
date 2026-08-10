@@ -233,11 +233,19 @@ install the CA in the system trust store — the user's decision, not the app's 
 ## 6. Testing
 
 ```bash
-./gradlew build                                    # 1068 JVM tests, all green
+./gradlew build                                    # 286 unit tests per variant, all green
 ./gradlew :core:database:connectedDebugAndroidTest # 24 tests, green on an emulator
 ```
 
-`:core:sync`'s `commonTest` (62 tests) covers the protocol and the policy against Ktor's
+⚠️ **That line said "1068 JVM tests" until M6's review, and 1,068 is not a test count** — it is
+Gradle's `1068 actionable tasks` from the same summary line, read as one and then quoted as one here,
+in `CLAUDE.md`, in `ROADMAP.md` and twice in M6's notes. The measured figure is `tests=` summed over
+`*/build/test-results/testDebugUnitTest/*.xml`, which at this milestone's commit (`d6993e3`) is
+**286** — `:core:model` 108, `:core:sync` 79, `:core:storage` 59, `:app` 17, `:android:pdf` 23 — and
+it is *per variant*: `build` runs the same tests again as `testReleaseUnitTest`, so 286 written and
+572 executed.
+
+`:core:sync`'s `commonTest` (79 tests) covers the protocol and the policy against Ktor's
 `MockEngine` and in-memory ports: SPEC §7.1's six rules, §7.3's PROPFIND body and
 multistatus parse, the weak-ETag trap, §7.5's whole response table, §7.6's coalescing table
 row by row, and the four drainer behaviours ROADMAP M5 lists as acceptance criteria.
@@ -289,7 +297,7 @@ about a one-line clamp when M1's owner next touches it.
 
 ### Two bugs only a real device found
 
-Both were invisible to 1068 JVM tests and to 24 instrumented ones, and both were about
+Both were invisible to all 286 JVM unit tests and to 24 instrumented ones, and both were about
 *account lifecycle* rather than the protocol.
 
 **Re-login created a second account.** `completeLogin` minted a fresh account id every

@@ -3,6 +3,7 @@ package dev.inkstone.core.storage
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageTemplate
@@ -56,7 +57,7 @@ class NoteDuplicateTest {
             ),
         )
         session.apply(pages[1].id, listOf(addOp("obj-3")))
-        session.close()
+        session.close(NoteSyncState.LOCAL_ONLY)
         return note.document.id
     }
 

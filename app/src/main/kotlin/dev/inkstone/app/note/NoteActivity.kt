@@ -18,7 +18,9 @@ import androidx.compose.ui.Modifier
 import dagger.hilt.android.AndroidEntryPoint
 import dev.inkstone.app.R
 import dev.inkstone.app.ink.InkScreen
+import dev.inkstone.app.sync.PollTicker
 import dev.inkstone.app.ui.InkstoneTheme
+import javax.inject.Inject
 
 /**
  * The note editor: one notebook, its pages, and the ink surface.
@@ -47,6 +49,18 @@ import dev.inkstone.app.ui.InkstoneTheme
 class NoteActivity : ComponentActivity() {
 
     private val editor: NoteEditorViewModel by viewModels()
+
+    /**
+     * SPEC §7.6's foreground poll (M6).
+     *
+     * Retained here as well as in `MainActivity` because the editor is precisely where a peer's
+     * edits have to arrive live (SPEC §13.2 row 10) — a note open on two tablets is the case the
+     * whole milestone is about. `PollTicker` counts screens rather than tracking one, which is what
+     * keeps polling continuous across the handover: Android runs this `onStart` **before** the
+     * library's `onStop`.
+     */
+    @Inject
+    lateinit var poll: PollTicker
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
@@ -81,7 +95,13 @@ class NoteActivity : ComponentActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        poll.retain()
+    }
+
     override fun onStop() {
+        poll.release()
         editor.materialize()
         super.onStop()
     }

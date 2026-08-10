@@ -137,11 +137,23 @@ class NextcloudAccounts @Inject constructor(
         }
 
         // `accountFor` resets `state` to ACTIVE and `lastError` to null, which is the
-        // clearing of the NEEDS_REAUTH flag — the whole point of coming back here.
+        // clearing of the NEEDS_REAUTH *and* SIGNED_OUT flags — the whole point of coming
+        // back here. `defaultFolder` and the cached capabilities are carried over rather than
+        // re-derived, so the folder the user chose once is still the folder they land in.
         val account = accountFor(accountId, credential)
             .copy(defaultFolder = existing?.defaultFolder ?: SyncAccount.DEFAULT_FOLDER)
             .withCapabilities(credential)
         accounts.upsert(account)
+
+        // ⭐ The other half of making sign-out reversible. Every binding this account still
+        // holds becomes live again, and only the notes that actually changed while signed out
+        // owe an upload — the rest are already on the server, byte for byte, under an ETag
+        // this device still holds. Coming back to a library of 200 synced notes costs zero
+        // requests, not 200.
+        //
+        // Must run *after* the upsert above: `resumeAccount` enqueues, and `SyncEngine` now
+        // refuses to enqueue for an account that is not yet usable.
+        if (existing != null) sync.resumeAccount(accountId)
         return account
     }
 
@@ -184,25 +196,74 @@ class NextcloudAccounts @Inject constructor(
      * Which is why the outcome is not checked. A server that cannot be reached must not
      * be able to trap the user in a session they asked to end.
      */
-    suspend fun signOut(accountId: String) {
+    suspend fun signOut(accountId: String): SignOutResult {
         credentials.get(accountId)?.let { ocs.revokeAppPassword(it) }
-        // Unbind first, while the account is still there to be found. Every note bound to
-        // this account goes back to LOCAL_ONLY and its queued rows are dropped — signing
-        // out is not a delete, so the copies on the server are left exactly where they are
-        // (CLAUDE.md rule 1), but there is no longer anything to sync them *with*.
+
+        // ⭐ **Paused, not unbound** (M6). Every note on this account stops syncing and its
+        // queued rows are dropped, but its `remote_binding` row — the only record of which
+        // note lives at which remote path — is kept.
         //
-        // Without this the bindings outlive the account: the notes claim PENDING_UPLOAD,
-        // the outbox rows never drain, and the worker reports success every time. Found on
-        // a device in M5 by signing out with work still queued.
+        // This used to call `sync.unbind`, which deleted those rows, and then
+        // `accounts.remove`, which deleted the server URL, login name, uid, default folder
+        // and cached capabilities too. Signing back in therefore meant re-typing a URL on a
+        // tablet and then re-binding **every note individually, choosing its folder again**.
+        // For a real library that is not a sign-in, it is a migration — and none of it was
+        // required by SPEC §7.1, which asks only that the app password be revoked.
+        //
+        // The M5 bug that motivated the unbind is fixed properly instead: work is no longer
+        // enqueued for an account that cannot send it (`SyncEngine.canSend`), and the drainer
+        // drops any row that raced the sign-out. See [AccountState.SIGNED_OUT].
+        val paused = sync.pauseAccount(accountId)
+
+        // The secret, and only the secret. SPEC §14 protects the app password; a server URL
+        // and a uid are not secrets, and keeping them is what the user is asking for when
+        // they sign back into the same account.
+        credentials.remove(accountId)
+        accounts.setState(accountId, AccountState.SIGNED_OUT, null)
+        return SignOutResult(pausedNotes = paused)
+    }
+
+    /**
+     * Forget an account completely — the row, the bindings, everything local about it.
+     *
+     * Separate from [signOut] because they are different intentions and only one of them is
+     * reversible. This is for "I will not use this server again"; sign-out is for "not now".
+     *
+     * **Still not a delete of anything remote** (CLAUDE.md rule 1): the notes stay on disk,
+     * go back to `LOCAL_ONLY`, and their copies on the server are left exactly where they are.
+     */
+    suspend fun forgetAccount(accountId: String) {
+        credentials.get(accountId)?.let { ocs.revokeAppPassword(it) }
         for (binding in bindings.forAccount(accountId)) sync.unbind(binding.noteId)
         credentials.remove(accountId)
         accounts.remove(accountId)
+    }
+
+    /**
+     * ⭐ Remember where this account's notes should go by default (M6).
+     *
+     * SPEC §7.6 says *"a default folder per account makes step 2 one tap"*, and the folder
+     * browser has always been able to reach any path on the server — but the default itself was
+     * the compile-time constant `Inkstone` and nothing could change it. So every note that
+     * belonged anywhere else meant navigating out of `Inkstone` by hand, every time, which
+     * reads as "the app insists on its own folder".
+     *
+     * Setting it changes only where the browser *starts* and where an unpinned note lands. It
+     * moves nothing that is already on the server: notes keep the `remote_path` they were bound
+     * with (CLAUDE.md rule 1 — a settings change is not a licence to move a user's files).
+     */
+    suspend fun setDefaultFolder(accountId: String, remotePath: String) {
+        val account = accounts.find(accountId) ?: return
+        accounts.upsert(account.copy(defaultFolder = remotePath.trim('/')))
     }
 
     /** After the user re-authenticates an account that was flagged `NEEDS_REAUTH`. */
     suspend fun clearReauthFlag(accountId: String) {
         accounts.setState(accountId, AccountState.ACTIVE, null)
     }
+
+    /** @property pausedNotes how many bound notes stopped syncing and will resume on sign-in. */
+    data class SignOutResult(val pausedNotes: Int)
 
     // -----------------------------------------------------------------------
     // Folder browsing — SPEC §7.6 step 2

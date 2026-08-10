@@ -1,0 +1,56 @@
+# A real Nextcloud for SPEC §13.2's merge matrix.
+#
+# SPEC §13.2: *"All rows are automated tests, run against a real Nextcloud in Docker —
+# mocks won't reproduce weak ETags, fileid churn on restore, or brute-force lockout."*
+# This is that server.
+#
+#   bash tools/nextcloud-docker/up.sh      # start, install, mint an app password
+#   bash tools/nextcloud-docker/occ ...    # run occ inside the container
+#   docker compose -f tools/nextcloud-docker/docker-compose.yml down -v
+#
+# ## Why SQLite and not MariaDB
+#
+# Two reasons, and the second is the one that matters. A test server is torn down and
+# rebuilt; SQLite installs in ~20 s where MariaDB needs a second container, a health
+# check and ~90 s. And SPEC §7.8 warns that *"emoji fail if the DB isn't utf8mb4"* —
+# SQLite has no such failure mode, so a note titled `Physics 📘` would pass here and
+# could still fail on the user's MariaDB. That asymmetry is deliberate: `RemoteNameTest`
+# and `NextcloudCapabilitiesTest` cover naming against the *capabilities document*, which
+# is where the real rules come from, and the emoji path is verified on the author's own
+# server (docs/M5-NEXTCLOUD.md §7) rather than trusted to this one.
+#
+# Set INKSTONE_NC_DB=mariadb and use the `mariadb` profile if you want the stricter DB.
+
+services:
+  nextcloud:
+    image: nextcloud:32-apache
+    container_name: inkstone-nextcloud
+    restart: unless-stopped
+    ports:
+      # 8080, not 80 — this runs on a developer machine that may already serve something.
+      - "${INKSTONE_NC_PORT:-8080}:80"
+    environment:
+      SQLITE_DATABASE: nextcloud
+      NEXTCLOUD_ADMIN_USER: "${INKSTONE_NC_ADMIN:-inkstone}"
+      NEXTCLOUD_ADMIN_PASSWORD: "${INKSTONE_NC_ADMIN_PASSWORD:-inkstone-test-only}"
+      # Without this, every request 400s with "Access through untrusted domain".
+      NEXTCLOUD_TRUSTED_DOMAINS: "localhost 127.0.0.1 host.docker.internal"
+      # ⚠️ The suite talks plain HTTP to localhost. SPEC §14 is HTTPS-only with no
+      # "accept anyway", and that rule is about the *app* — which enforces it through its
+      # network security config. The test harness drives Ktor directly against a loopback
+      # container, so no user credential and no note content crosses a network here.
+      OVERWRITEPROTOCOL: http
+    volumes:
+      - nextcloud-data:/var/www/html
+    healthcheck:
+      # status.php answers `installed:true` only once the installer has finished, which is
+      # what `up.sh` waits on. Hitting the WebDAV endpoint earlier gets a 503 that reads
+      # like a broken server.
+      test: ["CMD", "sh", "-c", "curl -sf http://localhost/status.php | grep -q '\"installed\":true'"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
+
+volumes:
+  nextcloud-data:

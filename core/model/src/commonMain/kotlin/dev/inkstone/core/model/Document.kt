@@ -7,10 +7,34 @@ package dev.inkstone.core.model
  * page order; a page's position in the list is never its identity.
  *
  * @property title an LWW register at the sync layer. Held as a plain string here
- *   because a document's title is not part of any page's op log.
+ *   because a document's title is not part of any page's op log — see [titleClock]
+ *   for the half that makes "LWW" mean anything.
+ * @property titleClock ⭐ **when [title] was last written, for SPEC §7.7 layer 2.**
+ *
+ *   *Added in M6, and SPEC §7.7 has been corrected.* That section says title is
+ *   *"LWW with the override recorded in history"*, and until M6 there was nothing
+ *   to resolve it **with**: a title was a bare `String`, so two devices renaming one
+ *   note offline gave a merge no way to tell which rename was later. The available
+ *   wrong answers were both bad — order by [modifiedEpochMillis], which CLAUDE.md
+ *   forbids outright because device clocks disagree, or pick the lexicographically
+ *   smaller string, which is deterministic and converges but silently discards
+ *   whichever rename the user actually meant.
+ *
+ *   Null means *"never renamed, or renamed by a build older than M6"*, and a null
+ *   loses to any non-null clock: a device that has recorded a rename knows something
+ *   a device that has not cannot contradict.
+ *
+ *   Resolved through [Register], the same mechanism every page-level register uses.
  * @property localRev SPEC §7.6 — bumped on every committed change, and the value
  *   an upload is validated against so a note edited mid-flight is not marked
  *   SYNCED with the edit left invisible to sync forever.
+ *
+ *   ⚠️ **Never adopted from a peer.** It is this device's counter of this device's
+ *   commits, and the outbox compares it against `outbox.local_rev_at_enqueue` to
+ *   decide whether a note changed mid-flight (SPEC §7.6). Taking `maxOf(local,
+ *   remote)` across devices — which is right when replaying a note's own journal onto
+ *   its own bundle, and meaningless across two — jumps the counter past what the
+ *   outbox recorded and makes the merged work invisible to sync forever.
  */
 public data class Document(
     val id: DocumentId,
@@ -21,7 +45,23 @@ public data class Document(
     val deviceId: String = "",
     val createdEpochMillis: Long = 0L,
     val modifiedEpochMillis: Long = 0L,
+    val titleClock: LamportClock? = null,
 ) {
+
+    /**
+     * SPEC §7.7 layer 2 — resolve this document's title against a peer's.
+     *
+     * @return the winning `(title, clock)`. The remote wins only on a strictly later
+     *   clock, so two devices merging each other's copies reach the same answer
+     *   whichever direction the merge runs in — which is the property that makes this
+     *   converge rather than oscillate.
+     */
+    public fun resolveTitle(remoteTitle: String, remoteClock: LamportClock?): Pair<String, LamportClock?> = when {
+        remoteClock == null -> title to titleClock
+        titleClock == null -> remoteTitle to remoteClock
+        remoteClock > titleClock -> remoteTitle to remoteClock
+        else -> title to titleClock
+    }
 
     /** Visible pages, in order. Deleted pages keep their slot in [pages] as tombstones. */
     public val livePages: List<PageRef> get() = pages.filterNot { it.deleted }

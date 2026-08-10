@@ -1,10 +1,12 @@
 package dev.inkstone.app.note
 
+import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PageSize
 
 /**
  * Shared doubles for the editor's JVM tests.
@@ -49,6 +51,21 @@ internal class FakeSurface : NoteEditor.NoteSurface {
 
     override fun applyOps(ops: List<PageOp>, record: Boolean) {
         applied += Applied(ops, record)
+    }
+
+    /**
+     * What [NoteEditor.NoteSurface.setPageMeta] was last given, or null if it was never called.
+     *
+     * A field of its own rather than a flag on [loadedPage], because the whole point of the method is
+     * that it is *not* `loadPage`: `loadPage` refits the camera and cancels the in-progress stroke,
+     * and SPEC §13.2 row 10 forbids both. A test that could not tell them apart could not tell a
+     * correct remote page-meta change from the one that eats the user's stroke.
+     */
+    var pageMeta: Pair<PageSize, Background>? = null
+        private set
+
+    override fun setPageMeta(size: PageSize, background: Background) {
+        pageMeta = size to background
     }
 }
 
@@ -112,5 +129,45 @@ internal class InMemoryFileSystem : FileSystem {
             directories += path.substring(0, index)
             index = path.indexOf('/', index + 1)
         }
+    }
+}
+
+/**
+ * An [InMemoryFileSystem] that can be **parked mid-write**, and that remembers the order it was
+ * written in.
+ *
+ * Both halves exist for the same reason: the editor's operations are only unsafe *while they are
+ * suspended*, and a test that calls two of them in sequence proves nothing about what happens when
+ * one lands inside the other. The suspension points that matter are all file I/O, so this is where a
+ * test can stand between a bundle write and the journal reset that follows it — the window in which
+ * a flushed stroke is destroyed.
+ *
+ * [writes] is the serialization evidence. Data assertions alone would let a refactor preserve the
+ * bytes by luck while reinstating the interleaving; the order of `write:`/`append:` entries is what
+ * says the two operations did not overlap.
+ */
+internal class GatedFileSystem(private val delegate: InMemoryFileSystem = InMemoryFileSystem()) :
+    FileSystem by delegate {
+
+    /** Every write and append, in order, as `write:<path>` / `append:<path>`. */
+    val writes = ArrayList<String>()
+
+    /**
+     * Runs **before** each atomic write, with the destination path.
+     *
+     * Before rather than after, because `writeBytesAtomically` is one step of a caller's sequence
+     * and what a test needs to interrupt is the sequence, not the write.
+     */
+    var onWrite: suspend (String) -> Unit = {}
+
+    override suspend fun writeBytesAtomically(path: String, bytes: ByteArray) {
+        onWrite(path)
+        writes += "write:$path"
+        delegate.writeBytesAtomically(path, bytes)
+    }
+
+    override suspend fun appendBytes(path: String, bytes: ByteArray) {
+        writes += "append:$path"
+        delegate.appendBytes(path, bytes)
     }
 }

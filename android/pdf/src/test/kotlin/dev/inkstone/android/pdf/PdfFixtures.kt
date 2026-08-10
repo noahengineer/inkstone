@@ -1,5 +1,8 @@
 package dev.inkstone.android.pdf
 
+import com.tom_roush.pdfbox.cos.COSArray
+import com.tom_roush.pdfbox.cos.COSDictionary
+import com.tom_roush.pdfbox.cos.COSFloat
 import com.tom_roush.pdfbox.cos.COSName
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPage
@@ -65,6 +68,97 @@ internal object PdfFixtures {
     }
 
     /**
+     * A one-page PDF whose page carries **its own** `/Resources`, used by content that
+     * needs them.
+     *
+     * `sourcePdf`'s pages reference no named resources at all, which makes it useless for
+     * the question of whether publishing *keeps* a source page's resources while adding
+     * ours. A name that a source content stream uses and the published file no longer
+     * defines is ink drawn on a page whose own graphics have gone.
+     */
+    fun sourcePdfWithPageResources(): ByteArray = PDDocument().use { doc ->
+        val page = PDPage(PDRectangle(612f, 792f))
+        page.cosObject.setItem(COSName.RESOURCES, resourcesWithState())
+        page.cosObject.setItem(
+            COSName.CONTENTS,
+            PDStream(doc, ByteArrayInputStream(sourceContent), COSName.FLATE_DECODE).cosObject,
+        )
+        doc.addPage(page)
+
+        val out = ByteArrayOutputStream()
+        doc.save(out)
+        out.toByteArray()
+    }
+
+    /**
+     * Two pages under an **intermediate `/Pages` node** that supplies their `/MediaBox` and
+     * `/Resources` by inheritance (PDF 32000-1 §7.7.3.4).
+     *
+     * This is the shape pdfTeX and Ghostscript produce for a long document, and the one that
+     * makes inheritance load-bearing: reordering or adding a page flattens the tree, and a
+     * page whose size came from the node that was cut out has no size at all. The MediaBox is
+     * deliberately **not** US Letter, because Letter is exactly what PDFBox falls back to
+     * when it cannot find one — a Letter fixture would make the bug invisible.
+     */
+    fun sourcePdfWithInheritedAttributes(): ByteArray = PDDocument().use { doc ->
+        val root = doc.documentCatalog.pages.cosObject
+        val node = COSDictionary().apply {
+            setItem(COSName.TYPE, COSName.getPDFName("Pages"))
+            setItem(COSName.PARENT, root)
+            setItem(COSName.MEDIA_BOX, box(INHERITED_WIDTH_PT, INHERITED_HEIGHT_PT))
+            setItem(COSName.RESOURCES, resourcesWithState())
+        }
+        val kids = COSArray()
+        repeat(2) {
+            kids.add(
+                COSDictionary().apply {
+                    setItem(COSName.TYPE, COSName.PAGE)
+                    setItem(COSName.PARENT, node)
+                    setItem(
+                        COSName.CONTENTS,
+                        PDStream(doc, ByteArrayInputStream(sourceContent), COSName.FLATE_DECODE).cosObject,
+                    )
+                },
+            )
+        }
+        node.setItem(COSName.KIDS, kids)
+        node.setInt(COSName.COUNT, kids.size())
+        root.setItem(COSName.KIDS, COSArray().apply { add(node) })
+        root.setInt(COSName.COUNT, kids.size())
+
+        val out = ByteArrayOutputStream()
+        doc.save(out)
+        out.toByteArray()
+    }
+
+    /** `/ExtGState << /SrcGS << /ca 0.5 /CA 0.5 >> >>` — one name a source stream uses. */
+    private fun resourcesWithState(): COSDictionary = COSDictionary().apply {
+        setItem(
+            COSName.EXT_G_STATE,
+            COSDictionary().apply {
+                setItem(
+                    COSName.getPDFName(SOURCE_STATE_NAME),
+                    COSDictionary().apply {
+                        setFloat(COSName.CA, 0.5f)
+                        setFloat(COSName.getPDFName("ca"), 0.5f)
+                    },
+                )
+            },
+        )
+    }
+
+    private fun box(width: Float, height: Float): COSArray = COSArray().apply {
+        add(COSFloat(0f))
+        add(COSFloat(0f))
+        add(COSFloat(width))
+        add(COSFloat(height))
+    }
+
+    /** Content that names [SOURCE_STATE_NAME], so dropping the source's resources is detectable. */
+    private val sourceContent: ByteArray
+        get() = "q /$SOURCE_STATE_NAME gs 0.9 0.9 0.9 rg 20 20 100 100 re f Q\n".toByteArray(Charsets.US_ASCII)
+
+    /**
      * A page with content on it, so the fixture is a real page rather than an empty
      * rectangle — and so a test can tell whether publishing kept it.
      */
@@ -122,6 +216,14 @@ internal object PdfFixtures {
 
     /** A highlighter: alpha 0x66, which is what makes it a highlighter (SPEC §3.4). */
     const val TRANSLUCENT_YELLOW: Int = 0x66FFE066
+
+    /** The `/ExtGState` name the inheritance fixtures' own content streams use. */
+    const val SOURCE_STATE_NAME: String = "SrcGS"
+
+    /** A4 in points — anything but US Letter, for the reason `sourcePdfWithInheritedAttributes` gives. */
+    const val INHERITED_WIDTH_PT: Float = 595f
+
+    const val INHERITED_HEIGHT_PT: Float = 842f
 }
 
 /**

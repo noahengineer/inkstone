@@ -68,9 +68,21 @@ public class WebDavClient(transport: NextcloudTransport, private val credential:
             setBody(WebDavXml.QUOTA_BODY)
         }.flatMapText { body -> parseMultistatus(body).map { it.firstOrNull() } }
 
-    /** Download a file whole. Used by the M5 round-trip spike and by M6's reconciler. */
+    /** Download a file whole, bytes only. The M5 round-trip spike's door; prefer [download]. */
     public suspend fun get(remotePath: String): DavOutcome<ByteArray> =
         callRaw(HttpMethod.Get, remotePath) {}.map { it.bytes }
+
+    /**
+     * Download a file whole, **with the validators that came back with it** (M6).
+     *
+     * [get] throws the ETag away, and the ETag of *the bytes actually received* is the one that
+     * may become `lastSyncedEtag` after a merge. It is not always the one the PROPFIND advertised:
+     * a peer saving between the two calls changes it, and storing the PROPFIND's value would leave
+     * the binding claiming a version of the file this device has never held — after which the next
+     * `If-Match` upload 412s against bytes nobody can produce.
+     */
+    public suspend fun download(remotePath: String): DavOutcome<DownloadedFile> =
+        callRaw(HttpMethod.Get, remotePath) {}.map { DownloadedFile(it.bytes, it.etag, it.ocId) }
 
     public suspend fun exists(remotePath: String): DavOutcome<Boolean> =
         when (val outcome = propfind(remotePath, Depth.Zero)) {
@@ -292,3 +304,17 @@ public class WebDavClient(transport: NextcloudTransport, private val credential:
  * binding first, which is slower and still correct.
  */
 public data class UploadReceipt(val status: Int, val etag: ETag?, val ocId: String?)
+
+/**
+ * A downloaded file and the two things the reconciler must remember about it (SPEC §7.6 step 3).
+ *
+ * Not a `data class`, deliberately. A generated `equals` over [bytes] compares array *references*,
+ * so two structurally identical downloads would answer "not equal" and one held in a `Set` would
+ * be found only by identity — a trap with no upside here, since nothing ever compares whole
+ * downloads. `ByteArray` fields are why `kotlin.io` avoids data classes too.
+ *
+ * @property etag off `OC-ETag`, falling back to `ETag`. Null when a reverse proxy stripped both,
+ *   which is not an error: the caller then keeps the PROPFIND's value and the weak-ETag fallback
+ *   (SPEC §7.3) covers the rest.
+ */
+public class DownloadedFile(public val bytes: ByteArray, public val etag: ETag?, public val ocId: String?)

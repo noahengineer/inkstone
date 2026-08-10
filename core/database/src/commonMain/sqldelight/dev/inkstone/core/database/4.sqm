@@ -1,0 +1,88 @@
+-- Migration 4 → 5: the reconciler's schema (M6, SPEC §7.4, §7.6's pull side, §7.7).
+--
+-- Purely additive: six new tables, their indexes, and one column on `remoteBinding`. Nothing is
+-- backfilled and nothing is rewritten — an existing database migrates without touching a row.
+--
+-- The one ALTER's default means what it did before. `lastSeenRemoteAt` is 0, "never seen", which
+-- is the truth for every row written before this milestone: no reconcile pass has ever run. It
+-- is on its own never a reason to trash a note (see the column comment in Sync.sq), so an
+-- upgraded device does not treat its whole library as deleted remotely on the first poll.
+--
+-- The new column is **last** in `Sync.sq`'s `CREATE TABLE remoteBinding` because
+-- `ALTER TABLE ADD COLUMN` appends, and a fresh install has to produce the same column order a
+-- migrated database does. `verifyMigrations` diffs the two and fails the build on any
+-- disagreement — the same rule 2.sqm records for the folder-cover columns.
+--
+-- The column comments live in Sync.sq. This file is the delta, and duplicating them would give
+-- two places to keep in step — which is also why it must never be re-synced from Sync.sq later:
+-- a migration records what version 5 looked like *when it was written*.
+
+CREATE TABLE remoteDirectory (
+    accountId TEXT    NOT NULL,
+    path      TEXT    NOT NULL,
+    etag      TEXT,
+    etagWeak  INTEGER NOT NULL DEFAULT 0,
+    ocId      TEXT,
+    seenAt    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (accountId, path)
+);
+
+CREATE INDEX remoteDirectoryBySeen ON remoteDirectory(accountId, seenAt);
+
+CREATE TABLE syncCursor (
+    accountId       TEXT    NOT NULL PRIMARY KEY,
+    dataFingerprint TEXT,
+    rootEtag        TEXT,
+    rootEtagWeak    INTEGER NOT NULL DEFAULT 0,
+    lastReconcileAt INTEGER NOT NULL DEFAULT 0,
+    lastFullAt      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE pendingDownload (
+    noteId         TEXT    NOT NULL PRIMARY KEY,
+    accountId      TEXT    NOT NULL,
+    remotePath     TEXT    NOT NULL,
+    remoteOcId     TEXT,
+    remoteEtag     TEXT,
+    remoteEtagWeak INTEGER NOT NULL DEFAULT 0,
+    tempPath       TEXT    NOT NULL,
+    fetchedAt      INTEGER NOT NULL
+);
+
+CREATE TABLE syncAttention (
+    id                   TEXT    NOT NULL PRIMARY KEY,
+    accountId            TEXT    NOT NULL,
+    noteId               TEXT,
+    kind                 TEXT    NOT NULL,
+    detail               TEXT,
+    conflictedCopyNoteId TEXT,
+    remotePath           TEXT,
+    createdAt            INTEGER NOT NULL,
+    acknowledgedAt       INTEGER
+);
+
+CREATE INDEX syncAttentionOpen   ON syncAttention(acknowledgedAt, createdAt);
+CREATE INDEX syncAttentionByNote ON syncAttention(noteId);
+
+CREATE TABLE folderBinding (
+    folderId       TEXT    NOT NULL PRIMARY KEY,
+    accountId      TEXT    NOT NULL,
+    remotePath     TEXT    NOT NULL,
+    remoteOcId     TEXT,
+    remoteEtag     TEXT,
+    remoteEtagWeak INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX folderBindingByOcId ON folderBinding(accountId, remoteOcId);
+
+CREATE TABLE peerClock (
+    noteId         TEXT    NOT NULL,
+    peerDeviceId   TEXT    NOT NULL,
+    highestCounter INTEGER NOT NULL DEFAULT 0,
+    seenAt         INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (noteId, peerDeviceId)
+);
+
+ALTER TABLE remoteBinding ADD COLUMN lastSeenRemoteAt INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX remoteBindingByOcId ON remoteBinding(remoteOcId);

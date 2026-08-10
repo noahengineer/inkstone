@@ -226,13 +226,14 @@ private fun MoveDialogs(state: LibraryUiState, actions: LibraryActions, dialogs:
     }
 }
 
-/** The five things a folder's menu can start, wired to the dialog state and the actions. */
+/** The six things a folder's menu can start, wired to the dialog state and the actions. */
 private fun folderActions(folder: Folder, actions: LibraryActions, dialogs: LibraryDialogState) = FolderActions(
     onOpen = { actions.onOpenFolder(folder.id) },
     onRename = { dialogs.renaming = RenameTarget(folderId = folder.id, name = folder.name) },
     onMove = { dialogs.movingFolder = folder },
     onStyle = { dialogs.stylingFolder = folder },
     onTrash = { actions.onTrashFolder(folder.id) },
+    onSyncToFolder = { actions.onSyncFolderToNextcloud(folder.id) },
 )
 
 @Composable
@@ -261,6 +262,12 @@ private fun LibraryToolbar(state: LibraryUiState, actions: LibraryActions, onNew
             TextButton(onClick = onNewFolder) { Text("New folder") }
             TextButton(onClick = actions.onOpenTrash) { Text("Trash") }
             TextButton(onClick = actions.onOpenNextcloud) { Text("Nextcloud") }
+            // ⭐ SPEC §7.7's list, and it appears only when there is something in it (M6). A
+            // permanently visible "Needs attention" is a permanent suggestion that something is
+            // wrong, in an app whose whole conflict story is that nothing is.
+            if (state.attentionCount > 0) {
+                TextButton(onClick = actions.onOpenAttention) { Text("⚑ ${state.attentionCount}") }
+            }
             MeasureMenu(actions)
         }
 
@@ -362,6 +369,7 @@ private fun LibraryGrid(state: LibraryUiState, actions: LibraryActions, dialogs:
                 noteCount = state.allNotes.count { !it.isTrashed && it.folderId == folder.id },
                 actions = folderActions(folder, actions, dialogs),
                 cover = rememberFolderCover(folder, actions),
+                synced = folder.id in state.syncedFolders,
             )
         }
         gridItems(state.notes, key = { "note-${it.id.value}" }) { note ->
@@ -371,6 +379,7 @@ private fun LibraryGrid(state: LibraryUiState, actions: LibraryActions, dialogs:
                 selecting = state.selection.isNotEmpty(),
                 actions = actions,
                 onRename = { dialogs.renaming = RenameTarget(noteId = note.id, name = note.title) },
+                needsAttention = note.id in state.notesNeedingAttention,
             )
         }
     }
@@ -388,6 +397,7 @@ private fun LibraryList(state: LibraryUiState, actions: LibraryActions, dialogs:
                 folder = folder,
                 actions = folderActions(folder, actions, dialogs),
                 cover = rememberFolderCover(folder, actions),
+                synced = folder.id in state.syncedFolders,
             )
         }
         items(state.notes, key = { "note-${it.id.value}" }) { note ->
@@ -397,6 +407,7 @@ private fun LibraryList(state: LibraryUiState, actions: LibraryActions, dialogs:
                 selecting = state.selection.isNotEmpty(),
                 actions = actions,
                 onRename = { dialogs.renaming = RenameTarget(noteId = note.id, name = note.title) },
+                needsAttention = note.id in state.notesNeedingAttention,
             )
         }
     }
@@ -444,9 +455,18 @@ data class LibraryActions(
     val onOpenTrash: () -> Unit,
     /** SPEC §7.6 — *"Save to Nextcloud…"*. Opens the account/folder picker for this note. */
     val onSaveToNextcloud: (DocumentId) -> Unit,
+    /** M6 — pin a folder to a remote path, so everything under it syncs there (SPEC §9). */
+    val onSyncFolderToNextcloud: (FolderId) -> Unit,
     /** Stop syncing a bound note. Not a remote delete — the copy on the server stays. */
     val onStopSyncing: (DocumentId) -> Unit,
     val onOpenNextcloud: () -> Unit,
+    /**
+     * ⭐ SPEC §7.7 — open the "Needs attention" list (M6).
+     *
+     * A destination reached by tapping a count, never a dialog that arrives on its own (CLAUDE.md
+     * rule 6). Everything in that list has already been resolved without losing anything.
+     */
+    val onOpenAttention: () -> Unit,
     /** ROADMAP M3's frame-rate gate needs 500 notes. See `LibraryFixture`. */
     val onFillForMeasurement: () -> Unit,
     val thumbnail: suspend (NoteSummary) -> androidx.compose.ui.graphics.ImageBitmap?,

@@ -45,8 +45,21 @@ public object NoteLayout {
     /** Append-only op log. This is what autosave touches (SPEC §5.1). */
     public const val JOURNAL_OPS: String = "journal.ops"
 
-    /** Compaction snapshot. A cache, never the truth (SPEC §4.7). */
-    public const val SNAPSHOT_BUNDLE: String = "snapshot.bundle"
+    /**
+     * Compaction snapshots. A cache, never the truth (SPEC §4.7).
+     *
+     * **A directory, one entry per page — corrected in M6.** It was a single file per
+     * *document*, while `NoteSession.compactIfDue` loops every live page writing a snapshot
+     * to it, so on any multi-page note each page overwrote the previous one and
+     * `readSnapshot` returned null for every page but the last. Nothing failed: a missing
+     * snapshot is a full re-fold, which is correct, just slower.
+     *
+     * It became load-bearing in M6. SPEC §13.2 row 8 — *"A compacts while B is offline
+     * holding older ops"* — asserts that an op older than the snapshot discards it and
+     * re-folds, and with a per-document snapshot that row passed or failed according to
+     * which page the test happened to pick. A green result would have proven nothing.
+     */
+    public const val SNAPSHOT_DIR: String = "snapshot"
 
     /** The lossless bundle. M4 embeds these bytes in the PDF via `/Names /EmbeddedFiles` (SPEC §5.3). */
     public const val EMBEDDED_BUNDLE_NAME: String = "note.inkstone"
@@ -108,7 +121,39 @@ public object NoteLayout {
 
     public fun journal(id: DocumentId): String = "${noteDir(id)}/$JOURNAL_OPS"
 
-    public fun snapshot(id: DocumentId): String = "${noteDir(id)}/$SNAPSHOT_BUNDLE"
+    public fun snapshotDir(id: DocumentId): String = "${noteDir(id)}/$SNAPSHOT_DIR"
+
+    public fun snapshot(id: DocumentId, pageId: PageId): String = "${snapshotDir(id)}/${pageId.value}.bundle"
+
+    /**
+     * Where a pulled remote file is staged before it is merged (M6).
+     *
+     * **Never `notes/<id>/document.pdf`.** Three separate failures collapse into that one
+     * rule, and the first is the kind this project exists to prevent:
+     *
+     * 1. `writeBytesAtomically` writes through a temp file whose name is derived from the
+     *    destination, so two writers aimed at one path share one temp file — and then
+     *    atomically rename a **torn PDF** into place. The reconciler downloading while
+     *    `MaterializeWorker` republishes is exactly two writers aimed at one path.
+     * 2. The file's XMP `bundleSha256` describes the *remote* bundle. Written over
+     *    `document.pdf` it would disagree with the merged `note.inkstone` beside it, and the
+     *    next open would read `Recovered(BUNDLE_HASH_MISMATCH)` on a note that is perfectly
+     *    intact (SPEC §5.6).
+     * 3. Materialization truncates back to `originalLength` from the marker in whatever file
+     *    is there (SPEC §5.2), so the next local publish would silently rebase this note on
+     *    a *peer's* base bytes.
+     */
+    public const val DOWNLOAD_DIR: String = "download"
+
+    public fun download(id: DocumentId): String = "$DOWNLOAD_DIR/${id.value}.pdf"
+
+    /**
+     * This install's device id (SPEC §4.1's Lamport tiebreak) — see [DeviceIdentity].
+     *
+     * A sibling of `notes/`, because it belongs to the install and must never travel with a
+     * note that is copied, duplicated, published or synced.
+     */
+    public const val DEVICE_ID: String = "device.id"
 
     public fun undo(id: DocumentId): String = "${noteDir(id)}/$UNDO_JSON"
 
@@ -116,6 +161,29 @@ public object NoteLayout {
 
     public fun trashEntry(id: DocumentId, deletedEpochMillis: Long): String =
         "$TRASH_DIR/$deletedEpochMillis-${id.value}"
+
+    /**
+     * Where a **stub** `notes/<id>/` is set aside so a restore can proceed (M6). See
+     * [NoteTrash.restore].
+     *
+     * A stub is a note directory with no `note.inkstone` in it: the shape a live [NoteSession]
+     * leaves behind when the note is trashed underneath it and its next autosave appends to
+     * `journal.ops` at the old path (every write does `mkdirs` first). It holds ops with no bundle
+     * to fold them onto, so it is not a note and nothing can open it — but it is the user's ink, so
+     * it goes to the trash rather than to `delete` (CLAUDE.md rule 1) and expires on the same
+     * thirty-day clock as everything else in there.
+     *
+     * ⚠️ The suffix is what keeps it **invisible to [NoteTrash.restore]**: `entries()` parses the
+     * name after the millis as the id, so this entry's id is `<uuid>.orphaned`, which no note has
+     * and no restore can therefore pick up in place of the real thing. A UUIDv7 cannot contain a
+     * `.`, so the two can never be confused. [NoteTrash.purgeExpired] reads only the millis and
+     * sweeps it like any other entry.
+     */
+    public fun orphanedStub(id: DocumentId, setAsideEpochMillis: Long): String =
+        "${trashEntry(id, setAsideEpochMillis)}$ORPHANED_SUFFIX"
+
+    /** See [orphanedStub]. Not a legal part of a [DocumentId], which is the point. */
+    public const val ORPHANED_SUFFIX: String = ".orphaned"
 
     /**
      * Where a folder's own files live — currently just an imported cover image.

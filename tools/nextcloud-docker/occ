@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Run Nextcloud's `occ` inside the test container.
+#
+#   bash tools/nextcloud-docker/occ status
+#   bash tools/nextcloud-docker/occ maintenance:data-fingerprint    # SPEC §13.2 row 15
+#   bash tools/nextcloud-docker/occ config:app:set ...
+#
+# occ must run as the web-server user or it refuses and tells you to try again as www-data.
+set -euo pipefail
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec docker compose -f "$here/docker-compose.yml" exec -T -u www-data nextcloud php occ "$@"

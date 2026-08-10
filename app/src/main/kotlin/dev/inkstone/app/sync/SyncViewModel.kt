@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.inkstone.app.library.LibraryRepository
 import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.RemoteName
 import dev.inkstone.core.model.WorkScheduler
 import dev.inkstone.core.sync.AccountState
@@ -67,6 +68,56 @@ class SyncViewModel @Inject constructor(
         refresh()
     }
 
+    /**
+     * ⭐ Opened by a folder's *"Always sync to…"* (M6).
+     *
+     * The same folder browser the note flow uses, confirming into a **pin** rather than a
+     * binding: everything in this folder and every folder beneath it syncs under the chosen
+     * path from then on (SPEC §9's mirror).
+     */
+    fun openForFolder(folderId: FolderId) {
+        mutable.update { SyncUiState(pinningFolder = folderId) }
+        refresh()
+    }
+
+    /**
+     * Pin the folder being configured to the folder being browsed — and sync what is in it.
+     *
+     * Both halves, in one action. The first version recorded the pin and stopped, which meant
+     * the user pinned a folder, looked at their Nextcloud, and found nothing there: a pin is
+     * only *consulted* when a note is bound, and nothing bound anything. See
+     * [LibraryRepository.syncFolderToRemote].
+     */
+    fun pinFolderHere() {
+        val folderId = mutable.value.pinningFolder ?: return
+        val browser = mutable.value.browser ?: return
+        viewModelScope.launch {
+            val result = library.syncFolderToRemote(folderId, browser.accountId, browser.path)
+            val where = browser.path.ifEmpty { "the top level of your Nextcloud" }
+            mutable.update {
+                it.copy(
+                    pinningFolder = null,
+                    browser = null,
+                    // Says what it did, not just what it will do. A silent success reads exactly
+                    // like the bug this replaced.
+                    message = buildString {
+                        append("Notes in this folder — and any folder inside it — will sync to $where.")
+                        if (result.newlyBound > 0) {
+                            append(" Uploading ${result.newlyBound} ")
+                            append(if (result.newlyBound == 1) "note" else "notes")
+                            append(".")
+                        }
+                        if (result.movedOnServer > 0) {
+                            append(" Moving ${result.movedOnServer} already on the server.")
+                        }
+                        if (result.total == 0) append(" Nothing in it yet — new notes will sync automatically.")
+                    },
+                )
+            }
+            refresh()
+        }
+    }
+
     fun refresh() {
         viewModelScope.launch {
             val known = accounts.all()
@@ -79,8 +130,14 @@ class SyncViewModel @Inject constructor(
                     browser = it.browser,
                 )
             }
-            val single = known.singleOrNull()
-            if (mutable.value.bindingNote != null && mutable.value.browser == null && single?.isUsable == true) {
+            // "One usable account", not "one account". A remembered signed-out account now sits
+            // in the list beside the live one (M6), and `singleOrNull` over the whole list
+            // would have quietly stopped skipping to the folder browser the moment a second
+            // row existed — losing SPEC §7.6's "a default folder per account makes step 2 one
+            // tap" for exactly the users who had signed out and back in.
+            val single = mutable.value.usable.singleOrNull()
+            val wants = mutable.value.bindingNote != null || mutable.value.pinningFolder != null
+            if (wants && mutable.value.browser == null && single != null) {
                 chooseAccount(single.id)
             }
         }
@@ -92,6 +149,21 @@ class SyncViewModel @Inject constructor(
 
     fun setServerUrl(value: String) {
         mutable.update { it.copy(serverUrl = value) }
+    }
+
+    /**
+     * ⭐ Sign back in to an account we already remember — one tap, no typing.
+     *
+     * The account row survives a sign-out (see [AccountState.SIGNED_OUT]), so the server URL
+     * is already known. That is the whole difference between this and [startLogin]: the
+     * browser approval still happens, because SPEC §7.1 is the only way to get an app
+     * password and there is no shortcut worth having, but the user does not re-enter a URL on
+     * a tablet keyboard and does not re-bind a single note afterwards.
+     */
+    fun signInAgain(accountId: String) {
+        val account = mutable.value.accounts.firstOrNull { it.id == accountId } ?: return
+        mutable.update { it.copy(serverUrl = account.serverUrl) }
+        startLogin()
     }
 
     /**
@@ -166,8 +238,40 @@ class SyncViewModel @Inject constructor(
 
     fun signOut(accountId: String) {
         viewModelScope.launch {
-            accounts.signOut(accountId)
-            mutable.update { it.copy(message = "Signed out. The app password has been revoked.") }
+            val result = accounts.signOut(accountId)
+            mutable.update {
+                it.copy(
+                    // Says what was kept, not just what was revoked. A sign-out that only
+                    // mentions the revocation reads as "everything is gone", which is what
+                    // this used to actually mean.
+                    message = if (result.pausedNotes == 0) {
+                        "Signed out. The app password has been revoked."
+                    } else {
+                        "Signed out — app password revoked. ${result.pausedNotes} " +
+                            "${if (result.pausedNotes == 1) "note stays" else "notes stay"} linked and will " +
+                            "resume when you sign in again."
+                    },
+                )
+            }
+            refresh()
+        }
+    }
+
+    /**
+     * Forget an account for good, and unbind its notes.
+     *
+     * Kept distinct from [signOut] in the UI as well as the model, because only one of them is
+     * reversible and the difference is invisible once it has happened.
+     */
+    fun forgetAccount(accountId: String) {
+        viewModelScope.launch {
+            accounts.forgetAccount(accountId)
+            mutable.update {
+                it.copy(
+                    message = "Account removed. Your notes are still here, and the copies on " +
+                        "that server were left alone.",
+                )
+            }
             refresh()
         }
     }
@@ -205,6 +309,29 @@ class SyncViewModel @Inject constructor(
                     it.copy(busy = false, message = "That account needs signing in again.")
                 }
             }
+        }
+    }
+
+    /**
+     * "Always save here" — make the folder currently being browsed this account's default.
+     *
+     * The one thing that turns the folder browser from "navigate out of Inkstone every time"
+     * into "my notes go where I keep my documents". Nothing already on the server moves.
+     */
+    fun setDefaultFolderHere() {
+        val browser = mutable.value.browser ?: return
+        viewModelScope.launch {
+            accounts.setDefaultFolder(browser.accountId, browser.path)
+            mutable.update {
+                it.copy(
+                    message = if (browser.path.isEmpty()) {
+                        "New notes will be saved to the top level of your Nextcloud."
+                    } else {
+                        "New notes will be saved to ${browser.path}."
+                    },
+                )
+            }
+            refresh()
         }
     }
 
@@ -293,9 +420,20 @@ data class SyncUiState(
     val openInBrowser: LoginFlowStart? = null,
     val browser: RemoteBrowser? = null,
     val bindingNote: DocumentId? = null,
+    /** Non-null while a *folder* is being pinned to a remote path (M6). */
+    val pinningFolder: FolderId? = null,
     val outboxCount: Int = 0,
 ) {
     val needsReauth: List<SyncAccount> get() = accounts.filter { it.state == AccountState.NEEDS_REAUTH }
+
+    /**
+     * Accounts the user signed out of, which are remembered and one tap from working again
+     * (M6 — see [AccountState.SIGNED_OUT]).
+     */
+    val signedOut: List<SyncAccount> get() = accounts.filter { it.state == AccountState.SIGNED_OUT }
+
+    /** Accounts currently able to sync. What the folder browser and note binding can use. */
+    val usable: List<SyncAccount> get() = accounts.filter { it.isUsable }
 }
 
 /** One level of the remote tree (PROPFIND `Depth: 1`). */

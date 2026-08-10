@@ -35,6 +35,7 @@ class NoteEditorLibraryTest {
     private class RecordingLibrary : NoteEditor.LibraryUpdates {
         val saves = ArrayList<Triple<DocumentId, Long, Int>>()
         val materializations = ArrayList<Triple<DocumentId, Long, FoldedPage>>()
+        val renames = ArrayList<Pair<String, Long>>()
 
         override suspend fun onSaved(id: DocumentId, localRev: Long, pageCount: Int) {
             saves += Triple(id, localRev, pageCount)
@@ -42,6 +43,10 @@ class NoteEditorLibraryTest {
 
         override suspend fun onMaterialized(id: DocumentId, localRev: Long, pageCount: Int, cover: FoldedPage) {
             materializations += Triple(id, localRev, cover)
+        }
+
+        override suspend fun onRenamed(id: DocumentId, title: String, localRev: Long, pageCount: Int) {
+            renames += title to localRev
         }
     }
 
@@ -94,6 +99,52 @@ class NoteEditorLibraryTest {
         runCurrent()
 
         assertTrue("an idle autosave invalidated the thumbnail", library.saves.isEmpty())
+        editor.close()
+    }
+
+    @Test
+    fun `a rename is reported as a rename and reaches the bundle`() = runTest {
+        // ⭐ SPEC §7.7 layer 2 needs two things of a rename, and reporting it as an ordinary save gave
+        // neither: `recordSave` has no title column, so the library tile keeps the old string, and a
+        // rename that only *flushes* leaves the title in the journal — while a published PDF embeds
+        // `note.inkstone` as it is on disk, so no peer sees it until the note happens to close.
+        val library = RecordingLibrary()
+        val editor = editor(library)
+        editor.onSurfaceAttached(FakeSurface())
+        runCurrent()
+        library.materializations.clear()
+
+        editor.rename("Thermodynamics wk 4")
+        runCurrent()
+
+        val rename = library.renames.lastOrNull()
+        assertNotNull("the rename was not reported as a rename, so the library row keeps the old title", rename)
+        assertEquals("Thermodynamics wk 4", rename!!.first)
+        assertTrue("the rename did not move the revision, so no upload is ever owed for it", rename.second > 0)
+        assertTrue(
+            "the rename was not materialized, so the bundle a peer receives still holds the old title",
+            library.materializations.isNotEmpty(),
+        )
+        assertEquals("Thermodynamics wk 4", editor.state.value.title)
+        editor.close()
+    }
+
+    @Test
+    fun `renaming to the title it already has says nothing new`() = runTest {
+        val library = RecordingLibrary()
+        val editor = editor(library)
+        editor.onSurfaceAttached(FakeSurface())
+        runCurrent()
+        val title = editor.state.value.title
+        library.materializations.clear()
+
+        editor.rename(title)
+        runCurrent()
+
+        // Still reported — the *index* may be the thing that is out of step, and repairing that is
+        // what an apparently redundant rename is for — but nothing is rewritten for it.
+        assertEquals(1, library.renames.size)
+        assertTrue("an identical rename rewrote the bundle", library.materializations.isEmpty())
         editor.close()
     }
 

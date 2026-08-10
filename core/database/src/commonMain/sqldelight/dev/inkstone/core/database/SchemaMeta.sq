@@ -4,6 +4,10 @@
 --       not a table, so M2 came and went without one.
 --   M3  folder / note — the library index. See Library.sq and 1.sqm.
 --   M5  remote_binding / outbox (SPEC §7.6). `note` already has its columns.
+--   M6  the reconciler's tables — remoteDirectory / syncCursor / pendingDownload /
+--       syncAttention / folderBinding / peerClock, plus one column on remoteBinding.
+--       See Sync.sq and 4.sqm. Then foreignRemote and syncCursor.refusedUntil, added by
+--       M6's own review (5.sqm) — the two answers nothing was remembering.
 --
 -- This table predates the library index and is kept because dropping it would be a
 -- migration that buys nothing. `InkstoneDatabase.Schema.version` — not this row — is

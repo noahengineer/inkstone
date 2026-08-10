@@ -1,0 +1,289 @@
+package dev.inkstone.app.sync.matrix
+
+import dev.inkstone.core.model.PageOp
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+/**
+ * SPEC §13.2 rows 1 to 7 — **layer 1, end to end.**
+ *
+ * The convergence claims themselves are also made in `:core:storage`'s `NoteMergeTest`, over two
+ * `NoteStore`s and no network, and that is where they are cheapest to read. What these add is the
+ * whole pipe: a real published PDF with a real XMP marker and a real embedded bundle, a real
+ * `If-None-Match: *` PUT, a real PROPFIND walk, a real download, a real
+ * `PulledPdfExtractor.extract`, a real `NoteMerge.merge`, and a real bundle rewrite — twice, once
+ * per device. Every one of those steps is a place a correct merge can be delivered to the wrong
+ * note, or not delivered at all, and none of them exists in the JVM half.
+ *
+ * Rows 2, 3, 5 and 7 are the design-bug rows in this file (ROADMAP M6 names them): each one is a
+ * mechanism whose failure mode is *all ops present, no error, two devices permanently disagreeing*.
+ */
+class MergeMatrixLayerOneTest {
+
+    /**
+     * Row 1 — the grow-only union, and the property every other row rests on.
+     *
+     * Also the traffic claim: one PROPFIND pair and exactly **one** GET per direction. A second
+     * GET would mean the ETag the merge stored was not the ETag of the bytes it merged, which is
+     * the bug `WebDavClient.download` exists to prevent.
+     */
+    @Test
+    fun `row 1 - both devices strokes survive in both directions with one download each`() = matrixRow(
+        row = "row 1 (grow-only union)",
+        proven = "the union over a real published PDF round trip through a real WebDAV client",
+        notProven = "that Nextcloud's own storage layer leaves the published bytes alone",
+    ) { devices ->
+        val id = devices.share("Row1")
+        val page = devices.a.firstPage(id)
+
+        // Offline on both — no request is made by an edit (CLAUDE.md rule 4).
+        val fromA = devices.a.drawStroke(id)
+        val fromB = devices.b.drawStroke(id)
+
+        devices.a.drain()
+        devices.resetCounts()
+
+        val intoB = devices.b.pull()
+        assertEquals(1, intoB.merged, "B did not merge A's file")
+        devices.assertRequests("GET", 1, "row 1: B downloaded the file more than once")
+        devices.b.drain()
+        devices.resetCounts()
+
+        val intoA = devices.a.pull()
+        assertEquals(1, intoA.merged, "A did not merge B's file")
+        devices.assertRequests("GET", 1, "row 1: A downloaded the file more than once")
+
+        for (device in listOf(devices.a, devices.b)) {
+            val objects = device.page(id, page).objects.map { it.id }
+            assertTrue(fromA in objects, "${device.name} lost A's stroke")
+            assertTrue(fromB in objects, "${device.name} lost B's stroke")
+            assertTrue(device.attention().isEmpty(), "${device.name} raised attention for an ordinary merge")
+        }
+    }
+
+    /**
+     * ⚑ Row 2 — `Presence` is an LWW register, keyed independently of when `AddObject` arrived.
+     *
+     * A delete at a higher clock beats a transform, on both devices, and leaves **no ghost**: the
+     * object is absent from `objects`, present in `deleted`, and its ops are all still in the log
+     * (rule 1 — a losing register never costs bytes).
+     */
+    @Test
+    fun `row 2 - a concurrent delete beats a transform and leaves no ghost on either device`() = matrixRow(
+        row = "row 2 (presence as a register)",
+        proven = "delete-beats-transform through the real pipe on both devices",
+        notProven = "nothing extra — this row is pure fold, and the server only carries it",
+    ) { devices ->
+        val id = devices.share("Row2")
+        val page = devices.a.firstPage(id)
+        val target = devices.a.drawStroke(id)
+        devices.a.drain()
+        devices.b.pull()
+        devices.b.drain()
+        devices.a.pull()
+
+        // Concurrent, and deliberately ordered: the delete is later, so it must win everywhere.
+        devices.a.transformAtCounter(id, target, counter = COLLISION_COUNTER, scale = 2f)
+        devices.b.deleteObjectAt(id, target, counter = COLLISION_COUNTER + 5L)
+
+        devices.syncBothWays()
+
+        for (device in listOf(devices.a, devices.b)) {
+            val folded = device.page(id, page)
+            assertNull(folded.find(target), "${device.name} kept a ghost of a deleted object")
+            assertTrue(target in folded.deleted, "${device.name} lost the tombstone")
+            assertTrue(folded.objects.none { it.id == target }, "${device.name} still lists the object")
+            val ops = device.opsOn(id, page)
+            assertTrue(
+                ops.any { it is PageOp.SetTransform && it.target == target },
+                "${device.name} discarded the losing transform op — rule 1 forbids it",
+            )
+        }
+    }
+
+    /**
+     * ⚑ Row 3 — **`Register.write`'s `deviceId` tiebreak, which was broken until M6.**
+     *
+     * Both devices write the same register at the *same counter*. `LamportClock.compareTo` breaks
+     * that by `deviceId`, and `Register.write` keeps the incumbent when the clocks compare equal —
+     * so if both devices stamped the same id (M2 read it out of the note's manifest, which meant
+     * they did), the winner is whichever op the local fold happened to see first, and the two
+     * devices disagree **forever, with all ops present and no error**.
+     *
+     * Two assertions, and the second is the one that would have caught the original bug: the
+     * resolved matrix is identical on both devices, and no two ops in the merged log share a
+     * `LamportClock`.
+     */
+    @Test
+    fun `row 3 - two concurrent transforms at one counter resolve identically and never to a product`() = matrixRow(
+        row = "row 3 (Lamport tiebreak)",
+        proven = "an equal-counter collision resolving to one input on both devices",
+        notProven = "nothing extra — the tiebreak is local, and this is the row a shared deviceId broke",
+    ) { devices ->
+        val id = devices.share("Row3")
+        val page = devices.a.firstPage(id)
+        val target = devices.a.drawStroke(id)
+        devices.a.drain()
+        devices.b.pull()
+        devices.b.drain()
+        devices.a.pull()
+
+        val fromA = devices.a.transformAtCounter(id, target, counter = COLLISION_COUNTER, scale = 2f)
+        val fromB = devices.b.transformAtCounter(id, target, counter = COLLISION_COUNTER, scale = 3f)
+
+        devices.syncBothWays()
+
+        val onA = assertNotNull(devices.a.page(id, page).find(target), "A lost the object").transform
+        val onB = assertNotNull(devices.b.page(id, page).find(target), "B lost the object").transform
+        assertEquals(onA, onB, "the two devices disagree about an absolute register — the tiebreak degenerated")
+        assertTrue(
+            onA == fromA || onA == fromB,
+            "the resolved matrix is neither input — the ops were composed rather than resolved (CLAUDE.md rule 8)",
+        )
+
+        for (device in listOf(devices.a, devices.b)) {
+            val clocks = device.opsOn(id, page).map { it.clock }
+            assertEquals(
+                clocks.size,
+                clocks.toSet().size,
+                "${device.name} has two ops sharing a Lamport clock - the deviceId tiebreak is not distinguishing",
+            )
+        }
+    }
+
+    /** Row 4 — style and transform are independent registers, so both concurrent writes apply. */
+    @Test
+    fun `row 4 - a concurrent style and transform on one object both survive`() = matrixRow(
+        row = "row 4 (independent registers)",
+        proven = "two different registers on one object both applying on both devices",
+        notProven = "nothing extra",
+    ) { devices ->
+        val id = devices.share("Row4")
+        val page = devices.a.firstPage(id)
+        val target = devices.a.drawStroke(id)
+        devices.a.drain()
+        devices.b.pull()
+        devices.b.drain()
+        devices.a.pull()
+
+        val style = devices.a.setStyle(id, target, colorArgb = RED)
+        val transform = devices.b.transform(id, target, scale = 2f)
+
+        devices.syncBothWays()
+
+        for (device in listOf(devices.a, devices.b)) {
+            val obj = assertNotNull(device.page(id, page).find(target), "${device.name} lost the object")
+            assertEquals(style, obj.style, "${device.name} dropped the concurrent style")
+            assertEquals(transform, obj.transform, "${device.name} dropped the concurrent transform")
+        }
+    }
+
+    /**
+     * ⚑ Row 5 — a page added on each device, and **the page that survives a materialize.**
+     *
+     * `NoteSession.merge` will accept ops for a page `document.pages` has never heard of;
+     * `BundleWriter` then skips any page not in the order and `materialize` truncates the journal
+     * immediately afterwards. So a remote page merged without its `PageRef` is destroyed
+     * permanently, with a valid PDF and the right page count as the only evidence. `NoteMerge`
+     * merges the document *first* for exactly this reason, and the assertion below is the one that
+     * notices if it ever stops: every page is re-read from the bundle after the round trip.
+     */
+    @Test
+    fun `row 5 - a page added on each device gives three live pages that survive materialize`() = matrixRow(
+        row = "row 5 (page order union)",
+        proven = "three pages on both devices after a real publish-upload-download-merge-republish",
+        notProven = "nothing extra",
+    ) { devices ->
+        val id = devices.share("Row5")
+        val onlyOnA = devices.a.addPage(id)
+        val onlyOnB = devices.b.addPage(id)
+
+        devices.syncBothWays()
+
+        for (device in listOf(devices.a, devices.b)) {
+            val document = assertNotNull(device.document(id), "${device.name} lost the note")
+            assertEquals(3, document.livePages.size, "${device.name} does not have three pages")
+            assertTrue(onlyOnA.value in document.liveIds, "${device.name} lost the page A added")
+            assertTrue(onlyOnB.value in document.liveIds, "${device.name} lost the page B added")
+            // Re-read through the *bundle*, which is what `materialize` just rewrote. A page in
+            // `document.pages` whose contents `BundleWriter` skipped fails here and nowhere else.
+            for (ref in document.livePages) {
+                assertEquals(ref.id, device.page(id, ref.id).pageId, "${device.name} cannot load ${ref.id.value}")
+            }
+        }
+        assertEquals(devices.a.pageOrder(id), devices.b.pageOrder(id), "the two devices disagree about page order")
+    }
+
+    /** Row 6 — two different reorders of four pages converge to one byte-identical order. */
+    @Test
+    fun `row 6 - two different reorders of four pages converge to one order`() = matrixRow(
+        row = "row 6 (deterministic reorder)",
+        proven = "an identical page order on both devices after conflicting reorders",
+        notProven = "nothing extra",
+    ) { devices ->
+        val id = devices.share("Row6", pageCount = 4)
+        val pages = assertNotNull(devices.a.document(id), "no note").livePages
+
+        devices.a.movePage(id, pages[3].id, toIndex = 0)
+        devices.b.movePage(id, pages[0].id, toIndex = 3)
+
+        devices.syncBothWays()
+
+        assertEquals(4, assertNotNull(devices.a.document(id)).livePages.size, "A gained or lost a page")
+        assertEquals(4, assertNotNull(devices.b.document(id)).livePages.size, "B gained or lost a page")
+        assertEquals(
+            devices.a.pageOrder(id),
+            devices.b.pageOrder(id),
+            "the reorders did not converge - the tiebreak is not deterministic",
+        )
+    }
+
+    /**
+     * ⚑ Row 7 — SPEC §3.5's erase is an **area beside the stroke**, not a cut in it.
+     *
+     * The failure this rules out is a sample-based erase, which removes whole samples at full
+     * stroke width and therefore has to split one stroke into fragments. Under concurrency those
+     * fragments are new objects, so a peer's transform of the original lands on nothing and the
+     * object count differs between the two devices. With `SetErasedRegion` as an absolute
+     * register, there is still exactly one object and it carries both.
+     */
+    @Test
+    fun `row 7 - a partial erase and a concurrent transform converge without duplicating the stroke`() = matrixRow(
+        row = "row 7 (area-based erase)",
+        proven = "one object carrying both an erased region and a transform on both devices",
+        notProven = "nothing extra",
+    ) { devices ->
+        val id = devices.share("Row7")
+        val page = devices.a.firstPage(id)
+        val target = devices.a.drawStroke(id)
+        devices.a.drain()
+        devices.b.pull()
+        devices.b.drain()
+        devices.a.pull()
+
+        val erased = devices.a.erase(id, target)
+        val transform = devices.b.transform(id, target, scale = 2f)
+
+        devices.syncBothWays()
+
+        for (device in listOf(devices.a, devices.b)) {
+            val folded = device.page(id, page)
+            assertEquals(1, folded.objects.size, "${device.name} has more than one object - the erase fragmented it")
+            val obj = assertNotNull(folded.find(target), "${device.name} lost the stroke it erased part of")
+            assertEquals(erased, obj.erased, "${device.name} dropped the erased region")
+            assertEquals(transform, obj.transform, "${device.name} dropped the concurrent transform")
+        }
+    }
+
+    private companion object {
+        /**
+         * A counter far above anything the fixture's own gestures reach, so "the same counter on
+         * both devices" is a fact about the test rather than about how many strokes were drawn.
+         */
+        const val COLLISION_COUNTER = 10_000L
+        const val RED = 0xFFCC0000.toInt()
+    }
+}

@@ -65,6 +65,40 @@ class PageOrderTest {
     }
 
     @Test
+    fun `a restored page is re-deleted by the peer that still holds the tombstone`() {
+        // ⚠️ Pinning the limitation rather than the intention. This KDoc used to claim that
+        // "restoring from trash clears the flag with a fresh entry, so a restore still propagates",
+        // and `NoteSession.restorePage` clears the flag in place — so the review read the code as
+        // failing to do what the comment described. It is the comment that was wrong: `reconcile`
+        // ORs the two `deleted` flags unconditionally, and there is no version of a `PageRef` that
+        // wins against that. A fresh entry, a fresh key, a cleared `deletedEpochMillis` — all lose.
+        //
+        // Ordering a delete against a restore needs `deleted` to be a Lamport register per page
+        // (CLAUDE.md rule 8), which means a new member inside the manifest's `pages[]` array —
+        // where SPEC §5.8's carry-unknown-fields rule does not reach, so an older build would
+        // silently drop it on the next rewrite. That is a schema decision, not a patch, and it is
+        // recorded in SPEC §4.3 as such.
+        //
+        // No bytes are at risk either way: the page's whole op log survives under the tombstone
+        // (CLAUDE.md rule 1), and restoring again works — until the next sync.
+        val deleted = listOf(ref("p1", "1"), ref("p2", "2", deleted = true))
+        // What `restorePage` produces: same id, flag cleared, timestamp gone.
+        val restored = listOf(ref("p1", "1"), ref("p2", "2"))
+        // And what a "fresh entry" would produce instead — a new key, so the entry is not the old
+        // one in any sense a merge can see.
+        val restoredAfresh = listOf(ref("p1", "1"), ref("p2", "25"))
+
+        assertTrue(
+            PageOrder.mergePageOrder(restored, deleted).first { it.id.value == "p2" }.deleted,
+            "the tombstone stopped winning — either this is now fixed properly or a merge lost a delete",
+        )
+        assertTrue(
+            PageOrder.mergePageOrder(restoredAfresh, deleted).first { it.id.value == "p2" }.deleted,
+            "a fresh entry is not what makes a restore propagate; only an ordered `deleted` would be",
+        )
+    }
+
+    @Test
     fun `insert positions are computed from live pages only`() {
         val pages = listOf(ref("p1", "1"), ref("gone", "2", deleted = true), ref("p2", "3"))
 

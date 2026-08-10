@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug-only. SPEC §13.3 — "instrumented process kill during stroke capture, journal flush,
+  materialization, and upload".
+
+  A process kill can only be tested from a process the test is not running in: an instrumented
+  test runs *inside* dev.inkstone, so `am force-stop dev.inkstone` (or killing our own pid) takes
+  the assertions down with the subject. `CrashPointService` is the subject — it does the writing
+  and then SIGKILLs itself — and the test process survives to read what is left on disk.
+
+  Why here and not in `src/androidTest`: a component declared in the androidTest manifest belongs
+  to package `dev.inkstone.test`, which has its own uid and therefore its own `filesDir`. The
+  whole point is to crash a process that shares this app's storage, so the service has to be the
+  app's. It is `debug` only, so nothing of it exists in a release build.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+        <!--
+          A separate process, so killing it is a real process death and not a test-harness
+          shutdown: no finally blocks, no stream flush, no shutdown hooks. `exported="false"` —
+          only this app can start it, and only a debug build has it at all.
+        -->
+        <service
+            android:name="dev.inkstone.app.debug.CrashPointService"
+            android:exported="false"
+            android:process=":crashpoint" />
+
+        <!--
+          SPEC §13.2 row 10's wet half needs a window (see `InkHostActivity`). Also here rather
+          than in `src/androidTest`, because `Instrumentation.startActivitySync` refuses an
+          activity that belongs to the test package.
+
+          A platform theme: this activity extends `android.app.Activity` and holds one view, and
+          `Theme.Inkstone` is a Compose/Material theme it has no use for.
+        -->
+        <activity
+            android:name="dev.inkstone.app.debug.InkHostActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material.NoActionBar" />
+    </application>
+</manifest>

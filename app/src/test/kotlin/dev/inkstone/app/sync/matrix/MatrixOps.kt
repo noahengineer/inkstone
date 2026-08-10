@@ -1,0 +1,208 @@
+package dev.inkstone.app.sync.matrix
+
+import dev.inkstone.core.model.Document
+import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.EraseCapsule
+import dev.inkstone.core.model.ErasedArea
+import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.Matrix3
+import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.ObjectStyle
+import dev.inkstone.core.model.PageId
+import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.StrokeGeometry
+import dev.inkstone.core.model.StrokeObject
+import dev.inkstone.core.storage.renameNote
+import kotlin.random.Random
+import kotlin.test.assertNotNull
+
+/*
+ * The gestures a row of SPEC §13.2 makes, as one-liners.
+ *
+ * Every op here is stamped with `session.nextClock()` and `session.nextOpId()` — this device's
+ * real generator, seeded from the note, carrying this install's real `deviceId`. That matters
+ * more than it looks: the whole of row 3 is the `deviceId` tiebreak in `LamportClock.compareTo`,
+ * and a helper that invented a device string would test the fixture instead.
+ *
+ * Block comment, not KDoc: a file-level KDoc attaches to no declaration.
+ */
+
+/** A stroke on the note's first page. Returns its [ObjectId] so a row can aim ops at it. */
+internal suspend fun Device.drawStroke(noteId: DocumentId): ObjectId = edit(noteId) { session, page ->
+    val id = ids.newObjectId()
+    session.apply(page, listOf(addObject(session, id)))
+    id
+}
+
+/** A stroke on a named page, for the rows whose subject is which page an op landed on. */
+internal suspend fun Device.drawStrokeOn(noteId: DocumentId, pageId: PageId): ObjectId = edit(noteId) { session, _ ->
+    val id = ids.newObjectId()
+    session.apply(pageId, listOf(addObject(session, id)))
+    id
+}
+
+/** CLAUDE.md rule 8 — an **absolute** transform, as an LWW register. */
+internal suspend fun Device.transform(noteId: DocumentId, target: ObjectId, scale: Float): Matrix3 =
+    edit(noteId) { session, page ->
+        val absolute = Matrix3.scale(scale, scale)
+        session.apply(
+            page,
+            listOf(PageOp.SetTransform(session.nextOpId(), session.nextClock(), target, absolute)),
+        )
+        absolute
+    }
+
+/**
+ * A transform stamped at an **explicit** counter, so two devices can be made to collide exactly.
+ *
+ * Row 3's premise is *equal* Lamport counters, which is the case `Register.write`'s tiebreak
+ * exists for. Letting both devices call `nextClock()` usually produces equal counters anyway
+ * (they are folding the same log), but "usually" is not a test — this makes it certain.
+ */
+internal suspend fun Device.transformAtCounter(
+    noteId: DocumentId,
+    target: ObjectId,
+    counter: Long,
+    scale: Float,
+): Matrix3 = edit(noteId) { session, page ->
+    val absolute = Matrix3.scale(scale, scale)
+    session.apply(
+        page,
+        listOf(PageOp.SetTransform(session.nextOpId(), LamportClock(counter, deviceId()), target, absolute)),
+    )
+    absolute
+}
+
+/** A tombstone. The `AddObject` stays in the log (SPEC §4.2), which is why row 2 can be asked. */
+internal suspend fun Device.deleteObjectAt(noteId: DocumentId, target: ObjectId, counter: Long) {
+    edit(noteId) { session, page ->
+        session.apply(page, listOf(PageOp.DeleteObject(session.nextOpId(), LamportClock(counter, deviceId()), target)))
+    }
+}
+
+/** An independent register from the transform — row 4's whole point. */
+internal suspend fun Device.setStyle(noteId: DocumentId, target: ObjectId, colorArgb: Int): ObjectStyle =
+    edit(noteId) { session, page ->
+        val style = ObjectStyle(colorArgb = colorArgb, widthPt = STYLE_WIDTH_PT)
+        session.apply(page, listOf(PageOp.SetStyle(session.nextOpId(), session.nextClock(), target, style)))
+        style
+    }
+
+/**
+ * SPEC §3.5 — a partial erase, as the **area the eraser swept**, absolutely.
+ *
+ * The stroke is not touched and no fragment is created. Row 7 is the assertion that a concurrent
+ * transform of the same stroke therefore cannot duplicate it.
+ */
+internal suspend fun Device.erase(noteId: DocumentId, target: ObjectId): ErasedArea = edit(noteId) { session, page ->
+    val area = ErasedArea(listOf(EraseCapsule(ERASE_FROM, ERASE_FROM, ERASE_TO, ERASE_FROM, ERASE_RADIUS)))
+    session.apply(page, listOf(PageOp.SetErasedRegion(session.nextOpId(), session.nextClock(), target, area)))
+    area
+}
+
+/** A new page at the end. Row 5's gesture, on both devices at once. */
+internal suspend fun Device.addPage(noteId: DocumentId): PageId = edit(noteId) { session, _ -> session.addPage() }
+
+/**
+ * SPEC §7.7 layer 2 — a rename, through the **production** writer.
+ *
+ * ⚠️ `store.renameNote`, not a hand-rolled `session.rename` inside [Device.edit]. That is what this
+ * helper used to do, and it was the fixture being more generous than reality: the production rename
+ * renamed a library row and left `Document.title` and `titleClock` untouched, so a matrix row written
+ * against the old helper would have passed against a layer 2 with **no writer at all**. The rest is
+ * `LibraryRepository.noteRenamed` — the index row, the remote MOVE, and the upload the changed bundle
+ * now owes. `NoteSessionHost.renameNote` is the one link above this that a JVM test cannot reach.
+ */
+internal suspend fun Device.rename(noteId: DocumentId, title: String) {
+    val document = assertNotNull(store.renameNote(noteId, title, deviceId(), ids, clock), "$name has no $noteId")
+    val now = clock.nowEpochMillis()
+    index.renameNote(noteId, title, now)
+    // The revision has to move or `SyncEngine.noteChanged` reads `localRev <= lastSyncedRev` and the
+    // rename is a change no upload is ever owed for.
+    index.recordSave(noteId, document.localRev, document.livePages.size, now)
+    engine.notePathChanged(noteId, title)
+    engine.noteChanged(noteId)
+}
+
+/** Reorder the live pages by moving [pageId] to [toIndex]. Row 6's gesture. */
+internal suspend fun Device.movePage(noteId: DocumentId, pageId: PageId, toIndex: Int) {
+    edit(noteId) { session, _ -> session.movePage(pageId, toIndex) }
+}
+
+/**
+ * Every op in a page's log, bundle and journal together.
+ *
+ * Rows 2 and 3 are about the log rather than the fold: rule 1 says a losing register keeps its op
+ * forever, and row 3's tiebreak claim is *"no two ops share a `LamportClock`"*, which is not a
+ * question a `FoldedPage` can answer.
+ */
+internal suspend fun Device.opsOn(noteId: DocumentId, pageId: PageId): List<PageOp> {
+    val note = assertNotNull(store.open(noteId), "$name cannot open ${noteId.value}")
+    return store.loadPage(note, pageId).ops
+}
+
+/** Where this device believes the note lives on the server. */
+internal suspend fun Device.remotePath(noteId: DocumentId): String =
+    assertNotNull(binding(noteId), "$name has no binding for ${noteId.value}").remotePath
+
+/** The note's live page order, as `(sortKey, pageId)` — what row 5 and row 6 compare. */
+internal suspend fun Device.pageOrder(noteId: DocumentId): List<Pair<String, String>> =
+    assertNotNull(document(noteId), "$name has no ${noteId.value}")
+        .livePages
+        .map { it.sortKey.value to it.id.value }
+
+internal suspend fun Device.title(noteId: DocumentId): String =
+    assertNotNull(document(noteId), "$name has no ${noteId.value}").title
+
+private fun addObject(session: dev.inkstone.core.storage.NoteSession, id: ObjectId): PageOp.AddObject =
+    PageOp.AddObject(
+        opId = session.nextOpId(),
+        clock = session.nextClock(),
+        // Random bytes, not a shared constant: the geometry blob is opaque to everything the
+        // matrix asserts on (SPEC §5.4), and two strokes with identical bytes would let a merge
+        // that silently deduplicated by content pass row 1.
+        obj = StrokeObject(id = id, geometry = StrokeGeometry(Random.nextBytes(GEOMETRY_BYTES))),
+    )
+
+/**
+ * ⭐ A note both devices hold, bound, uploaded, and fully settled.
+ *
+ * 1. A creates it, binds it and drains — one MKCOL and one `If-None-Match: *` PUT.
+ * 2. B pulls and *adopts* it: `oc:id` unknown, marker present, `documentId` unknown, so
+ *    `NoteStore.installBundle`, a library row, and a binding **at the version just downloaded**.
+ *    Nothing is owed to the server afterwards — see `SyncEngine.bindPulled`, which exists because
+ *    the first version of this helper produced a permanent 412 here instead.
+ * 3. A pulls, so that its own cursor holds the current root ETag. Without it a row's first
+ *    measured poll would be paying for the setup's traffic.
+ *
+ * Counts are reset afterwards, so a row asserting "one PROPFIND and one GET" is measuring itself.
+ */
+internal suspend fun TwoDevices.share(title: String = "Shared", pageCount: Int = 1): DocumentId {
+    val id = a.createNote(title, pageCount)
+    a.bind(id, title)
+    a.drain()
+    b.pull()
+    a.pull()
+    resetCounts()
+    return id
+}
+
+/** Both devices reconcile, then drain what the reconcile decided was owed. */
+internal suspend fun TwoDevices.syncBothWays() {
+    a.pull()
+    a.drain()
+    b.pull()
+    b.drain()
+    a.pull()
+    a.drain()
+    b.pull()
+    b.drain()
+}
+
+internal val Document.liveIds: List<String> get() = livePages.map { it.id.value }
+
+private const val GEOMETRY_BYTES = 64
+private const val STYLE_WIDTH_PT = 3f
+private const val ERASE_FROM = 100f
+private const val ERASE_TO = 140f
+private const val ERASE_RADIUS = 6f

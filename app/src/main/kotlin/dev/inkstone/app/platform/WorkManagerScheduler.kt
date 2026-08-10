@@ -11,6 +11,7 @@ import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import dev.inkstone.app.sync.MaterializeWorker
 import dev.inkstone.app.sync.OutboxDrainWorker
+import dev.inkstone.app.sync.ReconcileWorker
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.WorkScheduler
 import java.util.concurrent.TimeUnit
@@ -58,6 +59,67 @@ class WorkManagerScheduler @Inject constructor(private val workManager: WorkMana
             ExistingPeriodicWorkPolicy.KEEP,
             PeriodicWorkRequestBuilder<OutboxDrainWorker>(PERIOD_MINUTES, TimeUnit.MINUTES)
                 .setConstraints(networkRequired)
+                .build(),
+        )
+    }
+
+    /**
+     * ⭐ SPEC §7.6's pull side (M6) — look for remote changes now.
+     *
+     * `KEEP` for [enqueueOutboxDrain]'s reason: a pass already coming will see whatever this one
+     * would have, because the work is derived from the server's state rather than from a queue, and
+     * `REPLACE` would cancel a pass that is mid-download.
+     */
+    override fun enqueueReconcile() {
+        workManager.enqueueUniqueWork(
+            ReconcileWorker.NAME,
+            ExistingWorkPolicy.KEEP,
+            OneTimeWorkRequestBuilder<ReconcileWorker>()
+                .setConstraints(networkRequired)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, BACKOFF_SECONDS, TimeUnit.SECONDS)
+                .build(),
+        )
+    }
+
+    /**
+     * SPEC §7.7 — the 412 path. `If-Match` failed, so somebody else changed the file, so this is a
+     * conflict and not a retry (CLAUDE.md rule 1).
+     *
+     * Uniquely named per note so two 412s on two notes cannot cancel one another. The pass is a
+     * whole-account one; [ReconcileWorker.nameFor] explains why that is the right shape and what it
+     * costs.
+     */
+    override fun enqueueReconcile(noteId: DocumentId) {
+        workManager.enqueueUniqueWork(
+            ReconcileWorker.nameFor(noteId),
+            ExistingWorkPolicy.KEEP,
+            OneTimeWorkRequestBuilder<ReconcileWorker>()
+                .setConstraints(networkRequired)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, BACKOFF_SECONDS, TimeUnit.SECONDS)
+                .build(),
+        )
+    }
+
+    /**
+     * The periodic poll (SPEC §7.6). Registered from `InkstoneApplication`, like [ensurePeriodicDrain].
+     *
+     * Fifteen minutes because that is WorkManager's floor and a smaller number here would be a lie
+     * in the code — it is silently clamped. The *foreground* poll is [dev.inkstone.app.sync.PollTicker]
+     * and runs at `capabilities.core.pollinterval`, which is where the sixty-second figure SPEC §7.6
+     * asks for actually lives.
+     *
+     * ⚠️ **`setBackoffCriteria` explicitly**, unlike [ensurePeriodicDrain], which omits it and
+     * silently inherits EXPONENTIAL/30 s. Stating it is the point rather than the value: this is the
+     * job whose retry ladder CLAUDE.md rule 5 cares about, so the ladder is written down where
+     * somebody reading the rule can check it.
+     */
+    fun ensurePeriodicReconcile() {
+        workManager.enqueueUniquePeriodicWork(
+            ReconcileWorker.PERIODIC_NAME,
+            ExistingPeriodicWorkPolicy.KEEP,
+            PeriodicWorkRequestBuilder<ReconcileWorker>(PERIOD_MINUTES, TimeUnit.MINUTES)
+                .setConstraints(networkRequired)
+                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, BACKOFF_SECONDS, TimeUnit.SECONDS)
                 .build(),
         )
     }

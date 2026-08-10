@@ -27,8 +27,21 @@ public object PageOrder {
      *
      * Deletion is a tombstone (see [PageRef.deleted]) and a tombstone wins over a
      * live entry, because the alternative is a page the user deleted on one device
-     * reappearing on the other every time it syncs. Restoring from trash clears the
-     * flag with a fresh entry, so a restore still propagates.
+     * reappearing on the other every time it syncs.
+     *
+     * ⚠️ **A restore therefore does not propagate, and this KDoc used to claim it did**
+     * (*"restoring from trash clears the flag with a fresh entry"*). [reconcile]'s
+     * `a.deleted || b.deleted` is unconditional, so freshness is not a thing it can
+     * see: once a peer has the tombstone, the peer keeps it, and the *next* merge in
+     * the other direction re-deletes the page here. `NoteSession.restorePage` clears
+     * the flag in place and nothing it could do instead would help — the missing piece
+     * is an ordering between the delete and the restore, i.e. `deleted` as a Lamport
+     * register per page (CLAUDE.md rule 8) rather than a boolean OR. That is a manifest
+     * change inside `pages[]`, where SPEC §5.8's carry-unknown-fields rule does not
+     * reach, so it is not a fix that can be smuggled in; it is recorded in SPEC §4.3
+     * and pinned by `PageOrderTest`. No bytes are at risk either way: the page's whole
+     * op log survives under the tombstone (CLAUDE.md rule 1) and a re-restore works
+     * until the next sync.
      */
     public fun mergePageOrder(local: List<PageRef>, remote: List<PageRef>): List<PageRef> {
         val merged = LinkedHashMap<PageId, PageRef>()

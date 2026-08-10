@@ -1,8 +1,10 @@
 package dev.inkstone.core.storage
 
 import dev.inkstone.core.model.Background
+import dev.inkstone.core.model.FoldOutcome
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.LamportClockGenerator
+import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
@@ -183,7 +185,7 @@ class NoteStoreTest {
             assertTrue(expected.message.orEmpty().contains("stale"))
         }
 
-        session.close()
+        session.close(NoteSyncState.LOCAL_ONLY)
         store.assertNotStale(note.document.id)
     }
 
@@ -255,6 +257,12 @@ class NoteStoreTest {
         val page = note.document.pages.single().id
         val session = session(note)
         session.apply(page, listOf(addOp("obj-1"), addOp("obj-2")))
+        // Materialized first, so the two ops are in the *log* before anything caches a fold
+        // of them. A snapshot taken over unflushed work would be a cache of state the log
+        // does not contain, and discarding it — which rule 9 requires the moment a late op
+        // arrives — would then lose that work outright. `compactIfDue` refuses to do this;
+        // the test must not do it either, or it proves the opposite of what it claims.
+        session.materialize()
         store.writeSnapshot(note.document.id, session.page(page), "device-a")
         assertNotNull(store.readSnapshot(note.document.id, page))
 
@@ -265,9 +273,16 @@ class NoteStoreTest {
             obj = stroke("obj-late"),
         )
         val fresh = session(assertNotNull(store.open(note.document.id)))
-        fresh.apply(page, listOf(late), undoable = false)
+        // `merge`, because that is what this is: a peer's op arriving. Since M6 it is the
+        // only door remote work comes through, and it is the door that reports
+        // SNAPSHOT_STALE rather than leaving the caller to notice.
+        val outcome = fresh.merge(page, listOf(late))
 
+        assertEquals(FoldOutcome.SNAPSHOT_STALE, outcome, "a late remote op must report the snapshot stale")
         assertNull(store.readSnapshot(note.document.id, page), "the stale snapshot was kept")
+        // The late op is not merely tolerated — it is present, which is the half of CLAUDE.md
+        // rule 9 that a discarded snapshot alone does not prove.
+        assertEquals(3, fresh.page(page).objects.size, "the peer's op was lost in the re-fold")
     }
 
     @Test
@@ -305,7 +320,7 @@ class NoteStoreTest {
                 ),
             )
         }
-        session.close()
+        session.close(NoteSyncState.LOCAL_ONLY)
 
         val path = NoteLayout.bundle(note.document.id)
         val counting = CountingByteSource(FileByteSource(fs, path))

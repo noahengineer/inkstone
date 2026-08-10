@@ -6,6 +6,7 @@ import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.IdFactory
+import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.storage.NoteSession
@@ -129,10 +130,10 @@ class LibraryFixture @Inject constructor(
                 nextClock = session::nextClock,
             )
         }
-        session.apply(page, ops, undoable = false)
+        session.replay(page, ops)
         // Materializes, so the note is complete on disk and its thumbnail can be rendered
         // from the bundle rather than from a journal that is still open.
-        session.close()
+        session.close(NoteSyncState.LOCAL_ONLY)
 
         repository.adoptGenerated(note.document.id, "Notebook ${index + 1}", folder)
     }

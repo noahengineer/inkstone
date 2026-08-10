@@ -47,10 +47,39 @@ public class NoteTrash(private val fs: FileSystem, private val clock: Clock) {
      *   operation this class exists to prevent.
      */
     public suspend fun restore(id: DocumentId): Boolean {
-        if (fs.exists(NoteLayout.noteDir(id))) return false
         val entry = entries().firstOrNull { it.id == id } ?: return false
+        if (fs.exists(NoteLayout.noteDir(id)) && !setAsideStub(id)) return false
         fs.createDirectories(NoteLayout.NOTES_DIR)
         fs.move(entry.path, NoteLayout.noteDir(id))
+        return true
+    }
+
+    /**
+     * ⚠️ **Tell a live note apart from a stub, and move the stub aside so a restore can proceed.**
+     *
+     * Added in M6, for a permanent-data-loss path found in review. `notes/<id>/` existing was read
+     * as *"a live note is already there"*, and there is a second way for it to exist: a note trashed
+     * while a [NoteSession] held it. The session knows nothing about the move, its next two-second
+     * autosave appends to `journal.ops` at the old path, and every [dev.inkstone.core.model.FileSystem]
+     * write creates the parent directory first — so the directory comes back holding a journal, an
+     * `undo.json` and **no bundle**. From there the restore refused forever (this function's caller
+     * returned false, silently, on every attempt), the note could not be opened either
+     * (`NoteStore.open` needs the bundle), and thirty days later [purgeExpired] deleted the only copy
+     * of every page.
+     *
+     * The bundle is what decides, because the bundle is what makes a directory a note: `NoteStore.open`
+     * reads it, and a journal without one folds onto nothing.
+     *
+     * The stub is **moved, never deleted** (CLAUDE.md rule 1). What is in it is a handful of ops the
+     * user drew after the delete landed — small, unopenable on its own, and not ours to throw away.
+     * See [NoteLayout.orphanedStub] for why it goes where it goes.
+     *
+     * @return false when `notes/<id>/` holds a real note, which is still refused rather than
+     *   overwritten.
+     */
+    private suspend fun setAsideStub(id: DocumentId): Boolean {
+        if (fs.exists(NoteLayout.bundle(id))) return false
+        fs.move(NoteLayout.noteDir(id), NoteLayout.orphanedStub(id, clock.nowEpochMillis()))
         return true
     }
 

@@ -16,6 +16,7 @@ import dev.inkstone.android.ink.InkStrokeRebuilder
 import dev.inkstone.android.pdf.InkstonePdfMaterializer
 import dev.inkstone.android.pdf.PdfGateway
 import dev.inkstone.android.pdf.PdfPageRasterizer
+import dev.inkstone.android.pdf.PulledPdfExtractor
 import dev.inkstone.app.library.ThumbnailSourcePagesImpl
 import dev.inkstone.app.platform.AndroidFileSystem
 import dev.inkstone.app.platform.KeystoreCredentialStore
@@ -26,12 +27,15 @@ import dev.inkstone.core.database.DatabaseDriverFactory
 import dev.inkstone.core.database.InkstoneDatabase
 import dev.inkstone.core.database.createDatabase
 import dev.inkstone.core.database.library.LibraryIndex
+import dev.inkstone.core.database.sync.SqlFolderBindingStore
+import dev.inkstone.core.database.sync.SqlPeerClockStore
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.CredentialStore
 import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.PageThumbnailRenderer
+import dev.inkstone.core.model.RemoteBundleExtractor
 import dev.inkstone.core.model.WorkScheduler
 import dev.inkstone.core.storage.NoteStore
 import dev.inkstone.core.storage.NoteTrash
@@ -91,6 +95,24 @@ object PlatformProvidersModule {
     @Singleton
     fun provideLibraryIndex(database: InkstoneDatabase): LibraryIndex = LibraryIndex(database, Dispatchers.IO)
 
+    /** SPEC §9's folder mirror (M6) — which library folders are pinned to which remote path. */
+    @Provides
+    @Singleton
+    fun provideFolderBindingStore(database: InkstoneDatabase): SqlFolderBindingStore =
+        SqlFolderBindingStore(database, Dispatchers.IO)
+
+    /**
+     * SPEC §4.7's causal-stability horizon (M6) — what each peer has been seen to hold.
+     *
+     * The concrete class because `LibraryRepository` reads it directly to answer
+     * `Compaction.isAllowed`'s `oldestAckedCounter`, which has been passed null since M2.
+     * `SyncModule` also exposes it as `:core:sync`'s port, for the reconciler that writes it.
+     */
+    @Provides
+    @Singleton
+    fun providePeerClockStore(database: InkstoneDatabase): SqlPeerClockStore =
+        SqlPeerClockStore(database, Dispatchers.IO)
+
     @Provides
     @Singleton
     fun provideThumbnailCache(fs: FileSystem): ThumbnailCache = ThumbnailCache(fs)
@@ -116,6 +138,23 @@ object PlatformProvidersModule {
     @Provides
     @Singleton
     fun providePdfPageRasterizer(): PdfPageRasterizer = PdfPageRasterizer()
+
+    /**
+     * SPEC §5.6 + §7.6 (M6) — what the reconciler gets out of a peer's published PDF.
+     *
+     * `:android:pdf`'s third public door, and the reason `:core:sync` can decide what a pulled file
+     * *is* without ever seeing PdfBox. Deliberately **not** [PdfGateway]: that acts on the same
+     * three observations as a user's import, which for a background pull means an early return that
+     * silently drops every remote edit to a note this device already has, and a Recovered branch
+     * that trashes the local note from a WorkManager job with no user in the loop.
+     *
+     * `Dispatchers.IO` is supplied here for the reason every other `:core`/`:android` collaborator's
+     * is: parsing a 40 MB PDF is I/O and a decode, and neither belongs on the caller's thread.
+     */
+    @Provides
+    @Singleton
+    fun provideRemoteBundleExtractor(fs: FileSystem): RemoteBundleExtractor =
+        PulledPdfExtractor(fs = fs, dispatcher = Dispatchers.IO)
 
     /**
      * For reading the PDF the document picker returned (M4).

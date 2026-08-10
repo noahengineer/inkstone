@@ -6,6 +6,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.inkstone.android.pdf.PdfOpenResult
+import dev.inkstone.app.sync.NoteSessionHost
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.Folder
 import dev.inkstone.core.model.FolderCover
@@ -18,6 +19,7 @@ import dev.inkstone.core.model.NoteSummary
 import dev.inkstone.core.storage.PdfOpenMode
 import dev.inkstone.core.storage.RecoveryLoss
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -54,6 +56,14 @@ class LibraryViewModel @Inject constructor(
     private val repository: LibraryRepository,
     private val fixture: LibraryFixture,
     /**
+     * The single-writer gate over a note's one `NoteSession` (M6).
+     *
+     * The library needs it for exactly one action: a rename writes the note's document, not just its
+     * index row (SPEC §7.7 layer 2), and the note may be open in the editor while this screen is
+     * visible — split-screen, or a paused Activity whose `ViewModel` is still alive.
+     */
+    private val sessions: NoteSessionHost,
+    /**
      * Read here and nowhere deeper. A `Uri` is only readable while this process holds
      * the grant the picker made, and neither `:core:storage` nor `:android:pdf` may
      * learn what a `ContentResolver` is.
@@ -66,13 +76,28 @@ class LibraryViewModel @Inject constructor(
     /** Set by an action that needs to say something, cleared by the UI. */
     private val message = MutableStateFlow<String?>(null)
 
+    /**
+     * The three sync-shaped overlays on the library, combined once.
+     *
+     * Folded together here rather than passed individually because `combine` is only typed up to
+     * five sources, and the untyped `vararg` overload would turn every one of these into an
+     * `Any?` cast at the point where getting them the wrong way round is a silent bug — the
+     * pinned-folder set and the flagged-note set are both `Set<…>`.
+     */
+    private val overlay: Flow<SyncOverlay> = combine(
+        repository.pinnedFolders,
+        repository.notesNeedingAttention,
+        repository.openAttentionCount,
+    ) { pinned, flagged, count -> SyncOverlay(pinned, flagged, count) }
+
     val state: StateFlow<LibraryUiState> = combine(
         repository.folders,
         repository.notes,
         controls,
         message,
-    ) { folders, notes, controls, message ->
-        uiStateOf(folders, notes, controls, message)
+        overlay,
+    ) { folders, notes, controls, message, overlay ->
+        uiStateOf(folders, notes, controls, message, overlay)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), LibraryUiState())
 
     val trash: StateFlow<TrashUiState> = combine(
@@ -217,7 +242,17 @@ class LibraryViewModel @Inject constructor(
     private fun titleFor(uri: Uri): String =
         uri.lastPathSegment?.substringAfterLast('/')?.removeSuffix(".pdf").orEmpty().ifEmpty { "Imported PDF" }
 
-    fun renameNote(id: DocumentId, title: String) = viewModelScope.launch { repository.renameNote(id, title) }
+    /**
+     * ⭐ Through [sessions], not through the repository — SPEC §7.7 layer 2.
+     *
+     * A rename writes the note's own `Document.title` and stamps `titleClock` from that note's Lamport
+     * generator, so it needs the note's single `NoteSession` (and the live editor's, if one holds it).
+     * Calling `repository` here is what M6 shipped, and it renamed an index row only: the register the
+     * sync layer resolves titles with was never written, so two devices renaming one note kept two
+     * titles for good, silently. The repository still does the index and remote-path half — the host
+     * calls it once the document is stamped.
+     */
+    fun renameNote(id: DocumentId, title: String) = viewModelScope.launch { sessions.renameNote(id, title) }
 
     fun renameFolder(id: FolderId, name: String) = viewModelScope.launch { repository.renameFolder(id, name) }
 
@@ -338,6 +373,7 @@ private fun uiStateOf(
     notes: List<NoteSummary>,
     controls: LibraryControls,
     message: String?,
+    overlay: SyncOverlay,
 ): LibraryUiState {
     val searching = controls.query.isNotBlank()
     val visibleNotes = LibraryFiltering.visibleNotes(
@@ -351,6 +387,12 @@ private fun uiStateOf(
     val visibleFolders = LibraryFiltering.visibleFolders(folders, controls.folderId, controls.query)
 
     return LibraryUiState(
+        // "Covered by a pin", not "is the pinned folder": a subfolder of a pinned folder syncs
+        // just as much, and a cloud on only the folder holding the mapping row would describe
+        // the implementation rather than the outcome.
+        syncedFolders = coveredByPins(overlay.pinnedFolders, folders),
+        notesNeedingAttention = overlay.flaggedNotes,
+        attentionCount = overlay.attentionCount,
         folderId = controls.folderId,
         breadcrumb = FolderTree.pathOf(controls.folderId, folders.associateBy { it.id }),
         folders = visibleFolders,
@@ -391,6 +433,35 @@ private data class LibraryControls(
     val selection: Set<DocumentId> = emptySet(),
 )
 
+/**
+ * Every folder that syncs: the pinned ones, plus everything beneath them.
+ *
+ * Walks each folder's ancestry rather than descending from each pin, because a folder's parent
+ * chain is bounded and `FolderTree.pathOf` already terminates on a cycle or a missing parent —
+ * which folders arriving from a server can both be (SPEC §9).
+ */
+private fun coveredByPins(pins: Set<FolderId>, folders: List<Folder>): Set<FolderId> {
+    if (pins.isEmpty()) return emptySet()
+    val byId = folders.associateBy { it.id }
+    return folders
+        .filterTo(HashSet()) { folder ->
+            FolderTree.pathOf(folder.id, byId).any { it.id in pins }
+        }
+        .mapTo(HashSet()) { it.id }
+}
+
+/**
+ * The sync-shaped facts the library overlays on its own rows (M6).
+ *
+ * @property flaggedNotes notes with an open SPEC §7.7 entry. Ids rather than entries — the tile draws
+ *   one flag whatever the reason, and the reasons belong on the "Needs attention" screen.
+ */
+private data class SyncOverlay(
+    val pinnedFolders: Set<FolderId>,
+    val flaggedNotes: Set<DocumentId>,
+    val attentionCount: Long,
+)
+
 /** Everything the library screen draws. */
 data class LibraryUiState(
     val folderId: FolderId? = null,
@@ -399,6 +470,12 @@ data class LibraryUiState(
     val notes: List<NoteSummary> = emptyList(),
     val allFolders: List<Folder> = emptyList(),
     val allNotes: List<NoteSummary> = emptyList(),
+    /** Folders whose notes sync, pinned or beneath a pin (M6). Drives the cloud badge. */
+    val syncedFolders: Set<FolderId> = emptySet(),
+    /** Notes with an open SPEC §7.7 entry (M6). Drives the flag on a tile. */
+    val notesNeedingAttention: Set<DocumentId> = emptySet(),
+    /** How many entries are open. Zero hides the toolbar's button entirely. */
+    val attentionCount: Long = 0L,
     val layout: LibraryLayout = LibraryLayout.GRID,
     val sort: LibrarySort = LibrarySort.MODIFIED,
     val descending: Boolean = true,

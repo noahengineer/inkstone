@@ -75,7 +75,21 @@ class AndroidFileSystem @Inject constructor(@ApplicationContext private val cont
         val destination = resolve(path)
         destination.parentFile?.mkdirs()
         // Same directory as the destination, so the rename below is a rename and not a copy.
-        val temp = File(destination.parentFile, "${destination.name}$TEMP_SUFFIX")
+        //
+        // ⭐ **Unique per call, since M6.** The name used to be `"${destination.name}.tmp"` — one
+        // temp file per *destination* — so two concurrent writers aimed at one path interleaved
+        // into a single temp file and then atomically renamed the mixture into place. A torn ZIP
+        // inside a PDF, delivered by the very mechanism CLAUDE.md rule 10 exists to prevent, and
+        // undetectable afterwards because the rename itself succeeded.
+        //
+        // M6's reconciler is single-flighted and stages downloads outside `notes/<id>/`, so it
+        // cannot be the second writer any more. That closed the reachable path and left the
+        // trap: any future second writer to one destination revives it, and the failure is
+        // silent. The fix belongs here rather than in each caller's scheduling, because "only
+        // one thing writes this path" is an invariant nothing in the type system holds.
+        //
+        // `createTempFile` in the destination's own directory keeps the rename a rename.
+        val temp = File.createTempFile(destination.name, TEMP_SUFFIX, destination.parentFile)
         temp.outputStream().use { out ->
             out.write(bytes)
             // fsync before the rename. Without it the rename can be durable while the bytes

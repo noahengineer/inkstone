@@ -19,3 +19,9 @@ xcuserdata/
 
 # Graphify knowledge-graph output. A derived artifact — rebuildable with `graphify update .`
 graphify-out/
+
+# M6 — the live-Nextcloud test suite's connection details, including an app password.
+# SPEC §13.2 requires the merge matrix to run against a real server, and a real server
+# needs a real credential. The suite reads env vars first and this file second, so CI
+# never needs the file to exist; a developer's copy must never be committed.
+nextcloud-test.local.properties

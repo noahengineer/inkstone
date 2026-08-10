@@ -35,7 +35,6 @@ One milestone per session. A half-built ink engine sitting next to a half-built 
 | M3 | Library + organisation | Folders, search, trash | Low |
 | M4 | PDF import + materialization | Annotate a PDF, export a real PDF | 🟡 Unverified dependency + coordinate math |
 | M5 | Nextcloud auth + upload | Bind a note, upload it, offline queue | 🟡 Auth is fiddly |
-
 | M6 | Nextcloud pull + conflicts | Two-way sync that can't lose data | 🔴 **Second highest** |
 | — | — | *usable app from here* | |
 | M7 | Recognition + search | Searchable handwriting, in-app and in the PDF | Medium |
@@ -389,7 +388,8 @@ annotations will hang Preview and Chrome.
 
 ### Acceptance
 
-Automated (green — `./gradlew build`, 1068 tests):
+Automated (green — `./gradlew build`, **286 unit tests per variant** at this milestone's commit; the
+"1068 tests" this line used to claim was Gradle's task count, see `docs/M5-NEXTCLOUD.md` §6):
 
 - [x] **500 offline edits → exactly one upload** — `OutboxDrainerTest`, and `SqlSyncStoresTest` against real SQLite
 - [x] **Note edited while its PUT is in flight → not marked SYNCED, re-enqueued** (`local_rev`) — `OutboxDrainerTest`
@@ -469,16 +469,237 @@ verify it round-trips intact.
 - Polling honouring `core.pollinterval`; `notify_push` as optimisation only
 - Folder mirroring both directions
 
+*What landed differently from the list above:* folder mirroring is a **pin** — one library folder
+pointed at any remote path, deepest pin wins, everything beneath it follows (SPEC §9). `notify_push`
+is deliberately not implemented at all rather than implemented as an optimisation; SPEC §7.6 allows
+that, and it is not bundled with Nextcloud. Live re-render covers strokes and not page metadata
+(below). Three things not in the scope list turned out to be prerequisites and are in: a per-install
+`deviceId`, per-page compaction snapshots, and forward-compatible manifest carrying.
+
 ### Acceptance
 
-**All 21 rows of SPEC §13.2 as automated tests, against a real Nextcloud in Docker.** Then manually:
+**The bar:** all 21 rows of SPEC §13.2 as automated tests, against a real Nextcloud in Docker, then
+six manual gates.
+
+All 21 rows are written and every one of them runs in `./gradlew build` — **539 unit tests per
+variant, 0 failures, 0 skipped** (`:core:model` 142, `:core:sync` 174, `:core:storage` 118, `:app`
+62, `:android:pdf` 43, counted from `*/build/test-results/testDebugUnitTest/*.xml`; `build` runs the
+same suite again as `testReleaseUnitTest`, so it executes 1,078 and there are 539). Re-measured
+2026-08-10 from a run forced with `--rerun --no-build-cache`, because a `BUILD SUCCESSFUL` line
+whose test tasks logged `UP-TO-DATE` or `FROM-CACHE` is not evidence about the suite —
+`docs/M6-SYNC.md` §7.
+
+*Automated* and *automated and run against a real Nextcloud* are different claims. **26 of the 27
+matrix bodies run twice**, unchanged: once against a real HTTP/1.1 server on loopback that speaks
+enough Nextcloud to keep the production transport, the real WebDAV client and the real multistatus
+parser in the loop, and once against a real Nextcloud 32.0.13 in Docker. Of those 26, **24 assert
+their own claims live**; rows 15 and 12b reach the server and then return at a trigger that needs a
+shell on the instance. The 27th, row 19, has no server in it by design. Since `CountingProxy` the
+live half also measures **request counts**, which is where SPEC §7's economy claims live. The
+row-by-row table with a per-row `Live` column, and the three-bucket split of
+*written* / *automated* / *automated and run live*, is `docs/M6-SYNC.md` §7.
+
+Automated and green:
+
+- [x] **Rows 1–8, 11, 13, 14, 17, 18, 19, 21** — the union and its clock sort, delete-beats-transform,
+      the `deviceId` tiebreak, independent registers, both-add-a-page surviving a `materialize()`,
+      two conflicting reorders converging, absolute `SetErasedRegion` beside a transform, snapshot
+      staleness on a 3-page note, a move detected with zero GETs, 412 → reconcile → merge →
+      re-upload, a remote delete that does not annihilate a pending UPLOAD, 500 saves → one PUT, the
+      mid-flight `local_rev` guard, outbox durability across a reopen, and fileid churn on
+      trash-restore — `app/src/test/…/sync/matrix/`
+- [x] **Three rows SPEC does not list** — a two-device merge settles in ≤3 rounds and then costs one
+      `PROPFIND` with no ETag movement, which is §7.6's ETag-ping-pong termination argument
+      (`MergeMatrixConvergenceTest`); a rename crossing in both directions, which is §7.7 layer 2
+      converging (`MergeMatrixTitleTest`); and an unmergeable file met on four polls leaving **one**
+      copy and one dismissed row, which is layer 3 being bounded (`MergeMatrixConvergenceTest`). The
+      last two exist because the review found layer 2 and layer 3 broken after the 21 rows were
+      green — `docs/M6-SYNC.md` §5.7, §5.8
+- [x] **Rows 9, 10, 12 in part.** Layer 3 on an unreadable pull, undo after a pull through a
+      *reopened* session, and a cancelled PUT leaving the row and the remote file whole, are
+      automated **and run live**. Their remaining halves are not: row 9's flattened-page (>500
+      strokes) and recover-then-re-upload variants are not written at all; row 10's wet-ink half is
+      instrumented rather than live (`WetInkRemoteMergeTest`, ticked below); row 12's mid-socket
+      abort needs a sidecar.
+- [x] **Row 19 is automated, and deliberately has no server in it.** It is `runTest`, not
+      `matrixRow`: a file-backed SQLite database closed and reopened. That is the right shape for
+      "queued work survives a process boundary", and the half a server could never supply — a kill
+      *during* the write — is `CrashSafetyTest`'s upload kill, instrumented and green (below).
+      Recorded explicitly because "all 21 rows run against a real Nextcloud" was previously written
+      as though this row did.
+- [x] **Rows 16 and 20 against the real server**, through an in-process counting reverse proxy
+      (`CountingProxy`): row 16's weak validator is a genuine `W/"…"` rewrite in front of a real
+      Nextcloud, and row 20's 401 is a genuine refusal of a deliberately wrong app password, costing
+      exactly the two brute-force attempts it asserts. The proxy is also what makes every *request
+      count* assertable live — rows 1, 11, 16, 17, 20 and the convergence row were previously
+      printing "counts not observable" — `docs/M6-SYNC.md` §7
+- [x] **Row 15 against an in-process switch** standing in for `occ maintenance:data-fingerprint`,
+      which needs a shell on the instance. Row 12b's 507 likewise, which would mean filling the
+      server's disk. The client-side behaviour is asserted; those two server-side triggers are not
+      real, and on the live half **every assertion that is the point of either row is skipped** —
+      the live run does the setup, prints `LIVE HALF SKIPPED`, and returns. Row 15's `GET == 0` is
+      consequently the one request count in the suite the proxy did not make assertable, and its
+      `pruned == 0` is vacuous in the matrix fixture (a run folder has no child collections), so
+      that half rests on `ReconcilerWalkTest` instead.
+- [x] **Four silent data-loss bugs found and fixed before the matrix was written**, each of which
+      would have failed rows underneath every other row — `docs/M6-SYNC.md` §1
+- [x] **The defects an adversarial review found *after* the matrix was green**, all fixed with a
+      test that fails without the fix: a remote delete that made an open note permanently
+      unrestorable, two paths that mass-trashed notes whose files were sitting on the server (the
+      pass limit and a 404'd folder), a 401 ladder on WorkManager's backoff, no memory of "this
+      remote file is not ours", two unserialized writers, layer 2 wired at neither end, and layer 3
+      unbounded in both directions — `docs/M6-SYNC.md` §5.5–§5.8. Worth reading before the ticks
+      above are trusted: every one of them sat behind a comment or a KDoc asserting the opposite
+- [x] **Five the close-out audit found, four of them one decision expressed in two places** — a
+      second door into the merge with no production caller (and no `mergeDocument` in front of the
+      `NoteSession.merge` it called), `MergeReport.TooNew` behind a check no input could reach,
+      `MaterializeWorker` publishing `document.pdf` from under an open editor and leaving a marker
+      describing a bundle that no longer existed, a conflicted-copy name stamped from two clock
+      readings, `PENDING_DOWNLOAD` set before the GET that had to succeed for it to be true, and a
+      poll interval that a rotation reset. Each has a test that fails without the fix; row 10's JVM
+      half now drives the door the host actually calls — `docs/M6-SYNC.md` §5.9
+- [x] **`connectedDebugAndroidTest`, every module that has one, on `Test_Tablet(AVD) - 15`** (Pixel
+      Tablet, API 35, x86_64):
+      - `:core:database` — **47 tests, 0 failures.** `LibraryIndexTest` 15, `SqlSyncStoresTest` 9,
+        `SqlReconcileStoresTest` 20 (including the three the review repairs added, which had until
+        now compiled without ever executing) and the new `MigrationOnDeviceTest` 3.
+      - `:app` — **6 tests, 0 failures**, in a source set that did not exist before this pass.
+      - `:android:ink` — **15 tests, 10 failures, and every one is M1's**: nine
+        `StrokeStoreEraseTest` cases die on `StrokeInput::orientation … Got: -0.00147393π` because
+        the synthetic-ink fixture does not clamp to `[0, 2π)`, and
+        `pressureAndTiltSurviveTheRoundTrip` fails an arm64-tuned float tolerance
+        (`y at 1 expected:<415.70966> but was:<415.7085>`). Pre-existing, documented in CLAUDE.md
+        since M5, **not** an M6 regression and deliberately not "fixed" by loosening M1's tolerances.
+- [x] **SPEC §13.3 crash safety — four instrumented process kills, written for the first time.**
+      `app/src/androidTest/…/CrashSafetyTest.kt` kills a real second process
+      (`dev.inkstone:crashpoint`) at four named instants and asserts a **bound** at each: an
+      unflushed stroke is the only loss during capture; the record that was mid-write is the only
+      loss during a journal append, and the reader reports the tear rather than throwing; a kill
+      between materialization's bundle write and its journal reset loses nothing **and doubles
+      nothing**; and a kill while republishing leaves the queued UPLOAD with its attempts unspent
+      and `document.pdf` byte-identical to the complete previous version. Also driven by hand
+      against the real app: `am force-stop` immediately after a stroke reopened the note at the last
+      autosaved revision, which is the same bound from the other side — `docs/M6-SYNC.md` §5.10
+- [x] **SPEC §13.1's on-device migration test.** `MigrationOnDeviceTest` builds a **version-4**
+      database with real rows on the device — one folder, one note, an account, a binding carrying a
+      *weak* ETag, and a queued UPLOAD with two attempts spent — and opens it through the production
+      driver so `Schema.migrate` runs `4.sqm` and `5.sqm` for real. Both existing instrumented
+      suites open in-memory databases with `name = null`, which calls `Schema.create` and **never**
+      `Schema.migrate`, so this path had run on a developer's machine and on no device, ever. The
+      version-4 and version-5 fixtures were *generated* from the committed `1.db` plus `1.sqm`–
+      `4.sqm`, not transcribed from the current `.sq`
+- [x] **Row 10's wet half, on a device.** `WetInkRemoteMergeTest` draws a real stylus stroke, leaves
+      it in progress, delivers a peer's `AddObject` through `applyOps(record = false)`, and asserts
+      the camera does not move and the in-progress stroke still lands when the pen lifts. Its
+      control drives the forbidden path — `loadPage` — and asserts the damage, so the first test
+      cannot pass by accident. The peer's geometry is harvested from a stroke the test itself drew,
+      so `SyntheticInk`'s x86_64 orientation bug cannot leak into it
+- [x] **The M6 app driven end-to-end over `adb` on the emulator**, which is the check that catches
+      "correct in every test, inert in the app": a folder created through the UI, *"Always sync to…"*
+      reachable from its overflow menu, the folder's cloud badge appearing, a note created inside the
+      pinned folder producing a `remoteBinding` at `Inkstone/Lectures/Untitled.pdf` and **MKCOL then
+      UPLOAD** in the outbox at the right `local_rev` each, two strokes drawn with
+      `input stylus swipe`, and the *"Needs attention"* screen rendering both a known kind and an
+      unknown one — `docs/M6-SYNC.md` §5.10.
+      ⚠️ **This tick rests on a transcript and cannot be re-checked.** `connectedAndroidTest`
+      uninstalled the app afterwards, so `run-as dev.inkstone` now answers *"unknown package"* and the
+      database rows quoted above are gone. It is the only M6 tick with no re-runnable artefact behind
+      it; the unit suite, the instrumented XML under `build/outputs/` and the live matrix all have one.
+
+Still owed:
+
+- [ ] **Rows 15 and 12b's live triggers.** Both need a shell on the instance and there is no SSH key
+      to the Pi: `occ maintenance:data-fingerprint` and a quota the test can fill. The in-process
+      switch stands in and the live half skips loudly. Also still not automated: the mid-socket half
+      of row 12 (an nginx `limit_rate` sidecar), and reading `nextcloud.log` to confirm row 20 logged
+      no brute-force lockout.
+      **Satisfied by:** an SSH key on the Pi so `occ=` can go in `nextcloud-test.local.properties`
+      (`setDataFingerprint` then returns true and row 15's live half runs to its own `GET == 0`); a
+      second Nextcloud user with a tiny quota, or a loopback filesystem the container's data
+      directory sits on, for 12b; an nginx `limit_rate` sidecar in `tools/nextcloud-docker/` for 12;
+      and `docker exec inkstone-nc grep -i bruteforce data/nextcloud.log` after row 20.
+
+The six manual gates. **None has happened.** Five need a second physical device and the sixth needs
+seven days of elapsed time, so nothing here can be closed from a workstation — what each one would
+take is written out rather than left as "manual":
 
 - [ ] Two devices, both offline, both write on the same page → reconnect → **both sets present, no prompt**
+      **Satisfied by:** the APK on two tablets bound to one Nextcloud folder; airplane mode on both;
+      a stroke on each in the same page; airplane mode off; both notes then showing both strokes and
+      no dialog having appeared. **Automated stand-in:** row 1, live. What only the devices add is
+      the real radio, the real WorkManager scheduling and a human confirming no prompt was shown.
 - [ ] Two devices, both offline, both add a page → **both pages present**, neither orphaned
+      **Satisfied by:** the same setup, *Add page* on each while offline, then a page count of 3 on
+      both after reconnect. **Automated stand-in:** row 5, live, including surviving a `materialize`.
 - [ ] Move a note in the Nextcloud **web UI** → detected as a move, no re-download, no duplicate
+      **Satisfied by:** renaming or dragging the note's PDF in a browser and watching the library
+      show one row at the new path with no download. **Automated stand-in:** row 11's live half,
+      which does the MOVE with a real WebDAV client neither device owns. What is still missing is
+      Nextcloud's *own* UI as the mover — it may set headers or trigger versioning that `raw.move`
+      does not.
 - [ ] Delete on the server while local has unsynced edits → local → trash, user notified, nothing lost
-- [ ] Both devices online with the same page open → strokes appear live, camera doesn't jump, your in-progress stroke survives
+      **Satisfied by:** deleting the PDF in the web UI while a tablet holds an unsynced stroke, then
+      finding the note in local trash, a *Needs attention* row naming it, and the stroke intact after
+      Restore. **Automated stand-in:** row 14, live — and §5.5's first finding, which is what this
+      gate would have caught had it been run: it required the note to be **open** at the time.
+- [ ] Both devices online with the same page open → strokes appear live, camera doesn't jump, your
+      in-progress stroke survives.
+      **Satisfied by:** two tablets on one page, one person drawing while the other holds a stroke
+      down. **Automated stand-in:** row 10's wet half on an AVD (ticked above) for the camera and the
+      wet stroke; row 1 live for the merge. ⚠️ **This gate is expected to fail in one respect and
+      the reason is known:** a peer's `SetPageMeta` or a `SetTransform` on an *existing* object does
+      not render until a page switch (§8, and the `:android:ink` item below). New strokes do appear.
 - [ ] **A full week of real daily use across two devices with deliberate airplane-mode toggling → zero data loss**
+      **Satisfied by:** seven calendar days, both tablets in ordinary use, airplane mode toggled at
+      arbitrary moments including mid-upload, ending with every note openable and no note in
+      `Recovered` mode or holding a conflicted copy nobody asked for. Nothing substitutes: the whole
+      point is elapsed time, real batteries, real Doze and real WorkManager deferral, none of which a
+      test clock reproduces.
+- [ ] **A pass on the actual Galaxy Tab** (CLAUDE.md definition of done #4). The emulator pass is
+      done — instrumented suites, four process kills and an `adb`-driven walk through the app — and
+      an emulator explicitly does **not** substitute: ink feel, latency and frame timing exist only
+      on the tablet, and `:android:ink`'s suite is red on x86_64 for reasons that are green on arm64.
+      **Satisfied by:** accepting the USB-debugging dialog on the tablet (it currently reports
+      `unauthorized`), then `connectedDebugAndroidTest` for all three modules — `:android:ink`'s 10
+      x86_64 failures should go green — plus `dumpsys gfxinfo` for the frame-rate gate and a session
+      of actual handwriting. Until the dialog is accepted, `tools/send-to-tablet.ps1` copies the APK
+      over MTP but no measurement is possible.
+- [ ] **Guardrail 2, the iOS framework link.** `./gradlew build` on this machine runs
+      `checkCoreIsPlatformFree` and the iOS **klib** compile; **25 `link*Ios*` tasks log `SKIPPED`**
+      (5 `:core:*` modules × 5 link tasks) because Kotlin/Native cannot target Apple on Windows, and
+      so do all five `iosSimulatorArm64Test` tasks — so the common tests are compiled for
+      Kotlin/Native and never executed on it. Every figure in this section is a JVM result. The macOS
+      `ios-core-link` job in `.github/workflows/ci.yml` is what proves the link.
+      ⚠️ **It has never run, and cannot: `git remote -v` is empty.** There is no `origin`, so no CI
+      has ever executed for this repository at all — the previous wording, "has not run for this
+      branch", implied a remote that does not exist. Guardrail 2 has therefore been unproven since
+      M0, not since M6. It matters more now than usual, M6 being the first milestone since M5 to add
+      a `:core:*` edge (`:core:sync → :core:storage`).
+      **Satisfied by:** a remote plus one push, or a macOS machine running `./gradlew linkIosCore`.
+- [ ] **M6 is not committed.** `git status`: **54 modified files and 45 untracked paths**, 5,774
+      insertions, all of it in the working tree only. `HEAD` is still `d6993e3` ("M5: notes upload
+      themselves") on a branch named `m5-nextcloud-auth-upload`. Every figure in this section
+      describes a tree that exists on one disk with no remote and no commit — which is also why none
+      of it can be reviewed, bisected, or recovered from a lost working copy.
+      **Satisfied by:** a branch named for M6, a commit, and — for anything above that says "CI" — a
+      remote to push it to.
+- [ ] **The `:android:ink` half of live re-render.** A peer's `SetPageMeta` folds correctly, reaches
+      the bundle and does **not** appear on screen until the page is switched: `NoteSurface.setPageMeta`
+      is a documented no-op on the real surface because `InkSurfaceView` can only change the paper
+      through `loadPage`, which refits the camera and cancels the in-progress stroke — both of row
+      10's forbidden outcomes. `StrokeStore.applyOps` also still drops `SetTransform` / `SetStyle` /
+      `SetZOrder` on the floor, so a peer's transform of an existing object folds and does not
+      render. Data-safe, visibly late.
+- [ ] **SPEC §13.1's remaining gap: no bundle fixture is committed for any schema version**, so
+      *"round-trip every schema version"* is currently a round trip of whatever the current build
+      writes. This bullet previously also claimed there was no on-device migration test; that half
+      is **closed** — `MigrationOnDeviceTest` runs `Schema.migrate` on a device, 3 tests green
+      (ticked above). A committed **bundle** fixture is a different artefact from a database fixture
+      and belongs to `:core:storage`.
+      ⚠️ **`SPEC.md` §13.1 still asserts both halves are open** and needs the same correction; it was
+      out of scope for this documentation pass.
+
+Notes: `docs/M6-SYNC.md`.
 
 ### Prompt
 

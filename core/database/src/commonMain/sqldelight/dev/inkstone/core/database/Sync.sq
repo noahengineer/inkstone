@@ -1,4 +1,6 @@
 -- M5 — SPEC §7.6's sync schema: accounts, bindings, outbox.
+-- M6 — and the pull side: the directory ETag cache, the per-account cursor, in-flight
+--      downloads, the "Needs attention" list, folder bindings, and peer clocks.
 --
 -- WHAT IS NOT HERE, AND WHY
 --
@@ -20,6 +22,12 @@
 -- `remoteBinding.accountId` are unconstrained; the drainer treats a binding whose note or
 -- account has gone as "nothing is owed" and drops the row, which is a recoverable outcome.
 -- A failed insert mid-sync is not.
+--
+-- M6's tables hold to that, and one of them makes the case louder: a `PROPFIND Depth:1` walk
+-- delivers a collection before its contents but a *moved* subtree can arrive in any order, so
+-- `remoteDirectory` legitimately holds a child whose parent row does not exist yet. A foreign
+-- key would fail that insert in the middle of a reconcile pass, which is how a walk half-writes
+-- an ETag cache — and a half-written ETag cache prunes a subtree that was never looked at.
 
 CREATE TABLE account (
     id            TEXT    NOT NULL PRIMARY KEY,
@@ -62,10 +70,32 @@ CREATE TABLE remoteBinding (
     -- MD5 of the bytes last uploaded — the fallback comparison when the ETag was weak.
     lastChecksum       TEXT,
     -- Where the file still is while a MOVE is owed. NULL almost always.
-    movedFromPath      TEXT
+    movedFromPath      TEXT,
+    -- Added by 4.sqm, so it is last: ALTER TABLE ADD COLUMN appends, and a fresh install has
+    -- to produce the same column order a migrated database does (`verifyMigrations` fails the
+    -- build on any disagreement — the same rule Library.sq's `coverKind` records).
+    --
+    -- ⚠️ The pass in which this note's remote directory was last actually WALKED and the file
+    -- found — not pruned by a matching directory ETag (SPEC §7.4 rule 1). Compared against the
+    -- reconcile pass's start time, it is what distinguishes SPEC §7.6 step 3's fourth branch,
+    -- "known oc:id absent remotely" (→ local copy to trash), from "we did not look".
+    --
+    -- Getting this wrong sends a hundred notes to the trash on one bad walk: a pass that
+    -- pruned a subtree, or aborted halfway, leaves every binding under it unstamped, and
+    -- reading that as "absent remotely" trashes the lot. So the rule is two-sided — a note is
+    -- only a deletion candidate when its directory was walked in *this* pass AND this column
+    -- is older than the pass. 0 means never seen, which is what every pre-M6 row gets and what
+    -- a note that has never been reconciled deserves; it is never on its own a reason to trash.
+    lastSeenRemoteAt   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX remoteBindingByAccount ON remoteBinding(accountId);
+
+-- SPEC §7.6 step 3 matches every remote file on `oc:id`, once per file per walk, and without
+-- this it is a table scan per file. No accountId in the key: `oc:id` is
+-- `<padded-fileid><instanceid>` and therefore globally unique across servers (SPEC §7.3),
+-- which is the entire reason this project stores `oc:id` and not `oc:fileid`.
+CREATE INDEX remoteBindingByOcId ON remoteBinding(remoteOcId);
 
 -- SPEC §7.6, verbatim:
 --   outbox(note_id, op_type, local_rev_at_enqueue, attempts, next_attempt_at, created_at,
@@ -89,6 +119,241 @@ CREATE TABLE outbox (
 );
 
 CREATE INDEX outboxDue ON outbox(nextAttemptAt);
+
+-- ===========================================================================
+-- M6 — the reconciler (SPEC §7.4, §7.6's pull side, §7.7)
+-- ===========================================================================
+
+-- The directory ETag cache. SPEC §7.4 rule 1: a change anywhere under a folder changes that
+-- folder's ETag, up to the root — so a matching ETag prunes the whole subtree and the common
+-- poll is one `PROPFIND Depth:0`. This table *is* the pruning; without it every poll walks
+-- the user's entire notes tree, which on a phone connection is the difference between a
+-- 400-byte request and a hundred of them.
+CREATE TABLE remoteDirectory (
+    -- Keyed with the path, not by it. Two accounts legitimately have an `Inkstone/` each, and
+    -- keying on path alone would let one server's cache prune the other server's subtree —
+    -- i.e. silently stop seeing changes on it, which is the worst failure this cache has.
+    accountId TEXT    NOT NULL,
+    -- The collection's remote path, as the walk addresses it.
+    path      TEXT    NOT NULL,
+    -- Unquoted, like every other ETag here (SPEC §7.3's table).
+    etag      TEXT,
+    -- ⚠️ A weak directory ETag must never be trusted to prune. A weak validator means
+    -- "semantically equivalent", so a gzip-compressing proxy may hand back the same `W/"…"`
+    -- for a directory whose contents changed — and a pruned subtree is a change that is never
+    -- seen, on any pass, ever. (The strong-ETag hazard is the other way round and louder: a
+    -- permanent 412. This one is silent, which is worse.) The flag is a column for the same
+    -- reason `remoteBinding.lastSyncedEtagWeak` is: "was this weak" cannot be recovered from
+    -- the stripped string.
+    etagWeak  INTEGER NOT NULL DEFAULT 0,
+    -- SPEC §7.4 rule 2 — a folder's `oc:id` survives a rename, so a renamed directory can have
+    -- its cache entry moved instead of dropped. Dropping it re-walks the subtree; worse, the
+    -- old path lingers and can shadow a *different* directory the user later creates there.
+    ocId      TEXT,
+    -- Which pass last saw this directory. Rows for directories that no longer exist would
+    -- otherwise accumulate forever, and a stale row at a path a new directory later takes
+    -- would prune a subtree that has never been walked. Sweeping by this after a full pass is
+    -- what prevents that.
+    seenAt    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (accountId, path)
+);
+
+CREATE INDEX remoteDirectoryBySeen ON remoteDirectory(accountId, seenAt);
+
+-- One row per account: where the last reconcile pass got to.
+CREATE TABLE syncCursor (
+    accountId       TEXT    NOT NULL PRIMARY KEY,
+    -- SPEC §7.6 step 4 — `nc:data-fingerprint`. It changes when an admin restores a backup,
+    -- at which point every cached ETag above describes files that have moved *backwards*.
+    -- Without this column that case is indistinguishable from "nothing changed", and the
+    -- client keeps pruning against a cache the server no longer agrees with. A change here
+    -- means invalidate everything and full-reconcile — never mass-re-download.
+    dataFingerprint TEXT,
+    -- SPEC §7.6 step 1: the whole poll is a `Depth:0` on the notes root compared against this.
+    rootEtag        TEXT,
+    -- Same trap as `remoteDirectory.etagWeak`, one level up and with the whole tree behind it:
+    -- a weak root ETag that happens to match would end the pass before it started.
+    rootEtagWeak    INTEGER NOT NULL DEFAULT 0,
+    -- When the last pass started. Two things read it: the pace against
+    -- `capabilities.core.pollinterval` (SPEC §7.6's floor, default 60 s), and the comparison
+    -- `remoteBinding.lastSeenRemoteAt` is made against.
+    lastReconcileAt INTEGER NOT NULL DEFAULT 0,
+    -- When the last *unpruned* walk happened. The backstop for every way ETag pruning can lie
+    -- — a weak ETag, a proxy, a server that does not propagate — because a subtree that
+    -- stopped propagating ETags is otherwise invisible for as long as the install lasts.
+    lastFullAt      INTEGER NOT NULL DEFAULT 0,
+    -- ⚠️ CLAUDE.md rule 5. When a 401 that SPEC §7.2's confirmation call could not *confirm* may
+    -- be met again. `NEEDS_REAUTH` is the confirmed case and already means zero requests; this
+    -- column is for the other two answers, both of which leave the account ACTIVE: the probe said
+    -- the credential is alive (so one path is refused, not the account), and the probe could not be
+    -- reached (so nothing may be concluded at all). Without it, an ACTIVE account whose folder 401s
+    -- re-walks the whole tree on every sixty-second poll and re-sends the refused credential 1 440
+    -- times a day — the pattern rule 5 exists to prevent, reached without any code "retrying a 401".
+    --
+    -- ⚠️ Added in M6 by repair, so it is **last** in this table: `ALTER TABLE ADD COLUMN` appends,
+    -- and a fresh install must produce the column order a migrated database has or
+    -- `verifyMigrations` fails the build. See 5.sqm.
+    refusedUntil    INTEGER NOT NULL DEFAULT 0
+);
+
+-- A remote version fetched but not yet merged. SPEC §7.6 step 3's "REMOTE EDIT → download →
+-- merge" is two operations with a process death between them.
+--
+-- A marker, never a payload (SPEC §7.6, CLAUDE.md rule 4): the bytes are in the temp file this
+-- row points at, and there is no BLOB column here or anywhere else in this file.
+CREATE TABLE pendingDownload (
+    -- One in flight per note. A second row would mean two writers racing onto the same
+    -- materialisation, and the loser's merge disappears without an error.
+    noteId         TEXT    NOT NULL PRIMARY KEY,
+    accountId      TEXT    NOT NULL,
+    remotePath     TEXT    NOT NULL,
+    remoteOcId     TEXT,
+    -- Which remote version these bytes are. Without it the merge cannot become a binding
+    -- update, so the next pass sees a differing ETag and downloads the same file again —
+    -- forever, on every poll.
+    remoteEtag     TEXT,
+    remoteEtagWeak INTEGER NOT NULL DEFAULT 0,
+    -- Where the bytes landed. This row is the **only** record of that file: CLAUDE.md rule 10
+    -- writes temp-then-rename, so a kill between download and merge leaves a real file on
+    -- disk that nothing else knows the name of — a leak that grows by one lecture PDF per
+    -- interrupted sync.
+    tempPath       TEXT    NOT NULL,
+    -- How old the temp is. A stale one is re-fetched rather than merged: the remote may have
+    -- moved on, and merging a version the server has already replaced would immediately be
+    -- overwritten by the next pass — with the merge's own work inside it.
+    fetchedAt      INTEGER NOT NULL
+);
+
+-- SPEC §7.7's "Needs attention" list. CLAUDE.md rule 6: conflicts resolve automatically and
+-- non-destructively and then appear *here*. Never a modal, never blocking sync — which is why
+-- this is a table and not a dialog: the reconciler writes a row and carries on.
+CREATE TABLE syncAttention (
+    -- Minted by the caller, which makes it the dedup handle — see `insertAttention`.
+    id                   TEXT    NOT NULL PRIMARY KEY,
+    accountId            TEXT    NOT NULL,
+    -- Nullable, because not every entry is about a note: a full quota, a folder the user may
+    -- not write to, and an unknown PDF offered for import are all account-level.
+    noteId               TEXT,
+    -- The vocabulary belongs to `:core:sync`, and is stored by name for the reason `syncState`
+    -- and `opType` are: a kind written by a newer build is *kept and shown as itself* rather
+    -- than dropped or guessed at. An entry this build cannot explain is still an entry the
+    -- user needs to see.
+    kind                 TEXT    NOT NULL,
+    -- What to tell the human. Free text; nothing parses it.
+    detail               TEXT,
+    -- SPEC §7.7 layer 3 keeps both versions as `… (conflicted copy …).pdf`. Without a pointer
+    -- to that note the entry cannot offer to open it, and the copy is an untitled mystery file
+    -- in the library that the user is most likely to delete.
+    conflictedCopyNoteId TEXT,
+    -- For entries with no local note at all — the unknown PDF, the unwritable path.
+    remotePath           TEXT,
+    createdAt            INTEGER NOT NULL,
+    -- 0 for open, a timestamp once the user has seen it. **Never NULL**, and never deleted.
+    --
+    -- Not NULL because `acknowledgedAt IS NULL` makes SQLDelight infer a different nullability
+    -- for the column in that one result and generate a whole second row type plus mapper for
+    -- this table — exactly what Library.sq's `deletedAt >= 0` exists to avoid. Every query
+    -- here uses `= 0`. The column stays nullable so a row written by any other path still
+    -- reads, and the mapper treats NULL as open.
+    --
+    -- Never deleted because CLAUDE.md rule 1 has no exception for metadata: acknowledging is a
+    -- tombstone. There is deliberately no DELETE statement for this table.
+    acknowledgedAt       INTEGER
+);
+
+CREATE INDEX syncAttentionOpen   ON syncAttention(acknowledgedAt, createdAt);
+CREATE INDEX syncAttentionByNote ON syncAttention(noteId);
+
+-- Which remote directory a library folder mirrors. SPEC §9 wants folders to mirror Nextcloud
+-- in both directions; M5 did the push side per note, and this is what the pull side matches
+-- against.
+CREATE TABLE folderBinding (
+    folderId       TEXT    NOT NULL PRIMARY KEY,
+    accountId      TEXT    NOT NULL,
+    remotePath     TEXT    NOT NULL,
+    -- ⚠️ SPEC §7.4 rule 2 — a folder renamed in the web UI keeps its `oc:id`. This column is
+    -- what makes that a rename. Without it the walk sees one directory gone and another
+    -- appeared, and "gone" means every note under it is a deletion candidate while
+    -- "appeared" means every note in it is a fresh import: one rename, a trashed folder and a
+    -- duplicate library.
+    remoteOcId     TEXT,
+    remoteEtag     TEXT,
+    -- The folder's own ETag, so an unchanged folder is skipped. Weak flag for the reason
+    -- `remoteDirectory.etagWeak` gives, and it matters here too — a weak match that prunes a
+    -- folder never reports the notes inside it.
+    remoteEtagWeak INTEGER NOT NULL DEFAULT 0
+);
+
+-- The reverse lookup the walk does once per remote directory. `accountId` leads so the same
+-- index also serves a per-account sweep.
+CREATE INDEX folderBindingByOcId ON folderBinding(accountId, remoteOcId);
+
+-- SPEC §4.7's causal-stability horizon, at last.
+--
+-- `Compaction.isAllowed` has taken an `oldestAckedCounter` since M2 and has always been passed
+-- **null**, because nothing knew what any peer had seen — so the 30-day wall clock was the only
+-- guard. This table is what makes the parameter mean something: per note, the highest Lamport
+-- counter each peer device is known to have seen, read from a downloaded bundle's
+-- `highestClockCounter` and its `document.deviceId` (`NoteMerge.Merged` already reports both).
+-- Compaction takes the `min` across peers.
+--
+-- What it prevents is merge-matrix row 8 (SPEC §13.2): folding away ops above a peer's
+-- high-water mark leaves that peer's older ops nowhere to reintegrate. They still arrive, they
+-- still sort before the snapshot, and the only correct response is to throw the snapshot away —
+-- so guessing here does not lose data, it just makes the work pointless.
+-- ⭐ The negative half of SPEC §5.6's identity check: remote `.pdf`s that are **not ours**.
+--
+-- Whether a PDF is an Inkstone note is decided by an XMP marker in the PDF catalog, so answering it
+-- costs the whole file. Nothing recorded the answer, and a directory's ETag moves every time any
+-- note in it uploads — so a 40 MB handout beside the notes was downloaded again on every note save,
+-- inside a WorkManager job, on whatever connection the tablet had. Worse, each unknown file spends
+-- one unit of the pass budget (`Reconciler.DEFAULT_LIMIT`), so `limit` strangers ahead of the notes
+-- in listing order consumed every pass forever: the notes behind them never reconciled, and the
+-- poll reported success the whole time. Added in M6 by repair.
+CREATE TABLE foreignRemote (
+    accountId  TEXT    NOT NULL,
+    -- The stable identity `Reconciler.stagingKey` also names the staged download with: `oc:id` when
+    -- the server published one (globally unique — SPEC §7.3), else the flattened path for an
+    -- instance behind a proxy that strips `OC-FileId`. One function for both, so a staged file and
+    -- its "not ours" row cannot disagree about which file they are about. Not `key`, which reads as
+    -- a keyword at a glance in a table whose primary key it is half of.
+    fileKey    TEXT    NOT NULL,
+    -- Where it was when we looked. Not identity (CLAUDE.md: identity is never a path) — it is here
+    -- so a human reading the table can tell what the row is about.
+    remotePath TEXT    NOT NULL,
+    -- ⚠️ The version this answer is about. A row answers for **these bytes** and no others: a path
+    -- that held a stranger's scan yesterday can hold a peer's note today, and a cache that skipped
+    -- the file anyway would be a note that never syncs and never says why.
+    etag       TEXT,
+    -- Beside the value, never recomputed (SPEC §7.3, and `remoteBinding`'s note).
+    etagWeak   INTEGER NOT NULL DEFAULT 0,
+    -- `oc:checksums`' MD5, so SPEC §7.3's fallback answers when the ETag cannot. Without it a
+    -- weak-ETag server re-downloads every foreign file on every pass — the livelock above, one step
+    -- removed.
+    checksum   TEXT,
+    -- When this answer was last confirmed. Nothing sweeps by it yet: the row count is bounded by the
+    -- number of non-Inkstone PDFs in the user's notes folders, which is small and not growing on its
+    -- own. A sweep needs a timestamp, and adding one later would need another migration.
+    seenAt     INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (accountId, fileKey)
+);
+
+CREATE TABLE peerClock (
+    noteId         TEXT    NOT NULL,
+    -- The peer's `document.deviceId`, i.e. the tie-breaker half of a `LamportClock`. Per note,
+    -- because a peer that has a note at all may not have every note.
+    peerDeviceId   TEXT    NOT NULL,
+    -- Monotonic by construction — see `upsertPeerClock`, which takes the `max`. A counter that
+    -- moved backwards would only make compaction more conservative, which is safe, but it
+    -- would also be a lie about what the peer has seen and the next reader could not tell.
+    highestCounter INTEGER NOT NULL DEFAULT 0,
+    -- When this peer was last heard from. A tablet that has been in a drawer for a year must
+    -- not hold compaction hostage forever, and the only way to know that is a timestamp. This
+    -- is a retention decision like the 30-day trash, **never an ordering** — ops are ordered by
+    -- Lamport clock and nothing here changes that (CLAUDE.md).
+    seenAt         INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (noteId, peerDeviceId)
+);
 
 -- ---------------------------------------------------------------------------
 -- Accounts
@@ -121,11 +386,56 @@ SELECT * FROM remoteBinding WHERE noteId = ?;
 selectBindingsForAccount:
 SELECT * FROM remoteBinding WHERE accountId = ?;
 
+-- SPEC §7.6 step 3, the match every remote file goes through. No account filter, because
+-- `oc:id` is globally unique (SPEC §7.3) — adding one would only make it possible to pass the
+-- wrong account and get an empty answer that looks like "unknown file".
+--
+-- Returns rows, not a row. SPEC §7.4's caveats include one file shared in twice — one `oc:id`
+-- at two paths — and `executeAsOne` would *throw* on that, inside a reconcile pass, which is
+-- the opposite of the "degrade gracefully" the same paragraph asks for.
+selectBindingByOcId:
+SELECT * FROM remoteBinding WHERE remoteOcId = ?;
+
+-- The secondary key SPEC §7.4 requires: a Nextcloud trash-restore **changes the fileid**, so a
+-- restored note cannot be found by `oc:id` at all and has to be re-bound by path (SPEC §7.6's
+-- "re-bind by path and repair remote_oc_id from the PUT response"). Also rows, for the reason
+-- above: nothing in the schema stops two notes claiming one path, only the code that checks
+-- `pathsOn` first, and a broken invariant must not become a crash.
+selectBindingByAccountAndPath:
+SELECT * FROM remoteBinding WHERE accountId = :accountId AND remotePath = :remotePath;
+
+-- One statement per pass, not one per note: the set of notes whose directory was walked and
+-- whose file was found is known at the end of the walk, and a 500-note library would otherwise
+-- be 500 round trips. ⚠️ Guard the empty case in Kotlin — SQLDelight expands `IN :noteIds` to
+-- as many placeholders as there are values, and none is a syntax error (`IN ()`).
+stampBindingSeen:
+UPDATE remoteBinding SET lastSeenRemoteAt = :seenAt WHERE noteId IN :noteIds;
+
+-- The candidates for SPEC §7.6 step 3's fourth branch: bindings this pass did not see.
+--
+-- ⚠️ Candidates, not conclusions. A pruned or aborted subtree leaves its bindings unstamped
+-- too, so the caller must intersect this with the directories it actually walked before
+-- trashing anything (see the column comment — this is the hundred-notes-in-the-trash bug).
+-- Only two columns, so nothing has to duplicate `RemoteBinding`'s shape to read one new field.
+selectBindingsNotSeenSince:
+SELECT noteId, remotePath FROM remoteBinding
+WHERE accountId = :accountId AND lastSeenRemoteAt < :since;
+
+-- ⚠️ `lastSeenRemoteAt` is carried forward, not passed in.
+--
+-- `INSERT OR REPLACE` deletes the conflicting row and inserts a new one, so a column left out
+-- of the list — or handed a value the caller does not have — comes back as its DEFAULT of 0,
+-- i.e. "never seen". Every ordinary binding write (a successful upload stamping an ETag, a
+-- MOVE recording a path) would therefore reset it, and the next reconcile pass would read the
+-- whole library as absent remotely. The subquery is evaluated against the pre-delete row, so
+-- the value survives; `stampBindingSeen` is the only statement that changes it.
 upsertBinding:
 INSERT OR REPLACE INTO remoteBinding(noteId, accountId, remotePath, remoteOcId, lastSyncedEtag,
                                      lastSyncedEtagWeak, lastSyncedRev, lastUploadAt,
-                                     lastChecksum, movedFromPath)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                                     lastChecksum, movedFromPath, lastSeenRemoteAt)
+VALUES (:noteId, :accountId, :remotePath, :remoteOcId, :lastSyncedEtag,
+        :lastSyncedEtagWeak, :lastSyncedRev, :lastUploadAt, :lastChecksum, :movedFromPath,
+        coalesce((SELECT lastSeenRemoteAt FROM remoteBinding WHERE noteId = :noteId), 0));
 
 deleteBinding:
 DELETE FROM remoteBinding WHERE noteId = ?;
@@ -170,3 +480,219 @@ DELETE FROM outbox WHERE noteId = :noteId AND opType = :opType;
 
 countOutbox:
 SELECT count(*) FROM outbox;
+
+-- ---------------------------------------------------------------------------
+-- Directory ETag cache
+-- ---------------------------------------------------------------------------
+
+-- The whole cache for one account. Deliberately not one query per directory: the walk needs
+-- the cache to decide what *not* to request, so it needs it before it knows which paths it
+-- cares about, and an account's folder count is a handful of kilobytes (the same argument
+-- Library.sq makes for `selectAllFolders`).
+selectDirectories:
+SELECT * FROM remoteDirectory WHERE accountId = ?;
+
+upsertDirectory:
+INSERT OR REPLACE INTO remoteDirectory(accountId, path, etag, etagWeak, ocId, seenAt)
+VALUES (?, ?, ?, ?, ?, ?);
+
+-- Every cached ETag for an account, dropped. Two callers, and both are correctness rather than
+-- housekeeping: `nc:data-fingerprint` changed (SPEC §7.6 step 4 — an admin restored a backup,
+-- so every cached ETag describes a file that has moved backwards) and sign-out. Cheap to lose:
+-- the next pass rebuilds it with one extra walk, which is precisely the trade the cache exists
+-- to make in the other direction.
+deleteDirectoriesFor:
+DELETE FROM remoteDirectory WHERE accountId = ?;
+
+-- ---------------------------------------------------------------------------
+-- Cursor
+-- ---------------------------------------------------------------------------
+
+selectCursor:
+SELECT * FROM syncCursor WHERE accountId = ?;
+
+-- ⚠️ `refusedUntil` is written by the **pass's own** cursor write and not by a second statement of
+-- its own. `INSERT OR REPLACE` deletes and re-inserts, so two writers in one pass means the later
+-- one silently resets whatever the earlier one stored — and the value being reset here is the thing
+-- standing between a refused credential and the sixty-second poll (CLAUDE.md rule 5).
+upsertCursor:
+INSERT OR REPLACE INTO syncCursor(accountId, dataFingerprint, rootEtag, rootEtagWeak,
+                                  lastReconcileAt, lastFullAt, refusedUntil)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+-- ---------------------------------------------------------------------------
+-- Pending downloads
+-- ---------------------------------------------------------------------------
+
+selectPendingDownload:
+SELECT * FROM pendingDownload WHERE noteId = ?;
+
+upsertPendingDownload:
+INSERT OR REPLACE INTO pendingDownload(noteId, accountId, remotePath, remoteOcId, remoteEtag,
+                                       remoteEtagWeak, tempPath, fetchedAt)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+
+-- The row goes after the temp file has been consumed or deleted, in that order — a row dropped
+-- first leaves a file nothing can name (see `tempPath`'s comment). This is not a CLAUDE.md
+-- rule 1 exception: the row describes a *copy* of remote bytes, and the remote still has them.
+deletePendingDownload:
+DELETE FROM pendingDownload WHERE noteId = ?;
+
+-- ---------------------------------------------------------------------------
+-- Needs attention (SPEC §7.7)
+-- ---------------------------------------------------------------------------
+
+-- `acknowledgedAt = 0`, never `IS NULL` — see the column comment. Newest first, which the
+-- `syncAttentionOpen` index serves directly.
+--
+-- This is the reconciler's read: a snapshot, used only to avoid re-adding an entry that is
+-- already open. The screen uses the joined query below.
+selectOpenAttention:
+SELECT * FROM syncAttention WHERE acknowledgedAt = 0 ORDER BY createdAt DESC;
+
+-- ⭐ One row by id, **whatever its `acknowledgedAt`**, which is the entire point of it.
+--
+-- Two reads need it and both are about not repeating oneself: the reconciler asking whether the list
+-- already says this before it writes, and layer 3 asking whether this conflict already has a
+-- conflicted copy. Asking `selectOpenAttention` instead is how a dismissal got wiped on the next
+-- poll — an acknowledged row is not in that result, so the guard passed and `insertAttention`'s
+-- REPLACE reset the tombstone to 0. That also makes this query the reason the table has no DELETE
+-- twice over: the tombstone is what remembers the copy.
+selectAttention:
+SELECT * FROM syncAttention WHERE id = ?;
+
+-- ⭐ The same rows as the "Needs attention" screen shows them: joined to `note` for the titles.
+--
+-- ⚠️ **One query, not two Flows combined in Kotlin.** SQLDelight's invalidation is per *table*.
+-- A Flow over `syncAttention` alone does not re-emit when the note is renamed or trashed, and a
+-- Flow over `note` alone does not re-emit when a row is acknowledged — so a `combine` of the two
+-- goes stale in whichever direction happens not to fire. The direction that goes stale here is
+-- "the user renamed the note", which leaves the list pointing at a title that no longer exists
+-- and an "Open the copy" button next to it. A join is registered against both tables, so either
+-- write re-emits.
+--
+-- Both joins are LEFT and both have to be: `noteId` is NULL for an account-level entry (a full
+-- quota, a credential the server has stopped accepting) and `conflictedCopyNoteId` is NULL for
+-- every kind except SPEC §7.7 layer 3. An INNER JOIN would silently drop exactly the entries
+-- that matter most, and a list that hides a conflict is the one failure this table exists to
+-- prevent.
+--
+-- The titles come from the index rather than from the entry because `detail` is free text nothing
+-- parses, and duplicating a title into it would be a second copy to keep in step with a rename.
+-- ⚠️ `deletedAt` is projected, not filtered on. A trashed note's entry must still be *shown* — the
+-- REMOTE_DELETED kind is precisely "your local copy is now in the trash" — but the screen must not
+-- offer to open it: `NoteEditor.openOrCreate` falls back to `store.create` when `store.open` returns
+-- null, so opening a note whose directory has moved under `trash/` would silently mint a **new empty
+-- note** under a new id. Projecting the column lets the screen point at the trash instead.
+selectOpenAttentionWithTitles:
+SELECT syncAttention.*,
+       note.title     AS noteTitle,
+       note.deletedAt AS noteDeletedAt,
+       copyNote.title AS copyTitle
+FROM syncAttention
+LEFT JOIN note             ON note.id     = syncAttention.noteId
+LEFT JOIN note AS copyNote ON copyNote.id = syncAttention.conflictedCopyNoteId
+WHERE syncAttention.acknowledgedAt = 0
+ORDER BY syncAttention.createdAt DESC;
+
+-- How many entries are open, for the library's badge. A count rather than the list, because the
+-- library screen wants a number and re-deriving it from a list of rows it does not draw would
+-- hold every entry in memory behind a Flow that never uses them.
+countOpenAttention:
+SELECT count(*) FROM syncAttention WHERE acknowledgedAt = 0;
+
+-- Which notes have something open, for the per-tile badge (M6). DISTINCT because a note can need
+-- attention for two reasons at once — a conflicted copy *and* a title this device lost — and the
+-- tile shows one flag either way.
+selectNotesNeedingAttention:
+SELECT DISTINCT noteId FROM syncAttention WHERE acknowledgedAt = 0 AND noteId IS NOT NULL;
+
+-- REPLACE, not INSERT, and the id is why. A caller that derives the id from the problem — say
+-- `(noteId, kind)` — gets exactly one entry per problem however many passes rediscover it; a
+-- caller that mints a UUIDv7 gets an append. With a plain INSERT the first choice would be a
+-- constraint violation raised in the middle of a reconcile pass, and SPEC §7.7 rule 3 is that a
+-- conflicted note is flagged and skipped while *everything else keeps syncing*.
+insertAttention:
+INSERT OR REPLACE INTO syncAttention(id, accountId, noteId, kind, detail, conflictedCopyNoteId,
+                                     remotePath, createdAt, acknowledgedAt)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+-- The only mutation. There is no delete: acknowledging is a tombstone (CLAUDE.md rule 1), and
+-- the history of what sync had to do to a user's notes is worth keeping.
+acknowledgeAttention:
+UPDATE syncAttention SET acknowledgedAt = :acknowledgedAt WHERE id = :id;
+
+-- ---------------------------------------------------------------------------
+-- Folder bindings
+-- ---------------------------------------------------------------------------
+
+selectFolderBinding:
+SELECT * FROM folderBinding WHERE folderId = ?;
+
+-- Every pin on one account, for resolving where a note belongs (SPEC §9's folder mirror).
+--
+-- The resolver walks a note's library ancestry looking for the *deepest* pinned folder, so it
+-- needs the whole set rather than one row: which ancestor is pinned is not known until the
+-- chain has been walked, and a query per level would be one round trip per folder depth on a
+-- path the note editor waits behind.
+selectFolderBindingsForAccount:
+SELECT * FROM folderBinding WHERE accountId = ?;
+
+-- Every pinned folder, any account — for the library's cloud badge (M6). The badge answers
+-- "do the things in here go to Nextcloud", which is not an account-specific question.
+selectAllFolderBindings:
+SELECT * FROM folderBinding;
+
+-- Rows rather than a row, for the reason `selectBindingByOcId` gives: a server can present one
+-- `oc:id` at two paths, and throwing inside a walk is worse than answering with both.
+selectFolderBindingByOcId:
+SELECT * FROM folderBinding WHERE accountId = :accountId AND remoteOcId = :remoteOcId;
+
+upsertFolderBinding:
+INSERT OR REPLACE INTO folderBinding(folderId, accountId, remotePath, remoteOcId, remoteEtag,
+                                     remoteEtagWeak)
+VALUES (?, ?, ?, ?, ?, ?);
+
+-- Unbinding a folder, not deleting one. The `folder` row and every note under it are untouched
+-- — this says only "no longer mirrored", which is what sign-out and un-share mean.
+deleteFolderBinding:
+DELETE FROM folderBinding WHERE folderId = ?;
+
+-- ---------------------------------------------------------------------------
+-- Foreign files (SPEC §5.6's identity check, negatively)
+-- ---------------------------------------------------------------------------
+
+-- The whole set for one account, for `selectDirectories`' reason: the walk consults it to decide
+-- what *not* to download, so it needs it before it knows which files it cares about. Read lazily —
+-- a pass that meets no unrecognised file never runs this.
+selectForeignRemotes:
+SELECT * FROM foreignRemote WHERE accountId = ?;
+
+-- Every column, because a re-confirmation of the same file legitimately carries a new ETag, a new
+-- checksum and a new path (the same stranger's PDF, renamed).
+upsertForeignRemote:
+INSERT OR REPLACE INTO foreignRemote(accountId, fileKey, remotePath, etag, etagWeak, checksum, seenAt)
+VALUES (?, ?, ?, ?, ?, ?, ?);
+
+-- ---------------------------------------------------------------------------
+-- Peer clocks (SPEC §4.7)
+-- ---------------------------------------------------------------------------
+
+-- All peers for one note. The caller takes the `min`; there is no `min()` here because the
+-- number of peers is one or two, the same rows are what a "last seen" display would want, and
+-- SQL's `min()` over no rows returns NULL — which would then have to be told apart from a
+-- genuine zero, having thrown away the row count that distinguishes them.
+selectPeerClocks:
+SELECT * FROM peerClock WHERE noteId = ?;
+
+-- ⚠️ Monotonic: the stored counter can only go up. Downloads arrive out of order — a poll can
+-- hand back a peer's older bundle after its newer one — and `INSERT OR REPLACE` would happily
+-- lower the high-water mark. That direction is *safe* (a lower `min` refuses more compactions,
+-- and SPEC §4.7 says a snapshot is a cache anyway) but it is still a false statement about what
+-- the peer has seen, and one `max` makes it unrepresentable rather than remembered.
+upsertPeerClock:
+INSERT OR REPLACE INTO peerClock(noteId, peerDeviceId, highestCounter, seenAt)
+VALUES (:noteId, :peerDeviceId,
+        max(:highestCounter, coalesce((SELECT highestCounter FROM peerClock
+                                       WHERE noteId = :noteId AND peerDeviceId = :peerDeviceId), 0)),
+        :seenAt);

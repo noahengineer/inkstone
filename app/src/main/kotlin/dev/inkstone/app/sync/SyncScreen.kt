@@ -143,13 +143,31 @@ private fun AccountCard(account: SyncAccount, actions: SyncActions) {
                     style = MaterialTheme.typography.bodySmall,
                 )
 
+                // ⭐ M6 — remembered, not gone. The point of the state is that getting back
+                // costs one tap, so the card says so rather than looking like a dead row the
+                // user is expected to clean up.
+                AccountState.SIGNED_OUT -> Text(
+                    "Signed out. Your notes are still linked to this account — sign in again " +
+                        "and they pick up where they left off.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+
                 AccountState.ACTIVE -> account.lastError?.let {
                     Text(it, style = MaterialTheme.typography.bodySmall)
                 }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = { actions.onChooseAccount(account.id) }) { Text("Browse folders") }
-                TextButton(onClick = { actions.onSignOut(account.id) }) { Text("Sign out") }
+                if (account.state == AccountState.SIGNED_OUT) {
+                    // No URL to retype: the address is on the row above, and `signInAgain`
+                    // uses it. The browser approval still happens — SPEC §7.1 is the only way
+                    // to get an app password — but that is one tap and a confirm, not a
+                    // keyboard and then a note-by-note re-bind.
+                    OutlinedButton(onClick = { actions.onSignInAgain(account.id) }) { Text("Sign in again") }
+                    TextButton(onClick = { actions.onForgetAccount(account.id) }) { Text("Remove") }
+                } else {
+                    TextButton(onClick = { actions.onChooseAccount(account.id) }) { Text("Browse folders") }
+                    TextButton(onClick = { actions.onSignOut(account.id) }) { Text("Sign out") }
+                }
             }
         }
     }
@@ -194,16 +212,7 @@ private fun FolderBrowser(state: SyncUiState, actions: SyncActions) {
             }
         }
 
-        if (state.bindingNote != null) {
-            Row(modifier = Modifier.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = actions.onBindHere) { Text("Save here") }
-                TextButton(onClick = actions.onCancelBrowse) { Text("Cancel") }
-            }
-        } else {
-            Row(modifier = Modifier.padding(16.dp)) {
-                TextButton(onClick = actions.onCancelBrowse) { Text("Done") }
-            }
-        }
+        BrowserConfirmRow(state, actions)
     }
 
     if (naming) {
@@ -214,6 +223,38 @@ private fun FolderBrowser(state: SyncUiState, actions: SyncActions) {
                 naming = false
             },
         )
+    }
+}
+
+/**
+ * What confirming the folder browser means, which depends entirely on why it was opened.
+ *
+ * Three cases: pinning a folder sets an ongoing rule, binding a note is a one-off, and neither
+ * is a plain visit. "Always save here" appears in the last two because that is where a user who
+ * has just navigated somewhere is standing when they realise they want to keep going there.
+ */
+@Composable
+private fun BrowserConfirmRow(state: SyncUiState, actions: SyncActions) {
+    Row(modifier = Modifier.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        when {
+            state.pinningFolder != null -> {
+                // Worded as the ongoing rule it sets rather than as a one-off save, which is the
+                // whole difference from "Save here".
+                OutlinedButton(onClick = actions.onPinFolderHere) { Text("Always sync here") }
+                TextButton(onClick = actions.onCancelBrowse) { Text("Cancel") }
+            }
+
+            state.bindingNote != null -> {
+                OutlinedButton(onClick = actions.onBindHere) { Text("Save here") }
+                TextButton(onClick = actions.onSetDefaultFolderHere) { Text("Always save here") }
+                TextButton(onClick = actions.onCancelBrowse) { Text("Cancel") }
+            }
+
+            else -> {
+                TextButton(onClick = actions.onSetDefaultFolderHere) { Text("Always save here") }
+                TextButton(onClick = actions.onCancelBrowse) { Text("Done") }
+            }
+        }
     }
 }
 
@@ -248,11 +289,19 @@ data class SyncActions(
     val onStartLogin: () -> Unit,
     val onCancelLogin: () -> Unit,
     val onSignOut: (String) -> Unit,
+    /** M6 — sign back into a remembered account without retyping its address. */
+    val onSignInAgain: (String) -> Unit,
+    /** M6 — the irreversible one: forget the account and unbind its notes. */
+    val onForgetAccount: (String) -> Unit,
     val onChooseAccount: (String) -> Unit,
     val onBrowseTo: (String, String) -> Unit,
     val onGoUp: () -> Unit,
     val onCreateFolder: (String) -> Unit,
+    /** M6 — make the folder being browsed this account's default for new notes. */
+    val onSetDefaultFolderHere: () -> Unit,
     val onBindHere: () -> Unit,
+    /** M6 — confirm a folder pin (SPEC §9's mirror). */
+    val onPinFolderHere: () -> Unit,
     val onCancelBrowse: () -> Unit,
     val onSyncNow: () -> Unit,
 )
