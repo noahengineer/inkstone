@@ -628,7 +628,14 @@ class LibraryRepository @Inject constructor(
     // -----------------------------------------------------------------------
 
     /**
-     * Autosave committed (SPEC §5.1). Bumps the row and invalidates the thumbnail.
+     * A local change was flushed (SPEC §5.1) — an autosave tick, **or any structural edit**: add,
+     * duplicate, delete or move a page, or change the paper. Bumps the row and invalidates the
+     * thumbnail.
+     *
+     * ⚠️ This said "autosave committed", and that reading is why every structural edit called a bare
+     * `session.flush()` and reported nothing for a milestone — leaving the tile's page count stale
+     * and, because this ends in `sync.noteChanged`, enqueuing **no upload** until the user happened
+     * to draw a stroke or close the note.
      *
      * Not a thumbnail *render* — that would put a page tessellation on the two-second
      * autosave timer, which is the kind of thing CLAUDE.md rule 7 is about even when it

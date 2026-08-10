@@ -243,11 +243,65 @@ class NoteStoreTest {
 
         val restored = session(assertNotNull(store.open(note.document.id)))
 
-        assertTrue(restored.canUndo, "the undo stack did not survive the restart")
+        assertTrue(restored.canUndo(page), "the undo stack did not survive the restart")
         assertTrue(restored.undo(page))
         assertEquals(1, restored.page(page).objects.size)
         assertTrue(restored.redo(page))
         assertEquals(2, restored.page(page).objects.size)
+    }
+
+    @Test
+    fun `an undo cannot reach a page the gesture did not happen on`() = runTest {
+        // ⭐ The bug: the stacks were document-wide and `undo(pageId)` replayed whatever was on top
+        // onto the page the *caller* named — which is the page on screen. So changing page 1's paper,
+        // turning to page 2 and pressing undo wrote the inverse `SetPageMeta` into page 2's log:
+        // page 2's paper changed, was journaled, was uploaded, and pressing undo again popped the
+        // next entry rather than putting it right. The `= Unit` in `InkScreen.setPageMeta` was the
+        // only reason nobody had seen it.
+        val note = store.create("Notebook", "device-a")
+        val one = note.document.pages.single().id
+        val session = session(note)
+        val two = session.addPage(1, background = Background.Template(PageTemplate.GRID))
+        val paperOnTwo = session.page(two).background
+        val paperOnOne = session.page(one).background
+
+        // The gesture happens on page one.
+        val cornell = PageOp.SetPageMeta(
+            session.nextOpId(),
+            session.nextClock(),
+            background = Background.Template(PageTemplate.CORNELL),
+        )
+        session.apply(one, listOf(cornell))
+
+        // Undo asked for while page two is showing.
+        assertFalse(session.canUndo(two), "page two offered an undo for a gesture made on page one")
+        assertFalse(session.undo(two), "the undo landed on page two")
+        assertEquals(paperOnTwo, session.page(two).background, "page two's paper was changed by page one's undo")
+
+        // And the gesture is still undoable where it belongs — not consumed by the refusal.
+        assertTrue(session.canUndo(one))
+        assertTrue(session.undo(one))
+        assertEquals(paperOnOne, session.page(one).background)
+    }
+
+    @Test
+    fun `each page keeps its own undo history`() = runTest {
+        // The corollary of the fix, and the reason it filters rather than refusing outright: drawing
+        // on page two must not consume or block page one's undo.
+        val note = store.create("Notebook", "device-a")
+        val one = note.document.pages.single().id
+        val session = session(note)
+        val two = session.addPage(1, background = Background.Template(PageTemplate.GRID))
+
+        session.apply(one, listOf(addOp("on-one")))
+        session.apply(two, listOf(addOp("on-two")))
+
+        assertTrue(session.undo(two), "page two could not undo its own stroke")
+        assertEquals(0, session.page(two).objects.size)
+        assertEquals(1, session.page(one).objects.size, "undoing on page two removed page one's stroke")
+
+        assertTrue(session.undo(one), "page one's undo was consumed by the gesture on page two")
+        assertEquals(0, session.page(one).objects.size)
     }
 
     @Test

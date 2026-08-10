@@ -60,6 +60,16 @@ internal class FakeSurface : NoteEditor.NoteSurface {
      * that it is *not* `loadPage`: `loadPage` refits the camera and cancels the in-progress stroke,
      * and SPEC §13.2 row 10 forbids both. A test that could not tell them apart could not tell a
      * correct remote page-meta change from the one that eats the user's stroke.
+     *
+     * ⚠️ **Recording the call is all this can prove, and for one milestone that was less than it
+     * looked.** The production surface is the anonymous `NoteSurface` in `InkScreen`, and its
+     * `setPageMeta` was `= Unit` for the whole of M6 — so every assertion made against this field was
+     * true about the editor and false about the app, which is CLAUDE.md's *"correct in every test and
+     * inert in the app"* precisely. What closes the gap is
+     * `app/src/androidTest/…/device/PageMetaLiveChangeTest.kt`, which drives the real
+     * `InkSurfaceView` on a device and asserts the paper actually changed, the camera did not move
+     * and the wet stroke survived. Read a green tick here as *"the editor asked"*, never as *"the
+     * screen changed"*.
      */
     var pageMeta: Pair<PageSize, Background>? = null
         private set

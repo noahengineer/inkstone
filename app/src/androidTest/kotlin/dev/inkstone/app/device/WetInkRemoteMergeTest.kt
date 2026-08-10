@@ -39,10 +39,12 @@ import kotlin.test.assertTrue
  * 1. the stroke the user is still drawing lands when they lift the pen, and
  * 2. the camera does not move.
  *
- * The second is two indirections away from anything camera-shaped: `display()` →
- * `surface.loadPage` → `pageSize` setter → `resetCamera(FIT_WIDTH)`, and the camera is not
- * persisted anywhere, so once refit the user's zoom is gone. `the forbidden path` below drives
- * exactly that and asserts the damage, so the first test cannot pass by accident.
+ * The second is one call away: `display()` → `surface.loadPage` → `resetCamera(FIT_WIDTH)`, and the
+ * camera is not persisted anywhere, so once refit the user's zoom is gone. It was *two* indirections
+ * away until `pageSize`'s setter stopped refitting on every write, which is also why
+ * `the forbidden path` below matters more than it looks: it is what stops `loadPage`'s refit being
+ * removed by accident along with the setter's. It drives exactly that path and asserts the damage,
+ * so the first test cannot pass by accident.
  *
  * ## Every stroke here is real ink
  *

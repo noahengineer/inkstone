@@ -518,6 +518,7 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
         for (entry in entries) {
             add(
                 buildJsonObject {
+                    put(U_PAGE, JsonPrimitive(entry.pageId.value))
                     put(U_FORWARD, buildJsonArray { for (op in entry.forward) add(OpCodec.encode(op, geometry)) })
                     put(U_INVERSE, buildJsonArray { for (op in entry.inverse) add(OpCodec.encode(op, geometry)) })
                 },
@@ -525,10 +526,25 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
         }
     }
 
+    /**
+     * ⚠️ **An entry with no page is dropped, deliberately.**
+     *
+     * `undo.json` written before [UndoEntry] carried a [PageId] does not say which page a gesture
+     * happened on, and the only ways to proceed are to guess a page or to drop the entry. Guessing
+     * is the bug this field exists to remove — an inverse applied to the wrong page repapers it or
+     * leaves a tombstone for an object that was never there, journaled and uploaded, with no error.
+     *
+     * Dropping costs the user the *ability to undo* gestures made before the upgrade, once. It
+     * costs no data: every forward op is already in the log and in the bundle, so the drawing is
+     * untouched — this is the same class of loss as `view.json` forgetting which page you were on.
+     * A malformed page id is treated the same way rather than trusted.
+     */
     private fun decodeEntries(element: JsonElement?, geometry: GeometryReader) =
-        element?.jsonArray.orEmpty().map { entry ->
+        element?.jsonArray.orEmpty().mapNotNull { entry ->
             val obj = entry.jsonObject
+            val page = obj[U_PAGE]?.jsonPrimitive?.content?.takeIf { it.isNotEmpty() } ?: return@mapNotNull null
             UndoEntry(
+                pageId = PageId(page),
                 forward = obj[U_FORWARD]?.jsonArray.orEmpty().map { OpCodec.decode(it.jsonObject, geometry).op },
                 inverse = obj[U_INVERSE]?.jsonArray.orEmpty().map { OpCodec.decode(it.jsonObject, geometry).op },
             )
@@ -605,6 +621,7 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
 
         /** `view.json`'s only key — the page this device was last on. */
         const val V_PAGE = "pageId"
+        const val U_PAGE = "p"
         const val U_FORWARD = "f"
         const val U_INVERSE = "i"
     }

@@ -5,6 +5,7 @@ import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.model.StrokeGeometry
 import dev.inkstone.core.model.StrokeObject
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -28,6 +29,18 @@ import org.junit.Test
  * The rendering itself is `:android:ink`'s and needs a device. What is testable here — and
  * what actually broke things when it was missing — is that the reports happen at all, with
  * the right revision.
+ *
+ * ⚠️ **The structural-edit half was missing from this file for a milestone, and it is the half that
+ * broke.** `addPage` / `duplicateCurrentPage` / `deleteCurrentPage` / `movePage` / `setTemplate` each
+ * called a bare `session.flush()`, which reaches neither `thumbnails.invalidate` nor
+ * `sync.noteChanged` — so the tile's page count was stale all session and **no upload was
+ * enqueued**, while every test here stayed green. They all go through `NoteEditor.flushAndReport`
+ * now, and the last two tests below are the ones that would have caught it.
+ *
+ * It was in fact found by driving the app over `adb` and reading `pageCount` back out of
+ * `databases/inkstone.db` with zero strokes drawn. Worth being precise about that: the device walk
+ * is what *did* catch it, not the only thing that *could* have — this fake was already here, and
+ * three lines against it would have done. That is the more useful lesson.
  */
 @OptIn(ExperimentalCoroutinesApi::class)
 class NoteEditorLibraryTest {
@@ -166,6 +179,48 @@ class NoteEditorLibraryTest {
         // be one session stale.
         assertEquals(1, materialized!!.third.objects.size)
         assertEquals(ObjectId("obj-1"), materialized.third.objects.single().id)
+        editor.close()
+    }
+
+    @Test
+    fun `adding a page tells the library even though nothing was drawn`() = runTest {
+        // ⭐ The regression. A structural edit flushes, and `saveLocked`'s report is gated on
+        // `hasUnflushedWork` — which the flush has just cleared. So this reported nothing at all: the
+        // grid kept showing "1 page" and, because `onSaved` is the only route to
+        // `SyncEngine.noteChanged`, the new page reached the server only if the user later drew a
+        // stroke or closed the note.
+        val library = RecordingLibrary()
+        val editor = editor(library)
+        editor.onSurfaceAttached(FakeSurface())
+        runCurrent()
+        library.saves.clear()
+
+        editor.addPage(PageTemplate.GRID)
+        runCurrent()
+
+        val save = library.saves.lastOrNull()
+        assertNotNull("adding a page told the library nothing — stale tile, and no upload", save)
+        assertEquals("the reported page count is not the new one", 2, save!!.third)
+        editor.close()
+    }
+
+    @Test
+    fun `changing the paper tells the library even though nothing was drawn`() = runTest {
+        // The same gate, on the edit least likely to be followed by a stroke: a user who picks a
+        // different paper has often just finished writing.
+        val library = RecordingLibrary()
+        val editor = editor(library)
+        editor.onSurfaceAttached(FakeSurface())
+        runCurrent()
+        library.saves.clear()
+
+        editor.setTemplate(PageTemplate.CORNELL)
+        runCurrent()
+
+        assertTrue(
+            "a paper change told the library nothing — no thumbnail refresh, no upload",
+            library.saves.isNotEmpty(),
+        )
         editor.close()
     }
 }

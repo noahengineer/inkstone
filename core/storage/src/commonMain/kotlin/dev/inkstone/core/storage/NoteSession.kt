@@ -95,9 +95,17 @@ public class NoteSession(
 
     public val hasUnflushedWork: Boolean get() = pending.isNotEmpty() || documentDirty
 
-    public val canUndo: Boolean get() = undoStack.canUndo
+    /**
+     * Whether [pageId] has a gesture to undo.
+     *
+     * ⚠️ Per page, and it takes the page as an argument for the same reason [UndoEntry] carries
+     * one: the histories are per page, so a document-wide answer would enable the button on a page
+     * whose [undo] can only be a no-op — or, before the page moved onto the entry, could only be a
+     * write to the wrong page.
+     */
+    public fun canUndo(pageId: PageId): Boolean = undoStack.canUndo(pageId)
 
-    public val canRedo: Boolean get() = undoStack.canRedo
+    public fun canRedo(pageId: PageId): Boolean = undoStack.canRedo(pageId)
 
     public val pageCount: Int get() = document.livePages.size
 
@@ -134,7 +142,7 @@ public class NoteSession(
         val log = pageLog(pageId)
         val inverse = Undo.inverseOf(ops, log.state, ::nextOpId, ::nextClock)
         val outcome = absorb(log, pageId, ops)
-        undoStack.commit(UndoEntry(ops, inverse))
+        undoStack.commit(UndoEntry(pageId, ops, inverse))
         return outcome
     }
 
@@ -211,14 +219,14 @@ public class NoteSession(
 
     /** SPEC §4.6 — appends the inverse ops. Never pops, and never enters the stack again. */
     public suspend fun undo(pageId: PageId): Boolean {
-        val ops = undoStack.undo(::nextOpId, ::nextClock)
+        val ops = undoStack.undo(pageId, ::nextOpId, ::nextClock)
         if (ops.isEmpty()) return false
         replay(pageId, ops)
         return true
     }
 
     public suspend fun redo(pageId: PageId): Boolean {
-        val ops = undoStack.redo(::nextOpId, ::nextClock)
+        val ops = undoStack.redo(pageId, ::nextOpId, ::nextClock)
         if (ops.isEmpty()) return false
         replay(pageId, ops)
         return true

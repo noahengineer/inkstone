@@ -20,7 +20,11 @@ complexity:
     # taps and the camera matrix are all separate classes.
     # M2 added the op-log surface to InkSurfaceView: bind a page, load one, drain the
     # recorder, apply ops. Four functions, each with a distinct owner on the other side.
-    thresholdInClasses: 26
+    # M6 added one more: setPageMeta, which changes the paper and the page's extent without
+    # refitting the camera or cancelling the in-progress stroke. It cannot fold into loadPage
+    # — loadPage does both of those deliberately, and the whole point of the new method is that
+    # it does neither (SPEC §13.2 row 10).
+    thresholdInClasses: 27
     # A codec is one small function per type it encodes, by construction — OpCodec has a
     # writer and a reader for each of the seven op kinds and four object kinds. Collapsing
     # them into fewer, larger functions would make the format harder to check against

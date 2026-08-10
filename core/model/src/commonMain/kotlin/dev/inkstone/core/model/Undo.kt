@@ -120,13 +120,27 @@ public object Undo {
 }
 
 /**
- * One gesture, in both directions.
+ * One gesture, in both directions, **on one page**.
  *
+ * ⚠️ [pageId] is not bookkeeping. Without it this class was a live data bug: the stack was
+ * document-wide and [UndoStack.undo] popped whatever was on top, while `NoteSession.undo(pageId)`
+ * replayed the result onto whichever page the *caller* named — which is the page on screen. So
+ * changing page 1's paper, turning to page 2 and pressing undo wrote the inverse `SetPageMeta`
+ * into **page 2's** log: page 2's paper changed, was journaled, and was uploaded, and the user's
+ * obvious recovery (press undo again) popped the next entry instead. A stroke undo mis-fired the
+ * same way, more quietly — an inverse `DeleteObject` for a page-1 stroke lands in page 2's log as
+ * a tombstone for an object that was never there, which the fold accepts by design (SPEC §4.2),
+ * so the symptom was simply that undo did nothing.
+ *
+ * Carrying the page makes the wrong-page write unrepresentable rather than guarded, which is the
+ * same move that replaced `apply(pageId, ops, undoable = true)` with three named methods.
+ *
+ * @property pageId the page the gesture happened on. Its inverse can only be applied there.
  * @property forward the ops the gesture appended.
  * @property inverse the ops that undo them, computed at commit time while the state
  *   before the gesture is still in hand.
  */
-public data class UndoEntry(val forward: List<PageOp>, val inverse: List<PageOp>) {
+public data class UndoEntry(val pageId: PageId, val forward: List<PageOp>, val inverse: List<PageOp>) {
     public val isEmpty: Boolean get() = forward.isEmpty() && inverse.isEmpty()
 }
 
@@ -158,8 +172,9 @@ public class UndoStack(
     private val undoable = ArrayList(undo)
     private val redoable = ArrayList(redo)
 
-    public val canUndo: Boolean get() = undoable.isNotEmpty()
-    public val canRedo: Boolean get() = redoable.isNotEmpty()
+    public fun canUndo(pageId: PageId): Boolean = undoable.any { it.pageId == pageId }
+
+    public fun canRedo(pageId: PageId): Boolean = redoable.any { it.pageId == pageId }
 
     /** For persistence. Oldest first. */
     public val undoEntries: List<UndoEntry> get() = undoable
@@ -169,27 +184,46 @@ public class UndoStack(
     /**
      * Record a committed gesture.
      *
-     * A new gesture invalidates the redo branch — the standard linear history, and the
-     * same result §4.6's op-log model gives, since a redo op that was never appended
-     * simply does not exist.
+     * A new gesture invalidates the redo branch **of its own page** — the standard linear history,
+     * and the same result §4.6's op-log model gives, since a redo op that was never appended simply
+     * does not exist. Per page, because the histories are per page: drawing on page 2 is not a
+     * reason the user can no longer redo on page 1.
      */
     public fun commit(entry: UndoEntry) {
         if (entry.isEmpty) return
         undoable += entry
-        redoable.clear()
+        redoable.removeAll { it.pageId == entry.pageId }
+        // The cap is a document-wide budget, so the oldest gesture anywhere is the one that goes.
+        // What it bounds is `undo.json` and the cost of re-folding from it — **not** the bundle:
+        // `undo.json` sits beside the bundle and is not inside it (SPEC §5.1).
         while (undoable.size > maxDepth) undoable.removeAt(0)
     }
 
-    /** @return the ops to apply, already re-stamped, or an empty list if there is nothing to undo. */
-    public fun undo(nextOpId: () -> String, nextClock: () -> LamportClock): List<PageOp> {
-        val entry = undoable.removeLastOrNull() ?: return emptyList()
+    /**
+     * Undo the last gesture **on [pageId]**, skipping entries that belong to other pages.
+     *
+     * ⚠️ Filtering rather than popping the global top is the whole correctness argument (see
+     * [UndoEntry]): an entry's inverse is only meaningful on the page it was computed against, so
+     * the alternative to filtering is applying it somewhere it does not belong. It also makes the
+     * button honest — [canUndo] asks the same question this answers, so "enabled but nothing
+     * happens" is not reachable.
+     *
+     * @return the ops to apply, already re-stamped, or an empty list if this page has nothing to
+     *   undo.
+     */
+    public fun undo(pageId: PageId, nextOpId: () -> String, nextClock: () -> LamportClock): List<PageOp> {
+        val index = undoable.indexOfLast { it.pageId == pageId }
+        if (index < 0) return emptyList()
+        val entry = undoable.removeAt(index)
         redoable += entry
         return entry.inverse.map { Undo.restamp(it, nextOpId(), nextClock()) }
     }
 
-    /** @return the ops to apply, already re-stamped, or an empty list if there is nothing to redo. */
-    public fun redo(nextOpId: () -> String, nextClock: () -> LamportClock): List<PageOp> {
-        val entry = redoable.removeLastOrNull() ?: return emptyList()
+    /** @return the ops to apply, already re-stamped, or an empty list if [pageId] has nothing to redo. */
+    public fun redo(pageId: PageId, nextOpId: () -> String, nextClock: () -> LamportClock): List<PageOp> {
+        val index = redoable.indexOfLast { it.pageId == pageId }
+        if (index < 0) return emptyList()
+        val entry = redoable.removeAt(index)
         undoable += entry
         return entry.forward.map { Undo.restamp(it, nextOpId(), nextClock()) }
     }

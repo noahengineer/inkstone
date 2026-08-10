@@ -121,17 +121,17 @@ class UndoTest {
             val before = fixture.log.state
             val add = PageOp.AddObject(opId(), clock(), StrokeObject(id, StrokeGeometry(byteArrayOf(1))))
             fixture.apply(add)
-            stack.commit(UndoEntry(listOf(add), Undo.inverseOf(listOf(add), before, ::opId, ::clock)))
+            stack.commit(UndoEntry(pageId, listOf(add), Undo.inverseOf(listOf(add), before, ::opId, ::clock)))
         }
         assertEquals(GESTURES, fixture.log.state.objects.size)
 
         // The restart: the stacks come back from the bundle, nothing else survives.
         val reloaded = UndoStack(stack.undoEntries, stack.redoEntries)
 
-        repeat(UNDO_STEPS) { fixture.apply(*reloaded.undo(::opId, ::clock).toTypedArray()) }
+        repeat(UNDO_STEPS) { fixture.apply(*reloaded.undo(pageId, ::opId, ::clock).toTypedArray()) }
         assertEquals(GESTURES - UNDO_STEPS, fixture.log.state.objects.size)
 
-        repeat(UNDO_STEPS) { fixture.apply(*reloaded.redo(::opId, ::clock).toTypedArray()) }
+        repeat(UNDO_STEPS) { fixture.apply(*reloaded.redo(pageId, ::opId, ::clock).toTypedArray()) }
         assertEquals(GESTURES, fixture.log.state.objects.size)
         // Re-applying a stored op only works because every op is absolute: a replayed
         // AddObject writes presence and cannot overwrite geometry.
@@ -142,14 +142,14 @@ class UndoTest {
     fun `a new gesture invalidates the redo branch`() {
         val stack = UndoStack()
         val add = PageOp.AddObject(opId(), clock(), stroke("obj-1"))
-        stack.commit(UndoEntry(listOf(add), listOf(PageOp.DeleteObject(opId(), clock(), ObjectId("obj-1")))))
-        stack.undo(::opId, ::clock)
-        assertTrue(stack.canRedo)
+        stack.commit(UndoEntry(pageId, listOf(add), listOf(PageOp.DeleteObject(opId(), clock(), ObjectId("obj-1")))))
+        stack.undo(pageId, ::opId, ::clock)
+        assertTrue(stack.canRedo(pageId))
 
-        stack.commit(UndoEntry(listOf(add), emptyList()))
+        stack.commit(UndoEntry(pageId, listOf(add), emptyList()))
 
-        assertFalse(stack.canRedo)
-        assertTrue(stack.canUndo)
+        assertFalse(stack.canRedo(pageId))
+        assertTrue(stack.canUndo(pageId))
     }
 
     @Test

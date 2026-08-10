@@ -575,6 +575,35 @@ argument" is no longer a reachable state. It also removed an O(n·m) trap — `U
 does a linear scan of the fold per op, so merging thousands of remote ops through the undoable
 path was quadratic before it was wrong.
 
+⚠️ **The undo stack is per *page*, and this section did not say so until M6's follow-up — by
+which point it was a live bug.** `UndoEntry` carried no `PageId`, `UndoStack.undo` popped
+whatever was on top of a document-wide stack, and `NoteSession.undo(pageId)` replayed the result
+onto the page the **caller** named, which is the page on screen. So:
+
+> Change page 1's paper. Turn to page 2. Press undo. The inverse `SetPageMeta` is applied to
+> **page 2's** log. Page 2's paper changes, is journaled, and is uploaded — and pressing undo
+> again pops the *next* entry rather than putting it right.
+
+A stroke undo mis-fired the same way and more quietly: an inverse `DeleteObject` for a page-1
+stroke lands in page 2's log as a tombstone for an object that was never there, which the fold
+accepts by design (§4.2), so the only symptom was that undo appeared to do nothing. The reason
+nobody had seen the paper version is that the app's `NoteSurface.setPageMeta` was a `= Unit`
+stub for the whole of M6 (§13.2 row 10), so the wrong-page write was invisible until the next
+page switch.
+
+`UndoEntry` now carries its `PageId`, and `undo`/`redo`/`canUndo`/`canRedo` all take one and
+operate on the topmost entry **for that page**. That makes the wrong-page write unrepresentable
+rather than guarded — the same move as deleting the `undoable` boolean — and it makes the
+toolbar honest, since `canUndo` asks exactly the question `undo` answers. The histories are
+independent per page: drawing on page 2 neither consumes nor blocks page 1's undo, and a new
+gesture clears only its own page's redo branch. The depth cap stays document-wide, and what it
+bounds is `undo.json` and the cost of re-folding from it — **not** the bundle, which does not
+contain `undo.json` at all (§5.1).
+
+An entry in an `undo.json` written before this **is dropped on load**, since the alternative is
+to guess a page and the guess is the bug. That costs the ability to undo gestures made before
+the upgrade, once, and costs no data: every forward op is already in the log.
+
 ### 4.7 Compaction
 
 **The naive rule ("compact when SYNCED") is wrong twice:** it would never compact a `LOCAL_ONLY` note (i.e. most notes, and all notes before M5), and "SYNCED" means "this device uploaded", not "every peer has seen these ops" — compacting while your other tablet holds older ops offline leaves them nowhere to reintegrate.
@@ -1591,18 +1620,29 @@ version moved, a copy now exists — is rewritten and re-opened.
 **Live editing during a remote change:** if a page is open in the editor when a remote op arrives, re-fold and re-render the page, preserving the camera and any in-progress stroke. **Incoming remote ops never enter the local undo stack** (§4.6).
 
 ⚠️ **"Preserving the camera" is a rule about what the re-render must *not* call** (M6). Reloading
-the page is two indirections from anything camera-shaped: `loadPage` sets `pageSize`, whose setter
-calls `resetCamera(FIT_WIDTH)` unconditionally, and also cancels unfinished strokes. The camera is
+the page cancels unfinished strokes and refits: `loadPage` calls `resetCamera(FIT_WIDTH)` itself. The
+refit used to arrive two indirections away, through `pageSize`'s setter, which refit on *every* write
+to it — which is why it is now one explicit line in the one caller that wants it, and why
+`setPageMeta` re-leashes instead of refitting. The camera is
 persisted nowhere, so once refit the previous value is gone — both of this paragraph's forbidden
 outcomes, reached by a call that looks like a refresh, with every JVM test still passing. The
 supported route is to **diff the folds** and push only the delta with recording off, which is
 correct for an append and a re-fold alike and touches neither the camera nor the wet layer.
 
-⚠️ **Not yet true of page *metadata*.** A peer's `SetPageMeta` folds correctly, reaches the bundle,
-and does not appear on screen until the page is switched: changing the paper without moving the
-camera needs a method `:android:ink` does not have yet, and its `StrokeStore` drops the op besides.
-Data-safe, visibly late; recorded in `docs/M6-SYNC.md` and ROADMAP M6 rather than quietly worked
-around, because the available workaround is `loadPage`, which is worse.
+⚠️ **True of page *metadata* since M6's follow-up — and the attribution above was wrong before it
+was stale.** A peer's `SetPageMeta`, and both directions of a local template pick, now reach the
+screen through `InkSurfaceView.setPageMeta`, which sets the extent and the paper, clears the raster
+that belonged to the old one, and **re-leashes** rather than refitting. `StrokeStore.applyOps`'s
+`else -> false` never had anything to do with it: `reconcile` diffs the folds and emits only
+`AddObject` / `DeleteObject` / `SetErasedRegion`, so a `SetPageMeta` never reaches the store. The one
+swallower was `:app`'s `NoteSurface.setPageMeta = Unit`, which a recording fake in the JVM suite made
+look implemented for a whole milestone.
+
+What is still visibly late is a peer's `SetTransform` / `SetStyle` / `SetZOrder` / `SetTextContent`
+on an **existing** object. Those wait on three things, not one: `reconcile` compares only ids and
+erased regions, `StrokeStore` really does drop them at `else -> false`, and nothing in
+`:android:ink` reads `InkObject.transform` at all. No build before M8 can send one, because no
+production writer for any of the four exists.
 
 **One `NoteSession` per note, enforced outside the session.** Two sessions over one note each hold
 their own pending ops and their own folded pages, so whichever materializes **second** writes a

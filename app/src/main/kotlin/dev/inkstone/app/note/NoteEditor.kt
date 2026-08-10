@@ -205,7 +205,14 @@ class NoteEditor(
      * test, and a repository drags in a database.
      */
     interface LibraryUpdates {
-        /** Autosave committed. Bump the index row; invalidate the thumbnail. */
+        /**
+         * A local change was flushed — an autosave tick, **or any structural edit**: add, duplicate,
+         * delete or move a page, or change the paper.
+         *
+         * ⚠️ It said "autosave committed" for a milestone, and that reading is why every structural
+         * edit called a bare `session.flush()` and reported nothing. This ends in
+         * `SyncEngine.noteChanged`, so it is also the only route such an edit has to an **upload**.
+         */
         suspend fun onSaved(id: DocumentId, localRev: Long, pageCount: Int)
 
         /**
@@ -279,7 +286,12 @@ class NoteEditor(
 
         /**
          * The current page's size or paper changed **without** the page changing — a peer's
-         * `SetPageMeta`, or an undone template change (M6).
+         * `SetPageMeta`, or the PageBar's template picker in **either** direction.
+         *
+         * Forward and reverse deliberately share this one route. `setTemplate` used to repaint by
+         * ending in [display] → [loadPage] while its own undo came through here, so the two could
+         * disagree — and did: the forward direction worked and undo did nothing, because the only
+         * production implementation of this method was `= Unit`.
          *
          * Separate from [loadPage] because [loadPage] cancels the in-progress stroke and refits the
          * camera, which are both of SPEC §13.2 row 10's forbidden outcomes. A page whose paper just
@@ -417,13 +429,30 @@ class NoteEditor(
             session.apply(page, gesture)
         }
         if (gestures.isNotEmpty() || session.hasUnflushedWork) {
-            session.flush()
-            // SPEC §5.7 — the note changed, so the library's picture of it is stale. Told,
-            // not redrawn: rendering a page on the two-second autosave timer is exactly the
-            // kind of work CLAUDE.md rule 7 keeps off this path.
-            library?.onSaved(session.document.id, session.document.localRev, session.pageCount)
+            flushAndReport(session)
             publish()
         }
+    }
+
+    /**
+     * Flush, then tell the library — the two halves of *"this note changed"*.
+     *
+     * ⚠️ **The second half used to happen only on the autosave path**, and every structural edit
+     * called `session.flush()` on its own. `library.onSaved` is the only route to
+     * `thumbnails.invalidate` **and** `sync.noteChanged`, and `saveLocked`'s report is gated on
+     * `hasUnflushedWork`, which a bare `flush()` has just cleared. So adding a page, deleting one,
+     * moving one, duplicating one or changing the paper left the library tile's page count stale for
+     * the whole session *and enqueued no upload* — the change reached the server only when the user
+     * happened to draw a stroke afterwards, or when the note closed and `materialize` fired
+     * `onMaterialized`. Structural edits are exactly the ones a user makes and then puts the tablet
+     * down.
+     *
+     * SPEC §5.7 — told, not redrawn: rendering a page here would put a tessellation on the
+     * two-second autosave timer, which is the kind of work CLAUDE.md rule 7 keeps off this path.
+     */
+    private suspend fun flushAndReport(session: NoteSession) {
+        session.flush()
+        library?.onSaved(session.document.id, session.document.localRev, session.pageCount)
     }
 
     /**
@@ -683,9 +712,10 @@ class NoteEditor(
      * [mergeRemoteBundle]'s tail: flush what the user has drawn, take the union, then bring the
      * screen in line from the fold diff.
      *
-     * ⚠️ **Never through [display].** `display` → `NoteSurface.loadPage` →
-     * `InkSurfaceView.pageSize`'s setter → `resetCamera(FIT_WIDTH)`, unconditionally, plus
-     * `cancelUnfinishedStrokes()`. The camera is persisted nowhere (`view.json` holds only the
+     * ⚠️ **Never through [display].** `display` → `NoteSurface.loadPage` → `resetCamera(FIT_WIDTH)`
+     * plus `cancelUnfinishedStrokes()`. The refit used to arrive through `InkSurfaceView.pageSize`'s
+     * setter, so *every* write to the size was a camera move; it is an explicit line in `loadPage`
+     * now, which makes this no safer to call — a page **switch** wants a refit, and this is not one. The camera is persisted nowhere (`view.json` holds only the
      * last-open page), so once refit the previous value is gone. That is *both* of SPEC §13.2 row
      * 10's forbidden outcomes — the view jumps and the in-progress stroke is eaten — reached two
      * indirections from anything camera-shaped, with every JVM test still passing. [reconcile] is
@@ -719,15 +749,20 @@ class NoteEditor(
      * folds and tells the surface what changed. For an undo that is one or two objects.
      */
     private fun reconcile(before: FoldedPage, after: FoldedPage) {
-        val surface = this.surface ?: return
         // ⚠️ Page metadata is part of the diff since M6. A peer's `SetPageMeta` folds correctly and
         // — before this — rendered not at all, so the screen and the log disagreed about the paper
         // until the next page switch, with no error anywhere. Pushed through `setPageMeta` and not
         // `loadPage`, because `loadPage` refits the camera and cancels the in-progress stroke.
-        if (after.size != before.size || after.background != before.background) {
+        //
+        // The picker's own label is updated *before* the `surface ?: return` below, because the
+        // label is state and the surface is a view: a fold that changed the paper has changed what
+        // the picker should say whether or not anything is currently on screen to draw it.
+        val metaChanged = after.size != before.size || after.background != before.background
+        if (metaChanged) {
             currentTemplate = (after.background as? Background.Template)?.template ?: PageTemplate.BLANK
-            surface.setPageMeta(after.size, after.background)
         }
+        val surface = this.surface ?: return
+        if (metaChanged) surface.setPageMeta(after.size, after.background)
         val beforeIds = before.objects.map { it.id }.toSet()
         val afterIds = after.objects.map { it.id }.toSet()
 
@@ -796,7 +831,7 @@ class NoteEditor(
             saveLocked()
             val index = currentPageIndex() + 1
             val added = session.addPage(index, background = Background.Template(template))
-            session.flush()
+            flushAndReport(session)
             display(session, added)
             publish()
         }
@@ -806,7 +841,7 @@ class NoteEditor(
         withPage { session, page ->
             saveLocked()
             val copy = session.duplicatePage(page, currentPageIndex() + 1)
-            session.flush()
+            flushAndReport(session)
             copy?.let { display(session, it) }
             publish()
         }
@@ -821,7 +856,7 @@ class NoteEditor(
                 publish(message = CANNOT_DELETE_LAST_PAGE)
                 return@withPage
             }
-            session.flush()
+            flushAndReport(session)
             val next = session.document.livePages.getOrNull(index) ?: session.document.livePages.last()
             display(session, next.id)
             publish()
@@ -832,21 +867,42 @@ class NoteEditor(
         withPage { session, page ->
             saveLocked()
             session.movePage(page, toIndex)
-            session.flush()
+            flushAndReport(session)
             publish()
         }
     }
 
+    /**
+     * The PageBar's template picker — the one production writer that changes an *existing* page's
+     * paper (every other `SetPageMeta` stamps a page being created).
+     *
+     * ⭐ **Through [reconcile], not [display], and that is the fix rather than a tidy-up.** It used
+     * to end in `display`, which reloads the page through `NoteSurface.loadPage` — so the forward
+     * direction repainted by *rebuilding the page*, cancelling the in-progress stroke and refitting
+     * the camera on the way, while its own undo went through [reconcile] and reached
+     * `setPageMeta`, which was a no-op in the app. Two mechanisms for one change, and only one of
+     * them worked: picking a paper redrew, undoing it did not.
+     *
+     * Now both directions are the same three lines as [undo] — fold, diff, push the diff — so
+     * "changing the paper" and "un-changing the paper" cannot disagree, and neither of them touches
+     * the camera or the pen.
+     */
     fun setTemplate(template: PageTemplate) {
         withPage { session, page ->
             saveLocked()
-            val background = Background.Template(template)
+            val before = session.page(page)
             session.apply(
                 page,
-                listOf(PageOp.SetPageMeta(session.nextOpId(), session.nextClock(), background = background)),
+                listOf(
+                    PageOp.SetPageMeta(
+                        session.nextOpId(),
+                        session.nextClock(),
+                        background = Background.Template(template),
+                    ),
+                ),
             )
-            session.flush()
-            display(session, page)
+            flushAndReport(session)
+            reconcile(before, session.page(page))
             publish()
         }
     }
@@ -882,8 +938,8 @@ class NoteEditor(
             pageIndex = currentPageIndex(),
             pageCount = session.pageCount,
             pageIds = session.document.livePages.map { it.id },
-            canUndo = session.canUndo,
-            canRedo = session.canRedo,
+            canUndo = currentPage?.let { session.canUndo(it) } ?: false,
+            canRedo = currentPage?.let { session.canRedo(it) } ?: false,
             localRev = session.document.localRev,
             template = currentTemplate,
             recoveredFromCrash = recovered,

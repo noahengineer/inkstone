@@ -48,7 +48,15 @@ class SourcePages @Inject constructor(
     private val rasterizer: PdfPageRasterizer,
 ) {
 
-    private data class Key(val id: DocumentId, val index: Int)
+    /**
+     * ⚠️ [size] is part of the key because the bitmap's dimensions are derived from it at raster
+     * time. Without it, a page whose extent changed under the same source index answered with the
+     * previous bitmap and `PagePainter` stretched it into the new page rect — right paper, wrong
+     * aspect, no error. Only reachable since `InkSurfaceView.setPageMeta` made an in-place size
+     * change possible at all, which is exactly why it is worth naming here rather than discovering
+     * later.
+     */
+    private data class Key(val id: DocumentId, val index: Int, val size: PageSize)
 
     private var cachedKey: Key? = null
     private var cached: Bitmap? = null
@@ -60,7 +68,7 @@ class SourcePages @Inject constructor(
      */
     suspend fun render(id: DocumentId, background: Background, size: PageSize): Bitmap? {
         val index = (background as? Background.SourcePdfPage)?.index ?: return null
-        val key = Key(id, index)
+        val key = Key(id, index, size)
         cached?.takeIf { cachedKey == key && !it.isRecycled }?.let { return it }
 
         val file = File(context.filesDir, NoteLayout.documentPdf(id))

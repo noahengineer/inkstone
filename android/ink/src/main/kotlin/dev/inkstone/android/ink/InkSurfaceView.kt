@@ -14,6 +14,7 @@ import androidx.ink.authoring.InProgressStrokesFinishedListener
 import androidx.ink.authoring.InProgressStrokesView
 import androidx.ink.strokes.Stroke
 import androidx.input.motionprediction.MotionEventPredictor
+import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Camera
 import dev.inkstone.core.model.FitMode
 import dev.inkstone.core.model.FoldedPage
@@ -192,12 +193,25 @@ public class InkSurfaceView @JvmOverloads constructor(
             eraser.mode = value
         }
 
+    /**
+     * The page's extent in points — the CropBox with `/Rotate` applied (SPEC §4.4), never the
+     * MediaBox.
+     *
+     * ⚠️ **Assigning this no longer refits the camera, and that is the point.** It used to, which
+     * made *every* write to it a camera move — `loadPage` wanted one and nothing else did, and
+     * "nothing else" turned out to include a peer's paper change arriving mid-stroke. A setter two
+     * indirections away from anything camera-shaped is not somewhere the SPEC §13.2 row 10 rule
+     * ("the view must not jump") can be enforced or even noticed, so the two callers now say which
+     * they want: [loadPage] refits explicitly, [setPageMeta] re-leashes.
+     */
     public var pageSize: PageSize = PageSize.Letter
         set(value) {
             field = value
             dryView.pageSize = value
-            resetCamera(FitMode.FIT_WIDTH)
         }
+
+    /** The paper under the ink. Changed through [loadPage] or [setPageMeta], never on its own. */
+    public val pageBackground: Background get() = dryView.pageBackground
 
     public var camera: Camera = Camera.Identity
         private set(value) {
@@ -265,6 +279,9 @@ public class InkSurfaceView @JvmOverloads constructor(
         wetView.cancelUnfinishedStrokes()
         strokes.reset()
         pageSize = page.size
+        // Explicit, because the setter above no longer does it. A page *switch* should fit the new
+        // page — it is a different piece of paper and the old camera means nothing on it.
+        resetCamera(FitMode.FIT_WIDTH)
         dryView.pageBackground = page.background
         // Cleared, not kept: the next page's paper is not this one's, and leaving the
         // old bitmap up means an imported page briefly shows the previous page's scan.
@@ -280,6 +297,45 @@ public class InkSurfaceView @JvmOverloads constructor(
         )
         dryView.onStoreChanged()
         onStrokeCountChanged?.invoke(strokes.size)
+    }
+
+    /**
+     * Change the paper and the page's extent **in place** — no camera move, no lost stroke.
+     *
+     * This is [loadPage] minus everything [loadPage] does that a *live* meta change must not do,
+     * and the list is the whole reason the method exists (SPEC §13.2 row 10):
+     *
+     * - **No `cancelUnfinishedStrokes`.** The stroke under the pen survives. Its geometry is safe
+     *   by construction — `startStroke` captures the view→page transform once and page space has
+     *   its origin at the page's top-left, so a [PageSize] is an *extent* and changing it moves no
+     *   point of any stroke, wet or dry.
+     * - **No `strokes.reset()`.** Nothing on screen is rebuilt, so nothing flickers and the open
+     *   gesture bracket is not dropped mid-stroke.
+     * - **No refit.** [Camera.leashedTo] keeps the current pan and zoom and only clamps the pan
+     *   back inside SPEC §4.5's leash, which matters when the page *shrinks* and is an identity
+     *   when the camera is already in bounds. A refit would be unrecoverable: the camera is
+     *   persisted nowhere, so once refit the user's place in the page is gone.
+     *
+     * The repaint comes from `DryStrokesView`'s own setters, each of which invalidates —
+     * `onStoreChanged()` would be a no-op here because a metadata change bumps no store revision.
+     *
+     * ⚠️ **The rasterised source page is cleared.** Whatever is in it was rendered for the paper
+     * and the size this call is replacing, and leaving it up puts the old scan under the new
+     * template. Re-rendering belongs to `:app` (`InkScreen`), which owns `:android:pdf` — same
+     * split as [loadPage] and [sourcePage], for the same reason: folding is immediate and
+     * rasterising a page of a 200-page scan is not.
+     *
+     * ⚠️ **The leash is guarded on a non-zero viewport.** `leashedTo` builds a `coerceIn` range
+     * from the viewport extent, and with a zero one that range inverts and `Float.coerceIn`
+     * throws. [resetCamera] and `onSizeChanged` both guard the same way; the old `pageSize` setter
+     * was safe only because it went through [resetCamera].
+     */
+    public fun setPageMeta(size: PageSize, background: Background) {
+        if (size == pageSize && background == dryView.pageBackground) return
+        pageSize = size
+        dryView.pageBackground = background
+        dryView.sourcePage = null
+        if (width > 0 && height > 0) camera = camera.leashed()
     }
 
     /**

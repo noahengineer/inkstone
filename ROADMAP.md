@@ -472,9 +472,11 @@ verify it round-trips intact.
 *What landed differently from the list above:* folder mirroring is a **pin** — one library folder
 pointed at any remote path, deepest pin wins, everything beneath it follows (SPEC §9). `notify_push`
 is deliberately not implemented at all rather than implemented as an optimisation; SPEC §7.6 allows
-that, and it is not bundled with Nextcloud. Live re-render covers strokes and not page metadata
-(below). Three things not in the scope list turned out to be prerequisites and are in: a per-install
-`deviceId`, per-page compaction snapshots, and forward-compatible manifest carrying.
+that, and it is not bundled with Nextcloud. Live re-render covers strokes and — since M6's follow-up
+— page metadata; what it still does not cover is a transform, style or z-order change on an existing
+object, which no build before M8a can send (below). Three things not in the scope list turned out to
+be prerequisites and are in: a per-install `deviceId`, per-page compaction snapshots, and
+forward-compatible manifest carrying.
 
 ### Acceptance
 
@@ -487,7 +489,8 @@ variant, 0 failures, 0 skipped** (`:core:model` 142, `:core:sync` 174, `:core:st
 same suite again as `testReleaseUnitTest`, so it executes 1,078 and there are 539). Re-measured
 2026-08-10 from a run forced with `--rerun --no-build-cache`, because a `BUILD SUCCESSFUL` line
 whose test tasks logged `UP-TO-DATE` or `FROM-CACHE` is not evidence about the suite —
-`docs/M6-SYNC.md` §7.
+`docs/M6-SYNC.md` §7. **The three follow-up fixes below took it to 555**; this breakdown is the one
+that shipped, not the current total.
 
 *Automated* and *automated and run against a real Nextcloud* are different claims. **26 of the 27
 matrix bodies run twice**, unchanged: once against a real HTTP/1.1 server on loopback that speaks
@@ -603,8 +606,84 @@ Automated and green:
       unknown one — `docs/M6-SYNC.md` §5.10.
       ⚠️ **This tick rests on a transcript and cannot be re-checked.** `connectedAndroidTest`
       uninstalled the app afterwards, so `run-as dev.inkstone` now answers *"unknown package"* and the
-      database rows quoted above are gone. It is the only M6 tick with no re-runnable artefact behind
-      it; the unit suite, the instrumented XML under `build/outputs/` and the live matrix all have one.
+      database rows quoted above are gone. The unit suite, the instrumented XML under
+      `build/outputs/` and the live matrix all leave a re-runnable artefact; the `adb` walks do not,
+      and there are now three of them — this one, and the two in the follow-up block below.
+
+**Found after this section was written, and fixed.** Three, in one session, all of them the same
+class — CLAUDE.md's definition of done #6, a feature correct in every test and inert in the app:
+
+- [x] **`NoteSurface.setPageMeta` is implemented, so a paper change reaches the screen.**
+      ⚠️ **The previous version of this section blamed the wrong code, and had done since before the
+      fix.** It said `StrokeStore.applyOps`'s `else -> false` swallowed a remote `SetPageMeta`. It
+      cannot: nothing ever put one in front of it. `NoteEditor.reconcile` diffs two folds and builds
+      its own op list of `AddObject` / `DeleteObject` / `SetErasedRegion` only
+      (`NoteEditor.kt:764-767`), routing a changed paper through `surface.setPageMeta` instead
+      (`NoteEditor.kt:752`). The single swallower was `InkScreen`'s
+      `override fun setPageMeta(…) = Unit` — an app-layer stub whose KDoc was itself accurate at the
+      time: `:android:ink` had no method that could change the paper without refitting the camera and
+      cancelling the in-progress stroke. It has one now. `InkSurfaceView.setPageMeta`
+      (`InkSurfaceView.kt:333`) sets the extent and the paper, clears the stale raster, and
+      **re-leashes** — `camera.leashed()`, guarded on a non-zero viewport because `leashedTo` builds
+      a `coerceIn` range out of the viewport extent and a zero one inverts it and throws — with no
+      `cancelUnfinishedStrokes` and no `strokes.reset()`. Those are row 10's three requirements, so
+      the ⚠️ on the fifth manual gate below shrinks to its transform half. `pageSize`'s setter no
+      longer refits at all (`InkSurfaceView.kt:207`) and `loadPage` asks for the refit in one
+      explicit line (`InkSurfaceView.kt:284`), because a page *switch* is the only caller that wants
+      one.
+      ⚠️ **This was never only a sync bug, which is why it should not have waited for a peer.**
+      `setTemplate` used to end in `display()`, which reloads the page — so picking a paper repainted
+      by *rebuilding the page*, refitting the camera and eating the stroke on the way, while its own
+      undo went through `reconcile` into the `= Unit` stub and did nothing at all. Two mechanisms for
+      one change and only one of them worked. Both directions are now `reconcile(before, after)`
+      (`NoteEditor.kt:892`), the same three lines as `undo`. One device, by hand, no sync involved.
+      **Verified**, in definition of done #6's language: *automated and run on a device* —
+      `app/src/androidTest/…/device/PageMetaLiveChangeTest.kt`, 4 tests, on an **x86_64 emulator**
+      (Test_Tablet AVD, API 35) together with `WetInkRemoteMergeTest`'s 2, **6/6 passed**;
+      ⚠️ **not run on the physical tablet — this is not the tablet pass.** And *driven through the
+      real UI over `adb`* on the same emulator, confirmed by two readers that are not the writer: the
+      framebuffer (ruled→grid = 8.3% of sampled page pixels differ, grid→after-undo = 8.3%,
+      ruled→after-undo = **0 of 61,440, pixel-identical**) and the zoom readout, which held at 100%
+      across a template change where the old path refit to 94% fit-width.
+- [x] **The undo stack is per page** — a live wrong-page write that the stub above was hiding.
+      `UndoEntry` carried no page (`Undo.kt:143` now does), `UndoStack.undo` popped the top of a
+      **document-wide** stack, and `NoteSession.undo(pageId)` replayed the result onto whichever page
+      the *caller* named, which is the page on screen. So: change page 1's paper, turn to page 2,
+      press undo — and the inverse `SetPageMeta` is written into **page 2's** log, folded, journaled
+      and uploaded, with the user's obvious recovery (press undo again) popping the next entry
+      instead. A stroke undo mis-fired identically and more quietly: an inverse `DeleteObject` for a
+      page-1 stroke lands in page 2's log as a tombstone for an object that was never there, which
+      the fold accepts by design (SPEC §4.2), so the only symptom was that undo appeared to do
+      nothing. ⚠️ **The `= Unit` stub is the entire reason the paper version was invisible** — the
+      wrong write happened on every attempt and no pixel moved to report it. `undo`, `redo`,
+      `canUndo` and `canRedo` all take a page now (`Undo.kt:175`, `NoteSession.kt:106`) and the
+      toolbar asks the same question `undo` answers (`NoteEditor.kt:928-929`), so "enabled but
+      nothing happens" is unreachable. An entry in an `undo.json` written before this **is dropped on
+      load** (`NoteStore.kt:545`) rather than applied to a guessed page: that costs the ability to
+      undo pre-upgrade gestures, once, and costs no data, since every forward op is already in the log
+      and the bundle.
+      **Verified:** *automated* — `NoteStoreTest`'s *"an undo cannot reach a page the gesture did not
+      happen on"* and *"each page keeps its own undo history"*, plus `NoteEditorRemoteOpsTest`'s
+      *"undoing a template change puts the previous paper back on the screen"* (9 tests in that class
+      now). SPEC §4.6 has been corrected in the same change; it did not say the stack was per page.
+- [x] **Every structural edit reports to the library, so it enqueues an upload.** `addPage`,
+      `duplicateCurrentPage`, `deleteCurrentPage`, `movePage` and `setTemplate` each called bare
+      `session.flush()`, and `library.onSaved` is the only route to `thumbnails.invalidate` **and**
+      `sync.noteChanged`. The autosave path's own report is gated on `hasUnflushedWork`, which the
+      bare `flush()` has just cleared — so the library tile's page count stayed stale for the whole
+      session and **no upload was enqueued**. The change reached the server only if the user happened
+      to draw a stroke afterwards, or when closing the note fired `onMaterialized`; structural edits
+      are exactly the ones a user makes and then puts the tablet down. One helper, `flushAndReport`
+      (`NoteEditor.kt:441`), at all five structural call sites — plus the autosave path, which
+      already reported and now shares the helper: six callers in total.
+      **Verified:** *driven through the real UI over `adb`* on the emulator and read back with a
+      reader that is not the writer — `run-as dev.inkstone cat databases/inkstone.db` showed
+      `pageCount=2, localRev=7` after structural edits alone with **zero strokes drawn**, which is
+      precisely the state the old path could not reach.
+
+`./gradlew build` green with all three in, and **555 tests under `testDebugUnitTest` across modules,
+0 failures** — the 539 above is the figure as M6's documentation pass left it. ⚠️ Windows, so this
+is guardrail 1 plus the iOS **klib** compile only; the framework link still logs `SKIPPED`.
 
 Still owed:
 
@@ -623,14 +702,36 @@ The six manual gates. **None has happened.** Five need a second physical device 
 seven days of elapsed time, so nothing here can be closed from a workstation — what each one would
 take is written out rather than left as "manual":
 
+⚠️ **Two emulators as two peers was set up, and it does not close the three two-device gates.** A
+second AVD is a genuine second *install*, which is what those gates need — `applicationId` has no
+debug suffix, so a second APK would not do. It was cloned by copying **only `config.ini`**, never a
+snapshot and never `userdata-qemu.img`, and `device.id` was confirmed different on each
+(`019feb4b-77e7-…` vs `019feb51-3d4f-…`); a userdata copy would hand both "peers" the same
+`deviceId` and collapse SPEC §4.1's tiebreak, so the pair would diverge permanently with every op
+present and no error. What stops it is **sign-in: neither emulator can authenticate against the
+plain-HTTP test container**, and no resource or manifest change fixes that, because there are three
+gates and not one — the platform network-security config (which a `src/debug` overlay could
+address); `LoginFlowV2.begin`'s `isSecure` check on the typed URL, which lives in **`commonMain`,
+shared with iOS**, and refuses `http://` before a socket is opened; and the app password itself,
+which only the login flow can write into the Keystore. Weakening shared `:core:sync` code so a test
+may use cleartext is a worse trade than these gates are worth, so **SPEC §14 stands unchanged**:
+two peers need an **HTTPS** Nextcloud the platform already trusts, plus **a browser sign-in
+performed by the user** — required either way, since the app never sees the password (SPEC §7.1,
+Login Flow v2 issues an app password per device). The README's *Two emulators as two sync peers* has
+the clone recipe and the launch traps.
+
 - [ ] Two devices, both offline, both write on the same page → reconnect → **both sets present, no prompt**
       **Satisfied by:** the APK on two tablets bound to one Nextcloud folder; airplane mode on both;
       a stroke on each in the same page; airplane mode off; both notes then showing both strokes and
       no dialog having appeared. **Automated stand-in:** row 1, live. What only the devices add is
       the real radio, the real WorkManager scheduling and a human confirming no prompt was shown.
+      ⚠️ **The emulator pair cannot stand in** — neither peer can sign in over cleartext; see the
+      three gates above.
 - [ ] Two devices, both offline, both add a page → **both pages present**, neither orphaned
       **Satisfied by:** the same setup, *Add page* on each while offline, then a page count of 3 on
       both after reconnect. **Automated stand-in:** row 5, live, including surviving a `materialize`.
+      ⚠️ Same cleartext sign-in block as the gate above, and the same HTTPS-plus-browser-sign-in
+      requirement to lift it.
 - [ ] Move a note in the Nextcloud **web UI** → detected as a move, no re-download, no duplicate
       **Satisfied by:** renaming or dragging the note's PDF in a browser and watching the library
       show one row at the new path with no download. **Automated stand-in:** row 11's live half,
@@ -646,9 +747,15 @@ take is written out rather than left as "manual":
       in-progress stroke survives.
       **Satisfied by:** two tablets on one page, one person drawing while the other holds a stroke
       down. **Automated stand-in:** row 10's wet half on an AVD (ticked above) for the camera and the
-      wet stroke; row 1 live for the merge. ⚠️ **This gate is expected to fail in one respect and
-      the reason is known:** a peer's `SetPageMeta` or a `SetTransform` on an *existing* object does
-      not render until a page switch (§8, and the `:android:ink` item below). New strokes do appear.
+      wet stroke; row 1 live for the merge; and `PageMetaLiveChangeTest` on an AVD for a paper change
+      arriving mid-stroke. ⚠️ Same cleartext sign-in block as the two gates above — an emulator pair
+      cannot run this one either.
+      ⚠️ **This gate is still expected to fail in one respect, but a narrower one than before:** a
+      peer's `SetPageMeta` **now renders live** (the follow-up tick above), so what remains is a
+      `SetTransform` / `SetStyle` / `SetZOrder` / `SetTextContent` on an *existing* object, which does
+      not render until a page switch — and which no build before M8a can send, so on two tablets
+      running *this* build the gate has nothing left to fail on. New strokes appear, and so does new
+      paper (§8, and the transform item below).
 - [ ] **A full week of real daily use across two devices with deliberate airplane-mode toggling → zero data loss**
       **Satisfied by:** seven calendar days, both tablets in ordinary use, airplane mode toggled at
       arbitrary moments including mid-upload, ending with every note openable and no note in
@@ -683,13 +790,28 @@ take is written out rather than left as "manual":
       of it can be reviewed, bisected, or recovered from a lost working copy.
       **Satisfied by:** a branch named for M6, a commit, and — for anything above that says "CI" — a
       remote to push it to.
-- [ ] **The `:android:ink` half of live re-render.** A peer's `SetPageMeta` folds correctly, reaches
-      the bundle and does **not** appear on screen until the page is switched: `NoteSurface.setPageMeta`
-      is a documented no-op on the real surface because `InkSurfaceView` can only change the paper
-      through `loadPage`, which refits the camera and cancels the in-progress stroke — both of row
-      10's forbidden outcomes. `StrokeStore.applyOps` also still drops `SetTransform` / `SetStyle` /
-      `SetZOrder` on the floor, so a peer's transform of an existing object folds and does not
-      render. Data-safe, visibly late.
+- [ ] **The transform / style / z-order half of live re-render.** The `SetPageMeta` half is
+      **closed** — `NoteSurface.setPageMeta` is implemented and verified on an emulator and through
+      the UI (ticked above), and the attribution this bullet used to carry was wrong: the swallower
+      was `InkScreen`'s `= Unit`, not `StrokeStore.applyOps`. What remains is `SetTransform`,
+      `SetStyle`, `SetZOrder` and `SetTextContent` on an **existing** object: those fold correctly,
+      reach the bundle, and do not appear on screen until the page is switched. Data-safe, visibly
+      late — and the gap is three layers deep, not one. `NoteEditor.reconcile` compares only object
+      identity and `erased`, so it never notices that a transform moved; `StrokeStore.applyOps`'s
+      `else -> false` would drop the op if it did; and `.transform` is read **nowhere** in
+      `:android:ink`, `:android:pdf` or `:app` — `startStroke` passes
+      `strokeToWorldTransform = identity` and `DryStrokesView` puts the *camera* on the canvas, so
+      there is no code that could apply an object's own matrix.
+      ⚠️ **Left open deliberately, because nothing in this build can produce one of these ops.**
+      There is **no production writer** of any of the four. `PageFold.kt` folds them, `OpCodec`
+      decodes them off disk and `Undo.inverseOf` can invert one; no gesture, screen or worker
+      constructs one, and outside those three the only constructors are in tests — so the only way
+      one arrives is a peer running a later build. Selection and transform are **M8a**; text is M8c.
+      Both halves of each — the op that writes it and the renderer that draws it — belong to the
+      milestone that introduces the gesture, rather than a fourth `when` branch in `applyOp` drawing
+      something no local action can create.
+      **Satisfied by:** M8a, whose acceptance already requires a transform to survive a sync
+      round-trip and merge LWW (SPEC §13.2 rows 3 and 7).
 - [ ] **SPEC §13.1's remaining gap: no bundle fixture is committed for any schema version**, so
       *"round-trip every schema version"* is currently a round trip of whatever the current build
       writes. This bullet previously also claimed there was no on-device migration test; that half

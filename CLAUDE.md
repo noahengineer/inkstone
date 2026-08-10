@@ -133,6 +133,8 @@ The tablet and the emulator answer different questions. Do not substitute either
 | Crash safety — `am force-stop` mid-write | ✅ | ✅ |
 | On-device schema migration | ✅ | ✅ |
 | "Is this feature actually reachable?" | ✅ **use it for this** | ✅ |
+| "Did the screen actually change?" | ✅ compare `screencap` framebuffers | ✅ |
+| Two devices as two sync peers | ✅ a second AVD (see below) | one device only |
 | Ink feel, latency, frame timing | ❌ | ✅ **only here** |
 | `:android:ink`'s instrumented suite | ❌ ten fail on x86_64 (see below) | ✅ |
 | Definition of done #4 | ❌ does not substitute | ✅ |
@@ -140,6 +142,22 @@ The tablet and the emulator answer different questions. Do not substitute either
 `adb devices` reporting the tablet as `unauthorized` does **not** mean no device is available —
 that is the case `tools/send-to-tablet.ps1` exists for, and an emulator is usually attached
 alongside it.
+
+**Two peers is a second AVD, and cloning it has one hard rule: copy `config.ini` and nothing
+else.** `applicationId` has no debug suffix, so a second install needs a second device. But
+`DeviceIdentity` is a file beside `notes/`, minted once per install — so copying a snapshot or
+`userdata-qemu.img` gives both "peers" the **same `deviceId`**, which collapses SPEC §4.1's
+tiebreak: concurrent ops at the same counter compare equal, `Register.write` keeps the incumbent,
+and the two diverge permanently with every op present and no error. That is the bug `DeviceIdentity`
+exists to prevent, reintroduced by the test setup. Read `files/device.id` off both and confirm they
+differ before believing anything a pair of them tells you. `tools/emulator-ui.py` drives either.
+
+**Neither peer can sign in to the plain-HTTP test container, and no manifest or resource change
+fixes it.** Three gates, not one: the network-security config; `LoginFlowV2.begin`'s `isSecure`
+check on the typed URL, which lives in `commonMain` and refuses `http://` before a socket is
+opened; and the app password, which only the login flow can write into the Keystore. A `src/debug`
+NSC overlay clears the first and buys nothing. Two-peer work needs an **HTTPS** Nextcloud, and the
+sign-in is the user's step either way — the app never sees the password (SPEC §7.1).
 
 ### Required before a milestone is done
 
@@ -206,6 +224,7 @@ A milestone is done when:
 | Ink input requirements | SPEC §3.3 |
 | Erase model (area-based since M1) | SPEC §3.5 |
 | Op vocabulary + absolute transforms | SPEC §4.2 |
+| **Undo — per page, and why** | SPEC §4.6 |
 | Convergence / re-folding | SPEC §4.3 |
 | **Coordinate spaces** | SPEC §4.4 |
 | Camera / viewport | SPEC §4.5 |
@@ -250,6 +269,10 @@ Collected during research so they don't get reintroduced from stale training dat
 - **A merge must carry the *peer's* unknown bundle entries and manifest members, or materializing deletes them** (M6). `materialize` read `carried` from the local reader only, and `BundleReader` rebuilt the manifest from a fixed field list. Both drops are invisible by definition — the lost data is exactly what this build cannot render (SPEC §5.8).
 - **A compaction snapshot is per *page*, and `compactIfDue` loops pages** (M6). One path per document meant every page but the last overwrote the previous one, so `readSnapshot` answered null for all of them — harmless (a missing snapshot is a re-fold) until SPEC §13.2 row 8, which then passed or failed on which page the test picked. Also: the causal-stability horizon is the oldest op *being folded*, never `document.createdEpochMillis` — that made the gate pass for ops seconds old on any note over 30 days, which is every notebook it exists to protect.
 - ⚠️ **A feature can be correct in every test and inert in the app.** Three times in M6: folder pinning recorded its mapping and bound nothing; `enqueueReconcile(noteId)` existed on both sides of the boundary with no caller; the PDF `/Resources` were checked by re-parsing with the library that wrote them. All green. The gap each time was the absence of anything that ran the **real path** — and `LibraryRepository` cannot be constructed in a JVM test at all, because its `PdfGateway` needs `androidx.ink`'s native code. Hoist the *decision* into a pure function over plain data so a test can at least assert the decision was made.
+- ⚠️ **A `= Unit` override with a recording fake in front of it is the most convincing form of that bug — and it can hide a second one.** `InkScreen`'s `NoteSurface.setPageMeta` was `= Unit` for all of M6 with a KDoc explaining why; `FakeSurface.setPageMeta` recorded the call, and a test asserted the recording. Every assertion was true of the editor and false of the app. Two lessons. First, the stub was **not only a sync gap**: the undo of a *local* template change takes the same path, so "pick a paper, press undo" did nothing on screen, on one device, by hand — a stub reached from one caller is nearly always reached from another. Second, **a stub that swallows a write can be the only thing hiding a corruption**: the undo stack had no page dimension, so the inverse `SetPageMeta` was being applied to *whichever page was on screen*, and implementing `setPageMeta` without fixing that would have made a wrong-page write visible instead of merely silent. Before implementing a stub, ask what has been writing into the void.
+- **An entry on an undo stack must name the page it happened on** (M6 follow-up). `UndoEntry` carried only `forward`/`inverse`, `UndoStack.undo` popped the document-wide top, and `NoteSession.undo(pageId)` replayed it onto the page the *caller* named. Change page 1's paper, turn to page 2, press undo: page 2's paper changes, is journaled and is uploaded, and pressing undo again pops the next entry rather than putting it right. A stroke undo mis-fired identically but silently — an inverse `DeleteObject` for a page-1 stroke is a tombstone for an object page 2 never had, which the fold accepts by design (SPEC §4.2). The stack is per page now and `canUndo`/`canRedo` take one, which also makes the button honest. Same shape as the `undoable` boolean above: the wrong call was *representable*, so eventually it was made.
+- **`session.flush()` is half of saving; `library.onSaved` is the other half** (M6 follow-up). It is the only route to `thumbnails.invalidate` **and** `sync.noteChanged`, and `saveLocked`'s call to it is gated on `hasUnflushedWork` — which a bare `flush()` has just cleared. So every structural edit that flushed on its own (add page, delete, move, duplicate, change paper) left the library tile's page count stale for the whole session and **enqueued no upload**: the change reached the server only if the user later drew a stroke, or closed the note. Structural edits are exactly the ones a user makes and then puts the tablet down. `NoteEditor.flushAndReport` is now the only way to flush.
+- **A setter that moves the camera is a trap wherever it is called from.** `InkSurfaceView.pageSize`'s setter called `resetCamera(FIT_WIDTH)` unconditionally, so *every* write to it was a camera move — `loadPage` wanted one and nothing else did, and "nothing else" came to include a peer's paper change arriving mid-stroke. The refit is explicit in `loadPage` now and `setPageMeta` re-leashes instead. ⚠️ `Camera.leashedTo` is **not** safe before layout: it builds a `coerceIn` range from the viewport extent, and a zero viewport inverts that range and throws. `resetCamera` and `onSizeChanged` both guard on `width > 0 && height > 0`; anything new that leashes must too.
 - **`:app`'s unit tests are the only source set that sees `:core:sync`, `:core:storage` and `:android:pdf` together**, which is why SPEC §13.2's matrix lives there (M6). Two things make it work: `unitTests.isReturnDefaultValues = true`, because OkHttp's platform detection reads `android.os.Build.VERSION.SDK_INT`; and `JdbcSqliteDriver(IN_MEMORY)`, so the real `Sql*` stores are under test rather than a `LinkedHashMap` fake. **`com.sun.net.httpserver` does not exist on that classpath** — it is `android.jar` plus `java.*`, no `jdk.httpserver` — so a stand-in server is hand-rolled over `ServerSocket`, which has the side benefit of keeping the production transport and the real multistatus parser in the loop.
 - **OkHttp and dav4jvm are JVM-only.** They cannot go in `:core:*`. Ktor can — but **Ktor's own types must not leave `:core:sync` either** (M5). `:app` is Android-only, so nothing would complain if it started holding an `HttpClient` and later made a request outside the outbox. `NextcloudTransport` is opaque outside the module, so there is nothing in `:app` to make a request *with*.
 - **There is no digest in common Kotlin**, and `java.security.MessageDigest` is JVM-only. SHA-256 (`:core:storage`, SPEC §5.6) and MD5 (`:core:sync`, for SPEC §7.5's `OC-Checksum`, which Nextcloud *verifies*) are both hand-written against published test vectors. MD5 is a transport integrity check and must never become a security primitive.

@@ -39,11 +39,13 @@ import kotlin.test.assertIs
  * looks harmless:
  *
  * 1. **The camera must not be refit.** `display()` → `NoteSurface.loadPage` →
- *    `InkSurfaceView.pageSize`'s setter → `resetCamera(FIT_WIDTH)`, unconditionally. The camera is
- *    persisted nowhere, so once refit the previous value is gone: the user's zoom and pan vanish
- *    mid-sentence. Asserted here by `loadedPage` being the *same object* it was before the merge —
- *    `loadPage` is the only route to a refit, so proving it was not called proves the camera stood
- *    still.
+ *    `resetCamera(FIT_WIDTH)` — one explicit line since M6's follow-up, and before that a
+ *    `pageSize` setter that refit on *every* write to it. The camera is persisted nowhere, so once
+ *    refit the previous value is gone: the user's zoom and pan vanish mid-sentence. Asserted here by
+ *    `loadedPage` being the *same object* it was before the merge — `loadPage` is the only route to a
+ *    **refit**, so proving it was not called proves the zoom survived. ⚠️ It does not prove the
+ *    camera is bit-identical: `setPageMeta` re-*leashes*, which may legitimately clamp the pan when
+ *    the page shrinks. `PageMetaLiveChangeTest` is where that distinction is asserted, on a device.
  * 2. **The in-progress stroke must not be cancelled.** `loadPage` also calls
  *    `wetView.cancelUnfinishedStrokes()`, which eats the stroke being drawn at that instant. The wet
  *    layer is private to `InkSurfaceView` and cannot be observed from the JVM, so the honest test of
@@ -245,10 +247,16 @@ class NoteEditorRemoteOpsTest {
 
     @Test
     fun `a remote page meta change is pushed without reloading the page`() = runTest {
-        // `StrokeStore.applyOps` has `else -> false`, so before M6 a peer's `SetPageMeta` folded
-        // correctly and rendered not at all — screen and log disagreed about the paper until the next
-        // page switch, with no error anywhere. This asserts the editor's half: the change is
-        // recognised and pushed through `setPageMeta`, which does not touch the camera.
+        // Before M6 a peer's `SetPageMeta` folded correctly and rendered not at all — screen and log
+        // disagreed about the paper until the next page switch, with no error anywhere.
+        //
+        // ⚠️ The swallower was **not** `StrokeStore.applyOps`'s `else -> false`, which earlier
+        // comments here and in `ROADMAP.md` blamed: `reconcile` filters `SetPageMeta` out of the op
+        // list and sends it through `setPageMeta` instead, so the op never reaches the store at all.
+        // It was `InkScreen`'s `override fun setPageMeta(…) = Unit` — i.e. the very method this test
+        // asserts was called. That is why this assertion alone was not enough and
+        // `PageMetaLiveChangeTest` exists on the device: this one proves the editor *speaks*, and
+        // only an instrumented test can prove anything *listens*.
         val fixture = fixture()
         val bundle = fixture.peerBundle(
             listOf(
@@ -279,6 +287,80 @@ class NoteEditorRemoteOpsTest {
         )
         // The picker follows the page it is describing, or the template menu would show the old one.
         assertEquals(PageTemplate.CORNELL, editor.state.value.template)
+        editor.close()
+    }
+
+    // -----------------------------------------------------------------------
+    // The same path, driven locally (the PageBar template picker)
+    // -----------------------------------------------------------------------
+    //
+    // These two are here rather than in a file of their own because they are the *same mechanism* as
+    // the remote case above, and separating them is what let it break: `setTemplate` used to repaint
+    // through `display()` → `loadPage` while its own undo went through `reconcile` → `setPageMeta`.
+    // Two routes for one change, one of which was a no-op in the app, so the forward direction worked
+    // and the reverse silently did nothing. Both now go through `reconcile`, and testing them beside
+    // the peer's case is what keeps that true.
+
+    @Test
+    fun `picking a template pushes the paper without reloading the page`() = runTest {
+        val fixture = fixture()
+        val editor = editorOver(fixture)
+        val surface = FakeSurface()
+        editor.onSurfaceAttached(surface)
+        runCurrent()
+        val loadedBefore = surface.loadedPage
+
+        editor.setTemplate(PageTemplate.CORNELL)
+        runCurrent()
+
+        assertEquals(
+            "the local paper change never reached the surface",
+            Background.Template(PageTemplate.CORNELL),
+            surface.pageMeta?.second,
+        )
+        // The regression this guards: `display()` reloads the page to repaint it, which refits the
+        // camera and cancels the in-progress stroke — for a change the user made *while writing*.
+        assertSame(
+            "the page was reloaded to change the paper, which refits the camera and eats the stroke",
+            loadedBefore,
+            surface.loadedPage,
+        )
+        assertEquals(PageTemplate.CORNELL, editor.state.value.template)
+        editor.close()
+    }
+
+    @Test
+    fun `undoing a template change puts the previous paper back on the screen`() = runTest {
+        // ⭐ The bug, on one device, with no sync involved: pick a paper, press undo, and the page
+        // did not change back. The op was correct, the fold was correct, `reconcile` computed the
+        // right diff — and the only production `setPageMeta` was `= Unit`, so the paper stayed and
+        // the PageBar chip's label moved. Screen and log disagreeing, which is the thing this whole
+        // reconcile mechanism exists to prevent.
+        val fixture = fixture()
+        val editor = editorOver(fixture)
+        val surface = FakeSurface()
+        editor.onSurfaceAttached(surface)
+        runCurrent()
+        val paperBefore = editor.foldedPage(fixture.page)?.background
+        assertNotNull("the fixture has no page to change the paper of", paperBefore)
+
+        editor.setTemplate(PageTemplate.CORNELL)
+        runCurrent()
+        assertEquals(Background.Template(PageTemplate.CORNELL), surface.pageMeta?.second)
+
+        editor.undo()
+        runCurrent()
+
+        assertEquals(
+            "undoing a paper change left the new paper on screen",
+            paperBefore,
+            surface.pageMeta?.second,
+        )
+        assertEquals(
+            "the folded page and the screen disagree about the paper after an undo",
+            paperBefore,
+            editor.foldedPage(fixture.page)?.background,
+        )
         editor.close()
     }
 

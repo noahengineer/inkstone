@@ -15,12 +15,17 @@ dialogs, ever.** A remote delete goes to local trash. Signing out pauses your no
 unbinding them. Library folders can be **pinned** to any remote path, and everything beneath the pin
 follows.
 
-`./gradlew build` is green — **539 unit tests per variant** (counted from
+`./gradlew build` is green — **555 unit tests per variant** (counted from
 `*/build/test-results/testDebugUnitTest/*.xml`; `build` runs the same suite again as
-`testReleaseUnitTest`, so it executes 1,078 and there are 539), `detekt`, Android lint, **guardrail 1
+`testReleaseUnitTest`, so it executes 1,110 and there are 555), `detekt`, Android lint, **guardrail 1
 plus the iOS klib compile — not the iOS framework link, which is macOS-only** (see *The two
 guardrails*), and SQLDelight migration verification against a committed schema fixture (now at
 schema version 6).
+
+Last forced clean run: `detekt spotlessCheck checkCoreIsPlatformFree testDebugUnitTest
+testReleaseUnitTest --no-build-cache --rerun-tasks` → **444 actionable tasks: 444 executed**, 555
+tests per variant, 0 failures, 0 skipped. Quoting "444 executed" rather than "BUILD SUCCESSFUL" is
+the point: see the warning below.
 
 ⚠️ Do **not** read a test count off Gradle's last line. `build` ends with `1068 actionable tasks: …`,
 and that 1,068 was quoted as "1068 JVM tests" through two milestones. It is a task count.
@@ -31,8 +36,8 @@ is not enough, because the build cache restores them. Force it with
 `./gradlew --no-build-cache :core:model:testDebugUnitTest --rerun …` per module. This matters most
 for the live matrix, which reaches over the network and is exactly what an up-to-date check will skip.
 
-All 21 rows of the merge matrix are automated, and **26 of the 27 matrix tests also run against a
-real Nextcloud 32.0.13** — those bodies run twice, in-process and live, and the live half now
+All 21 rows of the merge matrix are automated across **28 tests**, and 26 of them also run against a
+real Nextcloud 32.0.13 — those bodies run twice, in-process and live, and the live half now
 measures request counts too (see [docs/M6-SYNC.md](docs/M6-SYNC.md) §7, which has a per-row `Live`
 column). 24 assert their own claims live. Rows 15 and 12b reach the server and return at a trigger
 needing a shell on the instance (`occ maintenance:data-fingerprint`; a fillable quota), and row 19
@@ -44,20 +49,29 @@ set that did not exist before, and `:android:ink` **15 with 10 failures that are
 x86_64-only — see *What an emulator cannot tell you*. SPEC §13.3's four process kills exist for the
 first time, and the M6 app has been driven end-to-end over `adb`.
 
-What is **outstanding**: all six of M6's manual gates — none has happened; five need a second
-physical tablet and the sixth needs seven calendar days — and a pass on the actual Galaxy Tab, which
-the emulator does not substitute for. `ROADMAP.md` M6 says per gate what would satisfy it and which
-automated row stands in meanwhile. One known symptom the live-editing gate will hit: a peer's
-*existing* object moving, or a paper change, does not appear until the page is switched. Also owed:
+What is **outstanding**: M6's manual gates, and a pass on the actual Galaxy Tab, which the emulator
+does not substitute for. Three of the gates need **two peers**, and that is now set up — a second AVD,
+with `device.id` confirmed different on each (see *Two emulators as two sync peers*) — but they still
+need an **HTTPS** Nextcloud and a browser sign-in on each peer, because the app refuses cleartext at
+three separate gates and only one of them is a resource file. One gate needs seven calendar days.
+`ROADMAP.md` M6 says per gate what would satisfy it and which automated row stands in meanwhile.
+
+The *paper-change* half of the known live-editing symptom is **fixed**: `InkSurfaceView.setPageMeta`
+exists, so a peer's paper change — and the undo of a local one — reaches the screen without moving
+the camera or eating the stroke. It also uncovered two bugs the `= Unit` stub had been hiding: undo
+was applied to whichever page was *on screen* rather than the one the gesture happened on, and no
+structural edit (add/delete/move/duplicate a page, change the paper) enqueued an upload or refreshed
+the library tile. A peer's *existing object* moving is still M8's — nothing in this build can move an
+object, and the renderer never reads `InkObject.transform`. Also owed:
 guardrail 2's iOS **framework** link (macOS CI only; it has not run for this branch), a committed
 bundle fixture per schema version, and from earlier milestones M3's two performance criteria (500
 notes at 60fps, no jank while thumbnails generate) and M1's latency gates — all of which need the
 tablet or a Mac.
 
-**M6 is not done.** Everything automatable is automated and green; nothing that requires a second
-device, a week, or the physical tablet has been done at all. ⚠️ And M6 is **uncommitted** — 54
-modified files and 45 untracked paths in the working tree, `HEAD` still at M5's commit, and `git
-remote -v` empty, which is also why guardrail 2's macOS CI job has never run for this repository.
+**M6 is not done.** Everything automatable is automated and green; nothing that requires a week or
+the physical tablet has been done at all. M6 itself is committed (`4df34cd`), as are the follow-ups.
+⚠️ `git remote -v` is **empty**, which is why guardrail 2's macOS CI job has never run for this
+repository.
 
 Milestone notes, newest first:
 
@@ -215,6 +229,17 @@ read `/sdcard` and `adb push` cannot target private storage.
 
 ### Driving the app
 
+`tools/emulator-ui.py` does the dump-find-tap loop, so a step reads as what it means rather than
+as a coordinate:
+
+```bash
+PYTHONIOENCODING=utf-8 python tools/emulator-ui.py emulator-5554 dump
+PYTHONIOENCODING=utf-8 python tools/emulator-ui.py emulator-5554 tap "Add"
+```
+
+`PYTHONIOENCODING=utf-8` is not optional on Windows: the app labels controls with `✎`, `⇩` and
+`›`, and cp1252 stdout raises on all three. The raw commands, when you want them:
+
 ```bash
 adb shell uiautomator dump /sdcard/ui.xml   # then read bounds= and tap the centre
 adb shell input tap <x> <y>
@@ -222,6 +247,84 @@ adb shell cmd connectivity airplane-mode enable      # …and disable
 adb shell am force-stop dev.inkstone
 adb exec-out run-as dev.inkstone cat databases/inkstone.db > local.db
 ```
+
+⚠️ **Pull the database with `exec-out`, and take `-journal`/`-wal` with it.** `adb shell run-as …
+cat` translates LF to CRLF and the copy opens as *"database disk image is malformed"*. And a live
+SQLite database is not the whole story on its own — the sidecar file is where the last transaction
+is.
+
+**To see whether the screen actually changed**, compare framebuffers rather than eyeballing
+screenshots. `screencap` with no `-p` is raw RGBA behind a 12- or 16-byte header (width, height,
+format, and a colour space on newer images — infer which by checking `len - hdr == w*h*4`):
+
+```bash
+adb -s emulator-5554 exec-out screencap > before.raw
+```
+
+Two of M6's follow-up fixes were confirmed this way and could not have been confirmed otherwise:
+picking a paper and pressing undo left the page **pixel-identical** to before (0 of 61,440 sampled
+pixels differing) while 8.3% differed with the new paper up. A reader that is not the writer, which
+is the fourth of CLAUDE.md's four checks.
+
+### Two emulators as two sync peers
+
+Rows about two devices need two *installs*, and `applicationId` has no debug suffix — so a second
+copy needs a second AVD, not a second APK. Clone the one you have by copying **only its
+`config.ini`**:
+
+```bash
+mkdir -p ~/.android/avd/Test_Tablet_B.avd
+sed -e 's/^AvdId=Test_Tablet$/AvdId=Test_Tablet_B/' \
+    -e 's/^avd.ini.displayname=Test Tablet$/avd.ini.displayname=Test Tablet B/' \
+    ~/.android/avd/Test_Tablet.avd/config.ini > ~/.android/avd/Test_Tablet_B.avd/config.ini
+printf 'avd.ini.encoding=UTF-8\npath=%s\ntarget=android-35\n' 'C:\Users\<you>\.android\avd\Test_Tablet_B.avd' \
+  > ~/.android/avd/Test_Tablet_B.ini
+```
+
+⚠️ **Copy the `config.ini` and nothing else. Never a snapshot, never `userdata-qemu.img`.**
+`DeviceIdentity` is a *file* beside `notes/`, minted once per install and never again — so a
+userdata copy hands two "peers" the **same `deviceId`**, which collapses SPEC §4.1's tiebreak:
+two concurrent ops at the same counter compare equal, `Register.write` keeps the incumbent, and the
+two devices diverge permanently with every op present and no error. It also duplicates every
+`DocumentId` and every `remoteBinding`, so both claim the same remote file. Confirm they differ
+before trusting anything a pair of them tells you:
+
+```bash
+for s in emulator-5554 emulator-5556; do
+  adb -s $s exec-out "run-as dev.inkstone cat files/device.id"; echo " $s"
+done
+```
+
+⚠️ **`connectedAndroidTest` destroys a peer.** It uninstalls the app, which takes `filesDir` with it
+— so `files/device.id` is gone and a **new** identity is minted on next launch, along with an empty
+database and no remote bindings. Half of a two-peer pairing therefore does not survive an instrumented
+run on that emulator. Run the instrumented suites *first*, pair the peers *after*, in that order — and
+re-read both ids if in doubt (observed: peer A went from `019feb4b-77e7-…` to `019feb9c-24d0-…` across
+one `connectedDebugAndroidTest`).
+
+⚠️ **Launch the second one detached, not from a shell whose lifetime is shorter than the boot.**
+A backgrounded `emulator … | tail` gets torn down with the pipe *after* the guest has booted, which
+looks like a boot failure and is not. On Windows use `Start-Process -RedirectStandardOutput`.
+
+⚠️ **`airplane-mode disable` is not instant.** Re-enabling took **more than six seconds** to restore
+connectivity on one of the two AVDs — long enough that a check run straight afterwards reads as *still
+offline*, which is exactly the wrong conclusion in a test about going back online. Poll for the
+network rather than sleeping a fixed amount, and `adb shell settings get global airplane_mode_on` to
+confirm the setting itself landed.
+
+⚠️ **First launch on a fresh AVD can ANR.** `Reason: No response to onStartJob` — WorkManager's job
+service, arriving while the app is still doing its first-run work at ~118% CPU on a shared host. The
+second launch was 9.4 s and clean. Give it a cold run before concluding anything.
+
+**They cannot both sign in to the throwaway test container**, and no resource or manifest change
+fixes that. There are three gates, not one: the platform network-security config (which a
+`src/debug` overlay could address), `LoginFlowV2.begin`'s `isSecure` check on the typed URL — in
+`commonMain`, shared with iOS, refusing `http://` *before a socket is opened* — and the app password
+itself, which only the login flow can write into the Keystore. Weakening shared `:core:sync` code so
+a test can use cleartext is a worse trade than SPEC §14 is worth, so **two peers need an HTTPS
+Nextcloud** the platform already trusts. Signing in is the user's step regardless: the app never
+sees the password (SPEC §7.1 — Login Flow v2 authorises in the browser and Nextcloud issues an app
+password per device).
 
 ⚠️ **Drawing needs `input stylus`, not `input`.** `PalmGuard` accepts only
 `TOOL_TYPE_STYLUS` and `TOOL_TYPE_ERASER` (SPEC §3.3), so a plain
@@ -367,5 +470,6 @@ Dependency direction is one-way: `:app` → `:android:*` → `:core:*`.
 | Script | What it does |
 |---|---|
 | `tools\send-to-tablet.ps1` | Build the debug APK and copy it to the tablet over MTP |
+| `tools/emulator-ui.py` | Dump/find/tap the app's UI over adb — the driving half of definition-of-done #4 |
 | `tools/verify-guardrails.sh` | Plant a real violation of each guardrail, assert the right one fails, revert |
 | `tools\bootstrap-wrapper.ps1` | Regenerate the Gradle wrapper if it is ever lost |

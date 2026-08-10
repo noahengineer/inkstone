@@ -238,25 +238,26 @@ private fun InkSurfaceView.asNoteSurface(scope: CoroutineScope, editor: NoteEdit
         override fun applyOps(ops: List<PageOp>, record: Boolean) = this@asNoteSurface.applyOps(ops, record)
 
         /**
-         * ⚠️ **Not implemented on the real surface yet, and the reason is not an oversight.**
+         * A paper change that must not disturb the pen — a peer's, or the undo of a local one.
          *
-         * The two things this has to do — change the paper and change the page geometry without
-         * moving the camera — are both out of reach from here. `InkSurfaceView` exposes the
-         * background only through `loadPage`, which cancels the in-progress stroke and calls
-         * `resetCamera(FIT_WIDTH)`; and its `pageSize` setter refits unconditionally. Both are
-         * exactly what SPEC §13.2 row 10 forbids, so doing either would trade a stale picture for
-         * an eaten stroke and a jumped view — the worse of the two.
+         * ⭐ **This was `= Unit` for the whole of M6**, with a KDoc explaining that `:android:ink`
+         * had no method that could change the paper without refitting the camera and cancelling the
+         * in-progress stroke. True at the time; the missing method is now
+         * `InkSurfaceView.setPageMeta`. Worth recording what the stub cost, because it is
+         * CLAUDE.md's definition-of-done #6 exactly: `NoteEditor.reconcile` computed the change,
+         * `FakeSurface.setPageMeta` *recorded* it, a test asserted the recording, and production
+         * threw it away. Green tick, inert feature — and not only for a peer: the undo of a local
+         * template change takes the identical path, so *"pick a paper, press undo"* did nothing on
+         * screen while the PageBar chip's label moved. One device, by hand, no sync involved.
          *
-         * What `:android:ink` needs to add is one method that sets `dryView.pageBackground`, sets
-         * the size, **re-leashes** (`camera.leashedTo`) instead of refitting, and calls
-         * `dryView.onStoreChanged()`. That is the `InkSurfaceView` half of M6's ink work and is
-         * tracked there; `StrokeStore.applyOps`'s `else -> false` swallows a remote `SetPageMeta`
-         * today regardless, so nothing here is made worse by waiting.
-         *
-         * Until then a peer's paper change is folded correctly, is in the log and the bundle, and
-         * appears on screen at the next page switch. Data-safe, visibly late.
+         * The raster is re-rendered after the fact, not before, so the ink and the new template are
+         * on screen immediately and an imported scan fills in behind — the same ordering [loadPage]
+         * uses, and the reason `setPageMeta` clears the old bitmap itself rather than waiting.
          */
-        override fun setPageMeta(size: PageSize, background: Background) = Unit
+        override fun setPageMeta(size: PageSize, background: Background) {
+            this@asNoteSurface.setPageMeta(size, background)
+            scope.launch { sourcePage = editor.sourcePage(background, size) }
+        }
     }
 
 /**

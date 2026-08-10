@@ -205,8 +205,13 @@ class MergeMatrixFoldTest {
 
         // Reopened: this is the session a restart would build, and `undo.json` is what it reads.
         val reopened = devices.b.session(id)
-        assertTrue(reopened.canUndo, "B lost its own undo history across the merge")
-        assertFalse(reopened.canRedo, "something was pushed onto the redo stack by a merge")
+        // Per page since the wrong-page-undo fix: an entry's inverse is only meaningful on the page
+        // it was computed against, so the question "is there anything to undo" only has an answer
+        // relative to a page. This also proves the page survived the `undo.json` round trip — an
+        // entry whose page could not be read is dropped on load, so a lost `p` field would read here
+        // as "B lost its own undo history".
+        assertTrue(reopened.canUndo(page), "B lost its own undo history across the merge")
+        assertFalse(reopened.canRedo(page), "something was pushed onto the redo stack by a merge")
         assertTrue(reopened.undo(page), "undo did nothing")
 
         val remaining = reopened.page(page).objects.map { it.id }

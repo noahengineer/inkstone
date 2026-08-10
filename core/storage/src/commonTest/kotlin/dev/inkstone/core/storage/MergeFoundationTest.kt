@@ -122,7 +122,7 @@ class MergeFoundationTest {
 
         session.merge(page, listOf(addOp("remote-1", device = "device-b")))
 
-        assertFalse(session.canUndo, "a remote op is undoable locally")
+        assertFalse(session.canUndo(page), "a remote op is undoable locally")
         assertEquals(1, session.page(page).objects.size, "the remote op was not applied at all")
     }
 
@@ -133,11 +133,11 @@ class MergeFoundationTest {
         val session = session(note)
 
         session.apply(page, listOf(addOp("local-1")))
-        assertTrue(session.canUndo, "a local gesture must be undoable")
+        assertTrue(session.canUndo(page), "a local gesture must be undoable")
 
         val fresh = session(assertNotNull(store.open(note.document.id)))
         fresh.replay(page, listOf(addOp("replayed-1")))
-        assertFalse(fresh.canUndo, "a replay must not add an undo entry")
+        assertFalse(fresh.canUndo(page), "a replay must not add an undo entry")
     }
 
     @Test
