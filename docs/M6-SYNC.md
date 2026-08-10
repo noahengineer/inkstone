@@ -1502,3 +1502,73 @@ In rough order of how much they would change what is known:
   Acrobat, Chrome and Preview. `INKSTONE_PDF_DUMP` writes one out.
 - Still carried from M5: an instance where the login name is an email address (uid ≠ loginName),
   and reading the Nextcloud log for zero brute-force entries after a revoked app password.
+
+## 9. The two-peer gates, run on two emulators against a real Nextcloud
+
+Two AVDs, each a separate install with its own `device.id`, both signed in by hand to a real
+Nextcloud over HTTPS (Login Flow v2 — the app never saw the password). A note was created on peer A,
+bound to `Inkstone/`, uploaded, and **discovered and adopted by peer B from the walk alone**: same
+`DocumentId`, same ETag, both `SYNCED`. That much is the pull side working end to end on real
+hardware, which nothing before this had shown.
+
+Then the gates.
+
+### Gate 3 — both offline, both write the same page: **converges, but late**
+
+Both peers offline, one stroke each on page 1, then back online. Both bundles end up holding **both
+ops** — verified by unzipping `note.inkstone` off each device rather than by asking the app: two
+`add` ops, both at Lamport counter **2**, with different `deviceId`s, so this is the genuine
+concurrent case and SPEC §4.1's tiebreak is what ordered them.
+
+⚠️ **But it did not converge at merge time.** Peer B merged A's stroke into a 2-op union and did
+**not** upload it. The server stayed at A's 1-op version, so A had nothing to pull, and A sat at one
+stroke through **six** automatic reconcile passes over ~6 minutes — `lastReconcileAt` advancing,
+`remoteDirectory.seenAt` frozen, both devices reporting `SYNCED`. A was not stuck by a bug of its
+own: its probe correctly found the ancestor ETag unchanged, because nothing had changed. The union
+reached the server only when B happened to make an **unrelated later edit**, and A then converged on
+its own within two poll cycles.
+
+### Gate 5 — both online, page open on both: **fails**
+
+A zoomed to 100% (away from the 94% fit, so a refit would show), both peers with the page open, then
+one stroke drawn on B. A was not touched again.
+
+- ✅ **The camera did not move** and the page did not change: A held `100% · 1 / 1` throughout. That
+  is the half of §13.2 row 10 that `setPageMeta` and `reconcile` exist for.
+- ❌ **The stroke never appeared.** Four minutes, eight samples, `2 strokes` every time.
+
+And it never appeared *on disk* either: A's bundle stayed at 2 ops with an empty journal, while
+**both** devices reported `SYNCED` at `localRev = 6` with the identical ETag. B's own two newest
+strokes were sitting in B's `journal.ops` (1,407 bytes) and had never been folded into its bundle.
+
+### What is actually wrong
+
+`lastSyncedRev` was advanced to a revision whose bytes the server never received. Once
+`lastSyncedRev == localRev`, `SyncEngine.noteChanged`'s guard (`localRev > lastSyncedRev`) is false
+and those ops can never be uploaded again — the device is silently muted for that work while every
+indicator reads healthy.
+
+The write that does it is SPEC §7.6's decision table in `Reconciler.apply`:
+`syncedRev = commit.localRev.takeIf { !merge.localNovel }`. The guard is exactly right and its KDoc
+names this hazard — *"in row 3 the local note is ahead of these bytes, and claiming otherwise is SPEC
+§7.6's mid-flight bug one layer up"*. The input is what fails:
+`localNovel = notes.localRev(noteId) > binding.lastSyncedRev` evaluated **false** on a device that
+genuinely held ops the server did not.
+
+**Nothing is lost.** Every stroke still exists on the device that drew it, and closing the note
+materializes the journal and bumps `localRev` past the false `lastSyncedRev`, which is why gate 3
+recovered on B's next edit. But between those moments the app tells the user their work is on the
+server when it is not, and a peer with the page open sees nothing arrive — which is the entire point
+of the live-editing feature.
+
+### Why 28 automated matrix tests did not catch it
+
+`TwoDevices.Device.edit` **materializes before every `engine.noteChanged`**. Production does not: an
+autosave flushes to the journal and leaves the bundle alone until the note closes. So no row models
+the state this failed in — a bound note with journal-only ops and an open editor. A fixture more
+generous than production, in CLAUDE.md's sense, and the reason a green matrix and a broken gate are
+both true.
+
+Gate 4 (both offline, both add a page) was **not run**: it goes through the same enqueue path and
+would have re-measured this rather than testing page-order merge.
+
