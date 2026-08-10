@@ -1081,8 +1081,15 @@ line you wrote — readable by you, and by an assistant with access to your Next
 and, more usefully, the three designs that were rejected and why. This entry is the checklist, not
 the design.
 
-**Numbered M12 so M8–M11's cross-references stay valid.** SPEC §12's *"out of scope for v1"* row is
-still true — v1 ends at M11.
+⚠️ **The number is an identifier, not a position in the queue. This can be built next, straight
+after M7.** M8–M11 already exist as sections and renaming them would break cross-references in
+SPEC, this file and six documents under `docs/` — so the number was chosen to avoid churn, not to
+schedule anything. Nothing here depends on M8–M11: the capture half needs the editor, the outbox
+and the folder machinery (M3/M5/M6), and the alignment half needs M7's `LineSegmenter`.
+`InkStrokeSampler` already applies object transforms, so M8's selection tools will not disturb it.
+
+SPEC §12's *"out of scope for v1"* row remains true in its own terms — v1 ends at M11 — but that
+is a statement about what v1 contains, not about what to build when.
 
 ### Scope
 

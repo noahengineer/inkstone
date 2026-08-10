@@ -322,6 +322,10 @@ Two halves that are independently useful, and the first is worth having on its o
 - **Alignment and transcript** — the server side, the −15/+5 window over M7's lines, the merged
   markdown, "Needs attention" on failure, audio to trash after verification.
 
-Numbered **M12** so that M8–M11's cross-references stay valid; renumbering would invalidate
-references throughout SPEC, ROADMAP and six `docs/` files for no benefit. It is *out of scope for
-v1* in SPEC §12's sense, which remains true — v1 ends at M11.
+⚠️ **The number is an identifier, not a build position — this can be built next, after M7.**
+M8–M11 already exist as sections and renumbering would invalidate references throughout SPEC,
+ROADMAP and six `docs/` files for no benefit, so 12 was chosen to avoid churn rather than to
+schedule anything. Nothing here depends on M8–M11.
+
+SPEC §12's *"out of scope for v1"* row stays true in its own terms — v1 ends at M11 — but that
+describes what v1 contains, not what order things get built in.
