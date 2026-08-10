@@ -31,10 +31,10 @@ import dev.inkstone.core.database.sync.SqlFolderBindingStore
 import dev.inkstone.core.database.sync.SqlPeerClockStore
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.CredentialStore
-import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.PageThumbnailRenderer
+import dev.inkstone.core.model.PdfPublisher
 import dev.inkstone.core.model.RemoteBundleExtractor
 import dev.inkstone.core.model.WorkScheduler
 import dev.inkstone.core.storage.NoteStore
@@ -128,7 +128,7 @@ object PlatformProvidersModule {
      */
     @Provides
     @Singleton
-    fun provideDocumentMaterializer(fs: FileSystem, clock: Clock, brushes: InkBrushFactory): DocumentMaterializer =
+    fun providePdfPublisher(fs: FileSystem, clock: Clock, brushes: InkBrushFactory): PdfPublisher =
         InkstonePdfMaterializer(
             fs = fs,
             store = NoteStore(fs, clock, IdFactory(clock)),

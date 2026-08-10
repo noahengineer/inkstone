@@ -10,12 +10,12 @@ import dev.inkstone.app.sync.NoteSessionHost
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
-import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
+import dev.inkstone.core.model.PdfPublisher
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -49,7 +49,7 @@ class NoteEditorViewModel @Inject constructor(
      * through the session already open here rather than opening a second one.
      */
     private val sessions: NoteSessionHost,
-    materializer: DocumentMaterializer,
+    publisher: PdfPublisher,
     savedState: SavedStateHandle,
 ) : ViewModel() {
 
@@ -84,7 +84,7 @@ class NoteEditorViewModel @Inject constructor(
             // SPEC §4.7's horizon, non-null for the first time in M6 (see the interface).
             override suspend fun oldestAckedCounter(id: DocumentId) = library.oldestAckedCounter(id)
         },
-        materializer = materializer,
+        publisher = publisher,
     )
 
     /**
@@ -181,7 +181,7 @@ class NoteEditorViewModel @Inject constructor(
      */
     suspend fun exportPdf(): android.net.Uri? {
         val id = state.value.documentId ?: return null
-        if (!editor.materializeNow()) return null
+        if (editor.materializeNow() == null) return null
         return sharing.snapshot(id, state.value.title)
     }
 

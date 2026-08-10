@@ -1602,3 +1602,29 @@ rather than a `Boolean` — and inject *that* into the drainer, leaving `Inkston
 reachable only from inside the host. Same shape as deleting `apply`'s `undoable` default and
 `NoteSession.close`'s `syncState` default: remove the option, don't document it.
 
+### Fixed, and all three gates re-run green
+
+`DocumentMaterializer` and `PdfPublisher` are now two types. The first is the gate and has exactly
+one implementation — `NoteSessionHost` — so `OutboxDrainer`'s materializer parameter can only be
+given the safe thing; the second is the raw publisher, reachable only by the host and the editor.
+`NoteEditorHandle.materialize()` answers a `MaterializedFile?` instead of a `Boolean`, because the
+drainer records `lastSyncedRev` from the revision the *bytes* were built from and only the editor
+knows what that is once it has folded its own journal.
+
+Re-run on the same two emulators against the same real Nextcloud, with the same note:
+
+| Gate | Before | After |
+|---|---|---|
+| 3 — both offline, same page | union reached one device only; six passes and ~6 min with both reading `SYNCED`, resolved only by an unrelated later edit | **6 → 7 strokes on both within 30 s**, on the automatic poll alone, no manual sync, A holding 100% zoom |
+| 4 — both offline, each adds a page | not run (same enqueue path) | **3 pages on both** — the union; neither device's page dropped, each peer left on the page it was viewing |
+| 5 — both online, page open on both | stroke never appeared; 4 min, 8 samples, and A's bundle never got it either | **2 → 5 strokes in under 30 s** in the *open* editor, at **100% zoom, page 1/1**, untouched — and it drained the two strokes the bug had stranded |
+
+Gate 5's "2 → 5" is the part worth keeping: A picked up B's new stroke *and* the two that the defect
+had left unsyncable, which is the strongest evidence available that the fix addresses the mechanism
+rather than the symptom. Both databases then agreed at `localRev = 7` with one ETag.
+
+⚠️ Still true, and still the reason this took two emulators to find: **no row in the JVM matrix can
+model an open note**, because `TwoDevices.Device.edit` materializes before every `noteChanged` and the
+harness has no editor registry to hand a publish to. `TwoDevices.materializer` now says so in its own
+KDoc. The type split is what carries the invariant; the matrix carries the drainer's ordering.
+

@@ -56,6 +56,10 @@ import kotlin.random.Random
  */
 @Module
 @InstallIn(SingletonComponent::class)
+// TooManyFunctions: a DI module is one `@Provides` per collaborator by construction, which is the
+// shape this rule judges worst — merging two providers to satisfy a count would hide a dependency
+// rather than remove one. Same reasoning as `Reconciler` and `LibraryRepository`.
+@Suppress("TooManyFunctions")
 object SyncModule {
 
     /**
@@ -217,6 +221,26 @@ object SyncModule {
     @Provides
     @Singleton
     fun provideRemoteMergeGate(host: NoteSessionHost): RemoteMergeGate = host.gate
+
+    /**
+     * ⭐ **The upload path publishes through the host, not around it** (M6's gate-5 fix).
+     *
+     * `OutboxDrainer` materializes before every PUT, and it used to be handed
+     * `InkstonePdfMaterializer` directly — so for a note the user had **open** it published from
+     * outside the note's mutex, behind the editor that was also writing that bundle, and then
+     * recorded `lastSyncedRev` from bytes that did not contain the editor's work. After that
+     * `SyncEngine.noteChanged` reads `localRev <= lastSyncedRev` and enqueues nothing, so the
+     * device goes permanently silent for that work while the note reads `SYNCED`. Two peers with
+     * the page open never converged, and neither of them could tell.
+     *
+     * `MaterializeWorker` already routed through the host and carried a KDoc saying everything must.
+     * A KDoc was not enough, which is why `DocumentMaterializer` and `PdfPublisher` are now
+     * different types: this is the only binding for the former, and the latter is reachable only by
+     * the host and the editor.
+     */
+    @Provides
+    @Singleton
+    fun provideDocumentMaterializer(host: NoteSessionHost): DocumentMaterializer = host
 
     @Provides
     @Singleton

@@ -3,17 +3,18 @@ package dev.inkstone.app.note
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
-import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.MaterializedFile
 import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
+import dev.inkstone.core.model.PdfPublisher
 import dev.inkstone.core.storage.BundleReader
 import dev.inkstone.core.storage.DeviceIdentity
 import dev.inkstone.core.storage.FileByteSource
@@ -112,7 +113,7 @@ class NoteEditor(
      * is the lossless truth (SPEC §5.3) and the PDF is the *published* form, so a
      * missing publisher costs interoperability, never data.
      */
-    private val materializer: DocumentMaterializer? = null,
+    private val publisher: PdfPublisher? = null,
 ) {
 
     /**
@@ -469,17 +470,19 @@ class NoteEditor(
      * Takes [serial]: this rewrites the bundle and resets the journal, so a merge or an autosave tick
      * running alongside it is the data loss that class of interleaving produces.
      *
-     * @return false when the PDF could not be written. The bundle is still saved — see the
-     *   comment on the publish step — so this is "not publishable yet", never "lost".
+     * @return the published file, or null when the PDF could not be written. The bundle is still
+     *   saved — see the comment on the publish step — so null is "not publishable yet", never
+     *   "lost". It answers the file rather than a `Boolean` because `OutboxDrainer` records
+     *   `lastSyncedRev` from the revision these bytes were built from.
      */
-    suspend fun materializeNow(): Boolean = serial.withLock { materializeLocked() }
+    suspend fun materializeNow(): MaterializedFile? = serial.withLock { materializeLocked() }
 
     /**
      * ⭐ **The same materialize, for `MaterializeWorker` — which has to be able to *wait* for it.**
      *
      * `MaterializeWorker` republishes `document.pdf` for the notes the editor's `onStop` never
      * covers: one bound from the library without being opened, and "idle while charging". It did so
-     * by calling `DocumentMaterializer` directly, which for an *open* note is a second writer with
+     * by calling the raw `PdfPublisher` directly, which for an *open* note is a second writer with
      * no ordering against this one — and the failure is not a torn file (writes are atomic and, since
      * M6, uniquely named) but a **stale marker**. `InkstonePdfMaterializer` reads `note.inkstone`,
      * embeds it and records its SHA-256; if this editor rewrites the bundle in between, the worker's
@@ -495,15 +498,21 @@ class NoteEditor(
      * @return false **only** when this editor can no longer run anything, or the PDF could not be
      *   written. Both mean the host publishing through the materializer itself is correct.
      */
-    internal suspend fun materializeInSession(): Boolean {
+    internal suspend fun materializeInSession(): MaterializedFile? {
         // `work.async` on a cancelled scope produces a cancelled `Deferred`, and awaiting one throws
         // into the worker rather than answering it — the same contract [renameInSession] documents.
-        if (!work.isActive) return false
+        if (!work.isActive) return null
         return work.async { serial.withLock { materializeLocked() } }.await()
     }
 
-    private suspend fun materializeLocked(): Boolean {
-        val session = this.session ?: return false
+    /**
+     * ⚠️ **Returns the published file so the caller can trust its revision.** It used to answer a
+     * `Boolean`, and `NoteSessionHost` passed that straight to `OutboxDrainer`'s
+     * `DocumentMaterializer` — which needs the `localRev` the bytes were built from, because
+     * recording any other revision as synced silences every future upload of the difference.
+     */
+    private suspend fun materializeLocked(): MaterializedFile? {
+        val session = this.session ?: return null
         saveLocked()
         // ⚠️ Deliberately **not** `session.close(syncState)`, which is `materialize` +
         // `assertNotStale` + `compactIfDue(syncState, oldestAckedCounter = null)` — null because a
@@ -538,9 +547,9 @@ class NoteEditor(
         // Failure here is reported and does not undo the save. The bundle is already
         // on disk and is the truth; a note whose PDF could not be written is a note
         // that opens perfectly and cannot yet be read elsewhere.
-        val published = materializer?.let { runCatching { it.materialize(session.document.id) } }
+        val published = publisher?.let { runCatching { it.publish(session.document.id) } }
         publish(message = if (published?.isFailure == true) PUBLISH_FAILED else null)
-        return published?.isSuccess ?: false
+        return published?.getOrNull()
     }
 
     /**

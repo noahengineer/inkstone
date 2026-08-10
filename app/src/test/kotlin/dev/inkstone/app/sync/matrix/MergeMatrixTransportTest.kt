@@ -144,7 +144,7 @@ class MergeMatrixTransportTest {
             throw CancellationException("the sync worker was stopped")
         }
         assertFailsWith<CancellationException> { devices.a.drainer.drain() }
-        devices.a.materializer = devices.a.publisher
+        devices.a.materializer = devices.a.publishDirect
 
         val after = assertNotNull(
             devices.a.outboxRows().firstOrNull { it.opType == OutboxOpType.UPLOAD },
@@ -275,7 +275,7 @@ class MergeMatrixTransportTest {
         // A different note's published bytes, put at this note's path. Materialized on B and never
         // uploaded, so the server gains no extra file for the walk to adopt.
         val stranger = devices.b.createNote("Stranger")
-        devices.b.publisher.materialize(stranger)
+        devices.b.publisher.publish(stranger)
         devices.rawWrite(path, devices.b.publishedBytes(stranger))
 
         val pull = devices.a.pull()

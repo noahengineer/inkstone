@@ -10,7 +10,8 @@ import javax.inject.Singleton
  * `:core` declares what it needs (SPEC §2.2) and `:app` supplies it. Every entry that
  * once lived here has been filled in by the milestone that owned it:
  *
- *   DocumentMaterializer  M4  ->  :android:pdf's InkstonePdfMaterializer, wired in PlatformModule
+ *   PdfPublisher          M4  ->  :android:pdf's InkstonePdfMaterializer, wired in PlatformModule
+ *   DocumentMaterializer  M6  ->  NoteSessionHost — the *gated* publish, and the only binding
  *   PageThumbnailRenderer M3  ->  :android:ink's InkPageThumbnailRenderer
  *   CredentialStore       M5  ->  KeystoreCredentialStore  (AES-GCM, Keystore key, SPEC §14)
  *   WorkScheduler         M5  ->  WorkManagerScheduler

@@ -109,7 +109,7 @@ class MergeMatrixOutboxTest {
         devices.a.materializer = racing
 
         val first = devices.a.drainer.drain()
-        devices.a.materializer = devices.a.publisher
+        devices.a.materializer = devices.a.publishDirect
 
         assertTrue(racing.fired, "the seam never ran, so nothing was raced")
         assertEquals(1, first.requeued, "a note edited mid-flight was not re-enqueued")

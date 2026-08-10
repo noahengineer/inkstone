@@ -3,11 +3,11 @@ package dev.inkstone.android.pdf
 import dev.inkstone.core.model.AnnotationDensity
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.DocumentId
-import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.MaterializedFile
 import dev.inkstone.core.model.PageRef
+import dev.inkstone.core.model.PdfPublisher
 import dev.inkstone.core.model.StrokeOutliner
 import dev.inkstone.core.model.foldPage
 import dev.inkstone.core.storage.InkstoneMarker
@@ -22,7 +22,8 @@ import kotlinx.coroutines.withContext
 /**
  * SPEC §5.1/§5.2 — **materialization**: rewrite `document.pdf` from the bundle.
  *
- * This is `:core:model`'s [DocumentMaterializer], and it is the only thing about
+ * This is `:core:model`'s [PdfPublisher] — the *ungated* one, so only `NoteSessionHost` and
+ * `NoteEditor` may hold it. It is the only thing about
  * PDFs that leaves this module.
  *
  * ## ⭐ Rebase, then append exactly one update
@@ -58,7 +59,7 @@ public class InkstonePdfMaterializer internal constructor(
     private val outliner: StrokeOutliner,
     private val dispatcher: CoroutineDispatcher,
     private val writer: PdfWriter,
-) : DocumentMaterializer {
+) : PdfPublisher {
 
     /**
      * The only constructor callers outside this module can reach.
@@ -73,7 +74,7 @@ public class InkstonePdfMaterializer internal constructor(
         dispatcher: CoroutineDispatcher = Dispatchers.IO,
     ) : this(fs, store, outliner, dispatcher, PdfBoxWriter())
 
-    override suspend fun materialize(noteId: DocumentId): MaterializedFile = withContext(dispatcher) {
+    override suspend fun publish(noteId: DocumentId): MaterializedFile = withContext(dispatcher) {
         val note = checkNotNull(store.open(noteId)) { "no note ${noteId.value} to materialize" }
         val bundle = fs.readBytes(NoteLayout.bundle(noteId))
         val path = NoteLayout.documentPdf(noteId)

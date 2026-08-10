@@ -7,6 +7,8 @@ import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.IdFactory
+import dev.inkstone.core.model.MaterializedFile
+import dev.inkstone.core.model.PdfPublisher
 import dev.inkstone.core.storage.DeviceIdentity
 import dev.inkstone.core.storage.FileByteSource
 import dev.inkstone.core.storage.MergeReport
@@ -93,8 +95,8 @@ class NoteSessionHost @Inject constructor(
      * SPEC §5.2's publisher, for [materialize] — the third writer this class had to take
      * responsibility for. See that method for what publishing a note twice costs.
      */
-    private val materializer: DocumentMaterializer,
-) {
+    private val publisher: PdfPublisher,
+) : DocumentMaterializer {
 
     private val ids = IdFactory(clock)
     private val store = NoteStore(fs, clock, ids)
@@ -162,14 +164,19 @@ class NoteSessionHost @Inject constructor(
 
         /**
          * Fold and republish through the session **this editor already holds** — `MaterializeWorker`
-         * reaching in rather than writing `document.pdf` from underneath it.
+         * and `OutboxDrainer` reaching in rather than writing `document.pdf` from underneath it.
          *
          * Suspends until the editor has a session, like [mergeRemoteBundle].
          *
-         * @return false only when the editor can no longer run anything, or the PDF could not be
+         * ⚠️ **Answers the file, not a `Boolean`.** The drainer records `lastSyncedRev` from the
+         * revision the uploaded bytes were built from, and only the editor knows what that is once
+         * it has folded its own journal. A `Boolean` here is how the upload path came to record a
+         * revision the server did not have — see [DocumentMaterializer].
+         *
+         * @return null only when the editor can no longer run anything, or the PDF could not be
          *   written. Both mean the host publishing it itself is correct.
          */
-        suspend fun materialize(): Boolean
+        suspend fun materialize(): MaterializedFile?
     }
 
     /** Called from the editor's `ViewModel` as it is created; must be paired with [unregister]. */
@@ -233,7 +240,7 @@ class NoteSessionHost @Inject constructor(
      *
      * The worker exists for the notes the editor's `onStop` never covers: one bound to Nextcloud
      * from the library without ever being opened, and "idle while charging". It used to call
-     * [DocumentMaterializer] directly, which for an *open* note is a second writer with no ordering
+     * the raw [PdfPublisher] directly, which for an *open* note is a second writer with no ordering
      * against the first — the last half of M6's overlap finding, and the half the unique temp name
      * did not close.
      *
@@ -255,13 +262,14 @@ class NoteSessionHost @Inject constructor(
      * exception here would turn a retryable failure into a silent success — the worker's own
      * `catch` is the policy and this must not pre-empt it. The mutex is released either way.
      */
-    suspend fun materialize(noteId: DocumentId): Unit = withLock(noteId) {
+    override suspend fun materialize(noteId: DocumentId): MaterializedFile = withLock(noteId) {
         // The editor reports the note to the library itself (`onMaterialized`, which redraws the
         // thumbnail from the fold it has just written), so `noteRepublished` is only for the other
         // branch. Calling both would record one revision twice.
-        if (editorFor(noteId)?.materialize() == true) return@withLock
-        val materialized = materializer.materialize(noteId)
+        editorFor(noteId)?.materialize()?.let { return@withLock it }
+        val materialized = publisher.publish(noteId)
         library.noteRepublished(noteId, materialized.localRev)
+        materialized
     }
 
     // -----------------------------------------------------------------------

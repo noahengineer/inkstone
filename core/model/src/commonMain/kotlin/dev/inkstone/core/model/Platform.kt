@@ -16,9 +16,41 @@ package dev.inkstone.core.model
 /**
  * SPEC §5.2 — `:core:sync` needs a PDF to upload, and only `:android:pdf` can
  * produce one. Implemented in M4.
+ *
+ * ⭐ **This is the *gated* materialize, and it has exactly one implementation:
+ * `:app`'s `NoteSessionHost`.** That is the whole point of the type. A note the
+ * user has open is being written by its editor, and publishing it from anywhere
+ * else means two writers over one bundle — so the host holds the note's mutex and
+ * hands the work to the live editor when there is one.
+ *
+ * It used to be [PdfPublisher]'s job as well, and `OutboxDrainer` was wired
+ * straight to the raw publisher. That is the bug M6's gate-5 run found: for an
+ * **open** note the upload path published from outside the gate, then recorded
+ * `lastSyncedRev` for bytes that did not contain what the editor held — after
+ * which `SyncEngine.noteChanged` reads `localRev <= lastSyncedRev` and enqueues
+ * nothing, ever. The device goes silent for that work while every indicator reads
+ * healthy. `MaterializeWorker` already knew to route through the host; the drainer
+ * did not, and a KDoc saying so was not enough.
+ *
+ * Splitting the two apart is what makes the wrong wiring unrepresentable rather
+ * than remembered: there is nothing else a `DocumentMaterializer` parameter can be
+ * given. Same move as deleting `NoteSession.apply`'s `undoable` default.
  */
 public fun interface DocumentMaterializer {
     public suspend fun materialize(noteId: DocumentId): MaterializedFile
+}
+
+/**
+ * Writes `document.pdf` from the bundle on disk (SPEC §5.2), with **no idea whether
+ * anyone else is writing that note**.
+ *
+ * ⚠️ **Two callers, and no more:** `NoteSessionHost`, which holds the note's mutex
+ * and has already established that no editor holds it, and `NoteEditor`, which *is*
+ * that editor and is publishing its own session's bundle. Anything else wanting a
+ * note published wants [DocumentMaterializer].
+ */
+public fun interface PdfPublisher {
+    public suspend fun publish(noteId: DocumentId): MaterializedFile
 }
 
 /**

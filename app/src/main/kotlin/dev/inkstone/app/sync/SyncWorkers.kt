@@ -30,7 +30,11 @@ internal interface SyncWorkEntryPoint {
 
     /**
      * The single-writer gate (M6). [MaterializeWorker] publishes through it rather than through
-     * `DocumentMaterializer`, because an open note has an editor that also writes both files.
+     * `PdfPublisher`, because an open note has an editor that also writes both files.
+     *
+     * Since M6's gate-5 fix the host **is** the app's only `DocumentMaterializer`, so
+     * `OutboxDrainer` goes through it too — it used to hold the raw publisher, which is how an
+     * upload came to record a revision the server did not have.
      */
     fun sessions(): NoteSessionHost
 
@@ -170,7 +174,7 @@ class ReconcileWorker(context: Context, parameters: WorkerParameters) : Coroutin
  * This is for the ones it does not: a note bound to Nextcloud from the library without
  * ever being opened, and "idle while charging".
  *
- * ⚠️ **Through [NoteSessionHost], never through `DocumentMaterializer` directly.** For a note the
+ * ⚠️ **Through [NoteSessionHost], never through `PdfPublisher` directly.** For a note the
  * user has open that is two writers over one pair of files, and the failure is silent: the
  * materializer reads `note.inkstone`, embeds it and records its hash in the XMP marker, so a bundle
  * rewritten by the editor in between leaves this worker publishing a marker that describes a bundle

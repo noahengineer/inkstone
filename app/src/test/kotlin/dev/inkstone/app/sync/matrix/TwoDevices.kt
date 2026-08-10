@@ -23,6 +23,7 @@ import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.NoteSummary
 import dev.inkstone.core.model.PageId
+import dev.inkstone.core.model.PdfPublisher
 import dev.inkstone.core.storage.DeviceIdentity
 import dev.inkstone.core.storage.NoteLayout
 import dev.inkstone.core.storage.NoteSession
@@ -117,10 +118,22 @@ internal class Device(
     val gate: MatrixGate = MatrixGate(fs, clock, store, ids, index) { deviceId() }
 
     /** The real one. PdfBox runs as plain Java here — see `:app`'s `isReturnDefaultValues`. */
-    val publisher: DocumentMaterializer = InkstonePdfMaterializer(fs, store, MatrixOutliner, dispatcher)
+    val publisher: PdfPublisher = InkstonePdfMaterializer(fs, store, MatrixOutliner, dispatcher)
 
-    /** Swappable, for row 18's mid-flight edit. Everything else uses [publisher]. */
-    var materializer: DocumentMaterializer = publisher
+    /**
+     * What the drainer materializes through. Swappable, for row 18's mid-flight edit.
+     *
+     * ⚠️ **A degenerate gate, and the gap M6's gate-5 run fell into.** In production this is
+     * `NoteSessionHost`: a per-note mutex plus a registry of live editors, so publishing a note the
+     * user has **open** is handed to that editor's own session. There is no editor here and no
+     * mutex, so **no row in this harness can model an open note** — which is exactly the state where
+     * the upload path published behind the editor and recorded a `lastSyncedRev` the server did not
+     * have. Two emulators found it; 28 green rows did not. Read a pass here as *"the drainer's own
+     * ordering is right"*, never as *"publishing is safe while the note is open"*.
+     */
+    val publishDirect: DocumentMaterializer = DocumentMaterializer { publisher.publish(it) }
+
+    var materializer: DocumentMaterializer = publishDirect
 
     /**
      * The transport is `NextcloudTransport.create()` — the production one, real OkHttp.

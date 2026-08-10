@@ -3,7 +3,6 @@ package dev.inkstone.app.note
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
-import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.MaterializedFile
@@ -11,6 +10,7 @@ import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
+import dev.inkstone.core.model.PdfPublisher
 import dev.inkstone.core.model.StrokeGeometry
 import dev.inkstone.core.model.StrokeObject
 import dev.inkstone.core.storage.BundleContents
@@ -88,7 +88,7 @@ class NoteEditorConcurrencyTest {
         return Fixture(fs, note.document.id, page, peerBundle)
     }
 
-    private fun TestScope.editorOver(fixture: Fixture, materializer: DocumentMaterializer? = null) = NoteEditor(
+    private fun TestScope.editorOver(fixture: Fixture, publisher: PdfPublisher? = null) = NoteEditor(
         fs = fixture.fs,
         clock = clock,
         scope = this,
@@ -97,7 +97,7 @@ class NoteEditorConcurrencyTest {
         // long the test took to run.
         autosaveIntervalMs = Long.MAX_VALUE,
         documentId = fixture.id,
-        materializer = materializer,
+        publisher = publisher,
     )
 
     /**
@@ -237,7 +237,7 @@ class NoteEditorConcurrencyTest {
         // live editor. What is asserted here is that the route it was given serializes.
         val fixture = fixture()
         val seen = ArrayList<Set<ObjectId>>()
-        val editor = editorOver(fixture, materializer = recordingMaterializer(fixture, seen))
+        val editor = editorOver(fixture, publisher = recordingPublisher(fixture, seen))
         val surface = FakeSurface()
         editor.onSurfaceAttached(surface)
         runCurrent()
@@ -256,7 +256,7 @@ class NoteEditorConcurrencyTest {
         release.complete(Unit)
         merge.await()
 
-        assertTrue(publish.await(), "the worker's publish reported failure")
+        assertNotNull(publish.await(), "the worker's publish reported failure")
         assertEquals(
             listOf(setOf(ObjectId(PEER_STROKE))),
             seen,
@@ -269,18 +269,17 @@ class NoteEditorConcurrencyTest {
      * A materializer that records what was in `note.inkstone` **at the moment it ran** — which is
      * exactly what `InkstonePdfMaterializer` embeds and hashes.
      */
-    private fun recordingMaterializer(fixture: Fixture, seen: MutableList<Set<ObjectId>>) =
-        DocumentMaterializer { noteId ->
-            val reader = assertNotNull(
-                BundleReader.open(FileByteSource(fixture.fs, NoteLayout.bundle(noteId))),
-                "the bundle the publisher read is not a bundle",
-            )
-            val ids = reader.pageIds.flatMap { page -> reader.page(page)?.ops.orEmpty() }
-                .filterIsInstance<PageOp.AddObject>()
-                .mapTo(HashSet()) { it.obj.id }
-            seen += ids
-            MaterializedFile(path = "published.pdf", sizeBytes = 1L, sha256 = "", localRev = reader.document.localRev)
-        }
+    private fun recordingPublisher(fixture: Fixture, seen: MutableList<Set<ObjectId>>) = PdfPublisher { noteId ->
+        val reader = assertNotNull(
+            BundleReader.open(FileByteSource(fixture.fs, NoteLayout.bundle(noteId))),
+            "the bundle the publisher read is not a bundle",
+        )
+        val ids = reader.pageIds.flatMap { page -> reader.page(page)?.ops.orEmpty() }
+            .filterIsInstance<PageOp.AddObject>()
+            .mapTo(HashSet()) { it.obj.id }
+        seen += ids
+        MaterializedFile(path = "published.pdf", sizeBytes = 1L, sha256 = "", localRev = reader.document.localRev)
+    }
 
     private companion object {
         const val NOW = 1_800_000_000_000L

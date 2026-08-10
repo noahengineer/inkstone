@@ -13,6 +13,7 @@ import dev.inkstone.core.model.MaterializedFile
 import dev.inkstone.core.model.NextcloudCredential
 import dev.inkstone.core.model.NoteSummary
 import dev.inkstone.core.model.PagePoint
+import dev.inkstone.core.model.PdfPublisher
 import dev.inkstone.core.model.StrokeOutline
 import dev.inkstone.core.model.StrokeOutliner
 import dev.inkstone.core.model.WorkScheduler
@@ -360,7 +361,7 @@ internal class MatrixGate(
  * this side of the socket — so the seam is here, where the bytes are made.
  */
 internal class EditDuringUploadMaterializer(
-    private val delegate: DocumentMaterializer,
+    private val delegate: PdfPublisher,
     private val onBytesProduced: suspend (DocumentId) -> Unit,
 ) : DocumentMaterializer {
 
@@ -368,7 +369,7 @@ internal class EditDuringUploadMaterializer(
         private set
 
     override suspend fun materialize(noteId: DocumentId): MaterializedFile {
-        val file = delegate.materialize(noteId)
+        val file = delegate.publish(noteId)
         if (!fired) {
             fired = true
             onBytesProduced(noteId)

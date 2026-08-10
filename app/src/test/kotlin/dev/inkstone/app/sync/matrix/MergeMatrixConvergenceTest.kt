@@ -127,7 +127,7 @@ class MergeMatrixConvergenceTest {
         // The impossible merge, made as row 13b makes it: another note's published bytes at this
         // note's path, so the marker inside names a document this is not.
         val stranger = devices.b.createNote("Stranger")
-        devices.b.publisher.materialize(stranger)
+        devices.b.publisher.publish(stranger)
         devices.rawWrite(path, devices.b.publishedBytes(stranger))
 
         val first = devices.a.pull()
