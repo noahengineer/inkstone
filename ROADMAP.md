@@ -720,14 +720,22 @@ performed by the user** — required either way, since the app never sees the pa
 Login Flow v2 issues an app password per device). The README's *Two emulators as two sync peers* has
 the clone recipe and the launch traps.
 
-- [ ] Two devices, both offline, both write on the same page → reconnect → **both sets present, no prompt**
-      **Satisfied by:** the APK on two tablets bound to one Nextcloud folder; airplane mode on both;
-      a stroke on each in the same page; airplane mode off; both notes then showing both strokes and
-      no dialog having appeared. **Automated stand-in:** row 1, live. What only the devices add is
-      the real radio, the real WorkManager scheduling and a human confirming no prompt was shown.
-      ⚠️ **The emulator pair cannot stand in** — neither peer can sign in over cleartext; see the
-      three gates above.
-- [ ] Two devices, both offline, both add a page → **both pages present**, neither orphaned
+- [x] Two devices, both offline, both write on the same page → reconnect → **both sets present, no prompt**
+      **Done on two emulators against a real HTTPS Nextcloud** (`docs/M6-SYNC.md` §9): two installs
+      with different `device.id`s, each signed in by hand; one stroke each while both offline; back
+      online and **6 → 7 strokes on both within 30 s on the automatic poll alone** — no manual sync,
+      no dialog, and the receiving peer held its 100% zoom. Both ops carried Lamport counter 2 with
+      different device ids, so SPEC §4.1's tiebreak is what ordered them.
+      ⚠️ **It failed the first time**, and that is the finding: the merging device did not upload the
+      union, so the other sat at one stroke through six passes with both reading `SYNCED`. Root cause
+      in §9 — the upload path published outside `NoteSessionHost` and recorded a `lastSyncedRev` the
+      server did not have. Fixed in `45bd266`; this row describes the re-run.
+      **Still owed by the physical pair:** the real radio, real WorkManager scheduling under Doze,
+      and ink feel. An emulator pair does not substitute for those.
+- [x] Two devices, both offline, both add a page → **both pages present**, neither orphaned
+      **Done on the emulator pair** (`docs/M6-SYNC.md` §9): *Add page* on each while offline, then
+      **3 pages on both** after reconnect — the union, neither device's page dropped, and each peer
+      left on the page it had been viewing.
       **Satisfied by:** the same setup, *Add page* on each while offline, then a page count of 3 on
       both after reconnect. **Automated stand-in:** row 5, live, including surviving a `materialize`.
       ⚠️ Same cleartext sign-in block as the gate above, and the same HTTPS-plus-browser-sign-in
@@ -743,8 +751,15 @@ the clone recipe and the launch traps.
       finding the note in local trash, a *Needs attention* row naming it, and the stroke intact after
       Restore. **Automated stand-in:** row 14, live — and §5.5's first finding, which is what this
       gate would have caught had it been run: it required the note to be **open** at the time.
-- [ ] Both devices online with the same page open → strokes appear live, camera doesn't jump, your
+- [x] Both devices online with the same page open → strokes appear live, camera doesn't jump, your
       in-progress stroke survives.
+      **Done on the emulator pair** (`docs/M6-SYNC.md` §9). One peer drew; the other's **open** editor
+      went **2 → 5 strokes in under 30 s** while staying at **100% zoom on page 1/1**, untouched — it
+      picked up the new stroke *and* two the defect had stranded. The in-progress-stroke half is
+      `WetInkRemoteMergeTest` + `PageMetaLiveChangeTest` on an AVD, not a human holding a pen down.
+      ⚠️ **This was the gate that failed and found the bug**: before `45bd266` the stroke never
+      arrived at all — four minutes, eight samples, and the receiving peer's bundle never got it
+      either while both devices reported `SYNCED` at one ETag.
       **Satisfied by:** two tablets on one page, one person drawing while the other holds a stroke
       down. **Automated stand-in:** row 10's wet half on an AVD (ticked above) for the camera and the
       wet stroke; row 1 live for the merge; and `PageMetaLiveChangeTest` on an AVD for a paper change
@@ -783,13 +798,11 @@ the clone recipe and the launch traps.
       M0, not since M6. It matters more now than usual, M6 being the first milestone since M5 to add
       a `:core:*` edge (`:core:sync → :core:storage`).
       **Satisfied by:** a remote plus one push, or a macOS machine running `./gradlew linkIosCore`.
-- [ ] **M6 is not committed.** `git status`: **54 modified files and 45 untracked paths**, 5,774
-      insertions, all of it in the working tree only. `HEAD` is still `d6993e3` ("M5: notes upload
-      themselves") on a branch named `m5-nextcloud-auth-upload`. Every figure in this section
-      describes a tree that exists on one disk with no remote and no commit — which is also why none
-      of it can be reviewed, bisected, or recovered from a lost working copy.
-      **Satisfied by:** a branch named for M6, a commit, and — for anything above that says "CI" — a
-      remote to push it to.
+- [ ] **No remote.** M6 itself is committed (`4df34cd`), as are its follow-ups through `45bd266`,
+      but `git remote -v` is still empty and the branch is still named `m5-nextcloud-auth-upload`.
+      Nothing here can be reviewed, bisected from another machine, or recovered from a lost working
+      copy — and it is why every "CI" claim above, including guardrail 2's macOS job, has never run.
+      **Satisfied by:** a remote to push to, and a branch named for the milestone.
 - [ ] **The transform / style / z-order half of live re-render.** The `SetPageMeta` half is
       **closed** — `NoteSurface.setPageMeta` is implemented and verified on an emulator and through
       the UI (ticked above), and the attribution this bullet used to carry was wrong: the swallower
