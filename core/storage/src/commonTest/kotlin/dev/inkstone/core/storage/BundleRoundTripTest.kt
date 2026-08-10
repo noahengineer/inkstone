@@ -242,9 +242,13 @@ class BundleRoundTripTest {
 
     @Test
     fun `entries this build does not produce are carried through`() = runTest {
-        // `text/<pageId>.json` is M7's, `assets/` is M8's. A note that gains them must not
-        // lose them the next time an older build saves.
-        val recognised = """{"words":[{"t":"hello","box":[1,2,3,4]}]}""".encodeToByteArray()
+        // `assets/` is M8's, `future/` stands in for whatever comes after. A note that gains
+        // them must not lose them the next time an older build saves.
+        //
+        // ⚠️ This used to use `text/<pageId>.json`. M7 made that a KNOWN family (SPEC §5.5) —
+        // it is written from `PageContents` and excluded from `carriedNames` — so as a fixture
+        // for *unknown* data it now asserts the opposite of what it says.
+        val recognised = """{"anything":"a newer build understands this"}""".encodeToByteArray()
         val image = ByteArray(64) { it.toByte() }
         val first = BundleWriter.write(
             contents(mapOf(pageA to everythingPage())).let { base ->
@@ -252,7 +256,7 @@ class BundleRoundTripTest {
                     base.document,
                     base.pages,
                     base.highestClockCounter,
-                    carried = mapOf(Bundle.pageText(pageA) to recognised, "assets/img-1.webp" to image),
+                    carried = mapOf("future/${pageA.value}.bin" to recognised, "assets/img-1.webp" to image),
                 )
             },
         )
@@ -260,7 +264,7 @@ class BundleRoundTripTest {
         val reader = assertNotNull(BundleReader.open(MemoryByteSource(first)))
         val carried = reader.carried()
 
-        assertContentEquals(recognised, carried.getValue(Bundle.pageText(pageA)))
+        assertContentEquals(recognised, carried.getValue("future/${pageA.value}.bin"))
         assertContentEquals(image, carried.getValue("assets/img-1.webp"))
         assertContentEquals(
             first,

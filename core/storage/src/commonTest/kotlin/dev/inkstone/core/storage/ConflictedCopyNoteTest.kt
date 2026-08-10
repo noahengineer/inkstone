@@ -262,7 +262,11 @@ class ConflictedCopyNoteTest {
     fun `the peers unknown bundle entries survive into the copy`() = runTest {
         val (remoteId, _) = peerPublished()
         val document = peerDocument(remoteId)
-        val peerEntry = "text/${document.livePages[0].id.value}.json"
+        // ⚠️ M7 made `text/` a KNOWN entry family (SPEC §5.5), so it is no longer an example
+        // of one this build cannot interpret — `BundleWriter` emits it from `PageContents`
+        // and `carriedNames` excludes it. The carried path still has to work, so the
+        // fixture uses a name no build has ever claimed.
+        val peerEntry = "future/${document.livePages[0].id.value}.bin"
         val bytes = BundleWriter.write(
             BundleContents(
                 document = document,

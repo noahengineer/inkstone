@@ -27,6 +27,7 @@ import dev.inkstone.core.model.StrokeObject
 import dev.inkstone.core.model.Viewport
 import dev.inkstone.core.model.ZoomLimits
 import dev.inkstone.core.model.cameraFor
+import dev.inkstone.core.model.centredOn
 import dev.inkstone.core.model.leashedTo
 import dev.inkstone.core.model.zoomedAround
 
@@ -336,6 +337,24 @@ public class InkSurfaceView @JvmOverloads constructor(
         dryView.pageBackground = background
         dryView.sourcePage = null
         if (width > 0 && height > 0) camera = camera.leashed()
+    }
+
+    /**
+     * SPEC §8.4 — mark where a search hit landed, and bring it into view.
+     *
+     * ⚠️ **The camera move goes through the existing leash, not through a fresh `resetCamera`.**
+     * `Camera.leashedTo` builds a `coerceIn` range from the viewport extent and a zero viewport
+     * inverts that range and throws, which is why every camera move in this class is guarded on
+     * having been laid out. A search hit can perfectly well arrive before the surface has a
+     * size — the note opens *because* of the hit — so it is the one caller most likely to be
+     * early.
+     *
+     * @param box null clears the highlight.
+     */
+    public fun highlight(box: dev.inkstone.core.model.PageRect?) {
+        dryView.highlight = box
+        if (box == null || width <= 0 || height <= 0) return
+        camera = camera.centredOn(box.centreX, box.centreY, width.toFloat(), height.toFloat())
     }
 
     /**

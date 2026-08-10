@@ -44,5 +44,10 @@ class InkstoneApplication : Application() {
         // floor; the sixty-second figure SPEC §7.6 asks for is `PollTicker`'s, and it only runs
         // while a screen is in front.
         scheduler.ensurePeriodicReconcile()
+        // SPEC §8.3's backlog. Registered here rather than from a screen for the same reason the
+        // other two are: a note the user never reopens still has to become searchable, and a
+        // registration that only happens when someone opens the library is a registration that
+        // does not happen on the device that most needs it.
+        scheduler.ensurePeriodicRecognition()
     }
 }

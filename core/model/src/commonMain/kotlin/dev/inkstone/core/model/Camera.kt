@@ -135,6 +135,16 @@ private const val A_TRANS_Y = 5
 public fun Camera.panned(deltaView: Offset): Camera = copy(translate = translate + deltaView)
 
 /**
+ * Put the page-space point ([pageX], [pageY]) in the middle of a [viewWidth] x [viewHeight]
+ * viewport, keeping the current zoom (SPEC §8.4 — a search hit scrolls to the word).
+ *
+ * The scale is deliberately untouched. Zooming to the word as well would be helpful exactly
+ * once and disorienting every other time, and it would also throw away a zoom the user chose.
+ */
+public fun Camera.centredOn(pageX: Float, pageY: Float, viewWidth: Float, viewHeight: Float): Camera =
+    copy(translate = Offset(viewWidth / 2f - pageX * scale, viewHeight / 2f - pageY * scale))
+
+/**
  * Zoom by [factor] while holding the page point currently under [focusView]
  * stationary — the behaviour a pinch must have to feel attached to the fingers.
  *

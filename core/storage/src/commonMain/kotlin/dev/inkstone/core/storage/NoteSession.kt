@@ -19,6 +19,8 @@ import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageOrder
 import dev.inkstone.core.model.PageRef
 import dev.inkstone.core.model.PageSize
+import dev.inkstone.core.model.PageText
+import dev.inkstone.core.model.RecognisedLine
 import dev.inkstone.core.model.ShapeObject
 import dev.inkstone.core.model.StrokeObject
 import dev.inkstone.core.model.TextBoxObject
@@ -74,6 +76,30 @@ public class NoteSession(
 
     /** Ops written since the last flush, with the page each belongs to. */
     private val pending = ArrayList<PendingOp>()
+
+    /**
+     * SPEC §5.5 text produced since the last materialize, per page — see [recognised].
+     *
+     * ⚠️ Deliberately **not** in [cache]. That is an LRU over folded page logs and it is
+     * evicted at [maxCachedPages]; recognised text that fell out of it would be silently
+     * dropped by the next materialize, which is the same shape of bug as the one
+     * `reloadJournal` exists to prevent one level down. A page's text is a few kilobytes and
+     * a recognition pass covers the pages that changed, so this map is small and short-lived
+     * — [materialize] clears it.
+     */
+    private val pendingText = LinkedHashMap<PageId, ByteArray>()
+
+    /**
+     * Pages whose stored text a merge invalidated — see [reconcileText].
+     *
+     * ⚠️ **A separate set, because "no pending text" and "delete the stored text" are different
+     * instructions to [materialize] and it only sees one map.** Without this, dropping a page's
+     * stale text does nothing at all: `pendingText` has no entry, so materialize falls through
+     * to the reader's copy and writes the very bytes the merge just decided were wrong. The
+     * page would then be published, indexed and searched against ink it does not describe, and
+     * the only symptom is that search says a page contains a word it no longer contains.
+     */
+    private val clearedText = LinkedHashSet<PageId>()
 
     private var documentDirty = false
 
@@ -238,6 +264,99 @@ public class NoteSession(
 
     /** The folded page, loading and folding it if it is not cached. */
     public suspend fun page(pageId: PageId): FoldedPage = pageLog(pageId).state
+
+    // -----------------------------------------------------------------------
+    // SPEC §5.5 / §8 — recognised text
+    // -----------------------------------------------------------------------
+
+    /**
+     * This page's recognised text, **or null if it is stale** (SPEC §5.5).
+     *
+     * Staleness is not a background job's problem to notice: the stored text carries the
+     * digest of the ink it was read from, so a word erased two seconds ago makes this return
+     * null immediately, everywhere, without anything having to run. The search index and the
+     * PDF text layer both go through here for exactly that reason — a page whose ink has
+     * moved on must not be published with text describing what used to be on it.
+     */
+    public suspend fun recognisedText(pageId: PageId): PageText? {
+        val bytes = pendingText[pageId]
+            ?: note.reader?.pageText(pageId).takeIf { pageId !in clearedText }
+            ?: return null
+        val text = PageTextCodec.decode(bytes) ?: return null
+        return text.takeIf { it.describes(PageTextCodec.inkDigestOf(page(pageId))) }
+    }
+
+    /**
+     * Record what the recogniser made of [pageId]. Written to the bundle by the next
+     * [materialize] — recognition is advisory (SPEC §8.3) and never worth a bundle rewrite
+     * of its own.
+     *
+     * ⚠️ **The digest is computed here, from the page as it is right now**, rather than being
+     * passed in by the caller. Recognition is asynchronous by construction — SPEC §8.3 debounces
+     * it three seconds behind the pen — so the ink can and does change while it runs, and a
+     * caller stamping the digest it saw when it *started* would certify text against ink that
+     * no longer exists. Computing it at the moment of recording makes that particular lie
+     * impossible; the text is then either correct or detectably stale, never confidently wrong.
+     *
+     * @return false when the ink moved under the recogniser, in which case nothing is stored.
+     */
+    public suspend fun recognised(pageId: PageId, lines: List<RecognisedLine>, recogniser: String): Boolean {
+        if (document.pages.none { it.id == pageId && !it.deleted }) return false
+        val text = PageText(
+            pageId = pageId,
+            inkDigest = PageTextCodec.inkDigestOf(page(pageId)),
+            recogniser = recogniser,
+            lines = lines,
+        )
+        pendingText[pageId] = PageTextCodec.encode(text)
+        return true
+    }
+
+    /**
+     * ⭐ Settle one page's recognised text against a peer's — SPEC §5.5, the rule in [PageTextMerge].
+     *
+     * Called by [NoteMerge] for every live page where *either* side has text. Both devices run
+     * the identical function over the identical candidate set and the identical merged page, so
+     * they reach the identical answer without exchanging anything further.
+     *
+     * ⚠️ **A page neither side has text for is not passed here at all**, and that is the reason
+     * this is cheap. Deciding requires the page's digest, which requires folding it; a note whose
+     * pages have never been recognised therefore costs one `pageText` lookup per page — a small
+     * read from an already-open ZIP directory — and folds nothing.
+     *
+     * @param remote the peer's `text/<pageId>.json` bytes, or null when it has none.
+     * @return what happened, for the merge report. A [TextOutcome.DROPPED] is normal and expected
+     *   after a real two-device merge: the union of two devices' strokes is ink neither of them
+     *   recognised, so neither one's text describes it.
+     */
+    public suspend fun reconcileText(pageId: PageId, remote: ByteArray?): TextOutcome {
+        val localBytes = pendingText[pageId] ?: note.reader?.pageText(pageId).takeIf { pageId !in clearedText }
+        if (localBytes == null && remote == null) return TextOutcome.NEITHER
+
+        val local = localBytes?.let(PageTextCodec::decode)
+        val chosen = PageTextMerge.choose(local, remote?.let(PageTextCodec::decode), inkDigestOf(pageId))
+        return when {
+            chosen == null -> {
+                // Explicit tombstone rather than "leave it alone": the bundle's own copy is
+                // what materialize would otherwise carry forward, so not writing anything
+                // here is how stale text survives a merge that invalidated it.
+                pendingText.remove(pageId)
+                clearedText += pageId
+                if (local == null) TextOutcome.NEITHER else TextOutcome.DROPPED
+            }
+
+            chosen === local -> TextOutcome.KEPT_LOCAL
+
+            else -> {
+                pendingText[pageId] = PageTextCodec.encode(chosen)
+                clearedText -= pageId
+                TextOutcome.ADOPTED_REMOTE
+            }
+        }
+    }
+
+    /** The digest recognition would be certified against right now. For the merge rule. */
+    public suspend fun inkDigestOf(pageId: PageId): String = PageTextCodec.inkDigestOf(page(pageId))
 
     private suspend fun pageLog(pageId: PageId): PageLog {
         cache.remove(pageId)?.let { existing ->
@@ -501,14 +620,21 @@ public class NoteSession(
         val pages = LinkedHashMap<PageId, PageContents>()
         for (ref in document.pages) {
             val cached = cache[ref.id]
+            // SPEC §5.5 — text this session recognised wins over what is in the bundle;
+            // otherwise the bundle's own copy is carried forward. Read straight from the
+            // reader rather than through the fold, so a page nobody looked at keeps its
+            // text without being folded to find that out.
+            val text = pendingText[ref.id] ?: note.reader?.pageText(ref.id).takeIf { ref.id !in clearedText }
             pages[ref.id] = if (cached != null) {
-                PageContents(cached.state.size, cached.state.background, cached.ops)
+                PageContents(cached.state.size, cached.state.background, cached.ops, text)
             } else {
                 val loaded = store.loadPage(note, ref.id)
-                PageContents(loaded.size, loaded.background, loaded.ops)
+                PageContents(loaded.size, loaded.background, loaded.ops, text)
             }
         }
         note = store.materialize(note.copy(document = document), pages, extraCarried, extraCarriedManifest)
+        pendingText.clear()
+        clearedText.clear()
         document = note.document
         journalBytes = note.journalBytes
         // The cached logs' ops are now in the bundle; keeping them would double-count

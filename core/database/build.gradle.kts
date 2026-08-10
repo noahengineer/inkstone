@@ -12,6 +12,10 @@ kotlin {
             // transaction they need. The edge is within :core:*, so SPEC §2.1's one-way
             // rule is untouched, and it is acyclic: :core:database -> :core:sync -> :core:model.
             api(project(":core:sync"))
+            // M7. Same shape as the :core:sync edge above: SPEC §8.4's semantics live in
+            // :core:search where they can be tested without a driver or a device, and this
+            // module supplies the rows. Still acyclic and still within :core:*.
+            api(project(":core:search"))
             api(libs.sqldelight.runtime)
             api(libs.sqldelight.coroutines)
             implementation(libs.kotlinx.coroutines.core)

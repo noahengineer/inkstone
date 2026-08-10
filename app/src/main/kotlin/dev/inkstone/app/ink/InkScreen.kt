@@ -32,6 +32,7 @@ import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.PageSize
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -236,6 +237,10 @@ private fun InkSurfaceView.asNoteSurface(scope: CoroutineScope, editor: NoteEdit
         override fun drainOps(): List<List<PageOp>> = this@asNoteSurface.drainOps()
 
         override fun applyOps(ops: List<PageOp>, record: Boolean) = this@asNoteSurface.applyOps(ops, record)
+
+        // SPEC §8.4 — the real thing, not a stub. See the interface's KDoc for why that
+        // sentence is worth writing down.
+        override fun highlight(box: PageRect?) = this@asNoteSurface.highlight(box)
 
         /**
          * A paper change that must not disturb the pen — a peer's, or the undo of a local one.

@@ -14,6 +14,7 @@ import dev.inkstone.core.storage.InkstoneMarker
 import dev.inkstone.core.storage.NoteLayout
 import dev.inkstone.core.storage.NoteStore
 import dev.inkstone.core.storage.OpenNote
+import dev.inkstone.core.storage.PageTextCodec
 import dev.inkstone.core.storage.sha256Hex
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
@@ -152,6 +153,38 @@ public class InkstonePdfMaterializer internal constructor(
                 // be written — a page whose strokes were all erased away is not dense.
                 mode = AnnotationDensity.modeFor(outlines.count { !it.isEmpty }),
                 outlines = outlines,
+                words = wordsFor(note, folded),
+            )
+        }
+    }
+
+    /**
+     * ⭐ SPEC §5.5 — the invisible text layer's words, from the bundle's recognised text.
+     *
+     * **M4 built the machinery and wrote an empty word list; this is where M7 fills it in.**
+     * The boxes are not estimated from a rasterised glyph the way an OCR sandwich must
+     * estimate them — they came from the strokes that made the word, which is the thing
+     * Goodnotes structurally cannot do.
+     *
+     * ⚠️ **The digest is checked here, at publish time, and not taken on trust.** Recognition
+     * is debounced three seconds behind the pen and batched overnight (SPEC §8.3), so a page
+     * can perfectly well be published between a stroke landing and the recogniser catching up.
+     * Publishing the previous text then puts words into the PDF that are not on the page — and
+     * because the layer is invisible, *nothing would ever look wrong*: `pdfgrep` would find a
+     * word the user had rubbed out, in a file that renders correctly. An absent text layer is a
+     * feature that has not run yet; a stale one is a lie with a search index built on it.
+     */
+    private suspend fun wordsFor(note: OpenNote, folded: FoldedPage): List<InvisibleWord> {
+        val stored = note.reader?.pageText(folded.pageId) ?: return emptyList()
+        val text = PageTextCodec.decode(stored) ?: return emptyList()
+        if (!text.describes(PageTextCodec.inkDigestOf(folded))) return emptyList()
+        return text.words.map { word ->
+            InvisibleWord(
+                text = word.text,
+                leftPt = word.bounds.left,
+                topPt = word.bounds.top,
+                rightPt = word.bounds.right,
+                bottomPt = word.bounds.bottom,
             )
         }
     }

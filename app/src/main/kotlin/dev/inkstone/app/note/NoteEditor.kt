@@ -1,5 +1,7 @@
 package dev.inkstone.app.note
 
+import dev.inkstone.app.search.NoteRecogniser
+import dev.inkstone.app.search.RecognitionReport
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
@@ -12,6 +14,7 @@ import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.model.PdfPublisher
@@ -114,6 +117,12 @@ class NoteEditor(
      * missing publisher costs interoperability, never data.
      */
     private val publisher: PdfPublisher? = null,
+    /**
+     * SPEC §8.3's debounced recognition (M7). Null in tests and on a build with no ML Kit, in
+     * which case the note is simply never read — search degrades to titles and nothing else
+     * about the editor changes.
+     */
+    private val recogniser: NoteRecogniser? = null,
 ) {
 
     /**
@@ -286,6 +295,17 @@ class NoteEditor(
         fun applyOps(ops: List<PageOp>, record: Boolean)
 
         /**
+         * SPEC §8.4 — mark where a search hit landed and bring it into view; null clears it.
+         *
+         * ⚠️ **Not a `= Unit` default.** M6's `setPageMeta` was exactly that, with a KDoc
+         * explaining why, and it was the milestone's most convincing invisible bug: a
+         * recording fake made every test true of the editor and false of the app. A method
+         * with no body here would make "search finds it and nothing happens" the shipped
+         * behaviour, and the test suite would agree it worked.
+         */
+        fun highlight(box: PageRect?)
+
+        /**
          * The current page's size or paper changed **without** the page changing — a peer's
          * `SetPageMeta`, or the PageBar's template picker in **either** direction.
          *
@@ -317,6 +337,10 @@ class NoteEditor(
             } finally {
                 serial.unlock()
             }
+            // Its own coroutine, not a second statement here: `autosaveLoop` never returns,
+            // so anything after it is unreachable — which is how a loop can be written,
+            // reviewed, tested through its own function and still never run in the app.
+            work.launch { recognitionLoop() }
             autosaveLoop()
         }
     }
@@ -433,6 +457,84 @@ class NoteEditor(
             flushAndReport(session)
             publish()
         }
+        // SPEC §8.3 — "debounced ~3 s after the last stroke on a page". This is the one place
+        // that knows a gesture actually landed *and* is off the ink thread; hanging it off the
+        // surface's stroke-finished callback instead would put the timer on the UI thread
+        // inside `onStrokesFinished` (CLAUDE.md rule 7).
+        if (gestures.isNotEmpty()) {
+            unreadPages += page
+            lastStrokeAtMs = clock.nowEpochMillis()
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Recognition (SPEC §8.3)
+    // -----------------------------------------------------------------------
+
+    /** Pages the pen has touched since the recogniser last read them. */
+    private val unreadPages = LinkedHashSet<PageId>()
+
+    private var lastStrokeAtMs: Long = 0
+
+    /**
+     * ⭐ SPEC §8.3 — **never while the user is writing.**
+     *
+     * The loop wakes on its own timer and does nothing until the pen has been still for
+     * [RECOGNITION_DEBOUNCE_MS]. Recognising on every save would put ML Kit on the two-second
+     * autosave tick; recognising from the stroke callback would put it on the ink path. Both
+     * are CLAUDE.md rule 7, and the second is the one that would actually drop frames.
+     */
+    private suspend fun recognitionLoop() {
+        while (work.isActive) {
+            delay(RECOGNITION_POLL_MS)
+            val idleFor = clock.nowEpochMillis() - lastStrokeAtMs
+            if (unreadPages.isEmpty() || idleFor < RECOGNITION_DEBOUNCE_MS) continue
+            recogniseNow()
+        }
+    }
+
+    /**
+     * Read the pages the pen has touched. Takes [serial], so it queues behind a merge or a
+     * save rather than folding a page one of them is rewriting.
+     */
+    suspend fun recogniseNow(): RecognitionReport = serial.withLock { recogniseLocked() }
+
+    /**
+     * SPEC §8.3's background pass reaching a note this editor holds — `NoteSessionHost.recognise`
+     * handing the job here rather than opening a second session over the same note.
+     *
+     * @return null only when this editor can no longer run anything, which is the one case where
+     *   the host recognising through its own session is correct. Same contract, and the same
+     *   `work.async` reason, as [materializeInSession].
+     */
+    internal suspend fun recogniseInSession(): RecognitionReport? {
+        if (!work.isActive) return null
+        // Every live page, not just the unread ones: the batch pass exists to catch up a note
+        // the debounce never got to — a note opened, written in and closed inside three seconds.
+        return work.async { serial.withLock { recogniseAllLocked() } }.await()
+    }
+
+    private suspend fun recogniseAllLocked(): RecognitionReport {
+        val session = this.session ?: return RecognitionReport.NOTHING
+        val recogniser = this.recogniser ?: return RecognitionReport.NOTHING
+        unreadPages.clear()
+        val report = recogniser.recognise(session)
+        if (report.changedAnything) flushAndReport(session)
+        return report
+    }
+
+    private suspend fun recogniseLocked(): RecognitionReport {
+        val session = this.session ?: return RecognitionReport.NOTHING
+        val recogniser = this.recogniser ?: return RecognitionReport.NOTHING
+        // Taken before the pass, not after: a stroke landing while ML Kit is working must
+        // leave that page queued for the next round rather than being marked read. The
+        // session's ink digest would catch it anyway (SPEC §5.5), but catching it here saves
+        // publishing a page with no text at all until the next stroke.
+        val pages = unreadPages.toList()
+        unreadPages.clear()
+        val report = recogniser.recognise(session, pages)
+        if (report.changedAnything) flushAndReport(session)
+        return report
     }
 
     /**
@@ -979,6 +1081,17 @@ class NoteEditor(
     internal companion object {
         /** SPEC §5.1 — "flushed ~2 s". */
         const val AUTOSAVE_INTERVAL_MS = 2_000L
+
+        /** SPEC §8.3 — "debounced ~3 s after the last stroke on a page". */
+        const val RECOGNITION_DEBOUNCE_MS = 3_000L
+
+        /**
+         * How often the debounce is checked. Deliberately coarser than the debounce itself:
+         * the cost of being a second late reading a page nobody is looking at is nothing, and
+         * the cost of waking a coroutine every 200 ms for the whole time a note is open is a
+         * battery complaint nobody would trace back to here.
+         */
+        const val RECOGNITION_POLL_MS = 1_000L
         const val DEFAULT_TITLE = "Notebook"
         const val CANNOT_DELETE_LAST_PAGE = "A note needs at least one page."
 

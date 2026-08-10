@@ -24,7 +24,13 @@ complexity:
     # refitting the camera or cancelling the in-progress stroke. It cannot fold into loadPage
     # — loadPage does both of those deliberately, and the whole point of the new method is that
     # it does neither (SPEC §13.2 row 10).
-    thresholdInClasses: 27
+    # M7 added one more to InkSurfaceView — highlight, which marks a search hit's box and
+    # brings it into view (SPEC §8.4) — and three to NoteSession, which are one cohesive
+    # sub-API rather than three unrelated members: recognisedText reads a page's text and
+    # re-checks its ink digest, recognised records a pass, reconcileText settles a peer's copy
+    # against the merged page (SPEC §5.5). They cannot be one function; they have three
+    # different callers and only one of them may write.
+    thresholdInClasses: 30
     # A codec is one small function per type it encodes, by construction — OpCodec has a
     # writer and a reader for each of the seven op kinds and four object kinds. Collapsing
     # them into fewer, larger functions would make the format harder to check against

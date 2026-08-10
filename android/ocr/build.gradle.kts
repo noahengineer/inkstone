@@ -15,6 +15,21 @@ dependencies {
 
     implementation(libs.androidx.core.ktx)
 
+    implementation(libs.kotlinx.coroutines.core)
+
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.test.junit)
+    // The class `testInstrumentationRunner` names, and it is NOT transitive from
+    // androidx.test.ext:junit. Without it every instrumented test in this module dies with
+    // ClassNotFoundException before one of them runs, and `check` cannot see it because
+    // compiling an instrumented test is not dexing it (M5 found this in two other modules).
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.kotlinx.coroutines.test)
+}
+
+android {
+    defaultConfig {
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
 }

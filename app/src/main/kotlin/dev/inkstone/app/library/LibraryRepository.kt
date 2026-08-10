@@ -683,6 +683,46 @@ class LibraryRepository @Inject constructor(
         thumbnails.invalidate(id)
     }
 
+    /**
+     * SPEC §5.7 — one page's thumbnail, rendered from a fold the caller supplies.
+     *
+     * Delegated rather than letting the editor's `ViewModel` hold `Thumbnails` itself: the
+     * repository is already the library's whole surface *including* thumbnails (see the file
+     * header), and the note editor having a second, direct route to the cache is one more
+     * place for SPEC §5.7's invalidation rules to be applied inconsistently.
+     */
+    suspend fun pageThumbnail(id: DocumentId, pageId: PageId, fold: suspend () -> FoldedPage?) =
+        thumbnails.page(id, pageId, fold)
+
+    /**
+     * Every note SPEC §8.3's batch pass should look at — the whole live library.
+     *
+     * Trashed notes are excluded: they are not searchable (`Search.sq` filters them out), so
+     * reading them would spend a charging device's night producing text nothing can find.
+     * Restoring one puts it back in scope for the next pass.
+     */
+    suspend fun allNoteIdsForRecognition(): List<DocumentId> = index.allNotes(includeTrashed = false).map { it.id }
+
+    /**
+     * SPEC §8.3 — a recognition pass read this note and its bundle was rewritten (M7).
+     *
+     * ⚠️ **Two deliberate differences from its siblings, and each is a bug avoided.**
+     *
+     * `sync.noteChanged` **is** called: the bundle's bytes changed, so the note owes an upload,
+     * and leaving it out would make recognised text local-forever with nothing to say so — the
+     * shape of failure M6 found four times. It reaches here only when a page was actually read,
+     * because `NoteSessionHost.recognise` does not materialize otherwise; a nightly batch over
+     * an unchanged library must not re-upload it.
+     *
+     * `thumbnails.invalidate` is **not** called: recognition changes no pixels. Invalidating
+     * would make the batch pass redraw every page of every note it looked at, on the one code
+     * path deliberately scheduled for when the device is idle and charging.
+     */
+    suspend fun noteRecognised(id: DocumentId, localRev: Long, pageCount: Int) {
+        index.recordSave(id, localRev, pageCount, clock.nowEpochMillis())
+        sync.noteChanged(id)
+    }
+
     // -----------------------------------------------------------------------
     // What the reconciler reports back (SPEC §7.6's pull side, M6)
     // -----------------------------------------------------------------------

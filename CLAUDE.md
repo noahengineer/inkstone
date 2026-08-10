@@ -246,6 +246,7 @@ A milestone is done when:
 | **M4.0 spike result + PDF decisions** | `docs/M4-PDF.md` |
 | **M5 Nextcloud decisions + spike #4 status** | `docs/M5-NEXTCLOUD.md` |
 | **M6 pull/merge/conflict decisions + the 21-row status table** | `docs/M6-SYNC.md` |
+| **M7 recognition/search decisions + the segmented-vs-blob numbers** | `docs/M7-RECOGNITION.md` |
 
 ---
 
@@ -290,6 +291,44 @@ Collected during research so they don't get reintroduced from stale training dat
 - ⚠️ **`INSERT OR REPLACE` resets any column the statement omits to its DEFAULT.** It deletes the conflicting row and inserts a new one. `remoteBinding.lastSeenRemoteAt` was reset to 0 — *"never seen"* — by every ordinary binding write, which would have made the next reconcile pass read **the whole library as deleted on the server** and trash it. Carry such a value forward through a subquery inside the upsert, and let exactly one statement change it.
 - **A pruned subtree looks exactly like a deleted one.** "Known `oc:id` absent remotely" is only decidable for a directory the pass actually *walked*, so intersect with the walked set and require `everUploaded` (M6). Cache a directory's ETag only once everything beneath it finished, or an unmerged download prunes that subtree on every later pass and the note silently stops syncing while the poll reports success.
 - **A remote-side delete is not `noteTrashed`.** That enqueues a DELETE, and a DELETE **annihilates the pending UPLOAD** — which destroys the only queued route a note's unsynced edits had to the server, on a path whose comments all read correct (M6, SPEC §13.2 row 14). There is also nothing to delete; the file is already in the server's trash.
+- ⚠️ **There is no FTS5 on Android, and SPEC §8.4 said to use it** (M7). The system SQLite is built
+  with `SQLITE_ENABLE_FTS3` and `FTS4` and not `FTS5` — API 35, SQLite 3.44.3, four years after
+  FTS5 landed upstream. (Room ships `@Fts3`/`@Fts4` and no `@Fts5` for the same reason.) **iOS's
+  SQLite does have it**, so a `:core:*` module using it compiles, links, passes on the simulator
+  and fails on every Android device — Guardrail 2 pointing the wrong way. `FtsAvailabilityTest`
+  asserts it at runtime rather than leaving it remembered. And it would not have been enough
+  anyway: SPEC §8.4 wants a page-space box per hit, no FTS module stores geometry, so the per-word
+  table has to exist regardless — and then answers prefix queries by itself.
+- ⚠️ **The ML Kit digital-ink package is `com.google.mlkit.vision.digitalink.recognition`, not
+  `com.google.mlkit.vision.digitalink`** (M7). Google's own guide and every tutorial written from
+  it import the shorter one, which does not exist in 19.0.0; the result types live in a third
+  package shipped in a separate artifact. `WritingArea` is **width and height only — no origin**,
+  so ink must be translated so the line's top-left is at zero; passing page coordinates compiles
+  and returns plausible-looking text. `fromLanguageTag` returns **null** for an unsupported tag
+  despite being declared `throws`. All read off the AAR with `javap`.
+- **A recogniser wants strokes in WRITING order, not left-to-right** (M7). SPEC §8.2 said
+  left-to-right and has been corrected: a `t` is crossed and an `i` dotted after the word is
+  finished, so sorting by x is precisely SPEC §8.1's *"out-of-order strokes degrade results"*,
+  applied on purpose. Measured on 20 pages: word recall 0.378 against 0.313.
+- **Clustering strokes into lines needs vertical overlap AND baseline proximity** (M7). Overlap
+  must be normalised by the *shorter* box or an `o` beside an `l` starts its own line — and that
+  same normalisation scores 1.0 for an `o` sitting inside an `f`'s descender from the line above,
+  so one pair chains two lines and union-find chains the third. And the gap that separates a word
+  space from a column gutter is a fraction of the **line** height, not the stroke height; the two
+  differ by about three times, which is the difference between "words in a line" and "letters in
+  a word". Both found by measuring, not by reading: 304 lines and 632 lines respectively, where
+  there were 472.
+- ⚠️ **A synthetic fixture is the worst possible witness for a geometric heuristic** (M7). The
+  rotated-text detector passed its unit test and flagged **105** false positives on 20 real pages,
+  because a page of ordinary prose leaves a scattering of strokes that happen not to overlap their
+  neighbours and any four of them chain into a "run" once transposed. The fixture had nothing else
+  on the page. Same lesson as *"distrust a fixture more generous than production"*, in the one
+  place a fixture is least like real ink.
+- ⚠️ **Feeding a recogniser upside-down handwriting is not an error, it is a bad score** (M7).
+  Two fifths of the IAMonDo corpus declares an identity `canvasTransform` and the rest a 180°
+  affine; assuming one of them flipped 40% of the sample and cost the segmented arm more than half
+  its accuracy, reported as nothing at all. Found by rendering a page to a PNG and *looking at it*.
+  When a measurement is worse than it should be and nothing is failing, draw the input.
 - **`EncryptedSharedPreferences` was deprecated in 2025.** Keystore AES-GCM directly.
 - Nextcloud's `loginName` is **not** the WebDAV path segment. Fetch the UID from `/ocs/v2.php/cloud/user`.
 - Nextcloud forbids only `\` and `/` by default — **not** the Windows character set. Read the real rules from capabilities.

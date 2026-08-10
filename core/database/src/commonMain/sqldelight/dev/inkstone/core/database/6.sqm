@@ -1,0 +1,24 @@
+-- M7 — SPEC §8.4's search index. See Search.sq for why there is no virtual table.
+--
+-- Additive only: a new table and two indices, nothing altered. So an upgrade cannot
+-- mis-default a column that already held user data, which is the failure `4.sqm` and `5.sqm`
+-- had to be checked for by hand on a device (MigrationOnDeviceTest). The index starts empty
+-- and fills as recognition runs; an empty index is exactly ROADMAP M7's degraded state, in
+-- which search still finds notes by title.
+
+CREATE TABLE pageWord (
+    noteId   TEXT    NOT NULL,
+    pageId   TEXT    NOT NULL,
+    ordinal  INTEGER NOT NULL,
+    word     TEXT    NOT NULL,
+    wordFold TEXT    NOT NULL,
+    boxLeft   REAL NOT NULL,
+    boxTop    REAL NOT NULL,
+    boxRight  REAL NOT NULL,
+    boxBottom REAL NOT NULL,
+    PRIMARY KEY (noteId, pageId, ordinal)
+);
+
+CREATE INDEX pageWordByWord ON pageWord(wordFold);
+
+CREATE INDEX pageWordByNote ON pageWord(noteId);

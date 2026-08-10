@@ -483,6 +483,12 @@ internal class FakeMergeGate(
                 overriddenTitle = overriddenTitle,
                 carried = emptyMap(),
                 carriedManifest = emptyMap(),
+                // SPEC §5.5 (M7). Zero because this fake merges nothing: recognised text is
+                // settled by `NoteSession.reconcileText`, which a fake with no session cannot
+                // reach — stated here rather than defaulted, so the next report field is
+                // noticed too (the `undoable` lesson, applied to a data class).
+                textDropped = 0,
+                textAdopted = 0,
                 peerDeviceId = "peer-device",
                 peerHighestCounter = 41L,
             )

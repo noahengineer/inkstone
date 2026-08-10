@@ -141,6 +141,25 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
     }
 
     /**
+     * SPEC §8.4's search highlight: a translucent wash over the word that was found.
+     *
+     * Painted *over* the ink rather than behind it, and with alpha rather than a blend mode —
+     * this is an ordinary dry-layer draw, but the rule from SPEC §3.4 still applies in spirit:
+     * a blend mode here would look different the moment the wet layer was involved, and the
+     * highlight has no reason to want one.
+     */
+    fun paintHighlight(canvas: Canvas, box: dev.inkstone.core.model.PageRect) {
+        canvas.drawRect(box.left, box.top, box.right, box.bottom, highlightPaint)
+    }
+
+    /** Amber at ~40% — visible over black ink, and not mistakable for a highlighter stroke. */
+    private val highlightPaint = Paint().apply {
+        style = Paint.Style.FILL
+        color = 0x66FFC107
+        isAntiAlias = true
+    }
+
+    /**
      * Draws one stroke, minus whatever an eraser has taken out of it.
      *
      * The layer is bounded to the stroke, and only strokes that have actually been erased

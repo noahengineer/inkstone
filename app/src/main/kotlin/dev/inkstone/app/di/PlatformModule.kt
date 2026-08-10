@@ -13,6 +13,9 @@ import dev.inkstone.android.ink.InkBrushFactory
 import dev.inkstone.android.ink.InkPageThumbnailRenderer
 import dev.inkstone.android.ink.InkStrokeOutliner
 import dev.inkstone.android.ink.InkStrokeRebuilder
+import dev.inkstone.android.ink.InkStrokeSampler
+import dev.inkstone.android.ocr.MlKitModels
+import dev.inkstone.android.ocr.MlKitRecogniser
 import dev.inkstone.android.pdf.InkstonePdfMaterializer
 import dev.inkstone.android.pdf.PdfGateway
 import dev.inkstone.android.pdf.PdfPageRasterizer
@@ -27,16 +30,21 @@ import dev.inkstone.core.database.DatabaseDriverFactory
 import dev.inkstone.core.database.InkstoneDatabase
 import dev.inkstone.core.database.createDatabase
 import dev.inkstone.core.database.library.LibraryIndex
+import dev.inkstone.core.database.search.SqlSearchIndex
 import dev.inkstone.core.database.sync.SqlFolderBindingStore
 import dev.inkstone.core.database.sync.SqlPeerClockStore
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.CredentialStore
 import dev.inkstone.core.model.FileSystem
+import dev.inkstone.core.model.HandwritingRecogniser
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.PageThumbnailRenderer
 import dev.inkstone.core.model.PdfPublisher
+import dev.inkstone.core.model.RecognitionModels
 import dev.inkstone.core.model.RemoteBundleExtractor
+import dev.inkstone.core.model.StrokeSampler
 import dev.inkstone.core.model.WorkScheduler
+import dev.inkstone.core.search.SearchIndex
 import dev.inkstone.core.storage.NoteStore
 import dev.inkstone.core.storage.NoteTrash
 import dev.inkstone.core.storage.ThumbnailCache
@@ -138,6 +146,48 @@ object PlatformProvidersModule {
     @Provides
     @Singleton
     fun providePdfPageRasterizer(): PdfPageRasterizer = PdfPageRasterizer()
+
+    // -----------------------------------------------------------------------
+    // SPEC §8 — recognition and search (M7)
+    // -----------------------------------------------------------------------
+
+    /**
+     * SPEC §8.1's `(x, y, t)` out of SPEC §5.4's blob. Same three-modules-meet-here shape as
+     * [providePdfPublisher]: `:android:ink` owns the decoder, `:core:search` owns the
+     * segmentation, `:android:ocr` owns ML Kit, and none of them knows about the others.
+     */
+    @Provides
+    @Singleton
+    fun provideStrokeSampler(brushes: InkBrushFactory): StrokeSampler = InkStrokeSampler(brushes)
+
+    /**
+     * Provided concretely and adapted to its port below — the convention `SyncModule` uses for a
+     * store that both a screen and a `:core` port need. The settings screen wants the concrete
+     * type's download progress; `MlKitRecogniser` wants the port.
+     */
+    @Provides
+    @Singleton
+    fun provideMlKitModels(): MlKitModels = MlKitModels()
+
+    @Provides
+    @Singleton
+    fun provideRecognitionModels(models: MlKitModels): RecognitionModels = models
+
+    /**
+     * ⚠️ Constructed unconditionally, and that is safe **because nothing here touches ML Kit**.
+     * `MlKitRecogniser`'s constructor allocates no recogniser and asks Play Services nothing;
+     * the first call that could fail is inside `recognise`, which answers
+     * `RecognitionOutcome.Unavailable` rather than throwing. A provider that tried to decide at
+     * injection time whether recognition were possible would make the whole graph — and so the
+     * first screen — depend on a Play Services round trip.
+     */
+    @Provides
+    @Singleton
+    fun provideRecogniser(models: MlKitModels): HandwritingRecogniser = MlKitRecogniser(models = models)
+
+    @Provides
+    @Singleton
+    fun provideSearchIndex(database: InkstoneDatabase): SearchIndex = SqlSearchIndex(database, Dispatchers.IO)
 
     /**
      * SPEC §5.6 + §7.6 (M6) — what the reconciler gets out of a peer's published PDF.

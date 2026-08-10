@@ -547,7 +547,11 @@ class MergeFoundationTest {
         // the ones this build cannot render, so nothing would ever have looked wrong.
         val note = store.create("Notebook", "device-a")
         val session = session(note)
-        val peerEntry = "text/peer-page.json"
+        // ⚠️ M7 made `text/` a KNOWN entry family (SPEC §5.5), so it is no longer an example
+        // of one this build cannot interpret — `BundleWriter` emits it from `PageContents`
+        // and `carriedNames` excludes it. The carried path still has to work, so the
+        // fixture uses a name no build has ever claimed.
+        val peerEntry = "future/peer-page.bin"
         val peerBytes = "recognised by a newer build".encodeToByteArray()
 
         session.materialize(extraCarried = mapOf(peerEntry to peerBytes))

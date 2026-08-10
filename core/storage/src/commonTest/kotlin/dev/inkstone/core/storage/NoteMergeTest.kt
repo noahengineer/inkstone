@@ -371,7 +371,11 @@ class NoteMergeTest {
         val session = a.session(note)
         session.materialize()
 
-        val peerEntry = "text/peer.json"
+        // ⚠️ M7 made `text/` a KNOWN entry family (SPEC §5.5), so it is no longer an example
+        // of one this build cannot interpret — `BundleWriter` emits it from `PageContents`
+        // and `carriedNames` excludes it. The carried path still has to work, so the
+        // fixture uses a name no build has ever claimed.
+        val peerEntry = "future/peer.bin"
         val peer = BundleWriter.write(
             BundleContents(
                 document = note.document,

@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.inkstone.app.library.LibraryRepository
 import dev.inkstone.app.library.Thumbnails
+import dev.inkstone.app.search.NoteRecogniser
 import dev.inkstone.app.sync.NoteSessionHost
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
@@ -13,6 +14,7 @@ import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.PageId
+import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.model.PdfPublisher
@@ -41,7 +43,6 @@ class NoteEditorViewModel @Inject constructor(
     fs: FileSystem,
     clock: Clock,
     private val library: LibraryRepository,
-    private val thumbnails: Thumbnails,
     private val sourcePages: SourcePages,
     private val sharing: NoteSharing,
     /**
@@ -50,6 +51,8 @@ class NoteEditorViewModel @Inject constructor(
      */
     private val sessions: NoteSessionHost,
     publisher: PdfPublisher,
+    /** SPEC §8.3's recogniser (M7), handed to the editor so its debounce has something to run. */
+    recogniser: NoteRecogniser,
     savedState: SavedStateHandle,
 ) : ViewModel() {
 
@@ -85,6 +88,7 @@ class NoteEditorViewModel @Inject constructor(
             override suspend fun oldestAckedCounter(id: DocumentId) = library.oldestAckedCounter(id)
         },
         publisher = publisher,
+        recogniser = recogniser,
     )
 
     /**
@@ -116,17 +120,65 @@ class NoteEditorViewModel @Inject constructor(
         // rewritten, and the next library rebuild reads that as Recovered — see
         // `NoteSessionHost.materialize`.
         override suspend fun materialize() = editor.materializeInSession()
+
+        // SPEC §8.3's batch pass arriving at a note that happens to be open. Through this
+        // editor's own session for the same reason a merge is: two sessions over one note each
+        // hold their own pending ops, and whichever materializes second drops the other's work.
+        override suspend fun recognise() = editor.recogniseInSession()
     }
 
     init {
         noteId?.let { sessions.register(it, handle) }
+        // SPEC §8.4 — arrive at the word, not at the note. Queued rather than applied: the
+        // editor is still opening, and `showPage` takes the same lock the open holds.
+        val pageId = savedState.get<String>(ARG_PAGE_ID)?.let(::PageId)
+        val box = savedState.get<FloatArray>(ARG_HIT_BOX)
+        if (pageId != null) {
+            viewModelScope.launch {
+                editor.showPage(pageId)
+                pendingHighlight = box?.takeIf { it.size == BOX_VALUES }?.let(::rectOf)
+                applyPendingHighlight()
+            }
+        }
+    }
+
+    /**
+     * ⚠️ **Held until a surface exists.** The activity starts, this runs, and the
+     * `AndroidView` that owns the ink surface has not been created yet — so highlighting
+     * immediately writes into nothing and the user lands on the right page with no mark on it.
+     * [onSurfaceAttached] replays it.
+     */
+    private var pendingHighlight: PageRect? = null
+
+    /** `[left, top, right, bottom]`, in the order [NoteActivity.EXTRA_HIT_BOX] documents. */
+    private fun rectOf(box: FloatArray): PageRect =
+        PageRect(left = box[LEFT], top = box[TOP], right = box[RIGHT], bottom = box[BOTTOM])
+
+    private fun applyPendingHighlight() {
+        val box = pendingHighlight ?: return
+        if (surface?.let {
+                it.highlight(box)
+                true
+            } == true
+        ) {
+            pendingHighlight = null
+        }
     }
 
     val state: StateFlow<NoteEditorState> = editor.state
 
-    fun onSurfaceAttached(surface: NoteEditor.NoteSurface) = editor.onSurfaceAttached(surface)
+    private var surface: NoteEditor.NoteSurface? = null
 
-    fun onSurfaceDetached() = editor.onSurfaceDetached()
+    fun onSurfaceAttached(surface: NoteEditor.NoteSurface) {
+        this.surface = surface
+        editor.onSurfaceAttached(surface)
+        applyPendingHighlight()
+    }
+
+    fun onSurfaceDetached() {
+        surface = null
+        editor.onSurfaceDetached()
+    }
 
     fun undo() = editor.undo()
 
@@ -158,7 +210,7 @@ class NoteEditorViewModel @Inject constructor(
      * overview. Cached and rendered by [Thumbnails]; this only supplies the fold.
      */
     suspend fun pageThumbnail(pageId: PageId) = state.value.documentId?.let { id ->
-        thumbnails.page(id, pageId) { editor.foldedPage(pageId) }
+        library.pageThumbnail(id, pageId) { editor.foldedPage(pageId) }
     }
 
     /**
@@ -217,5 +269,18 @@ class NoteEditorViewModel @Inject constructor(
     companion object {
         /** The note to open, as a [SavedStateHandle] key. */
         const val ARG_NOTE_ID: String = "noteId"
+
+        /** SPEC §8.4 — the page a search hit is on. */
+        const val ARG_PAGE_ID: String = "pageId"
+
+        /** The hit's page-space box, `[left, top, right, bottom]`. */
+        const val ARG_HIT_BOX: String = "hitBox"
+
+        /** [NoteActivity.EXTRA_HIT_BOX]'s layout, named so the order cannot be transposed. */
+        private const val LEFT = 0
+        private const val TOP = 1
+        private const val RIGHT = 2
+        private const val BOTTOM = 3
+        private const val BOX_VALUES = 4
     }
 }

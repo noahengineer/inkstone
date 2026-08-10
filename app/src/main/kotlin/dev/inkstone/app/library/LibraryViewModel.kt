@@ -5,7 +5,9 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.inkstone.android.ocr.MlKitRecogniser
 import dev.inkstone.android.pdf.PdfOpenResult
+import dev.inkstone.app.platform.WorkManagerScheduler
 import dev.inkstone.app.sync.NoteSessionHost
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.Folder
@@ -15,15 +17,26 @@ import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.FolderTree
 import dev.inkstone.core.model.LibraryLayout
 import dev.inkstone.core.model.LibrarySort
+import dev.inkstone.core.model.ModelDownload
 import dev.inkstone.core.model.NoteSummary
+import dev.inkstone.core.model.RecognitionModels
+import dev.inkstone.core.search.SearchHit
+import dev.inkstone.core.search.SearchIndex
 import dev.inkstone.core.storage.PdfOpenMode
 import dev.inkstone.core.storage.RecoveryLoss
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -64,6 +77,21 @@ class LibraryViewModel @Inject constructor(
      */
     private val sessions: NoteSessionHost,
     /**
+     * SPEC §8.4 (M7). The same search box now answers two questions — *"is there a note called
+     * this"* and *"did I write this down"* — because the user is asking one.
+     */
+    private val searchIndex: SearchIndex,
+    /**
+     * SPEC §8.1's downloadable language models (M7).
+     *
+     * Offered from the search box rather than buried in a settings screen, because the moment
+     * a user wants handwriting search is the moment they type into it and find only titles —
+     * and *"nothing matched"* with no explanation is the outcome ROADMAP M7 asks not to ship.
+     */
+    private val models: RecognitionModels,
+    /** SPEC §8.3 — reading a library's backlog once the model arrives. */
+    private val scheduler: WorkManagerScheduler,
+    /**
      * Read here and nowhere deeper. A `Uri` is only readable while this process holds
      * the grant the picker made, and neither `:core:storage` nor `:android:pdf` may
      * learn what a `ContentResolver` is.
@@ -90,14 +118,79 @@ class LibraryViewModel @Inject constructor(
         repository.openAttentionCount,
     ) { pinned, flagged, count -> SyncOverlay(pinned, flagged, count) }
 
+    /**
+     * SPEC §8.4's handwriting hits for the current query.
+     *
+     * ⚠️ **Debounced and off the state combine.** Title filtering is a pure function of lists
+     * already in memory (see this class's KDoc); a handwriting search is a database round trip
+     * per keystroke, and folding it into `state` would put one on every character typed *and*
+     * on every unrelated emission of `repository.notes`. `flatMapLatest` also cancels the query
+     * for a prefix the user has already typed past.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
+    private val handwritingHits: StateFlow<List<SearchHit>> = controls
+        .map { it.query }
+        .distinctUntilChanged()
+        .debounce(SEARCH_DEBOUNCE_MS)
+        .flatMapLatest { query ->
+            flow {
+                // Blank clears rather than searching: the index would answer "everything",
+                // and a library-wide list of every word ever written is not a search result.
+                emit(if (query.isBlank()) emptyList() else searchIndex.search(query).filter { it.pageId != null })
+            }
+        }
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), emptyList())
+
+    private val modelState = MutableStateFlow(RecognitionModelState())
+
+    /**
+     * ⚠️ **Asked once, not polled.** `isModelDownloaded` is a Play Services round trip; putting
+     * it in the state combine would fire one per emission of every library flow.
+     */
+    private fun refreshModel() {
+        viewModelScope.launch {
+            // Suspends, so it is resolved before the update rather than inside it — the
+            // update lambda is not a coroutine body.
+            val downloaded = models.isDownloaded(MlKitRecogniser.DEFAULT_LANGUAGE)
+            modelState.value = modelState.value.copy(downloaded = downloaded)
+        }
+    }
+
+    /**
+     * SPEC §8.1 — the user asked for the model, so it is fetched. Never called on their behalf:
+     * it is tens of megabytes on a connection they may be paying for, and ML Kit reports
+     * anonymous usage metrics to Google, which is a thing to say before the download and not
+     * after.
+     */
+    fun downloadRecognitionModel() {
+        if (modelState.value.downloading) return
+        modelState.value = modelState.value.copy(downloading = true, error = null)
+        viewModelScope.launch {
+            val outcome = models.download(MlKitRecogniser.DEFAULT_LANGUAGE, unmeteredOnly = false)
+            modelState.value = modelState.value.copy(
+                downloading = false,
+                downloaded = outcome is ModelDownload.Done,
+                error = (outcome as? ModelDownload.Failed)?.message,
+            )
+            // Everything already written is unread. One pass now, rather than waiting for the
+            // device to be idle and charging — the user just said they want this.
+            if (outcome is ModelDownload.Done) {
+                repository.allNoteIdsForRecognition().forEach(scheduler::enqueueRecognition)
+            }
+        }
+    }
+
     val state: StateFlow<LibraryUiState> = combine(
         repository.folders,
         repository.notes,
         controls,
         message,
-        overlay,
-    ) { folders, notes, controls, message, overlay ->
-        uiStateOf(folders, notes, controls, message, overlay)
+        // ⚠️ Combined into one flow rather than passed as a sixth: `combine` has typed
+        // overloads up to five, and the six-flow form is `Array<Any?>` with every element
+        // cast by hand — which compiles for the wrong arrangement just as happily.
+        combine(overlay, handwritingHits, modelState) { overlay, hits, model -> Triple(overlay, hits, model) },
+    ) { folders, notes, controls, message, (overlay, hits, model) ->
+        uiStateOf(folders, notes, controls, message, overlay, hits, model)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), LibraryUiState())
 
     val trash: StateFlow<TrashUiState> = combine(
@@ -112,6 +205,7 @@ class LibraryViewModel @Inject constructor(
         // cache. All three are I/O and none of them blocks the first frame — the library
         // renders from whatever the index already says and corrects itself a moment later.
         viewModelScope.launch { repository.startup() }
+        refreshModel()
     }
 
     // -----------------------------------------------------------------------
@@ -374,6 +468,8 @@ private fun uiStateOf(
     controls: LibraryControls,
     message: String?,
     overlay: SyncOverlay,
+    handwritingHits: List<SearchHit>,
+    model: RecognitionModelState,
 ): LibraryUiState {
     val searching = controls.query.isNotBlank()
     val visibleNotes = LibraryFiltering.visibleNotes(
@@ -405,6 +501,8 @@ private fun uiStateOf(
         query = controls.query,
         favouritesOnly = controls.favouritesOnly,
         searching = searching,
+        handwritingHits = handwritingHits,
+        model = model,
         // A selected note that has since been trashed or moved out of view must not stay
         // selected, or "Trash 3 notes" would act on a note the user can no longer see.
         selection = controls.selection intersect visibleNotes.mapTo(HashSet()) { it.id },
@@ -415,12 +513,37 @@ private fun uiStateOf(
 
 private fun notesWord(count: Int) = if (count == 1) "note" else "notes"
 
+/**
+ * ⚠️ There is deliberately only **one** of these. A sibling for `RecognitionModelState` looks
+ * obvious and does not compile: generics erase, so both would be
+ * `update(MutableStateFlow, Function1)` on the JVM. The model state assigns `.value` directly.
+ */
 private fun MutableStateFlow<LibraryControls>.update(transform: (LibraryControls) -> LibraryControls) {
     value = transform(value)
 }
 
+/**
+ * SPEC §8.1's language model, as the search box needs to talk about it.
+ *
+ * @property downloaded false is the ordinary state of a fresh install and is **not** an error.
+ *   ROADMAP M7: the app works fully without it and search degrades to titles.
+ */
+data class RecognitionModelState(
+    val downloaded: Boolean = true,
+    val downloading: Boolean = false,
+    val error: String? = null,
+)
+
 /** Long enough to survive a rotation without re-subscribing to the database. */
 private const val STOP_TIMEOUT_MS = 5_000L
+
+/**
+ * How long the typing has to stop before the handwriting index is asked.
+ *
+ * 250 ms — long enough that typing a five-letter word costs one query rather than five, short
+ * enough that it still feels like the results are keeping up.
+ */
+private const val SEARCH_DEBOUNCE_MS = 250L
 
 /** The knobs the user turns. Separate from [LibraryUiState], which is derived from these. */
 private data class LibraryControls(
@@ -482,6 +605,14 @@ data class LibraryUiState(
     val query: String = "",
     val favouritesOnly: Boolean = false,
     val searching: Boolean = false,
+    /**
+     * SPEC §8.4 — pages whose *handwriting* matches the query, each with the box to scroll to.
+     * Empty when nothing has been recognised, which is ROADMAP M7's degraded state and is
+     * indistinguishable from "no page says that" on purpose: both mean there is nothing to show.
+     */
+    val handwritingHits: List<SearchHit> = emptyList(),
+    /** SPEC §8.1's model, so the search box can say why it is only finding titles. */
+    val model: RecognitionModelState = RecognitionModelState(),
     val selection: Set<DocumentId> = emptySet(),
     val message: String? = null,
     /** False until the first database emission, so "no notes yet" is not shown to a full library. */

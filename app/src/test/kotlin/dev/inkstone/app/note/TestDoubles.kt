@@ -6,6 +6,7 @@ import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.PageSize
 
 /**
@@ -51,6 +52,23 @@ internal class FakeSurface : NoteEditor.NoteSurface {
 
     override fun applyOps(ops: List<PageOp>, record: Boolean) {
         applied += Applied(ops, record)
+    }
+
+    /**
+     * What [NoteEditor.NoteSurface.highlight] was last given (SPEC §8.4).
+     *
+     * ⚠️ **A recording fake, and it can only ever prove that the editor asked.** M6's
+     * `setPageMeta` was recorded by this same class while the production surface did nothing at
+     * all, and every assertion was simultaneously true of the editor and false of the app. So
+     * the fact that this records is not evidence the highlight is drawn — that lives in
+     * `InkSurfaceView.highlight` and `PagePainter.paintHighlight`, and the only check that
+     * covers it is driving the app.
+     */
+    var highlighted: PageRect? = null
+        private set
+
+    override fun highlight(box: PageRect?) {
+        highlighted = box
     }
 
     /**

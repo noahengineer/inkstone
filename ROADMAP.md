@@ -883,12 +883,23 @@ them passing.
 
 ### Acceptance
 
-- [ ] Write a page, search a word from it → correct result, correct page, highlighted in place
-- [ ] Recognition never drops a frame while writing
-- [ ] Delete the language model → app works fully, search degrades to titles, message is clear
-- [ ] **`pdfgrep` finds handwritten words in an exported PDF** ← the hard criterion
-- [ ] Line segmentation measurably beats whole-page-as-one-blob on a 20-page sample — **show both numbers**
-- [ ] *(Optional, environment-dependent)* Nextcloud full-text search finds it. ⚠️ This requires the `fulltextsearch` app plus Elasticsearch/OpenSearch plus a PDF extractor — **not present in a default install.** Set that up first if you want to test it; don't treat its absence as a failure.
+- [x] Write a page, search a word from it → correct result, correct page, highlighted in place —
+      driven over adb: drawn with `input stylus`, typed `III`, tapped the hit, screenshotted the
+      amber highlight sitting on the word
+- [x] Recognition never drops a frame while writing — it is off the ink path by construction
+      (debounced 3 s in the editor's own coroutine, never in `onStrokesFinished`). ⚠️ *Not*
+      measured: frame timing needs the Galaxy Tab, so this is a structural claim, not a number
+- [x] Delete the language model → app works fully, search degrades to titles, message is clear —
+      verified on a fresh install before any download
+- [x] **`pdfgrep` finds handwritten words in an exported PDF** ← the hard criterion. `pdfgrep`
+      itself is not installable here; run with **Xpdf's `pdftotext` (the engine `pdfgrep` is built
+      on) and `pypdf`**, both against the app's own `document.pdf`. See `docs/M7-RECOGNITION.md` §2
+- [x] Line segmentation measurably beats whole-page-as-one-blob on a 20-page sample — **both
+      numbers: CER 0.272 vs 0.848, word recall 0.714 vs 0.071**, 20 writers, IAMonDo
+- [ ] *(Optional, environment-dependent)* Nextcloud full-text search finds it — **not attempted**;
+      needs `fulltextsearch` + a search backend + a PDF extractor, none in a default install
+- [ ] ⚠️ **Definition of done #4 — the Galaxy Tab — is NOT met.** Everything above is an x86_64
+      emulator
 
 ### Prompt
 

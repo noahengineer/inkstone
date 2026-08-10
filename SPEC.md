@@ -788,6 +788,12 @@ PDF text rendering mode **`3 Tr`** (neither fill nor stroke) — the "sandwich" 
 
 Result: `pdfgrep` finds your handwriting. So does Acrobat, Preview, and (if configured) Nextcloud full-text search. **This is the thing Goodnotes structurally cannot do.**
 
+✅ **Discharged in M7 — see `PageTextMerge`.** `text/` is now a *known* bundle entry family
+(written from `PageContents.text`, excluded from `carriedNames`), and the file carries an
+`inkDigest` over the ink it was read from. A merge keeps whichever candidate still describes the
+merged page and drops both when neither does, which converges in one step with no clock. The
+original concern, kept because the reasoning is the design:
+
 ⚠️ **Before M7 writes the first `text/<pageId>.json`, carried bundle entries have to be ordered.**
 A merge unions the peer's carried entries with the local ones **local-wins** (§7.7, `NoteStore.materialize`),
 and that rule is symmetric: for an entry name *both* devices produce, each keeps its own value, neither
@@ -1690,12 +1696,34 @@ Quota via PROPFIND `d:quota-available-bytes` — ⚠️ **sentinel negatives**: 
 
 ### 8.2 Line segmentation
 
-1. Compute stroke bounding boxes (page space)
-2. Cluster by vertical overlap and baseline proximity
-3. Order clusters top-to-bottom, strokes left-to-right within
-4. Emit one `Ink` per line with a line-sized `WritingArea`
+1. Compute stroke bounding boxes (page space) — from the **samples**, not the tessellated mesh
+2. Cluster by vertical overlap **and baseline proximity** — both, see below
+3. Order clusters top-to-bottom; within a line, keep the strokes **in the order they were written**
+4. Emit one `Ink` per line with a line-sized `WritingArea`, and the previous line as `preContext`
 
 Multi-column and rotated text are out of scope for v1 — detect and skip rather than emitting nonsense.
+
+#### Corrected in M7, all three by measurement
+
+**Step 2 needs both signals, and overlap alone is the failure.** Overlap has to be normalised by
+the *shorter* box or an `o` beside an `l` starts its own line — and that same normalisation
+scores a perfect 1.0 for an `o` that happens to sit inside the vertical span of an `f`
+descending from the line above. One such pair chains two lines and union-find chains the third.
+Measured on 20 real pages, overlap alone found **304 lines where there were 472**. The baseline
+— the *bottoms* of the boxes — is the stable feature: ascenders rise above it, descenders fall
+below it by less than a line's pitch.
+
+**Step 3 said "left-to-right within" and that is wrong for the recogniser.** The model is trained
+on natural writing, where a `t` is crossed and an `i` dotted *after* the word is finished, so
+sorting by x moves those marks into the middle of the word — which is exactly §8.1's
+*"out-of-order strokes degrade results"*, applied by us on purpose. Measured: word recall
+**0.378** in draw order against **0.313** in x order. Only the *lines* are ordered spatially.
+
+**The gap that separates a word space from a column gutter is a fraction of the LINE height, not
+of the stroke height.** The first implementation scaled it to the median stroke height — about one
+letter — and split every line into its individual words: **632 lines where there were 472**. The
+two scales differ by roughly three times, which put the cut-off squarely between "letters in a
+word" and "words in a line".
 
 ### 8.3 When it runs
 
@@ -1703,7 +1731,26 @@ Never during writing. Never on the UI thread. Debounced ~3 s after the last stro
 
 ### 8.4 Search
 
-SQLite FTS5 over recognised text + titles + folder names. Results carry note + page + page-space bounding box, so a tap scrolls to and highlights the word. The same data feeds §5.5's invisible PDF text layer.
+Full-text search over recognised text + titles + folder names. Results carry note + page +
+page-space bounding box, so a tap scrolls to and highlights the word. The same data feeds §5.5's
+invisible PDF text layer.
+
+⚠️ **This section said FTS5. There is no FTS5 on Android, and it would not have been enough
+anyway** (corrected in M7). Two independent reasons:
+
+- **It is not there.** Android's SQLite is built with `SQLITE_ENABLE_FTS3` and `FTS4` and not
+  `FTS5` — on API 35, SQLite 3.44.3, four years after FTS5 landed upstream. Proved at runtime by
+  `FtsAvailabilityTest`, which creates the virtual table on a device and asserts the failure;
+  corroborated by Room shipping `@Fts3`/`@Fts4` and no `@Fts5`. **iOS's SQLite does have it**,
+  which is precisely what would have let a `:core:*` module using it compile, link, pass on the
+  simulator and fail on every Android device.
+- **An FTS table stores text, not geometry.** This section also requires a page-space box per
+  hit. No FTS module of any version holds one, so a per-word table has to exist regardless — and
+  once it does it answers word and prefix queries by itself through an ordinary index.
+
+So: one `pageWord(noteId, pageId, ordinal, word, wordFold, box…)` table, one index on `wordFold`,
+and a prefix **range scan** (`word >= p AND word < p + '￿'`). `LIKE 'p%'` cannot use the
+index and degrades to a full scan of every word in the library.
 
 ---
 

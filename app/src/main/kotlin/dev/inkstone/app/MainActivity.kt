@@ -46,6 +46,7 @@ import dev.inkstone.app.ui.InkstoneTheme
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FolderId
+import dev.inkstone.core.search.SearchHit
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -329,6 +330,8 @@ class MainActivity : ComponentActivity() {
     ) = LibraryActions(
         onOpenAttention = onOpenAttention,
         onOpenNote = ::openNote,
+        onOpenHit = ::openHit,
+        onDownloadModel = library::downloadRecognitionModel,
         onOpenFolder = library::openFolder,
         onGoUp = { library.goUp() },
         onNewNote = { library.createNote(::openNote) },
@@ -381,6 +384,18 @@ class MainActivity : ComponentActivity() {
     private fun openNote(id: DocumentId) {
         startActivity(
             Intent(this, NoteActivity::class.java).putExtra(NoteActivity.EXTRA_NOTE_ID, id.value),
+        )
+    }
+
+    /** SPEC §8.4 — *"a tap scrolls to and highlights the word"*. */
+    private fun openHit(hit: SearchHit) {
+        val page = hit.pageId ?: return openNote(hit.noteId)
+        val box = hit.bounds?.let { floatArrayOf(it.left, it.top, it.right, it.bottom) }
+        startActivity(
+            Intent(this, NoteActivity::class.java)
+                .putExtra(NoteActivity.EXTRA_NOTE_ID, hit.noteId.value)
+                .putExtra(NoteActivity.EXTRA_PAGE_ID, page.value)
+                .putExtra(NoteActivity.EXTRA_HIT_BOX, box),
         )
     }
 }

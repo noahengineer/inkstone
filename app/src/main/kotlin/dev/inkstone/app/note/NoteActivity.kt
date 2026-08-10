@@ -109,5 +109,16 @@ class NoteActivity : ComponentActivity() {
     companion object {
         /** The note to open, as a [dev.inkstone.core.model.DocumentId]'s string value. */
         const val EXTRA_NOTE_ID: String = NoteEditorViewModel.ARG_NOTE_ID
+
+        /** SPEC §8.4 — the page a search hit is on. Absent means "wherever the note was". */
+        const val EXTRA_PAGE_ID: String = NoteEditorViewModel.ARG_PAGE_ID
+
+        /**
+         * The hit's page-space box as `[left, top, right, bottom]`, to highlight.
+         *
+         * A float array rather than four extras because it travels as one thing and is
+         * meaningless in parts — three of four would place a rectangle somewhere plausible.
+         */
+        const val EXTRA_HIT_BOX: String = NoteEditorViewModel.ARG_HIT_BOX
     }
 }

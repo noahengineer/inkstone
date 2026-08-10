@@ -156,8 +156,24 @@ public class BundleContents(
     public val highestClockCounter: Long = maxOf(highestClockCounter, document.titleClock?.counter ?: 0L)
 }
 
-/** One page's log, as it goes into the bundle. */
-public class PageContents(public val size: PageSize, public val background: Background, public val ops: List<PageOp>)
+/**
+ * One page's log, as it goes into the bundle.
+ *
+ * @property text SPEC §5.5's recognised text for this page, already encoded
+ *   ([PageTextCodec]), or null when the page has none — which is every page until M7's
+ *   recogniser has been over it, and every page forever on a device with no language model.
+ *
+ *   ⚠️ **Bytes rather than a [dev.inkstone.core.model.PageText]** so that a page nobody
+ *   folded can be copied from the old bundle to the new one without decoding and re-encoding
+ *   it. Materializing touches every page, most of which are not in the cache; making that
+ *   path pay for a JSON round trip per page is how opening a 200-page notebook gets slow.
+ */
+public class PageContents(
+    public val size: PageSize,
+    public val background: Background,
+    public val ops: List<PageOp>,
+    public val text: ByteArray? = null,
+)
 
 /**
  * Serialises a [BundleContents] to bytes.
@@ -189,6 +205,10 @@ public object BundleWriter {
             // Always written, even when empty: an absent `.ink` and an empty one are
             // different states to debug, and an empty stored entry costs 60 bytes.
             entries += Zip.Entry(Bundle.pageInk(ref.id), geometry.toByteArray())
+            // ⚠️ Unlike `.ink`, absent when there is none — an empty `text/` entry would
+            // decode to a `PageText` with no digest, which `PageTextMerge` would then have
+            // to distinguish from "not recognised yet". Absent already means that.
+            page.text?.let { entries += Zip.Entry(Bundle.pageText(ref.id), it) }
         }
 
         // Sorted by name, not by map order: `toSortedMap` is JVM-only, and the point is
@@ -263,11 +283,29 @@ public class BundleReader private constructor(
     /** Every page the manifest lists, tombstones included. */
     public val pageIds: List<PageId> get() = document.pages.map { it.id }
 
-    /** Names of entries this build does not produce, to carry through on the next write. */
+    /**
+     * Names of entries this build does not produce, to carry through on the next write.
+     *
+     * ⚠️ **`text/` is excluded, and that exclusion is load-bearing** (M7). It was carried
+     * data until recognition shipped; now [BundleWriter] emits it from [PageContents.text].
+     * Leaving it here as well would make every page's text *both* carried and written, and
+     * [Zip.write] neither de-duplicates nor complains — it would append two entries with one
+     * name, the central directory's last one would win on read, and which one that is
+     * depends on map iteration order. Two states, one file, no error.
+     */
     public val carriedNames: List<String>
         get() = directory.names.filterNot { name ->
-            name == Bundle.MANIFEST || name.startsWith(Bundle.PAGES_DIR)
+            name == Bundle.MANIFEST || name.startsWith(Bundle.PAGES_DIR) || name.startsWith(Bundle.TEXT_DIR)
         }
+
+    /**
+     * SPEC §5.5's recognised text for one page, as stored — or null when it has none.
+     *
+     * A separate read from [page], so the lazy-load contract holds: opening a note to draw on
+     * one page must not read every page's text, and materializing must not fold a page just
+     * to copy its text forward.
+     */
+    public suspend fun pageText(id: PageId): ByteArray? = directory.read(Bundle.pageText(id))
 
     public suspend fun carried(): Map<String, ByteArray> =
         carriedNames.mapNotNull { name -> directory.read(name)?.let { name to it } }.toMap()

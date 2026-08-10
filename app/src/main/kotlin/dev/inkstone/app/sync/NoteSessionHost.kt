@@ -1,6 +1,8 @@
 package dev.inkstone.app.sync
 
 import dev.inkstone.app.library.LibraryRepository
+import dev.inkstone.app.search.NoteRecogniser
+import dev.inkstone.app.search.RecognitionReport
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.DocumentMaterializer
@@ -96,6 +98,8 @@ class NoteSessionHost @Inject constructor(
      * responsibility for. See that method for what publishing a note twice costs.
      */
     private val publisher: PdfPublisher,
+    /** SPEC §8.3. Injected rather than built here so `:app` owns the ML Kit wiring. */
+    private val recogniser: NoteRecogniser,
 ) : DocumentMaterializer {
 
     private val ids = IdFactory(clock)
@@ -177,6 +181,17 @@ class NoteSessionHost @Inject constructor(
          *   written. Both mean the host publishing it itself is correct.
          */
         suspend fun materialize(): MaterializedFile?
+
+        /**
+         * Read this note's handwriting through the session **this editor already holds**
+         * (SPEC §8.3's background pass, arriving at a note that happens to be open).
+         *
+         * Suspends until the editor has a session, like [mergeRemoteBundle].
+         *
+         * @return null only when the editor can no longer run anything, which is the one case
+         *   where the host recognising through its own session is correct.
+         */
+        suspend fun recognise(): RecognitionReport?
     }
 
     /** Called from the editor's `ViewModel` as it is created; must be paired with [unregister]. */
@@ -351,6 +366,37 @@ class NoteSessionHost @Inject constructor(
             library.notePulled(noteId, session.document.localRev, session.pageCount, session.document.title)
         }
         MergeCommit(report, session.document.localRev)
+    }
+
+    /**
+     * ⭐ SPEC §8.3's recognition pass, **through the gate**.
+     *
+     * Recognition writes `text/<pageId>.json` into the bundle, so it is a bundle writer, so it
+     * is exactly the second writer this class exists to exclude. M6's gate-5 bug was a caller
+     * given the raw publisher and trusted to behave; the lesson taken from it was that a
+     * parameter which can only be given the safe thing needs no warning — hence this method,
+     * and hence `RecognitionWorker` holding a `NoteSessionHost` and no `NoteStore`.
+     *
+     * ⚠️ **`materialize` runs only when something was actually read.** A pass over an unchanged
+     * note must not rewrite the bundle: the rewrite bumps `localRev`, `noteChanged` enqueues an
+     * upload, and a nightly batch over a 500-note library would re-upload the library every
+     * night for ever. `NoteRecogniser` skips pages whose text is already current, so an
+     * unchanged note reports zero and this does nothing.
+     */
+    suspend fun recognise(noteId: DocumentId): RecognitionReport = withLock(noteId) {
+        editorFor(noteId)?.recognise()?.let { return@withLock it }
+
+        val note = store.open(noteId) ?: return@withLock RecognitionReport.NOTHING
+        val session = NoteSession.open(store, ids, clock, note, deviceIdentity.get())
+        val report = recogniser.recognise(session)
+        if (report.changedAnything) {
+            session.materialize()
+            // Not `noteMaterialized`: recognition changes no pixels, so invalidating the
+            // thumbnail would redraw every page of every note the batch touched. It does
+            // change the published bytes, so the note does owe an upload.
+            library.noteRecognised(noteId, session.document.localRev, session.pageCount)
+        }
+        report
     }
 
     /**

@@ -1,0 +1,90 @@
+-- M7 — SPEC §8.4's search index over recognised handwriting.
+--
+-- ⭐ NO VIRTUAL TABLE, AND NOT FOR WANT OF TRYING
+--
+-- SPEC §8.4 said FTS5. Android does not have it: the system SQLite is built with
+-- SQLITE_ENABLE_FTS3 and FTS4 and not FTS5, on API 35 / SQLite 3.44.3. That is proved at
+-- runtime by FtsAvailabilityTest, which creates the virtual table on a real device and
+-- asserts the failure, rather than being remembered from one afternoon. (It is also why
+-- Room ships @Fts3 and @Fts4 annotations and no @Fts5.) iOS's SQLite *does* have FTS5,
+-- which is exactly what would have made a KMP module using it compile, link, pass on the
+-- simulator, and fail on every Android device.
+--
+-- But the deciding reason is the second one: SPEC §8.4 requires each hit to carry a
+-- page-space bounding box, so a tap can scroll to the word and highlight it. No FTS module
+-- of any version stores geometry. A per-word table therefore has to exist whatever else
+-- does — and once it exists it answers word and prefix queries on its own, through an
+-- ordinary index. An FTS table beside it would be a second copy of the same text kept in
+-- step by hand, buying ranking. SPEC §8.4 has been corrected.
+--
+-- ROW GRAIN
+--
+-- (noteId, pageId, word, box) — fixed back in M3, in Library.sq's own comment, precisely so
+-- that this table would not have to be thrown away and rebuilt when it arrived.
+--
+-- CASE FOLDING
+--
+-- `wordFold` is lowercased in KOTLIN and Unicode-aware, for the same reason `titleFold` is:
+-- SQLite's lower() and COLLATE NOCASE are ASCII-only, so 'ÜBUNG' would not find 'Übung'.
+--
+-- NO FOREIGN KEY to `note`, matching the rest of this schema — SQLite does not enforce one
+-- without PRAGMA foreign_keys = ON, so it would be documentation shaped like a guarantee.
+-- `forgetNote` is called explicitly instead.
+
+CREATE TABLE pageWord (
+    noteId   TEXT    NOT NULL,
+    pageId   TEXT    NOT NULL,
+    -- Position in reading order on the page. Part of the key because a page may legitimately
+    -- contain the same word twice and both occurrences are separately findable.
+    ordinal  INTEGER NOT NULL,
+    -- As recognised, for display in a result row.
+    word     TEXT    NOT NULL,
+    wordFold TEXT    NOT NULL,
+    -- Page space (SPEC §4.4): points, origin top-left, y DOWN. So `top` < `bottom`.
+    boxLeft   REAL NOT NULL,
+    boxTop    REAL NOT NULL,
+    boxRight  REAL NOT NULL,
+    boxBottom REAL NOT NULL,
+    PRIMARY KEY (noteId, pageId, ordinal)
+);
+
+-- The index the prefix range scan rides on. Without it every query is a full table scan of
+-- every word in the library.
+CREATE INDEX pageWordByWord ON pageWord(wordFold);
+
+CREATE INDEX pageWordByNote ON pageWord(noteId);
+
+insertWord:
+INSERT OR REPLACE INTO pageWord(noteId, pageId, ordinal, word, wordFold, boxLeft, boxTop, boxRight, boxBottom)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+
+deletePage:
+DELETE FROM pageWord WHERE noteId = ? AND pageId = ?;
+
+deleteNote:
+DELETE FROM pageWord WHERE noteId = ?;
+
+countWords:
+SELECT count(*) FROM pageWord;
+
+-- A prefix range scan, joined to the library so a hit can name its note without a second
+-- query. Trashed notes are excluded: a search that surfaces something the user deleted and
+-- then cannot open is worse than one that misses it (the trash has its own screen).
+searchWords:
+SELECT p.noteId, p.pageId, p.word, p.boxLeft, p.boxTop, p.boxRight, p.boxBottom, n.title, n.modifiedAt
+FROM pageWord p
+JOIN note n ON n.id = p.noteId
+WHERE p.wordFold >= ? AND p.wordFold < ? AND n.deletedAt IS NULL
+ORDER BY n.modifiedAt DESC, p.pageId, p.ordinal
+LIMIT ?;
+
+-- The degraded path, and the only one that works with no language model on the device
+-- (ROADMAP M7). Folder names come in through the same query because a folder's name is on
+-- the notes inside it as far as the user is concerned.
+searchTitles:
+SELECT n.id, n.title, n.modifiedAt
+FROM note n
+LEFT JOIN folder f ON f.id = n.folderId
+WHERE n.deletedAt IS NULL AND (n.titleFold LIKE ? ESCAPE '\' OR f.nameFold LIKE ? ESCAPE '\')
+ORDER BY n.modifiedAt DESC
+LIMIT ?;

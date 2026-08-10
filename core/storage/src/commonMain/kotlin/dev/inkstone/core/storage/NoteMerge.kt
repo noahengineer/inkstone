@@ -157,9 +157,30 @@ public object NoteMerge {
             session.flush()
         }
 
+        // ⭐ SPEC §5.5 — settle recognised text, after the ops and before the caller
+        // materializes. It has to be here rather than in the caller: the rule is a function of
+        // the *merged* page's ink digest, which only exists once every novel op is in.
+        //
+        // Every live page is offered, not only `pagesTouched`, because a peer can perfectly
+        // well have recognised a page this device has never changed — adopting that is the
+        // whole point of syncing derived data at all. The cost of the pages with no text on
+        // either side is one ZIP-directory lookup each and no fold; see `reconcileText`.
+        var textDropped = 0
+        var textAdopted = 0
+        for (ref in session.document.pages) {
+            if (ref.deleted) continue
+            when (session.reconcileText(ref.id, remote.pageText(ref.id))) {
+                TextOutcome.DROPPED -> textDropped++
+                TextOutcome.ADOPTED_REMOTE -> textAdopted++
+                TextOutcome.KEPT_LOCAL, TextOutcome.NEITHER -> Unit
+            }
+        }
+
         return MergeReport.Merged(
             remoteNovelOps = remoteNovel,
             pagesTouched = pagesTouched.toList(),
+            textDropped = textDropped,
+            textAdopted = textAdopted,
             outcome = outcome,
             titleOverridden = titleOverridden,
             overriddenTitle = localTitleBefore.takeIf { titleOverridden },
@@ -219,6 +240,15 @@ public sealed interface MergeReport {
     public data class Merged(
         val remoteNovelOps: Int,
         val pagesTouched: List<PageId>,
+        /**
+         * Pages whose recognised text neither device's copy still described, so both were
+         * discarded (SPEC §5.5, `PageTextMerge`). Normal after a merge that moved the ink;
+         * the recognition pass picks them up again. Counted because a note reporting this on
+         * every poll is two devices invalidating each other's recognition in a loop.
+         */
+        val textDropped: Int,
+        /** Pages where the peer's recognised text was the one that still described the ink. */
+        val textAdopted: Int,
         val outcome: FoldOutcome,
         val titleOverridden: Boolean,
         val overriddenTitle: String?,

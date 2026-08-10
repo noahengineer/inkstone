@@ -43,6 +43,7 @@ import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.LibraryLayout
 import dev.inkstone.core.model.LibrarySort
 import dev.inkstone.core.model.NoteSummary
+import dev.inkstone.core.search.SearchHit
 import androidx.compose.foundation.lazy.grid.items as gridItems
 
 /**
@@ -91,11 +92,28 @@ fun LibraryScreen(state: LibraryUiState, actions: LibraryActions, modifier: Modi
                 )
             }
 
+            // SPEC §8.4 — what the user wrote, above what the notes are called. The title
+            // match is the one they could have found by browsing; this is the one they could
+            // not, and burying it under the tiles would make the feature look absent.
+            if (state.handwritingHits.isNotEmpty()) {
+                HandwritingHits(hits = state.handwritingHits, onOpen = actions.onOpenHit)
+            }
+
+            // ROADMAP M7: *"search degrades to titles, message is clear"*. Shown only while
+            // searching, so it is an answer to a question the user just asked rather than a
+            // banner nagging about a 20 MB download on a screen they opened to find a note.
+            if (state.searching && !state.model.downloaded) {
+                RecognitionModelOffer(state.model, actions.onDownloadModel)
+            }
+
             when {
                 !state.loaded -> Unit
 
                 // The first frame. An empty-state here would be a lie.
-                state.isEmpty -> EmptyLibrary(searching = state.searching, query = state.query)
+                state.isEmpty && state.handwritingHits.isEmpty() ->
+                    EmptyLibrary(searching = state.searching, query = state.query)
+
+                state.isEmpty -> Unit
 
                 state.layout == LibraryLayout.GRID -> LibraryGrid(state, actions, dialogs)
 
@@ -248,7 +266,7 @@ private fun LibraryToolbar(state: LibraryUiState, actions: LibraryActions, onNew
                 value = state.query,
                 onValueChange = actions.onQueryChange,
                 singleLine = true,
-                label = { Text("Search titles and folders") },
+                label = { Text("Search titles, folders and handwriting") },
                 modifier = Modifier.weight(1f),
             )
             SortMenu(state = state, onSort = actions.onSort)
@@ -342,6 +360,64 @@ private fun SelectionBar(count: Int, actions: LibraryActions, onMove: () -> Unit
     }
 }
 
+/**
+ * SPEC §8.4's handwriting results: note, page, and the word that matched.
+ *
+ * Each row carries the page-space box, so tapping it opens the note *at the word* rather than
+ * at the note — which is the whole difference between search and a filtered list.
+ */
+@Composable
+private fun HandwritingHits(hits: List<SearchHit>, onOpen: (SearchHit) -> Unit) {
+    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Text(
+            text = "In your handwriting",
+            style = MaterialTheme.typography.titleSmall,
+            modifier = Modifier.padding(bottom = 4.dp),
+        )
+        for (hit in hits.take(MAX_HANDWRITING_HITS)) {
+            TextButton(onClick = { onOpen(hit) }, modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = "“${hit.word}” — ${hit.noteTitle}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f),
+                )
+            }
+        }
+    }
+}
+
+/** Enough to be useful, few enough that the notes below stay on screen. */
+private const val MAX_HANDWRITING_HITS = 8
+
+/**
+ * SPEC §8.1 — the language model, offered at the moment it would have helped.
+ *
+ * ⚠️ **The size and the metrics disclosure are both on the button, not behind it.** SPEC §8.1
+ * requires disclosing that ML Kit reports anonymous performance metrics to Google, and the only
+ * useful place for that is before the download rather than after.
+ */
+@Composable
+private fun RecognitionModelOffer(model: RecognitionModelState, onDownload: () -> Unit) {
+    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Text(
+            text = "Searching titles and folders only — handwriting recognition needs a language model.",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+        model.error?.let {
+            Text(text = "Download failed: $it", style = MaterialTheme.typography.bodySmall)
+        }
+        TextButton(onClick = onDownload, enabled = !model.downloading) {
+            Text(
+                if (model.downloading) {
+                    "Downloading English (~20 MB)…"
+                } else {
+                    "Download English (~20 MB) · ML Kit sends anonymous usage metrics to Google"
+                },
+            )
+        }
+    }
+}
+
 @Composable
 private fun EmptyLibrary(searching: Boolean, query: String) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -424,6 +500,10 @@ data class RenameTarget(val noteId: DocumentId? = null, val folderId: FolderId? 
  */
 data class LibraryActions(
     val onOpenNote: (DocumentId) -> Unit,
+    /** SPEC §8.4 — open the note at the page the word is on and highlight it. */
+    val onOpenHit: (SearchHit) -> Unit,
+    /** SPEC §8.1 — fetch the recognition model. Only ever from a press (see the offer). */
+    val onDownloadModel: () -> Unit,
     val onOpenFolder: (FolderId?) -> Unit,
     val onGoUp: () -> Unit,
     val onNewNote: () -> Unit,

@@ -9,6 +9,7 @@ import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import dev.inkstone.app.search.RecognitionWorker
 import dev.inkstone.app.sync.MaterializeWorker
 import dev.inkstone.app.sync.OutboxDrainWorker
 import dev.inkstone.app.sync.ReconcileWorker
@@ -138,6 +139,49 @@ class WorkManagerScheduler @Inject constructor(private val workManager: WorkMana
     }
 
     /**
+     * SPEC §8.3 — the recognition backlog, *"when charging and idle"*.
+     *
+     * ⚠️ **No network constraint, and that is deliberate.** Recognition is entirely on-device;
+     * requiring a connection would stop the batch on exactly the tablet this feature is for —
+     * one in a bag, charging overnight, with no wifi. The one part that does need a network is
+     * the model download, and that is a user-initiated act on a settings screen, not this.
+     *
+     * KEEP rather than REPLACE: the work is *"read whatever has not been read"*, so a pending
+     * request is not superseded by a newer one, it is the same request.
+     */
+    fun ensurePeriodicRecognition() {
+        workManager.enqueueUniquePeriodicWork(
+            RECOGNITION_PERIODIC_NAME,
+            ExistingPeriodicWorkPolicy.KEEP,
+            PeriodicWorkRequestBuilder<RecognitionWorker>(RECOGNITION_PERIOD_HOURS, TimeUnit.HOURS)
+                .setConstraints(
+                    Constraints.Builder()
+                        .setRequiresCharging(true)
+                        .setRequiresDeviceIdle(true)
+                        .build(),
+                )
+                .build(),
+        )
+    }
+
+    /**
+     * One note, now — what the library screen offers for *"this note is not searchable yet"*.
+     *
+     * Unconstrained: the user asked for it and is watching. That is the same reasoning
+     * [enqueueMaterialization] uses, and the reason the periodic version above is the one with
+     * the charging constraint.
+     */
+    fun enqueueRecognition(noteId: DocumentId) {
+        workManager.enqueueUniqueWork(
+            "$RECOGNITION_ONE_NAME.${noteId.value}",
+            ExistingWorkPolicy.KEEP,
+            OneTimeWorkRequestBuilder<RecognitionWorker>()
+                .setInputData(Data.Builder().putString(RecognitionWorker.KEY_NOTE_ID, noteId.value).build())
+                .build(),
+        )
+    }
+
+    /**
      * No network, no request. This is what makes airplane-mode editing free: the drainer
      * is never woken to discover it cannot connect.
      */
@@ -147,5 +191,15 @@ class WorkManagerScheduler @Inject constructor(private val workManager: WorkMana
     private companion object {
         const val BACKOFF_SECONDS = 30L
         const val PERIOD_MINUTES = 15L
+
+        const val RECOGNITION_PERIODIC_NAME = "inkstone.recognition.periodic"
+        const val RECOGNITION_ONE_NAME = "inkstone.recognition"
+
+        /**
+         * Six hours. WorkManager will not run it more often than the device is idle and
+         * charging anyway, so a shorter period buys nothing and a longer one leaves a
+         * newly-installed model waiting a day before old notes become searchable.
+         */
+        const val RECOGNITION_PERIOD_HOURS = 6L
     }
 }

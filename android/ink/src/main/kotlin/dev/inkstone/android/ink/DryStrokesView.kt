@@ -105,8 +105,22 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
         painter.paintBackground(canvas, pageSize, pageBackground, sourcePage)
         painter.paintStrokes(canvas, store, pageToView, visibleBoundsInPageSpace())
         painter.paintBorder(canvas, pageSize)
+        highlight?.let { painter.paintHighlight(canvas, it) }
         canvas.restoreToCount(saved)
     }
+
+    /**
+     * SPEC §8.4 — the box a search hit landed on, or null.
+     *
+     * Drawn inside the same page-space transform as the ink, so it stays on the word through a
+     * pan or a zoom rather than being a rectangle pinned to the screen.
+     */
+    var highlight: dev.inkstone.core.model.PageRect? = null
+        set(value) {
+            if (field == value) return
+            field = value
+            invalidate()
+        }
 
     /**
      * The viewport in page space, with a margin so a stroke whose *centre line*
