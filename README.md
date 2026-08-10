@@ -132,9 +132,25 @@ Builds `:app:assembleDebug` and copies the APK to the tablet's **Download**
 folder over MTP. Then on the tablet: **My Files → Download → tap it.** Android
 asks once for permission to install unknown apps from My Files.
 
+The file is named after the commit — `inkstone-<sha>.apk`, or
+`inkstone-<sha>-dirty.apk` when the tree has uncommitted changes — and the
+script prints the name it used. That is not cosmetic. It means **the copy lands
+under a name nothing on the tablet has, and older builds are deleted only after
+the new one's byte count has been verified.** A 95 MB MTP transfer takes about
+four minutes; when the earlier fixed name meant deleting first (an MTP overwrite
+raises a prompt, and the script has no console to answer one on), an interrupted
+run left the tablet with *no* APK rather than the previous build. Re-running
+after an interruption is cheap: a complete copy of the same build is detected and
+skipped.
+
 Requirements: the tablet plugged in, **unlocked**, with its USB mode set to
 **File transfer** — not *Charging only*, which hides the filesystem entirely.
 `-NoBuild` skips Gradle; `-Device <name>` picks one when several are plugged in.
+
+⚠️ **Run it with a timeout longer than the transfer, or in the background.** The
+transfer is four minutes on top of however long the build takes, and a caller
+that kills the script partway is the *only* way it has ever failed. Exit 137 is
+that, not a tablet problem.
 
 **Why not `adb install`?** Use it when you can — it is one command:
 

@@ -47,7 +47,26 @@ $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 $Apk = Join-Path $RepoRoot 'app\build\outputs\apk\debug\app-debug.apk'
-$DestName = 'inkstone-debug.apk'
+# ---------------------------------------------------------------------------
+# The destination name carries the commit, and that is a safety property
+# ---------------------------------------------------------------------------
+# It was the fixed `inkstone-debug.apk`, and the copy step deleted that file
+# *before* copying the replacement -- because an MTP overwrite raises a prompt
+# and this script has no console to answer one on. So any interruption during
+# the ~4 minutes a 95 MB MTP transfer takes left the tablet with **no APK at
+# all**, rather than with the previous build. That happened twice, and both
+# times the reason for the interruption (a caller's timeout) had nothing to do
+# with the tablet -- which is precisely when you want the old build still there.
+#
+# So: copy under a name no file on the tablet has, verify the byte count, and
+# only then remove the older copies. An interrupted run now costs a wasted
+# transfer and nothing else. The name is the short commit, plus `-dirty` when the
+# tree has uncommitted changes, so you can also tell at a glance which build you
+# are about to install -- which the single fixed name never let you do.
+$sha = (& git -C $RepoRoot rev-parse --short HEAD 2>$null)
+if (-not $sha) { $sha = 'nogit' }
+$dirty = if ((& git -C $RepoRoot status --porcelain 2>$null)) { '-dirty' } else { '' }
+$DestName = "inkstone-$sha$dirty.apk"
 
 # ---------------------------------------------------------------------------
 # 1. Build
@@ -131,12 +150,22 @@ if (-not (Test-Path $stagingDir)) { New-Item -ItemType Directory -Path $stagingD
 $staged = Join-Path $stagingDir $DestName
 Copy-Item $Apk $staged -Force
 
-# Remove any previous copy first. An MTP overwrite prompts, and this script has
-# no console to prompt on -- it would hang until the timeout.
-$stale = $dest.Items() | Where-Object { $_.Name -eq $DestName }
-if ($stale) {
-    Write-Host "Removing previous $DestName on the tablet" -ForegroundColor DarkGray
-    $stale.InvokeVerb('delete')
+# An identical transfer that already landed is not worth repeating -- a re-run
+# after an interruption should be cheap when the interruption was after the copy.
+$already = $dest.Items() | Where-Object { $_.Name -eq $DestName }
+if ($already -and [int64]$already.ExtendedProperty('System.Size') -eq $expectedBytes) {
+    Write-Host "OK  $DestName is already on the tablet, $expectedBytes bytes." -ForegroundColor Green
+    Write-Host 'On the tablet: My Files -> Download -> tap it.' -ForegroundColor Green
+    Remove-Item $staged -Force -ErrorAction SilentlyContinue
+    exit 0
+}
+# A same-named *short* file is a torn earlier attempt at this very build. That
+# one has to go before the retry, because it is the one name CopyHere would
+# prompt about -- but note this is the only delete that happens before a copy,
+# and what it deletes is never a usable build.
+if ($already) {
+    Write-Host "Removing a torn earlier attempt at $DestName" -ForegroundColor DarkGray
+    $already.InvokeVerb('delete')
     Start-Sleep -Seconds 3
 }
 
@@ -162,7 +191,20 @@ while ((Get-Date) -lt $deadline) {
         $size = [int64]$landed.ExtendedProperty('System.Size')
         if ($size -eq $expectedBytes) {
             Write-Host "OK  $DestName is on the tablet, $size bytes." -ForegroundColor Green
-            Write-Host 'On the tablet: My Files -> Download -> tap it.' -ForegroundColor Green
+
+            # Only now. Until this line the previous build was the way back.
+            #
+            # The pattern is deliberately the one *this script* mints -- a commit
+            # sha, optionally `-dirty`. A hand-named keepsake like `inkstone-m1.apk`
+            # is not this script's to delete, and `-like 'inkstone-*.apk'` would
+            # have taken it.
+            $mine = '^inkstone-[0-9a-f]{7,40}(-dirty)?\.apk$'
+            foreach ($old in @($dest.Items() | Where-Object { $_.Name -match $mine -and $_.Name -ne $DestName })) {
+                Write-Host "  removing older build $($old.Name)" -ForegroundColor DarkGray
+                $old.InvokeVerb('delete')
+            }
+
+            Write-Host "On the tablet: My Files -> Download -> tap $DestName." -ForegroundColor Green
             Remove-Item $staged -Force -ErrorAction SilentlyContinue
             exit 0
         }
