@@ -1072,6 +1072,99 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 
 ---
 
+## M12 — recorded lectures, aligned to the notes 🟡
+
+**Goal:** press record in a lecture, and afterwards the note carries what was *said* around each
+line you wrote — readable by you, and by an assistant with access to your Nextcloud.
+
+⚠️ **Design settled before any code: `docs/M12-AUDIO.md`.** Read it first; it records the decisions
+and, more usefully, the three designs that were rejected and why. This entry is the checklist, not
+the design.
+
+**Numbered M12 so M8–M11's cross-references stay valid.** SPEC §12's *"out of scope for v1"* row is
+still true — v1 ends at M11.
+
+### Scope
+
+**Capture (useful on its own)**
+
+- A record button in the note. One press to start; stops when you **leave the note** — not when
+  the Activity stops. Screen-off, lock, rotation and split-screen keep recording
+- A **per-folder** auto-record setting (not global). The app's first real user setting — there is
+  no settings store today
+- Foreground service, microphone type, visible elapsed timer
+- **Ogg/Opus**, never MP4 — an MP4 killed mid-lecture is unplayable
+- `recordings/<recordingId>.timeline`, append-only, `(objectId, offsetMs)` from
+  `SystemClock.elapsedRealtime`. **Not an op, not a bundle entry** — see the doc §3
+- Recordings under **30 seconds are discarded**, not uploaded
+- Orphan recovery: a recording interrupted by process death is finalised and offered on next launch
+- Pending uploads and their sizes, visible
+
+**Alignment and transcript (server side)**
+
+- Audio + timeline upload through the **outbox**, keyed `(noteId, recordingId)`
+- The server transcribes and writes the merged markdown into Nextcloud; the app never learns
+  AssemblyAI exists and holds no API key
+- Alignment unit is **M7's recognised line**, with an asymmetric window (writing lags speech)
+- Audio → Nextcloud trash, **after** the transcript is verified present
+- Sidecars keyed by `documentId`, never by filename
+- Empty or failed transcript → a "Needs attention" row, never a blank file
+
+### Acceptance
+
+- [ ] Record a real lecture end to end; the transcript lands in Nextcloud and reads correctly
+- [ ] **The teacher's emphasis lands on the right line.** Write something while it is being
+      explained, and check the transcript attached to that line is the explanation — **report the
+      window constants you tuned to, with the before and after**
+- [ ] ⚠️ **Two recordings in one note, both made offline, both arrive.** This is the coalescing
+      trap in doc §5 — the outbox's `(note_id, op_type)` UPSERT eats the first one unless the key
+      carries the recording id
+- [ ] Airplane mode for a whole lecture → recording is kept, uploads on reconnect
+- [ ] Screen off mid-lecture → still recording. Leave the note → stopped
+- [ ] `am force-stop` at minute N → the audio up to N is recoverable and playable
+- [ ] A phone call mid-lecture leaves a marked gap, not an hour of silence
+- [ ] Open a note for 20 s with auto-record on → nothing uploaded, nothing billed
+- [ ] Rename the note's PDF in the Nextcloud web UI → its transcript is still found
+- [ ] Audio is in Nextcloud's trash, and only after the transcript was verified
+- [ ] The reconciler treats the media folder as foreign, does not trash it, and does not mistake it
+      for a note
+- [ ] Ask Claude to read the Nextcloud folder and explain what a lecture covered
+
+### Prompt
+
+```
+Read docs/M12-AUDIO.md, then implement Milestone M12's capture half.
+
+The design is settled — do not redesign it. Three things it rejects are the
+three things that look obvious:
+
+  The timeline is NOT an op and NOT a bundle entry. It is an append-only
+  sidecar log. A recording is written by one device in one sitting, never
+  merged and never edited, so it has none of the properties that would make
+  it document data — and the op vocabulary IS the sync format.
+
+  Audio NEVER enters the bundle. The bundle is embedded in every published
+  PDF and re-uploaded whole on every close; audio is ~11 MB/hour against a
+  5 KB bundle.
+
+  The app does NOT talk to AssemblyAI. It writes two files and enqueues an
+  outbox op. An API key in an APK is extractable.
+
+The trap that will otherwise eat a lecture silently: the outbox coalesces on
+(note_id, op_type) with an UPSERT. Every audio file is distinct and none
+supersedes another, so the key must carry the recording id. Write the two-
+recordings-offline test first.
+
+Audio is the most irreplaceable data this app holds — you cannot re-record a
+lecture. Ogg/Opus, not MP4: an MP4 killed mid-lecture is unplayable.
+
+"Stops when you leave the note" means leaving the note, not the Activity
+stopping. If it hangs off onStop, the first screen timeout mid-lecture costs
+the rest of the lecture and says nothing.
+```
+
+---
+
 ## Working agreements
 
 **One milestone per session.** Fresh context each time.

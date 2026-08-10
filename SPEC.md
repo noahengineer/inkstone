@@ -95,7 +95,7 @@ A tablet note-taking app where:
 
 ### 1.2 Not in v1
 
-No real-time collaboration. No AI. No infinite canvas. No audio recording. See §12.
+No real-time collaboration. No AI. No infinite canvas. No audio recording — designed for M12, see §12.
 
 ### 1.3 The design principle
 
@@ -1857,7 +1857,7 @@ Toolchain is ready: Kotlin 2.3.20, Compose Multiplatform iOS stable since 1.8.0,
 | Real-time collaboration | The op-log supports it; transport and presence UI are their own project |
 | AI features | ML Kit GenAI can't do handwriting; cloud AI contradicts offline-first |
 | Infinite canvas | Different rendering and viewport model |
-| Audio + stroke sync | Large surface, and a data-loss risk area |
+| Audio + stroke sync | Large surface, and a data-loss risk area. **Designed for M12 — `docs/M12-AUDIO.md`.** Still out of scope for v1, which ends at M11; the reason above turned out to be exactly right, and the design is mostly the answer to it |
 | Tags / backlinks | Worth doing properly later |
 | Handwriting→text replace-in-place | Recognition exists in M7; the editing UX is its own design problem |
 | Editing annotations from imported PDFs | Render and preserve only in v1 |

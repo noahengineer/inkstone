@@ -247,6 +247,7 @@ A milestone is done when:
 | **M5 Nextcloud decisions + spike #4 status** | `docs/M5-NEXTCLOUD.md` |
 | **M6 pull/merge/conflict decisions + the 21-row status table** | `docs/M6-SYNC.md` |
 | **M7 recognition/search decisions + the segmented-vs-blob numbers** | `docs/M7-RECOGNITION.md` |
+| **M12 lecture recording — designed, not built** | `docs/M12-AUDIO.md` |
 
 ---
 
