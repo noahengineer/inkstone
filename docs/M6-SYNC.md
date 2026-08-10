@@ -1572,3 +1572,33 @@ both true.
 Gate 4 (both offline, both add a page) was **not run**: it goes through the same enqueue path and
 would have re-measured this rather than testing page-order merge.
 
+### Root cause: the drainer is the third writer, and it was never routed through the gate
+
+`NoteSessionHost` exists to be the only writer of a note an editor may be holding — a per-note mutex
+plus a registry of live editors, so a merge or a publish is handed to the editor's own session rather
+than done behind it. `MaterializeWorker` was fixed to go through it, and carries the warning:
+
+> ⚠️ **Through `NoteSessionHost`, never through `DocumentMaterializer` directly.** For a note [an
+> editor holds] the materializer reads `note.inkstone`, embeds it and records its hash in the XMP
+> marker, so a bundle [written behind the editor] is a lossy REPLACE that then wins the next sync.
+
+**`OutboxDrainer` was not.** `SyncModule.provideOutboxDrainer` injects the raw
+`DocumentMaterializer` (`PlatformModule.provideDocumentMaterializer` → `InkstonePdfMaterializer`),
+and `uploadOne` calls `materializer.materialize(entry.noteId)` directly before the PUT. So for an
+**open** note the upload path publishes from outside the gate — the exact writer that warning
+describes — and then records `lastSyncedRev = materialized.localRev` for bytes that do not contain
+what the editor holds. Every later `noteChanged` then reads `localRev <= lastSyncedRev` and enqueues
+nothing.
+
+The two symptoms fall out of that one line. Gate 5 fails because the peer's page is open, so the
+drainer's own materialize is the lossy one. Gate 3 recovers on the next edit because closing the note
+takes the *editor's* materialize path, which folds the journal properly and pushes `localRev` past
+the false `lastSyncedRev`.
+
+**The fix** is to make the wrong wiring unrepresentable rather than remembered: have
+`NoteSessionHost` implement `DocumentMaterializer` itself — returning a `MaterializedFile` instead of
+`Unit`, which means `NoteEditorHandle.materialize()` has to report the path and revision it wrote
+rather than a `Boolean` — and inject *that* into the drainer, leaving `InkstonePdfMaterializer`
+reachable only from inside the host. Same shape as deleting `apply`'s `undoable` default and
+`NoteSession.close`'s `syncState` default: remove the option, don't document it.
+
