@@ -237,6 +237,11 @@ private fun FolderBrowser(state: SyncUiState, actions: SyncActions) {
 private fun BrowserConfirmRow(state: SyncUiState, actions: SyncActions) {
     Row(modifier = Modifier.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         when {
+            state.movingNote != null -> {
+                OutlinedButton(onClick = actions.onMoveHere) { Text("Move here") }
+                TextButton(onClick = actions.onCancelBrowse) { Text("Cancel") }
+            }
+
             state.pinningFolder != null -> {
                 // Worded as the ongoing rule it sets rather than as a one-off save, which is the
                 // whole difference from "Save here".
@@ -300,6 +305,8 @@ data class SyncActions(
     /** M6 — make the folder being browsed this account's default for new notes. */
     val onSetDefaultFolderHere: () -> Unit,
     val onBindHere: () -> Unit,
+    /** Confirm a relocation of a synced note (a MOVE). */
+    val onMoveHere: () -> Unit,
     /** M6 — confirm a folder pin (SPEC §9's mirror). */
     val onPinFolderHere: () -> Unit,
     val onCancelBrowse: () -> Unit,

@@ -58,6 +58,65 @@ class MergeMatrixTransportTest {
     }
 
     /**
+     * ⭐ Row 11b — **the same move, into a folder no walk root covers.** Row 11's blind spot.
+     *
+     * Row 11 renames the file *inside* the folder the walk was already going to list, so rule 2's
+     * *"same `oc:id` + same ETag + a different href"* has a new href to compare. `RemoteWalk.rootsOf`
+     * visits only the account's default folder, the parent of every binding and the pinned folders —
+     * so a note dragged in the web UI into anything outside that set is listed **nowhere**, and its
+     * old directory is then walked and settled without it. Step 3's fourth branch read that as a
+     * remote deletion: reported from a real tablet, and reproduced here before the fix, the note went
+     * to the local trash with a *"Deleted on the server"* row while its file sat untouched on the
+     * server one folder away.
+     *
+     * The repair is to stop inferring the answer from what was listed and ask for it: one `SEARCH` on
+     * `/remote.php/dav/` resolving the binding's fileid to its current href. So this row asserts the
+     * economy as hard as the behaviour — **one** search, and it is the whole cost of the pass. If the
+     * search moved in front of `isAbsentRemotely`'s guards it would become one per note in the
+     * library on every poll that changed anything, and this assertion is what would catch that.
+     *
+     * The last two lines are the follow-on, and they need no code: walk roots are derived from the
+     * bindings, so the pass *after* this one lists the destination and reconciles the file there
+     * normally. Without that, a move plus an edit would leave the note repathed and never read again.
+     */
+    @Test
+    fun `row 11b - a file moved outside every walk root follows the binding and downloads nothing`() = matrixRow(
+        row = "row 11b (a move the walk cannot see)",
+        proven = "a binding repathed from one SEARCH, zero GETs, nothing trashed, and an untouched note",
+        notProven = "nothing extra — the MOVE, the SEARCH and the ETag that survived both are the server's",
+    ) { devices ->
+        val id = devices.share("Row11b")
+        val from = devices.a.remotePath(id)
+        val to = "${devices.makeOutsideFolder()}/Row11b-moved.pdf"
+        val revBefore = assertNotNull(devices.a.document(id)).localRev
+        val etagBefore = assertNotNull(assertNotNull(devices.a.binding(id)).lastSyncedEtag)
+
+        devices.rawMove(from, to)
+        devices.resetCounts()
+
+        val pull = devices.a.pull()
+
+        assertEquals(1, pull.moved, "the move was not detected: $pull")
+        assertEquals(0, pull.trashed, "a note that moved was trashed as though the server had deleted it")
+        assertEquals(to, devices.a.remotePath(id), "the binding did not follow the file out of the walked set")
+        assertEquals(
+            etagBefore,
+            assertNotNull(devices.a.binding(id)).lastSyncedEtag,
+            "a move changed the stored validator, so the next If-Match upload would 412",
+        )
+        devices.assertRequests("GET", 0, "a move cost a download")
+        devices.assertRequests("SEARCH", 1, "one search per absent candidate — never one per file")
+        assertTrue(devices.a.fs.exists(NoteLayout.noteDir(id)), "the note was moved out of notes/")
+        assertTrue(devices.a.fs.list(NoteLayout.TRASH_DIR).isEmpty(), "a moved note was put in the local trash")
+        assertEquals(1, devices.a.index.allNotes().size, "the move produced a second library row")
+        assertEquals(revBefore, assertNotNull(devices.a.document(id)).localRev, "a move rewrote the note")
+        assertTrue(devices.a.attention().isEmpty(), "the user was told about something that did not happen")
+
+        assertEquals(0, devices.a.pull().trashed, "the pass after the move concluded the deletion instead")
+        assertEquals(to, devices.a.remotePath(id), "the second pass moved the binding back")
+    }
+
+    /**
      * Row 12, first half — **a cancelled upload leaves the row exactly as it was.**
      *
      * WorkManager kills a job at ten minutes and the OS kills the process whenever it likes, so a

@@ -25,8 +25,17 @@ import io.ktor.http.encodeURLPathPart
  */
 public object NextcloudUrls {
 
+    /**
+     * The DAV endpoint itself, above `files/<uid>/`.
+     *
+     * Almost everything addresses [DAV_FILES] instead. The exception is `SEARCH`, which RFC 5323
+     * sends to a resource that *contains* the scope — and Nextcloud's search backend is mounted
+     * here, not under `files/<uid>/` (see [davRoot]).
+     */
+    private const val DAV_ROOT = "remote.php/dav"
+
     /** SPEC §7.3 — "no v2 exists. Don't use legacy `/remote.php/webdav`." */
-    private const val DAV_FILES = "remote.php/dav/files"
+    private const val DAV_FILES = "$DAV_ROOT/files"
 
     public const val OCS_USER: String = "ocs/v2.php/cloud/user"
     public const val OCS_CAPABILITIES: String = "ocs/v2.php/cloud/capabilities"
@@ -73,6 +82,24 @@ public object NextcloudUrls {
      */
     public fun davBase(serverUrl: String, uid: String): String =
         join(serverUrl, "$DAV_FILES/${uid.encodeURLPathPart()}") + "/"
+
+    /**
+     * `<server>/remote.php/dav/` — where a `SEARCH` goes, and the one URL here that carries no uid.
+     *
+     * ⚠️ **Not `davBase`.** `SEARCH` against `files/<uid>/` is a **404** on Nextcloud 32.0.13: the
+     * search backend is mounted at the DAV root and the `<d:scope>` inside the body is what narrows
+     * it to one user's files ([searchScope]). Addressing the wrong one fails as *"the file is not
+     * there"*, which is indistinguishable from the deletion the caller is trying to rule out.
+     */
+    public fun davRoot(serverUrl: String): String = join(serverUrl, DAV_ROOT) + "/"
+
+    /**
+     * `/files/<uid>` — a `SEARCH` scope, resolved against [davRoot] rather than against the origin.
+     *
+     * Percent-encoded per segment like every other path here, which also makes it XML-safe: an `&`
+     * in a uid becomes `%26` before it is ever written into a request body.
+     */
+    public fun searchScope(uid: String): String = "/files/${uid.encodeURLPathPart()}"
 
     /**
      * An absolute WebDAV URL for a remote path like `Notes/Physics/Lecture.pdf`.

@@ -45,6 +45,60 @@ public object WebDavXml {
     """.trimIndent()
 
     /**
+     * ⭐ RFC 5323 `SEARCH` — **where is the file with this fileid now?** (SPEC §7.4 rule 2.)
+     *
+     * ## Why this request exists at all
+     *
+     * Rule 2 says a move is *"same `oc:id` + same ETag + a different href"*, and every word of that
+     * is about a file the walk **listed**. [RemoteWalk.rootsOf] only visits folders the app already
+     * knows about, so a note the user drags into a folder outside them is not listed anywhere — and
+     * *"known id absent from a settled directory"* then reads it as a remote **deletion**. This is
+     * the one question that can be asked without a path: it takes the fileid and answers with the
+     * href, wherever the file has got to.
+     *
+     * ## Verified, and two alternatives that are not
+     *
+     * Measured against the Nextcloud 32.0.13 this project's suite runs on:
+     *
+     * ```
+     * SEARCH /remote.php/dav/               →  207, <d:href>…/MoveProbeB/probe.pdf</d:href>
+     * PROPFIND /remote.php/dav/meta/<id>    →  404  Sabre\DAV\Exception\NotFound: File not found:
+     *                                              meta in 'root'
+     * REPORT oc:filter-files                →  favourite and systemtag filters only, not fileid
+     * ```
+     *
+     * A fileid with nothing at it — including one whose file is in the server's own trash — comes
+     * back as a **207 with an empty `multistatus`**, which is what makes *"genuinely gone"*
+     * distinguishable from *"cannot tell"* (see `Reconciler`'s `FileIdSearch`).
+     *
+     * `<oc:id/>` is in the `<d:select>` deliberately and is not decoration: it is the only thing that
+     * proves the href belongs to *our* file rather than to whatever [RemoteBinding.remoteFileId]'s
+     * digits happened to resolve to. An unsupported property comes back as a 404 propstat, which
+     * [okProperties] already drops — so a server that will not select it yields no identifiable
+     * match rather than a confident wrong one.
+     *
+     * @param uid the account's WebDAV path segment, for the scope. **Not** the login name (SPEC §0.1 #3).
+     * @param fileId the numeric `oc:fileid`, which is the leading digits of an `oc:id`.
+     */
+    public fun searchByFileIdBody(uid: String, fileId: Long): String = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <d:searchrequest xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+          <d:basicsearch>
+            <d:select><d:prop><oc:id/><oc:fileid/><d:getetag/><d:resourcetype/></d:prop></d:select>
+            <d:from>
+              <d:scope>
+                <d:href>${NextcloudUrls.searchScope(uid)}</d:href>
+                <d:depth>infinity</d:depth>
+              </d:scope>
+            </d:from>
+            <d:where>
+              <d:eq><d:prop><oc:fileid/></d:prop><d:literal>$fileId</d:literal></d:eq>
+            </d:where>
+          </d:basicsearch>
+        </d:searchrequest>
+    """.trimIndent()
+
+    /**
      * Parse a `multistatus` document into one [DavResource] per `response`.
      *
      * Only properties inside a `propstat` whose `status` is 2xx are kept. A server

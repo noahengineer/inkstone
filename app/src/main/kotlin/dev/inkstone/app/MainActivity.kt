@@ -276,6 +276,10 @@ class MainActivity : ComponentActivity() {
                         sync.openForFolder(folderId)
                         onShow(Showing.SYNC)
                     },
+                    onMoveSyncedNote = { noteId ->
+                        sync.openForMove(noteId)
+                        onShow(Showing.SYNC)
+                    },
                     onOpenAttention = { onShow(Showing.ATTENTION) },
                 ),
             )
@@ -295,6 +299,7 @@ class MainActivity : ComponentActivity() {
         onCreateFolder = sync::createFolder,
         onSetDefaultFolderHere = sync::setDefaultFolderHere,
         onBindHere = sync::bindHere,
+        onMoveHere = sync::moveHere,
         onPinFolderHere = sync::pinFolderHere,
         onCancelBrowse = sync::cancelBrowse,
         onSyncNow = sync::syncNow,
@@ -319,6 +324,7 @@ class MainActivity : ComponentActivity() {
         onOpenTrash: () -> Unit,
         onOpenSync: (DocumentId?) -> Unit,
         onOpenSyncForFolder: (FolderId) -> Unit,
+        onMoveSyncedNote: (DocumentId) -> Unit,
         onOpenAttention: () -> Unit,
     ) = LibraryActions(
         onOpenAttention = onOpenAttention,
@@ -350,6 +356,7 @@ class MainActivity : ComponentActivity() {
         onDuplicate = library::duplicate,
         onOpenTrash = onOpenTrash,
         onSaveToNextcloud = { noteId -> onOpenSync(noteId) },
+        onChangeSyncFolder = { noteId -> onMoveSyncedNote(noteId) },
         onSyncFolderToNextcloud = { folderId -> onOpenSyncForFolder(folderId) },
         onStopSyncing = sync::unbind,
         onOpenNextcloud = { onOpenSync(null) },

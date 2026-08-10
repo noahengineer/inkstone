@@ -118,6 +118,38 @@ class SyncViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Opened by *"Change sync folder…"* on a note that is already synced.
+     *
+     * The same browser as binding, confirming into a `MOVE` rather than a new binding — which is
+     * what stops "relocate a note" meaning "leave a copy behind and make another".
+     */
+    fun openForMove(noteId: DocumentId) {
+        mutable.update { SyncUiState(movingNote = noteId) }
+        refresh()
+    }
+
+    /** Move the synced copy to the folder being browsed. One MOVE; nothing is duplicated. */
+    fun moveHere() {
+        val noteId = mutable.value.movingNote ?: return
+        val browser = mutable.value.browser ?: return
+        viewModelScope.launch {
+            val moved = library.moveRemoteTo(noteId, browser.path)
+            mutable.update {
+                it.copy(
+                    movingNote = null,
+                    browser = null,
+                    message = if (moved == null) {
+                        "That note is not synced, so there is nothing to move."
+                    } else {
+                        "Moving to $moved. The old copy is not left behind."
+                    },
+                )
+            }
+            refresh()
+        }
+    }
+
     fun refresh() {
         viewModelScope.launch {
             val known = accounts.all()
@@ -136,7 +168,9 @@ class SyncViewModel @Inject constructor(
             // row existed — losing SPEC §7.6's "a default folder per account makes step 2 one
             // tap" for exactly the users who had signed out and back in.
             val single = mutable.value.usable.singleOrNull()
-            val wants = mutable.value.bindingNote != null || mutable.value.pinningFolder != null
+            val wants = mutable.value.bindingNote != null ||
+                mutable.value.pinningFolder != null ||
+                mutable.value.movingNote != null
             if (wants && mutable.value.browser == null && single != null) {
                 chooseAccount(single.id)
             }
@@ -383,7 +417,7 @@ class SyncViewModel @Inject constructor(
 
     /** Leave the folder browser without binding anything. Changes nothing, remotely or locally. */
     fun cancelBrowse() {
-        mutable.update { it.copy(browser = null, bindingNote = null) }
+        mutable.update { it.copy(browser = null, bindingNote = null, movingNote = null, pinningFolder = null) }
     }
 
     fun unbind(noteId: DocumentId) {
@@ -420,6 +454,8 @@ data class SyncUiState(
     val openInBrowser: LoginFlowStart? = null,
     val browser: RemoteBrowser? = null,
     val bindingNote: DocumentId? = null,
+    /** Non-null while a synced note's remote copy is being relocated (a MOVE, not a re-bind). */
+    val movingNote: DocumentId? = null,
     /** Non-null while a *folder* is being pinned to a remote path (M6). */
     val pinningFolder: FolderId? = null,
     val outboxCount: Int = 0,

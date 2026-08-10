@@ -1117,6 +1117,7 @@ the proxy is in the loop rather than merely present.
 | 9 ⚑ | Layer 3 on an unreadable pull: never auto-recovered, local note and ETag untouched, `REMOTE_NOT_RECOVERABLE` row; plus 9b, first-write-wins on a re-merge | `MergeMatrixFoldTest`, `PulledPdfExtractorTest` | ✅ | The **flattened-page** (>500 strokes) and **recover-then-re-upload** variants are not written at all |
 | 10 ⚑ | `merge` bypasses the undo stack; undo after a pull removes this device's stroke and not the peer's, through a **reopened** session | `MergeMatrixFoldTest`, `NoteEditorRemoteOpsTest` | ✅ (JVM half) | The wet-ink/camera half is **not** live and not JVM: it is `WetInkRemoteMergeTest`, instrumented, 2 tests, green on the AVD only. `activeStrokeId` is private to `InkSurfaceView`, so a device is the only vantage point. And a peer's `SetPageMeta`/`SetTransform` on an **existing** object still does not render until a page switch (§8) |
 | 11 | Same `oc:id`, same ETag, new href: zero GETs, one library row, `localRev` unchanged | `MergeMatrixTransportTest` | ✅ — and **only** live is the real thing | In-process, the third-party rename is `LocalMatrixServer.moveDirectly`, so `WebDavClient.move` and the proxy's `Destination` rewrite are in the loop live only. Live therefore also settles the row's own `notProven` string: a real Nextcloud MOVE **did** preserve the ETag, since `moved == 1` is unreachable otherwise |
+| 11b | **Added after M6** (see the note under this table). The same move into a folder **outside every walk root**, where rule 2 has no href to compare: one `SEARCH` on `/remote.php/dav/` repaths the binding, zero GETs, nothing trashed, `localRev` untouched, one library row — and the pass after it reconciles the file at its new home | `MergeMatrixTransportTest`; the three fallback branches in `ReconcilerFileTest` | ✅ | Nothing. The MOVE, the `SEARCH`, the empty-`multistatus` answer for a fileid with nothing at it, and the ETag that survived the move are all the real server's |
 | 12 | Cancellation spends no attempt and leaves the remote file whole | `MergeMatrixTransportTest` | ✅ | A body that stops arriving **mid-socket** — needs an nginx `limit_rate` sidecar. The cancellation is injected at the materializer instead, deliberately, because mid-socket is a race |
 | 12b | A 507 parks rather than laddering; the day-long park releases on the clock; `OC-Checksum` verified server-side so a 2xx proves the header | `MergeMatrixTransportTest` | **setup only** | A quota the test can fill. Live, `refuseWithQuotaExceeded` returns false and the row returns after `share`/`drawStroke`, so **every assertion in this row is in-process only**. Also unproven: that a real Nextcloud answers 507 rather than 413 or 500 |
 | 13 | 412 → park → `DrainReport.conflicted` → reconcile → un-park → re-upload with the fresh `If-Match`, **no conflicted copy**; 13b: unmergeable → copy with a **new `DocumentId`** | `MergeMatrixTransportTest`, `NoteMergeTest`, `ReconcilerFileTest` | ✅ both halves | — |
@@ -1133,6 +1134,13 @@ the proxy is in the loop rather than merely present.
 | **+** | **§7.7 layer 3 is bounded**: an unmergeable file met on four polls (a neighbour's uploads moving the folder ETag, so the walk really re-reaches it) leaves **one** copy and **one** row, and a row the user dismissed in between stays dismissed and still names that copy | `MergeMatrixConvergenceTest`; the mechanisms in `ReconcilerFileTest`, `AttentionTest` | ✅ | — |
 
 ⚑ marks the rows ROADMAP M6 names as catching design bugs rather than coding bugs.
+
+⚠️ **Row 11b was added after this table was measured, and it is here because row 11 is what let the
+bug through.** The counts in the paragraph above (27 tests, 24 live) belong to the dated run that
+produced them and are left as measured; the matrix is **28** tests now. Row 11 renames a file inside
+a folder the walk was already listing, so it never asked whether §7.4 rule 2 can fire at all for a
+move *out* of the walked set — it cannot, and step 3's fourth branch trashed the note instead. A
+green row is only evidence about the fixture it was written with; see §6.
 
 **Summary of the column:** 24 of the 27 bodies assert their own claims against a real Nextcloud.
 Two (15, 12b) reach it and return at a trigger needing a shell on the instance. One (19) has no

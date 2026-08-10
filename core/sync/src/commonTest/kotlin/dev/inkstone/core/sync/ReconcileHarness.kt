@@ -11,6 +11,7 @@ import io.ktor.client.engine.mock.respondError
 import io.ktor.client.request.HttpRequestData
 import io.ktor.client.request.HttpResponseData
 import io.ktor.http.HttpStatusCode
+import io.ktor.http.content.OutgoingContent
 import io.ktor.http.headersOf
 
 /*
@@ -26,7 +27,15 @@ import io.ktor.http.headersOf
  * Block comment, not KDoc: a file-level KDoc attaches to no declaration and ktlint rejects it.
  */
 
-/** One resource as a server would describe it. */
+/**
+ * One resource as a server would describe it.
+ *
+ * @param fileId ⚠️ `oc:fileid`, stated **explicitly** rather than derived from [ocId] — which is
+ *   what a `SEARCH` matches on (SPEC §7.4 rule 2). Deriving it here would mean the fixture and
+ *   [RemoteBinding.remoteFileId] shared one reading of `oc:id`'s format, so a test could pass with
+ *   both of them wrong. Null means "this server publishes no fileid for it", which is a real case:
+ *   the property is a 404 propstat inside a `SEARCH` select on some backends.
+ */
 internal class Remote(
     val path: String,
     val isCollection: Boolean,
@@ -35,6 +44,7 @@ internal class Remote(
     val weak: Boolean = false,
     val md5: String? = null,
     val fingerprint: String? = null,
+    val fileId: Long? = null,
 )
 
 /**
@@ -57,9 +67,23 @@ internal class FakeServer {
 
     private var uidStatus: HttpStatusCode = HttpStatusCode.OK
 
+    private var searchStatus: HttpStatusCode? = null
+
     /** Make SPEC §7.2's confirmation call agree that the app password is dead. */
     fun refusingUid(): FakeServer {
         uidStatus = HttpStatusCode.Unauthorized
+        return this
+    }
+
+    /**
+     * An instance with no search backend — SPEC §7.4 rule 2's fallback has to survive one.
+     *
+     * 501 by default because that is what a Sabre server with the plugin absent answers; 405 and a
+     * proxy that blocks unknown methods land in the same branch, and all three must mean *"cannot
+     * tell"* rather than *"deleted"*.
+     */
+    fun refusingSearch(status: HttpStatusCode = HttpStatusCode.NotImplemented): FakeServer {
+        searchStatus = status
         return this
     }
 
@@ -88,10 +112,37 @@ internal class FakeServer {
         weak: Boolean = false,
         md5: String? = null,
         getEtag: String? = null,
+        fileId: Long? = null,
     ): FakeServer {
-        put(Remote(path, isCollection = false, etag = etag, ocId = ocId, weak = weak, md5 = md5))
+        put(Remote(path, isCollection = false, etag = etag, ocId = ocId, weak = weak, md5 = md5, fileId = fileId))
         bytes[path] = content
         getEtag?.let { onGet[path] = it }
+        return this
+    }
+
+    /**
+     * Move a file the way the Nextcloud web UI does: new href, **same `oc:id`, same ETag**.
+     *
+     * SPEC §7.4 rule 2, and the reason it is one method rather than a `file()` call at the new path —
+     * a fixture that re-declared the file would be free to give it a fresh validator, and then a test
+     * about move detection would be testing a change instead.
+     */
+    fun moveFile(from: String, to: String): FakeServer {
+        val stored = resources.getValue(from)
+        resources.remove(from)
+        children[from.substringBeforeLast('/', "")]?.remove(from)
+        bytes.remove(from)?.let { bytes[to] = it }
+        put(
+            Remote(
+                path = to,
+                isCollection = false,
+                etag = stored.etag,
+                ocId = stored.ocId,
+                weak = stored.weak,
+                md5 = stored.md5,
+                fileId = stored.fileId,
+            ),
+        )
         return this
     }
 
@@ -122,6 +173,10 @@ internal class FakeServer {
 
             request.method.value == "PROPFIND" -> propfind(pathOf(encoded), request.headers["Depth"])
 
+            // ⚠️ Not `pathOf`: a SEARCH is addressed at `/remote.php/dav/`, which has no uid in it,
+            // so `pathFromHref` answers null. See [NextcloudUrls.davRoot].
+            request.method.value == "SEARCH" -> search(request)
+
             request.method.value == "GET" -> get(pathOf(encoded))
 
             else -> respondError(HttpStatusCode.MethodNotAllowed)
@@ -142,6 +197,29 @@ internal class FakeServer {
         }
         return xml(multistatus(shown))
     }
+
+    /**
+     * RFC 5323 `SEARCH` over `oc:fileid` — SPEC §7.4 rule 2 asked without a path.
+     *
+     * A fileid with nothing at it answers **207 with an empty multistatus**, exactly as the real
+     * Nextcloud 32.0.13 does (measured), because that is the only thing that distinguishes *"the
+     * file is genuinely gone"* from *"this server cannot answer"*.
+     */
+    private fun MockRequestHandleScope.search(request: HttpRequestData): HttpResponseData {
+        searchStatus?.let { return respondError(it) }
+        val wanted = fileIdIn(bodyOf(request))
+        val hits = if (wanted == null) emptyList() else resources.values.filter { it.fileId == wanted }
+        return xml(multistatus(hits))
+    }
+
+    private fun bodyOf(request: HttpRequestData): String =
+        (request.body as? OutgoingContent.ByteArrayContent)?.bytes()?.decodeToString().orEmpty()
+
+    private fun fileIdIn(body: String): Long? = body
+        .substringAfter("<d:literal>", "")
+        .substringBefore("</d:literal>", "")
+        .trim()
+        .toLongOrNull()
 
     private fun MockRequestHandleScope.get(path: String): HttpResponseData {
         statusFor[path]?.let { return respondError(it) }
@@ -178,6 +256,7 @@ internal class FakeServer {
                 if (resource.isCollection) "<d:resourcetype><d:collection/></d:resourcetype>" else "<d:resourcetype/>",
             )
             resource.ocId?.let { append("<oc:id>$it</oc:id>") }
+            resource.fileId?.let { append("<oc:fileid>$it</oc:fileid>") }
             resource.md5?.let { append("<oc:checksums><oc:checksum>MD5:$it</oc:checksum></oc:checksums>") }
             resource.fingerprint?.let { append("<nc:data-fingerprint>$it</nc:data-fingerprint>") }
             append("</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>")

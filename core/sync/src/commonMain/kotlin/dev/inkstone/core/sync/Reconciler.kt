@@ -29,6 +29,7 @@ import kotlinx.coroutines.sync.Mutex
  * 6. extract the bundle            — RemoteBundleExtractor, in :android:pdf
  * 7. merge                         — RemoteMergeGate, in :app, under the note's mutex
  * 8. the outbox decision table     — the termination argument for the ETag ping-pong
+ * 9. per binding the walk missed   — SEARCH its fileid before concluding a deletion (resolveAbsent)
  * ```
  *
  * ## It performs no remote writes. None.
@@ -39,7 +40,7 @@ import kotlinx.coroutines.sync.Mutex
  * the outbox uploads it like anything else, with the `If-None-Match: *` that stops it landing on
  * top of the file it exists to preserve.
  *
- * ## Five things that are silent if they are wrong
+ * ## Six things that are silent if they are wrong
  *
  * **Exactly one pass runs at a time.** Two overlapping passes share the staging directory and the
  * directory cache, and every way that goes wrong ends as a *conflict* rather than as an error — a
@@ -55,6 +56,12 @@ import kotlinx.coroutines.sync.Mutex
  * unstamped bindings with the walked-and-settled set. Skipping that intersection puts a hundred
  * notes in the trash on one lucky ETag match — and *"walked"* alone was not enough: the pass limit,
  * a 404 and a failed file all left a directory in the walked set with its files unread.
+ *
+ * **A note absent from every walked folder may have simply been moved somewhere we do not walk.**
+ * The walk only ever visits folders this account already has a note in, so SPEC §7.4 rule 2 — which
+ * needs the *new* href to compare — cannot fire for a move out of that set, and the note was trashed
+ * with its file untouched on the server. [resolveAbsent] asks the fileid where it went before
+ * concluding anything, once per absent candidate and never per file.
  *
  * **A directory's ETag is cached only when everything under it finished.** The cache row means
  * *"fully reconciled at this version"*. Writing one over an unmerged download prunes that subtree
@@ -953,20 +960,118 @@ public class Reconciler(
         val deferred = ArrayList<String>()
         for (candidate in bindings.notSeenSince(pass.accountId, pass.passStartedAt)) {
             if (!isAbsentRemotely(candidate, visited)) continue
-            if (gate.trashRemotelyDeleted(candidate.noteId, DELETED_REASON)) {
-                engine.noteDeletedRemotely(candidate.noteId)
-                record(ReconcileOutcome.DeletedRemotely(candidate.noteId, candidate.remotePath), pass.accountId)
-                running = running.copy(trashed = running.trashed + 1)
-            } else {
-                record(ReconcileOutcome.Deferred(candidate.noteId, candidate.remotePath, EDITOR_HOLDS), pass.accountId)
-                deferred += candidate.remotePath.substringBeforeLast('/', "")
-            }
+            val outcome = resolveAbsent(pass, candidate)
+            record(outcome, pass.accountId)
+            running = running.counting(outcome)
+            if (outcome is ReconcileOutcome.Deferred) deferred += candidate.remotePath.substringBeforeLast('/', "")
         }
         // After the loop, never inside it: unsettling a directory mid-loop would change
         // [isAbsentRemotely]'s answer for every candidate after it in the same directory, which
         // would make the outcome depend on the order the rows came back in.
         for (directory in deferred) visited.unsettled(directory, owed = true)
         return running
+    }
+
+    /**
+     * ⭐ *"Absent from every folder we walk"* is not *"deleted"* — **ask where the file went first.**
+     *
+     * SPEC §7.4 rule 2 detects a move as *"same `oc:id` + same ETag + a different href"*, and all
+     * three of those are properties of a file the walk **listed**. [RemoteWalk.rootsOf] visits only
+     * the account's default folder, the parent of every binding and the pinned folders — so a note
+     * the user drags in the Nextcloud web UI into a folder outside that set is listed nowhere, its
+     * old directory is walked and settled without it, and this branch concluded a **remote
+     * deletion**. Reported from a real tablet: the note went to the local trash while its file sat
+     * untouched on the server one folder away. SPEC §13.2 row 11 passed throughout, because its
+     * fixture moves the file *within* a walked folder.
+     *
+     * So the fileid is asked directly ([locate]), and three answers are kept apart because only one
+     * of them may reach the trash:
+     *
+     * - **found** → rule 2, with no href to have compared: follow it, spend no bytes. The stored
+     *   ETag stays valid, because a move does not change it.
+     * - **found nowhere** → genuinely gone, and the existing path runs. A file in the server's own
+     *   trash answers this way too, which is what keeps row 14 working.
+     * - **cannot tell** — no search backend, a 405, an unreadable body, no fileid to derive — →
+     *   ⚠️ **exactly what this pass would have done without asking.** A failed search is evidence of
+     *   nothing: concluding a deletion from one would make an unsupported method delete notes, and
+     *   keeping the binding regardless would make a note stop syncing with the poll reporting
+     *   success. The walk's conclusion stands either way.
+     *
+     * ⚠️ **One SEARCH per absent *candidate*, and the guards come first.** [isAbsentRemotely] is what
+     * keeps this from being a request per note per pass: a pruned subtree leaves every binding under
+     * it unstamped, so searching before that guard would cost one SEARCH per note in the library
+     * every time anything anywhere changed. An idle account still costs one `PROPFIND Depth:0`.
+     *
+     * And it is asked **before** the gate, not after. A note an editor holds refuses the trash and
+     * defers forever, which is *"the app shows SYNCED and nothing happens"* — the other half of the
+     * reported symptom, and it would survive a fix that only ran when the trash succeeded.
+     */
+    private suspend fun resolveAbsent(pass: Pass, candidate: StaleBinding): ReconcileOutcome {
+        val binding = bindings.find(candidate.noteId)
+        if (binding != null) {
+            val located = locate(pass, binding)
+            if (located is FileIdSearch.At) return follow(pass, binding, located.path)
+        }
+        if (!gate.trashRemotelyDeleted(candidate.noteId, DELETED_REASON)) {
+            return ReconcileOutcome.Deferred(candidate.noteId, candidate.remotePath, EDITOR_HOLDS)
+        }
+        engine.noteDeletedRemotely(candidate.noteId)
+        return ReconcileOutcome.DeletedRemotely(candidate.noteId, candidate.remotePath)
+    }
+
+    /**
+     * Where the file with this binding's fileid is now, or why that is not knowable.
+     *
+     * The `oc:id` comparison is the guard, not a sanity check: [RemoteBinding.remoteFileId] reads
+     * digits off a string, and a hit whose identity cannot be confirmed must not repath a binding
+     * onto somebody else's file — the next UPLOAD would land on it. A 207 carrying something we
+     * cannot identify is therefore *"cannot tell"* and **not** *"gone"*; only an empty answer is
+     * gone.
+     */
+    private suspend fun locate(pass: Pass, binding: RemoteBinding): FileIdSearch {
+        val ocId = binding.remoteOcId ?: return FileIdSearch.CannotTell
+        val fileId = binding.remoteFileId ?: return FileIdSearch.CannotTell
+        val found = when (val outcome = pass.session.dav.searchByFileId(fileId)) {
+            is DavOutcome.Failed -> return FileIdSearch.CannotTell
+            is DavOutcome.Ok -> outcome.value
+        }
+        val match = found.firstOrNull { it.ocId == ocId }
+        return when {
+            match != null -> FileIdSearch.At(match.path)
+            found.isEmpty() -> FileIdSearch.Gone
+            else -> FileIdSearch.CannotTell
+        }
+    }
+
+    /**
+     * Point the binding at [path] — and **nothing else**.
+     *
+     * No download (rule 2: the ETag did not change, so the stored one still describes these bytes),
+     * and no library-folder move: [moved] can mirror a folder because the walk handed it the new
+     * parent's `oc:id`, and this branch has no walked directory at all. A path is not identity
+     * (CLAUDE.md), so matching the new parent against the folder pins by string here would be the
+     * one lookup in this class that did.
+     *
+     * ⭐ **The new parent joins the walk roots by itself, and that is the whole follow-on.**
+     * [RemoteWalk.rootsOf] derives roots from `bindingPaths`, so the pass after this one lists the
+     * destination folder and reconciles the file there normally — which is what makes a move *plus*
+     * an edit converge rather than leaving the note repathed and never read.
+     *
+     * Stamped seen although no directory was walked: a `SEARCH` that answered with this file's own
+     * `oc:id` is a stronger statement than a listing, and leaving it unstamped spends one more
+     * SEARCH on every pass until the walk happens to reach the new parent.
+     *
+     * @return [ReconcileOutcome.Moved] when the path actually changed. Otherwise the file is exactly
+     *   where the binding already says it is — a queued MOVE that has not drained, or a race with
+     *   the listing — so nothing is concluded and the directory is owed another look. Never a
+     *   deletion: the server has just said the file is there.
+     */
+    private suspend fun follow(pass: Pass, binding: RemoteBinding, path: String): ReconcileOutcome {
+        val followed = binding.following(path)
+        if (followed != binding) bindings.upsert(followed)
+        bindings.stampSeen(listOf(binding.noteId), pass.passStartedAt)
+        if (followed == binding) return ReconcileOutcome.Deferred(binding.noteId, path, STILL_ON_THE_SERVER)
+        return ReconcileOutcome.Moved(binding.noteId, binding.remotePath, path)
     }
 
     /**
@@ -1273,6 +1378,25 @@ public class Reconciler(
         data class Failed(val path: String, val failure: DavFailure) : RootProbe
     }
 
+    /**
+     * ⭐ What a fileid `SEARCH` established — and the three answers kept deliberately apart.
+     *
+     * A `Boolean?` would have collapsed the two that matter: *"the server says nothing has this
+     * fileid"* is a fact worth trashing on, and *"this server cannot answer"* is not a fact at all.
+     * Both look like *"not found"* from the call site, and only one of them may destroy a note.
+     * See [resolveAbsent].
+     */
+    private sealed interface FileIdSearch {
+        /** The file exists, here. Whatever the walk did or did not list, this is never a deletion. */
+        data class At(val path: String) : FileIdSearch
+
+        /** 207, and nothing on the server has that fileid. Includes a file in the server's trash. */
+        data object Gone : FileIdSearch
+
+        /** No usable answer. The conclusion the walk had already reached stands, unchanged. */
+        data object CannotTell : FileIdSearch
+    }
+
     private sealed interface Listing {
         data class Ok(val walk: WalkStep) : Listing
 
@@ -1318,6 +1442,9 @@ public class Reconciler(
         const val NOT_OURS = "no Inkstone marker"
 
         const val EDITOR_HOLDS = "the note is open in the editor; trashing it would make it unrestorable"
+
+        /** A `SEARCH` found the file where the binding already says it is. See [follow]. */
+        const val STILL_ON_THE_SERVER = "the file is still on the server at the path we hold"
 
         /**
          * How long an account is left alone after a 401 SPEC §7.2's probe could not confirm.

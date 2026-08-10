@@ -283,6 +283,16 @@ private fun NoteMenu(
                     onDismiss()
                 },
             )
+            // Relocating used to mean "Stop syncing" then "Save to Nextcloud…" elsewhere, which
+            // leaves the original file on the server (unbinding never deletes it — rule 1) and
+            // creates a second one. This is one MOVE and no duplicate.
+            DropdownMenuItem(
+                text = { Text("Change sync folder…") },
+                onClick = {
+                    actions.onChangeSyncFolder(note.id)
+                    onDismiss()
+                },
+            )
         }
         // "Move to trash", not "Delete". There is no delete (ROADMAP M3).
         DropdownMenuItem(

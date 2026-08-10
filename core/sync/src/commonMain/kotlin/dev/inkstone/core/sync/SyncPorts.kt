@@ -147,6 +147,27 @@ public data class RemoteBinding(
      */
     public val everUploaded: Boolean
         get() = remoteOcId != null || lastSyncedEtag != null || lastUploadAtEpochMillis > 0L
+
+    /**
+     * ⭐ The numeric `oc:fileid` inside [remoteOcId] — what a `SEARCH` matches on (SPEC §7.4 rule 2).
+     *
+     * SPEC §7.3's `oc:id` is `<zero-padded fileid><instanceid>`, and an instanceid is `oc` followed
+     * by ten random characters, so the fileid is the **leading run of digits**. Not the first eight
+     * characters: a fileid above 99 999 999 is simply longer than its padding, and truncating one
+     * there would silently address a different file.
+     *
+     * *Derived rather than stored,* and the argument is what happens when the derivation is wrong
+     * rather than how likely that is. A value that resolves to nothing yields *"genuinely gone"*,
+     * which is exactly the conclusion the pass had already reached without asking — so a bad
+     * derivation can only fail to *rescue* a moved note, never destroy one. That, plus
+     * [dev.inkstone.core.sync.WebDavXml.searchByFileIdBody] verifying `oc:id` on the way back, is
+     * why this does not need a column and a migration.
+     *
+     * Null when there is no `oc:id`, when it starts with no digits, or when those digits do not fit
+     * a `Long`. Every one of those means *"cannot tell"* to the caller, never *"deleted"*.
+     */
+    public val remoteFileId: Long?
+        get() = remoteOcId?.takeWhile(Char::isDigit)?.takeIf { it.isNotEmpty() }?.toLongOrNull()
 }
 
 /**

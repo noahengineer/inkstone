@@ -284,6 +284,28 @@ internal class TwoDevices private constructor(
     private val rawTransport = NextcloudTransport.create()
     val raw: WebDavClient = WebDavClient(rawTransport, server.credential)
 
+    /**
+     * ⭐ A folder **no walk root can reach** — row 11b's destination.
+     *
+     * A *sibling* of [remoteFolder], and that is the whole point rather than tidiness.
+     * [remoteFolder] is the account's default folder *and* the parent of every binding the fixture
+     * makes, so `RemoteWalk.rootsOf` makes it a root and everything inside it is under one by
+     * construction. Only a sibling is somewhere the walk has no reason to look, which is the case
+     * SPEC §7.4 rule 2 cannot see.
+     */
+    val outsideFolder: String get() = "$remoteFolder-outside"
+
+    private var madeOutsideFolder = false
+
+    /** MKCOL [outsideFolder] once, so a live `MOVE` has a destination that exists. */
+    suspend fun makeOutsideFolder(): String {
+        if (!madeOutsideFolder) {
+            raw.mkcolRecursive(outsideFolder)
+            madeOutsideFolder = true
+        }
+        return outsideFolder
+    }
+
     suspend fun start() {
         a.start()
         b.start()
@@ -407,21 +429,28 @@ internal class TwoDevices private constructor(
         // switch on, and then this teardown's own DELETE would 401 — leaving the folder behind *and*
         // spending another of the server's brute-force attempts on a request nobody asked for.
         server.refuseAuthorization(false)
-        // On a live server the fixture's own folder is removed, so a hundred runs do not leave a
+        // On a live server the fixture's own folders are removed, so a hundred runs do not leave a
         // hundred conflicted copies behind. `DELETE` is soft, so the bytes are still recoverable
         // from the server's trash if a failure needs looking at (CLAUDE.md rule 1).
+        //
+        // ⚠️ [outsideFolder] is a *sibling*, so deleting [remoteFolder] does not take it with it.
         if (server.isLive) {
-            @Suppress("TooGenericExceptionCaught", "SwallowedException")
-            // Best-effort cleanup after the assertions have already run or failed. Letting this
-            // throw would replace a real failure with a teardown one.
-            try {
-                kotlinx.coroutines.runBlocking { raw.delete(remoteFolder) }
-            } catch (ignored: Throwable) {
-                println("  (live) could not clean up $remoteFolder — remove it by hand")
-            }
+            cleanUp(remoteFolder)
+            if (madeOutsideFolder) cleanUp(outsideFolder)
         }
         rawTransport.close()
         server.close()
+    }
+
+    @Suppress("TooGenericExceptionCaught", "SwallowedException")
+    // Best-effort cleanup after the assertions have already run or failed. Letting this throw would
+    // replace a real failure with a teardown one.
+    private fun cleanUp(remoteFolder: String) {
+        try {
+            kotlinx.coroutines.runBlocking { raw.delete(remoteFolder) }
+        } catch (ignored: Throwable) {
+            println("  (live) could not clean up $remoteFolder — remove it by hand")
+        }
     }
 
     companion object {

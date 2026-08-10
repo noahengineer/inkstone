@@ -53,6 +53,13 @@ public object RemoteWalk {
      * would list `Notes/Physics` twice and, worse, would let the second walk stamp it as seen
      * after the first had pruned it.
      *
+     * ⚠️ **Nothing here can see a note moved *out* of the set**, and that is not a gap this function
+     * can close — widening the roots is rule 3's crawl of the user's photo library. It means SPEC
+     * §7.4 rule 2's move detection, which needs the new href in hand, cannot fire for such a move;
+     * `Reconciler.resolveAbsent` asks the server for the file's current path by fileid instead,
+     * before it is allowed to conclude a deletion. A note whose binding is repathed that way adds
+     * its new parent here on the very next pass, which is what closes the loop.
+     *
      * @return roots deepest-last, with `""` — the DAV root — present only if something is
      *   genuinely bound at the top level. [plan] must be called with `allowDescend = false` for
      *   that one.

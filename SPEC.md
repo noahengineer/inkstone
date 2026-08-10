@@ -1094,6 +1094,52 @@ restored backup instead.
 **Rule 2 — a file's ETag does NOT change when it moves.** Only source and destination directories change.
 ⇒ **Same `oc:id` + same ETag + different href = a move.** Update the binding; do not re-download, do not treat as delete-plus-create.
 
+⚠️ **Rule 2 can only fire for a file the walk LISTED, and the walk deliberately does not list
+everything** (M7). Every word of *"a different href"* presumes the new href is in hand, and it is
+not: rule 3 of §7.6's walk visits only the account's default folder, the parent of every binding and
+the pinned folders, because `Depth:1` from `/` is a crawl of the user's photo library. So a note the
+user drags in the **web UI** into a folder outside that set is listed nowhere — after which its old
+directory is walked and settled without it, and §7.6 step 3's **fourth branch** concludes a remote
+deletion. Reported from a real tablet: the local note went to the trash with a *"Deleted on the
+server"* row while its file sat untouched on the server one folder away. §13.2 row 11 passed
+throughout, because its fixture moves the file *within* a walked folder.
+
+**Fix: stop inferring the file's location and ask for it.** `SEARCH` on `/remote.php/dav/` resolves a
+fileid to its current path, verified against Nextcloud 32.0.13:
+
+```
+SEARCH /remote.php/dav/    Content-Type: text/xml
+<?xml version="1.0" encoding="UTF-8"?>
+<d:searchrequest xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:basicsearch>
+    <d:select><d:prop><oc:id/><oc:fileid/><d:getetag/><d:resourcetype/></d:prop></d:select>
+    <d:from><d:scope><d:href>/files/<uid></d:href><d:depth>infinity</d:depth></d:scope></d:from>
+    <d:where><d:eq><d:prop><oc:fileid/></d:prop><d:literal>1773</d:literal></d:eq></d:where>
+  </d:basicsearch>
+</d:searchrequest>
+   → 207  <d:href>/remote.php/dav/files/inkstone/MoveProbeB/probe.pdf</d:href>
+```
+
+Four measured details the implementation depends on:
+
+- ⚠️ **The URL is the DAV root, not `files/<uid>/`.** The search backend is mounted there and the
+  `<d:scope>` is what narrows it to one user; `SEARCH` against `files/<uid>/` is a **404**, which is
+  indistinguishable from the deletion this is trying to rule out.
+- **A fileid with nothing at it answers 207 with an empty `multistatus`** — including one whose file
+  is in the server's *own* trash. That is what keeps §13.2 row 14's deletion decidable.
+- **`<oc:id/>` is selectable and must be selected.** The numeric fileid is derived from the stored
+  `oc:id`'s leading digits (§7.3), and a hit whose identity cannot be *confirmed* must never repath a
+  binding — the next `PUT` would land on a stranger's file. An unidentifiable hit is *"cannot tell"*,
+  never *"gone"*. (`oc:checksums` is **not** selectable: 404 propstat inside a search.)
+- **Two alternatives do not work.** `PROPFIND /remote.php/dav/meta/<id>` is a 404 on 32.0.13
+  (`Sabre\DAV\Exception\NotFound: File not found: meta in 'root'`), and `REPORT oc:filter-files`
+  supports favourite and systemtag filters only, not fileid.
+
+**Cost:** one `SEARCH` per *absent candidate*, behind step 3's existing guards — never one per file.
+An idle account with 200 notes still costs one `PROPFIND Depth:0`. **And a failed search concludes
+nothing:** a non-207 or an unreadable body leaves the pass with exactly the conclusion it already
+had, because a server with no search backend must not be able to delete notes.
+
 **Caveats:** trash→restore **changes the fileid** (keep a secondary key: content hash + name); one file shared in twice has one id at two paths (key on `(oc:id, path)`); external-storage rescans have changed ids. Degrade gracefully.
 
 ✅ `OC-FileId` and `OC-Etag` come back as **response headers on PUT/MOVE/COPY** — no follow-up PROPFIND.
@@ -1321,6 +1367,14 @@ Each of these fails **silently**: the poll reports success and a note simply sto
   **404** was recorded as an empty listing (so renaming a bound folder in the web UI — §7.4 rule 2's
   *move* — trashed everything under it), and a file in it failed. The guard is
   `walked − unfinished`, and being over-conservative here only ever *keeps* a note.
+
+  ⚠️ **And even a settled directory only proves the file is not *there*** (M7). The walk visits the
+  folders this account already has notes in, so "absent from all of them" includes every file the
+  user moved somewhere else — see §7.4 rule 2, which cannot fire without the new href. Before this
+  branch may conclude anything, the binding's fileid is `SEARCH`ed for; found is a move, an empty
+  answer is a deletion, and a search that failed leaves the walk's conclusion alone. The search sits
+  **behind** the guards above, or it becomes one request per note in the library per poll, and
+  **before** the trash gate, or a note an editor holds never gets the benefit of it.
 - **The trash is not reachable while an editor holds the note.** `NoteTrash.trash` moves
   `notes/<id>/`, a live session is not told, and its next autosave recreates the directory with a
   journal and no bundle — after which the note is unrestorable, unopenable, and destroyed by the
@@ -1776,7 +1830,7 @@ is hammering somebody's server.
 | 8 | A compacts while B is offline holding older ops | B's ops reintegrate — snapshot discarded and re-folded (§4.7). |
 | 9 | Recovered-mode document re-uploaded | **Strokes are NOT duplicated** (§5.6 replace-not-union). |
 | 10 | Both devices online, same page open in the editor | Remote ops apply live; camera and in-progress stroke preserved; local undo unaffected. |
-| 11 | User moves the file in the Nextcloud web UI | Detected as a move. No re-download, no duplicate. |
+| 11 | User moves the file in the Nextcloud web UI | Detected as a move. No re-download, no duplicate. **Row 11b is the companion the table did not ask for and the design needs**: the same move into a folder **outside every walk root**, where rule 2 has no href to compare and step 3's fourth branch trashed the note instead. Asserts a repathed binding, one `SEARCH`, zero GETs, nothing trashed and an untouched `local_rev` (M7, §7.4 rule 2). |
 | 12 | Upload interrupted mid-PUT | Outbox retries. No partial remote file. |
 | 13 | 412 on `If-Match` | Merge attempted, then conflicted copy. Never a blind overwrite. |
 | 14 | Remote deleted while local has unsynced edits | Local → trash, not hard-deleted. User notified. |

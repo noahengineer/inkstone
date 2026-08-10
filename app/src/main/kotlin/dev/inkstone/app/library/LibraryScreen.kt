@@ -455,6 +455,8 @@ data class LibraryActions(
     val onOpenTrash: () -> Unit,
     /** SPEC §7.6 — *"Save to Nextcloud…"*. Opens the account/folder picker for this note. */
     val onSaveToNextcloud: (DocumentId) -> Unit,
+    /** Relocate a synced note's remote copy — one MOVE, no duplicate left behind. */
+    val onChangeSyncFolder: (DocumentId) -> Unit,
     /** M6 — pin a folder to a remote path, so everything under it syncs there (SPEC §9). */
     val onSyncFolderToNextcloud: (FolderId) -> Unit,
     /** Stop syncing a bound note. Not a remote delete — the copy on the server stays. */

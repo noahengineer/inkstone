@@ -220,3 +220,94 @@ class SignOutReversibleTest {
         assertEquals(before, h.scheduler.drains, "a resume with nothing to upload still woke the worker")
     }
 }
+
+/**
+ * ⭐ Relocating a synced note must be a **move**, not a second copy.
+ *
+ * Reported from the tablet: the only way to change where a note synced was "Stop syncing" and
+ * then "Save to Nextcloud…" somewhere else — and that leaves the original file on the server
+ * (unbinding deliberately never deletes it, CLAUDE.md rule 1) while binding again creates a
+ * second one. A few relocations and the remote folder is full of copies the app has forgotten.
+ *
+ * `notePathChanged` was always the right mechanism; nothing in the UI reached it with a new
+ * folder. These tests pin the properties that make it the right one.
+ */
+class MoveSyncedNoteTest {
+
+    private val note = DocumentId("note-a")
+
+    private class Harness {
+        val clock = FakeClock()
+        val notes = FakeSyncNotes()
+        val outbox = FakeOutboxStore()
+        val accounts = FakeAccountStore(testAccount)
+        val bindings = FakeBindingStore()
+        val engine = SyncEngine(SyncStores(accounts, bindings, outbox, notes), clock, NoopScheduler())
+
+        suspend fun bind(noteId: DocumentId, path: String) {
+            notes.setRev(noteId, 5)
+            bindings.upsert(
+                RemoteBinding(
+                    noteId = noteId,
+                    accountId = testAccount.id,
+                    remotePath = path,
+                    remoteOcId = "00000042ocidinstance",
+                    lastSyncedEtag = ETag("etag-1", weak = false),
+                    lastSyncedRev = 5,
+                    lastUploadAtEpochMillis = 1L,
+                ),
+            )
+        }
+    }
+
+    private class NoopScheduler : dev.inkstone.core.model.WorkScheduler {
+        override fun enqueueOutboxDrain() = Unit
+
+        override fun enqueueMaterialization(noteId: DocumentId) = Unit
+    }
+
+    @Test
+    fun `changing the folder queues a move and keeps the same binding`() = runTest {
+        val h = Harness()
+        h.bind(note, "Inkstone/Physics.pdf")
+
+        h.engine.notePathChanged(note, "Physics", remoteFolder = "Documents/Uni")
+
+        val binding = assertNotNull(h.bindings.find(note))
+        assertEquals("Documents/Uni/Physics.pdf", binding.remotePath, "the new path was not recorded")
+        // Where the file still is, so the MOVE has a source. Losing this is how a move becomes a
+        // copy: the drainer would have nothing to move *from* and the UPLOAD would create a second.
+        assertEquals("Inkstone/Physics.pdf", binding.movedFromPath)
+        assertNotNull(h.outbox.rows[note.value to OutboxOpType.MOVE], "no MOVE was queued")
+        // SPEC §7.4 rule 2 — a file's ETag does not change when it moves, so the stored one stays
+        // valid and nothing re-downloads.
+        assertEquals("etag-1", binding.lastSyncedEtag?.value)
+        assertEquals("00000042ocidinstance", binding.remoteOcId, "the identity changed, so it is a new file")
+    }
+
+    @Test
+    fun `there is only ever one binding for the note`() = runTest {
+        // The duplication this replaces: unbind then re-bind leaves the old remote file orphaned
+        // and the new binding pointing at a second one. A move has one binding throughout.
+        val h = Harness()
+        h.bind(note, "Inkstone/Physics.pdf")
+
+        h.engine.notePathChanged(note, "Physics", remoteFolder = "Documents/Uni")
+        h.engine.notePathChanged(note, "Physics", remoteFolder = "Archive/2026")
+
+        assertEquals(1, h.bindings.rows.size, "relocating twice produced more than one binding")
+        // Still the *original* source, not the intermediate: that is where the file actually is,
+        // and moving from a path that never existed on the server is a 404.
+        assertEquals("Inkstone/Physics.pdf", assertNotNull(h.bindings.find(note)).movedFromPath)
+    }
+
+    @Test
+    fun `moving to the folder it is already in queues nothing`() = runTest {
+        val h = Harness()
+        h.bind(note, "Inkstone/Physics.pdf")
+
+        h.engine.notePathChanged(note, "Physics", remoteFolder = "Inkstone")
+
+        assertEquals(0, h.outbox.count(), "a no-op relocation queued a request")
+    }
+}

@@ -983,6 +983,29 @@ class LibraryRepository @Inject constructor(
         )
     }
 
+    /**
+     * ⭐ Move a synced note's remote copy to a different folder, **without unbinding it**.
+     *
+     * The only way to relocate a synced note used to be "Stop syncing" and then "Save to
+     * Nextcloud…" somewhere else — which leaves the original file on the server forever, because
+     * unbinding deliberately does not delete it (CLAUDE.md rule 1), and binding again creates a
+     * second one. Do that a few times and the remote folder fills with copies the app no longer
+     * knows about.
+     *
+     * This is a `MOVE` instead: one request, `Overwrite: F`, and SPEC §7.6 drains it before that
+     * note's `UPLOAD` so the bytes never land at the old path and get shuffled afterwards. The
+     * binding, the note's identity, its history and its `oc:id` are all untouched — a moved file
+     * keeps its ETag (SPEC §7.4 rule 2), so nothing re-downloads either.
+     *
+     * @return the path the note is moving to, or null when it is not bound.
+     */
+    suspend fun moveRemoteTo(id: DocumentId, remoteFolder: String): String? {
+        val binding = sync.bindingOf(id) ?: return null
+        val note = index.note(id) ?: return null
+        sync.notePathChanged(id, note.title, remoteFolder)
+        return sync.bindingOf(id)?.remotePath
+    }
+
     /** Stop syncing a note. **Not** a remote delete — the copy on the server stays where it is. */
     suspend fun unbindFromNextcloud(id: DocumentId) {
         sync.unbind(id)

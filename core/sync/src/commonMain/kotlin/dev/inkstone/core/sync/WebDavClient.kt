@@ -84,6 +84,26 @@ public class WebDavClient(transport: NextcloudTransport, private val credential:
     public suspend fun download(remotePath: String): DavOutcome<DownloadedFile> =
         callRaw(HttpMethod.Get, remotePath) {}.map { DownloadedFile(it.bytes, it.etag, it.ocId) }
 
+    /**
+     * ⭐ Resolve a fileid to wherever the file is **now** — SPEC §7.4 rule 2 without a path.
+     *
+     * The one read in this class that is not addressed at a remote path, because it is the one
+     * question a path cannot express. [WebDavXml.searchByFileIdBody] carries the reason it exists
+     * and the two endpoints that do not work; [NextcloudUrls.davRoot] carries why the URL is the
+     * DAV root and not `files/<uid>/`.
+     *
+     * A server with no search backend answers 405 or 501, and **that is not evidence of anything**:
+     * the caller must treat any non-207 as *"cannot tell"* and leave the conclusion it already had.
+     *
+     * @return the matching resources, which is at most one — fileids are unique per instance. An
+     *   **empty** list is a real answer: nothing on the server has that fileid.
+     */
+    public suspend fun searchByFileId(fileId: Long): DavOutcome<List<DavResource>> =
+        callUrl(HttpMethod("SEARCH"), NextcloudUrls.davRoot(credential.serverUrl), SEARCH_TARGET) {
+            contentType(ContentType.Text.Xml)
+            setBody(WebDavXml.searchByFileIdBody(credential.uid, fileId))
+        }.flatMapText { body -> parseMultistatus(body) }
+
     public suspend fun exists(remotePath: String): DavOutcome<Boolean> =
         when (val outcome = propfind(remotePath, Depth.Zero)) {
             is DavOutcome.Ok -> DavOutcome.Ok(outcome.value.isNotEmpty())
@@ -189,19 +209,34 @@ public class WebDavClient(transport: NextcloudTransport, private val credential:
         configure: HttpRequestBuilder.() -> Unit,
     ): DavOutcome<RawResponse> = callRaw(method, remotePath, configure)
 
+    private suspend fun callRaw(
+        method: HttpMethod,
+        remotePath: String,
+        configure: HttpRequestBuilder.() -> Unit,
+    ): DavOutcome<RawResponse> = callUrl(method, url(remotePath), remotePath, configure)
+
+    /**
+     * The one place a request is actually sent.
+     *
+     * @param url absolute. Every caller but [searchByFileId] builds it from a remote path; that one
+     *   addresses [NextcloudUrls.davRoot], which has no path under it to name.
+     * @param describePath what a 404 is reported as. Cosmetic, and the only thing [url] is otherwise
+     *   needed for downstream.
+     */
     @Suppress("TooGenericExceptionCaught")
     // A network call fails in as many ways as there are engines. Ktor's exception types
     // differ per platform (kotlinx.io.IOException on Native, java.io.IOException on the
     // JVM engine), so catching a narrower type here would compile and then miss the real
     // failure on one of the two targets this module has to work on. Cancellation is
     // rethrown so a cancelled sync worker does not look like a transport error.
-    private suspend fun callRaw(
+    private suspend fun callUrl(
         method: HttpMethod,
-        remotePath: String,
+        url: String,
+        describePath: String,
         configure: HttpRequestBuilder.() -> Unit,
     ): DavOutcome<RawResponse> {
         val response = try {
-            http.request(url(remotePath)) {
+            http.request(url) {
                 this.method = method
                 header("Authorization", authorization)
                 configure()
@@ -211,7 +246,7 @@ public class WebDavClient(transport: NextcloudTransport, private val credential:
         } catch (failure: Throwable) {
             return DavOutcome.Failed(DavFailure.Transport(failure.message ?: failure.toString()))
         }
-        return interpret(response, remotePath)
+        return interpret(response, describePath)
     }
 
     private suspend fun interpret(response: HttpResponse, remotePath: String): DavOutcome<RawResponse> {
@@ -289,6 +324,9 @@ public class WebDavClient(transport: NextcloudTransport, private val credential:
         const val TOO_MANY_REQUESTS = 429
         const val INSUFFICIENT_STORAGE = 507
         const val DETAIL_LIMIT = 500
+
+        /** What a `SEARCH` failure is reported as. It addresses the DAV root, not a file. */
+        const val SEARCH_TARGET = "(search)"
     }
 }
 

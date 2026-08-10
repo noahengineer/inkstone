@@ -491,6 +491,10 @@ internal class LocalMatrixServer(uid: String = "matrixuser") : MatrixServer {
     private fun handle(request: Request): Response {
         if (request.rawPath.endsWith(OCS_USER_SUFFIX)) return ocsUser()
         if (!authorized(request)) return Response(UNAUTHORIZED)
+        // ⚠️ Before `pathFromHref`, because a SEARCH is addressed at `/remote.php/dav/` — there is no
+        // uid in that URL, so the path parse answers null and this would be a 404 that looks exactly
+        // like the deletion the search exists to rule out (SPEC §7.4 rule 2, `NextcloudUrls.davRoot`).
+        if (request.method == "SEARCH") return search(request)
 
         val path = NextcloudUrls.pathFromHref(request.rawPath, credential.uid) ?: return Response(NOT_FOUND)
         return when (request.method) {
@@ -537,6 +541,38 @@ internal class LocalMatrixServer(uid: String = "matrixuser") : MatrixServer {
             mapOf("Content-Type" to "application/xml; charset=utf-8"),
         )
     }
+
+    /**
+     * ⭐ RFC 5323 `SEARCH` over `oc:fileid` — SPEC §7.4 rule 2 asked without a path (row 11b).
+     *
+     * The fileid is the leading digits of an `oc:id` ([nextOcId]), so this resolves it back the way
+     * the real server's database does: over every file in the namespace, wherever it is, including
+     * folders no walk root covers. That last part is the only reason the method is here.
+     *
+     * A fileid with nothing at it answers **207 with an empty multistatus**, and a *trashed* file
+     * answers the same, because [trashed] is out of the namespace. Both are measured behaviours of
+     * the real Nextcloud 32.0.13 and both are load-bearing: an empty answer is what row 14's
+     * deletion is still allowed to conclude from.
+     */
+    private fun search(request: Request): Response = synchronized(lock) {
+        val wanted = request.body.decodeToString()
+            .substringAfter("<d:literal>", "")
+            .substringBefore("</d:literal>", "")
+            .trim()
+        // An unparseable body matches nothing. Without the guard it would match every `oc:id` whose
+        // digits trim to empty, which is a fixture that answers a question nobody asked.
+        val hits = if (wanted.isEmpty()) emptyList() else files.keys.filter { fileIdOf(it.storedOcId()) == wanted }
+        Response(
+            MULTI_STATUS,
+            multistatus(hits.map { it to false }).encodeToByteArray(),
+            mapOf("Content-Type" to "application/xml; charset=utf-8"),
+        )
+    }
+
+    /** The numeric part of an `oc:id`, unpadded — what `oc:fileid` reports and a SEARCH matches. */
+    private fun fileIdOf(ocId: String): String = ocId.takeWhile(Char::isDigit).trimStart('0')
+
+    private fun String.storedOcId(): String = files.getValue(this).ocId
 
     private fun get(path: String): Response = synchronized(lock) {
         val stored = files[path] ?: return Response(NOT_FOUND)
@@ -705,6 +741,9 @@ internal class LocalMatrixServer(uid: String = "matrixuser") : MatrixServer {
                 append("<d:getetag>${escaped(validator(stored.etag))}</d:getetag>")
                 append("<d:resourcetype/>")
                 append("<oc:id>${stored.ocId}</oc:id>")
+                // The unpadded numeric half, as the real server reports it — and the property a
+                // `SEARCH` filters on (SPEC §7.3: store `oc:id`, filter on `oc:fileid`).
+                append("<oc:fileid>${fileIdOf(stored.ocId)}</oc:fileid>")
                 append("<d:getcontentlength>${stored.bytes.size}</d:getcontentlength>")
                 stored.md5?.let { append("<oc:checksums><oc:checksum>MD5:$it</oc:checksum></oc:checksums>") }
             }
