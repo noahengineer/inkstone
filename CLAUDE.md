@@ -247,7 +247,7 @@ A milestone is done when:
 | **M5 Nextcloud decisions + spike #4 status** | `docs/M5-NEXTCLOUD.md` |
 | **M6 pull/merge/conflict decisions + the 21-row status table** | `docs/M6-SYNC.md` |
 | **M7 recognition/search decisions + the segmented-vs-blob numbers** | `docs/M7-RECOGNITION.md` |
-| **M12 lecture recording — designed, not built** | `docs/M12-AUDIO.md` |
+| **M12 lecture recording — capture built, alignment still designed** | `docs/M12-AUDIO.md` (§15 is what exists) |
 
 ---
 
@@ -349,5 +349,49 @@ Collected during research so they don't get reintroduced from stale training dat
 - **An erased stroke cannot be subtracted with even-odd or reversed-winding fills.** Both re-fill wherever two eraser capsules overlap, which is what every scribbled erase produces. The subtraction happens in `:android:ink` via Skia's `Path.op(DIFFERENCE)` and what crosses into `:android:pdf` is what is left (M4, SPEC §3.5).
 - PDF page size comes from **CropBox with `/Rotate` applied**, not MediaBox. Viewers display CropBox.
 - ML Kit's recogniser assumes **one line of text**. Segment first or the output is garbage.
+- ⚠️ **`MediaRecorder` writing MPEG-4 finalises its index on `stop()`** — kill the process at minute
+  50 and the file is large, complete-looking and unplayable by anything. Ogg is a stream of
+  self-describing pages, so a truncated file is simply a shorter recording. M12 measured it:
+  `am force-stop` mid-recording left **1,154 complete Ogg pages, zero CRC failures, 23.03 seconds
+  recoverable and a zero-byte torn tail**, verified by `tools/verify-ogg-opus.py` — which parses the
+  container by hand precisely because asking `MediaRecorder` whether its own output is readable is
+  the M4 mistake again.
 - ML Kit GenAI and Gemini Nano do **not** do handwriting recognition. There is no successor to Digital Ink Recognition.
 - A PDF with ink annotations and no embedded bundle is **not necessarily ours** — it might be a stranger's Acrobat markup. That's why the XMP marker exists (SPEC §5.6).
+- ⚠️ **`WebDavClient.put` hard-coded `Content-Type: application/pdf` for two milestones** (M12).
+  Nothing noticed, because everything this app uploaded really was a PDF. A recording's `.opus`
+  announced as a PDF stores perfectly, reads back byte-identical, and passes every assertion about
+  its bytes — the only component that can tell is one that **selects by declared type**, which is
+  exactly what M12's server half is. Same shape as M4's PDFs, which were valid, parseable and blank
+  in every viewer that was not the library that wrote them. The rule generalises: **when a new kind
+  of file starts going through an old path, check what the old path says it is** — and assert it off
+  the wire, not off the code.
+- **`MediaRecorder` treats `setAudioEncodingBitRate` as a hint, and Opus is VBR** (M12). Asked for
+  24 kbit/s it produced ~34, so a lecture hour is ~15 MB and not the ~11 MB `docs/M12-AUDIO.md` §4
+  budgeted. The consequence that mattered was not the storage: a recovered recording's duration was
+  being *estimated* from bytes ÷ bitrate and came out **42 % high**. A container states its own
+  length — `OggOpus.durationMillis` reads the last Ogg page's granule through
+  `FileSystem.readRange` — and a number shown to a user should never be a guess when the file
+  knows.
+- ⚠️ **SQLDelight's migration verifier does not model an index being dropped with its table** (M12).
+  A `.sqm` may `DROP TABLE` and `ALTER TABLE … RENAME TO` — both parse, which was the open question
+  before `7.sqm`, since every previous migration was `CREATE TABLE` / `CREATE INDEX` / `ADD COLUMN`
+  only. But the `CREATE INDEX` recreating the index afterwards fails the build with *"Duplicate
+  index name"*, naming an index whose table is two statements dead. An explicit `DROP INDEX` first
+  is a no-op on a real database and is what makes the file compile. Also worth knowing: the verifier
+  diffs **DDL**, so an `INSERT … SELECT` that copied nothing would pass it silently —
+  `MigrationOnDeviceTest` asserting a fixture row survives *with its `attempts`* is what covers that.
+- ⚠️ **`ViewModel.onCleared` cannot suspend** (M12), which is why M12's `RecordingController` is a
+  process-wide singleton with its own scope. `ViewModel.clear()` cancels `viewModelScope` **before**
+  invoking `onCleared`, so anything needing I/O there has no scope to run in. `NoteSessionHost`
+  documents the same trap for `unregister`; it bites harder here because *"the user left the note"*
+  is `onCleared` and nothing else — `onStop` fires for a screen timeout, and hanging a recorder off
+  it costs the rest of the lecture the first time the screen dims.
+- **Android lint's `ForegroundServiceType` check does not find the manifest entry for an
+  `@AndroidEntryPoint` service** (M12), though the merged manifest carries it. Suppressed, and then
+  **checked on the device rather than argued about**: `dumpsys activity services` reporting
+  `isForeground=true types=0x00000080` is what proves `startForeground(..., TYPE_MICROPHONE)` was
+  accepted. Suppressing a lint error that is really right is how a crash ships; the device is the
+  authority.
+- **`MediaRecorder(Context)` is API 31 and this project's `minSdk` is 30.** The context-taking
+  constructor exists for privacy attribution; on 30 the no-argument one is the only one there is.

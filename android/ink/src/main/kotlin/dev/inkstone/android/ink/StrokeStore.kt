@@ -162,14 +162,31 @@ internal class StrokeStore {
 
     // --- Insertion ----------------------------------------------------------
 
-    /** A stroke the user just drew. Assigns its [ObjectId] and queues its `AddObject`. */
-    fun add(stroke: Stroke, kind: InkBrushKind) {
-        val id = recorder?.strokeFinished(stroke, kind, inputModel) ?: ObjectId(UNBOUND_ID_PREFIX + size)
+    /**
+     * A stroke the user just drew. Assigns its [ObjectId] and queues its `AddObject`.
+     *
+     * @return the id it was given, or **null** when there is no recorder and the fallback id was
+     *   used. M12 needs it for the timeline, and the distinction matters: an unbound surface
+     *   records nothing to disk, so an `unbound-N` id names an object no log will ever contain and
+     *   must not be written into a recording's timeline either. (An unbound surface is a real
+     *   state, not a bug — see `NoteEditor.bindSurface` for the ordering race it exists to
+     *   tolerate.)
+     */
+    fun add(stroke: Stroke, kind: InkBrushKind): ObjectId? {
+        val recorded = recorder?.strokeFinished(stroke, kind, inputModel)
+        val id = recorded ?: ObjectId(UNBOUND_ID_PREFIX + size)
         insert(DryStroke(id, stroke, kind, PageBounds.of(stroke.shape.computeBoundingBox())))
         revision++
+        return recorded
     }
 
-    /** Bulk insert, for the synthetic load the SPEC §3.6 frame-rate gate needs. */
+    /**
+     * Bulk insert, for the synthetic load the SPEC §3.6 frame-rate gate needs.
+     *
+     * ⚠️ Deliberately does **not** report the ids. This is the "load 5,000 strokes" button, and
+     * M12's timeline hangs off `onStrokesFinished` rather than off [add] precisely so that pressing
+     * it during a lecture does not put five thousand entries in the timeline in one frame.
+     */
     fun addAll(strokes: List<Pair<Stroke, InkBrushKind>>) {
         for ((stroke, kind) in strokes) add(stroke, kind)
     }

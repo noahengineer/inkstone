@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.inkstone.app.library.LibraryRepository
+import dev.inkstone.core.database.recording.RecordingIndex
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.RemoteName
@@ -18,6 +19,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -38,6 +40,8 @@ class SyncViewModel @Inject constructor(
     private val accounts: NextcloudAccounts,
     private val library: LibraryRepository,
     private val outbox: OutboxStore,
+    /** M12 §11 — how many lectures are waiting, and how much of the tablet they hold. */
+    private val recordings: RecordingIndex,
     private val scheduler: WorkScheduler,
 ) : ViewModel() {
 
@@ -153,10 +157,14 @@ class SyncViewModel @Inject constructor(
     fun refresh() {
         viewModelScope.launch {
             val known = accounts.all()
+            // M12 §11. A count and a size, not the list: this screen draws two words.
+            val pending = recordings.pendingSummary().first()
             mutable.update {
                 it.copy(
                     accounts = known,
                     outboxCount = outbox.count(),
+                    pendingRecordings = pending.count,
+                    pendingRecordingBytes = pending.bytes,
                     // One account and a note to bind: skip straight to the folder browser.
                     // SPEC §7.6 — "a default folder per account makes step 2 one tap".
                     browser = it.browser,
@@ -459,6 +467,17 @@ data class SyncUiState(
     /** Non-null while a *folder* is being pinned to a remote path (M6). */
     val pinningFolder: FolderId? = null,
     val outboxCount: Int = 0,
+    /**
+     * ⭐ M12 §11 — *"Five lectures a day and a week offline is ~275 MB of audio waiting on the
+     * tablet. That must be **visible** — pending recordings and their sizes, somewhere reachable —
+     * rather than discovered when the device fills up."*
+     *
+     * Here rather than on the library screen because this is the screen that answers *"what does
+     * this device still owe the server"*, and a lecture is the largest thing on that list by three
+     * orders of magnitude.
+     */
+    val pendingRecordings: Int = 0,
+    val pendingRecordingBytes: Long = 0L,
 ) {
     val needsReauth: List<SyncAccount> get() = accounts.filter { it.state == AccountState.NEEDS_REAUTH }
 

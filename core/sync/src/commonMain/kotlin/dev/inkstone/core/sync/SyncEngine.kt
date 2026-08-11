@@ -65,6 +65,11 @@ public class SyncEngine(
         if (folder.isNotEmpty()) enqueue(noteId, OutboxOpType.MKCOL, localRev, everUploaded = false, now = now)
         enqueue(noteId, OutboxOpType.UPLOAD, localRev, everUploaded = false, now = now)
         notes.setSyncState(noteId, NoteSyncState.PENDING_UPLOAD, null)
+        // M12 — a note can hold recordings before it is bound to anything: you record a lecture,
+        // and only later decide the notebook should be on Nextcloud. Without this the lectures
+        // already on disk would wait for the next stroke to be drawn in that note, and a
+        // notebook you have stopped writing in never gets one.
+        enqueuePendingRecordings(noteId)
         scheduler.enqueueOutboxDrain()
         return binding
     }
@@ -77,7 +82,12 @@ public class SyncEngine(
      * is remote.
      */
     public suspend fun unbind(noteId: DocumentId) {
-        for (opType in OutboxOpType.entries) outbox.remove(noteId, opType)
+        // ⚠️ `removeAll`, not a loop over `OutboxOpType.entries` — see [OutboxStore.removeAll].
+        // The loop could not name a MEDIA_UPLOAD row, whose key carries a recording id it has
+        // no way to know, so it would have left one behind pointing at an account this note is
+        // no longer bound to. The recording itself is untouched and is re-enqueued if the note
+        // is ever bound again ([enqueuePendingRecordings]).
+        outbox.removeAll(noteId)
         bindings.remove(noteId)
         notes.setSyncState(noteId, NoteSyncState.LOCAL_ONLY, null)
     }
@@ -102,7 +112,11 @@ public class SyncEngine(
     public suspend fun pauseAccount(accountId: String): Int {
         val paused = bindings.forAccount(accountId)
         for (binding in paused) {
-            for (opType in OutboxOpType.entries) outbox.remove(binding.noteId, opType)
+            // See [unbind] for why this is not a loop over the op-type vocabulary. A queued
+            // lecture is dropped here along with everything else, and [resumeAccount] puts it
+            // back from the recording table — which is the whole reason that table records what
+            // is owed rather than leaving the queue to remember it.
+            outbox.removeAll(binding.noteId)
             // PAUSED, not LOCAL_ONLY: the binding is still there, so this note is not "never
             // bound" — it is bound and dormant. Calling it LOCAL_ONLY would hide the sync badge
             // on a note that is sitting on the server right now.
@@ -130,6 +144,11 @@ public class SyncEngine(
         var owing = 0
         val now = clock.nowEpochMillis()
         for (binding in resumed) {
+            // ⚠️ Before the `when` below, and outside it, because every branch of that `when` is
+            // about the note's **PDF**. A note unchanged since its last upload takes the
+            // `localRev <= lastSyncedRev` branch and is marked SYNCED — and a lecture recorded
+            // into it while signed out would then never upload, on a note the app calls synced.
+            enqueuePendingRecordings(binding.noteId)
             val localRev = notes.localRev(binding.noteId)
             when {
                 // The note itself is gone — a binding the trash cascade left behind. Nothing to
@@ -191,10 +210,79 @@ public class SyncEngine(
         // simply owes nothing yet, because nothing can be sent. Queuing here is what stranded
         // notes in M5: the row never drains and the worker reports success forever.
         if (!canSend(binding.accountId)) return
+        // M12 — the self-healing sweep. Cheap (one indexed query on a table with a handful of
+        // rows) and it is what makes a lecture impossible to strand: whatever dropped its outbox
+        // row — a sign-out, an unbind, a drain that met a momentarily missing binding — the next
+        // save puts it back. Coalescing makes a repeat harmless, because a re-enqueue of the same
+        // recording *inherits* `nextAttemptAt` rather than resetting it, so a failing upload
+        // cannot become a hot loop against the user's server.
+        enqueuePendingRecordings(noteId)
         val localRev = notes.localRev(noteId) ?: return
         if (localRev <= binding.lastSyncedRev && outbox.pendingFor(noteId).isEmpty()) return
         enqueue(noteId, OutboxOpType.UPLOAD, localRev, binding.everUploaded, clock.nowEpochMillis())
         notes.setSyncState(noteId, NoteSyncState.PENDING_UPLOAD, null)
+        scheduler.enqueueOutboxDrain()
+    }
+
+    /**
+     * ⭐ M12 — a recording finished and is kept. Enqueue its upload (docs/M12-AUDIO.md §5).
+     *
+     * ⚠️ **Not [noteChanged] with a different argument.** That path is about the note's
+     * published PDF: it compares `localRev` against `lastSyncedRev` and returns early when the
+     * note has not changed — which is the *normal* state after a lecture, because listening to
+     * one does not modify the notebook. A recording made in a note nobody wrote in would
+     * therefore never upload, and nothing would say so.
+     *
+     * A note that is not bound is not an error and not a loss: the recording stays READY in the
+     * table and [enqueuePendingRecordings] picks it up from [bind], [noteRestored],
+     * [resumeAccount] or the next save. Enqueuing here anyway would put a row in front of
+     * `OutboxDrainer.drainOne`'s first guard, which removes a row whose note has no binding —
+     * silently, and with no report field — and that is doc §5's catastrophe arriving through a
+     * different door.
+     */
+    public suspend fun recordingCaptured(noteId: DocumentId, recordingId: String) {
+        val binding = bindings.find(noteId) ?: return
+        if (!canSend(binding.accountId)) return
+        val localRev = notes.localRev(noteId) ?: binding.lastSyncedRev
+        enqueue(
+            noteId = noteId,
+            opType = OutboxOpType.MEDIA_UPLOAD,
+            localRev = localRev,
+            everUploaded = binding.everUploaded,
+            now = clock.nowEpochMillis(),
+            subject = recordingId,
+        )
+        scheduler.enqueueOutboxDrain()
+    }
+
+    /**
+     * Every finished recording on [noteId] that the server does not have, queued.
+     *
+     * The rows are the queue; the `recording` table is the **record of what is owed**, and this
+     * is the function that turns the second back into the first. Called from every point where a
+     * note (re)gains a usable binding — [bind], [noteRestored], [resumeAccount] — and from
+     * [noteChanged] as a sweep.
+     *
+     * Idempotent by construction: a recording already queued coalesces onto its own row, keyed
+     * by its own id, inheriting the backoff.
+     */
+    public suspend fun enqueuePendingRecordings(noteId: DocumentId) {
+        val binding = bindings.find(noteId) ?: return
+        if (!canSend(binding.accountId)) return
+        val pending = stores.recordings.pendingFor(noteId)
+        if (pending.isEmpty()) return
+        val localRev = notes.localRev(noteId) ?: binding.lastSyncedRev
+        val now = clock.nowEpochMillis()
+        for (recording in pending) {
+            enqueue(
+                noteId = noteId,
+                opType = OutboxOpType.MEDIA_UPLOAD,
+                localRev = localRev,
+                everUploaded = binding.everUploaded,
+                now = now,
+                subject = recording.recordingId,
+            )
+        }
         scheduler.enqueueOutboxDrain()
     }
 
@@ -261,7 +349,7 @@ public class SyncEngine(
      */
     public suspend fun noteRestored(noteId: DocumentId) {
         val binding = bindings.find(noteId) ?: return
-        outbox.remove(noteId, OutboxOpType.DELETE)
+        outbox.remove(noteId, OutboxKey(OutboxOpType.DELETE))
         bindings.upsert(
             binding.copy(
                 remoteOcId = null,
@@ -278,6 +366,10 @@ public class SyncEngine(
         enqueue(noteId, OutboxOpType.MKCOL, localRev, everUploaded = false, now = now)
         enqueue(noteId, OutboxOpType.UPLOAD, localRev, everUploaded = false, now = now)
         notes.setSyncState(noteId, NoteSyncState.PENDING_UPLOAD, null)
+        // The DELETE that went with the trashing did not annihilate this note's MEDIA_UPLOAD
+        // rows (see [OutboxCoalescing]), but `noteDeletedRemotely` and `pauseAccount` both drop
+        // every row — so a restore has to put them back rather than assume they survived.
+        enqueuePendingRecordings(noteId)
         scheduler.enqueueOutboxDrain()
     }
 
@@ -308,7 +400,10 @@ public class SyncEngine(
      */
     public suspend fun noteDeletedRemotely(noteId: DocumentId) {
         val binding = bindings.find(noteId) ?: return
-        for (opType in OutboxOpType.entries) outbox.remove(noteId, opType)
+        // See [unbind]. The lecture's row goes with the rest — there is nowhere to put it, since
+        // this clears the remote identity — and comes back through [noteRestored], which is the
+        // path a restore takes and which re-enqueues pending recordings.
+        outbox.removeAll(noteId)
         bindings.upsert(
             binding.copy(
                 remoteOcId = null,
@@ -427,18 +522,20 @@ public class SyncEngine(
         val row = outbox.pendingFor(noteId).firstOrNull { it.opType == OutboxOpType.UPLOAD } ?: return
         val now = clock.nowEpochMillis()
         if (row.nextAttemptAt <= now) return
-        outbox.reschedule(noteId, OutboxOpType.UPLOAD, row.attempts, now)
+        outbox.reschedule(noteId, row.key, row.attempts, now)
     }
 
+    @Suppress("LongParameterList") // The op, and the four facts coalescing decides against.
     private suspend fun enqueue(
         noteId: DocumentId,
         opType: OutboxOpType,
         localRev: Long,
         everUploaded: Boolean,
         now: Long,
+        subject: String = NO_SUBJECT,
     ) {
         outbox.mutate(noteId) { pending ->
-            OutboxCoalescing.plan(pending, opType, noteId, localRev, everUploaded, now)
+            OutboxCoalescing.plan(pending, opType, noteId, localRev, everUploaded, now, subject)
         }
     }
 

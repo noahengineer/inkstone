@@ -12,6 +12,7 @@ import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.StrokeGeometry
 import dev.inkstone.core.model.StrokeObject
+import dev.inkstone.core.storage.NoteLayout
 import dev.inkstone.core.storage.renameNote
 import kotlin.random.Random
 import kotlin.test.assertNotNull
@@ -187,6 +188,45 @@ internal suspend fun TwoDevices.share(title: String = "Shared", pageCount: Int =
     return id
 }
 
+/**
+ * ⭐ M12 — a lecture recorded into [noteId], as far as the outbox (docs/M12-AUDIO.md).
+ *
+ * The two files and the row, then `SyncEngine.recordingCaptured`. **No drain**, which is what
+ * makes it an offline recording: coalescing happens at enqueue time, in one transaction, before
+ * a socket is opened.
+ *
+ * ⚠️ The row goes through the real [dev.inkstone.core.database.recording.RecordingIndex] — `start`
+ * then `finish`, in that order — rather than being inserted by hand. That order is §9's orphan
+ * recovery, and a fixture that wrote a finished row in one statement could not fail if the app
+ * stopped writing the CAPTURING one. It is also the "build harnesses out of production objects"
+ * rule: what this fixture cannot reach is the *recorder* — there is no microphone here — so the
+ * bytes are stand-ins and the claim is about the queue and the wire, never about the audio.
+ *
+ * @param audioBytes how large to make the stand-in .opus. Distinct sizes per recording, so a test
+ *   that mixed the two files up would fail rather than pass on identical content.
+ * @return the recording id, which is also `outbox.subject` and the remote filename.
+ */
+internal suspend fun Device.recordLecture(noteId: DocumentId, label: String, audioBytes: Int): String {
+    val recordingId = ids.newRecordingId()
+    val startedAt = clock.nowEpochMillis()
+    recordingIndex.start(recordingId, noteId, startedAt)
+
+    // Deterministic, distinct, and not all-zero — a byte-equality assertion over two runs of
+    // zeroes proves nothing about which file arrived where.
+    val audio = ByteArray(audioBytes) { i -> (label.hashCode() + i).toByte() }
+    fs.writeBytesAtomically(NoteLayout.recordingAudio(recordingId), audio)
+    fs.appendBytes(
+        NoteLayout.recordingTimeline(recordingId),
+        "$label-object 1200\n$label-object-2 4800\n".encodeToByteArray(),
+    )
+
+    // Over §10's thirty-second floor, which is the app's decision and not the engine's — the
+    // engine is never told about a recording that did not clear it.
+    recordingIndex.finish(recordingId, durationMillis = RECORDED_MILLIS, audioBytes = audio.size.toLong())
+    engine.recordingCaptured(noteId, recordingId)
+    return recordingId
+}
+
 /** Both devices reconcile, then drain what the reconcile decided was owed. */
 internal suspend fun TwoDevices.syncBothWays() {
     a.pull()
@@ -200,6 +240,9 @@ internal suspend fun TwoDevices.syncBothWays() {
 }
 
 internal val Document.liveIds: List<String> get() = livePages.map { it.id.value }
+
+/** Well over §10's thirty-second floor, so the fixture never accidentally tests the floor. */
+private const val RECORDED_MILLIS = 45L * 60 * 1000
 
 private const val GEOMETRY_BYTES = 64
 private const val STYLE_WIDTH_PT = 3f

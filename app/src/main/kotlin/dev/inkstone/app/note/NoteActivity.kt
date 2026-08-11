@@ -85,6 +85,20 @@ class NoteActivity : ComponentActivity() {
                     }
                 }
 
+                // ⭐ M12 — the recorder's own channel: "not enough free space", "that was under
+                // thirty seconds", "the microphone could not be opened". A **second** effect
+                // rather than a field on `NoteEditorState`, because recording state has a
+                // different owner and a different lifetime — and because `NoteEditor.publish()`
+                // reconstructs that object rather than copying it, so a message put there would be
+                // cleared by the next autosave tick before anyone read it.
+                val recording by editor.recording.collectAsState()
+                LaunchedEffect(recording.message) {
+                    recording.message?.let { message ->
+                        snackbars.showSnackbar(message)
+                        editor.dismissRecordingMessage()
+                    }
+                }
+
                 Scaffold(
                     modifier = Modifier.fillMaxSize(),
                     snackbarHost = { SnackbarHost(snackbars) },

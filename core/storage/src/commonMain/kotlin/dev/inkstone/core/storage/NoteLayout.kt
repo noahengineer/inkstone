@@ -203,4 +203,52 @@ public object NoteLayout {
      * so nothing downstream has to sniff a file the user picked.
      */
     public fun folderCoverImage(id: FolderId): String = "${folderDir(id)}/cover$THUMBNAIL_EXTENSION"
+
+    // -----------------------------------------------------------------------
+    // M12 — recorded lectures (docs/M12-AUDIO.md)
+    // -----------------------------------------------------------------------
+
+    /**
+     * ⭐ A recording's two files: the audio, and the stroke↔audio timeline beside it.
+     *
+     * ```
+     * recordings/<recordingId>.opus       Ogg/Opus, written by the foreground service
+     * recordings/<recordingId>.timeline   append-only, one line per stroke
+     * ```
+     *
+     * ## ⚠️ A **sibling** of `notes/`, and not under `notes/<documentId>/`
+     *
+     * The doc's §3 sketch writes `recordings/<recordingId>.timeline` without saying where the
+     * directory hangs, and putting it inside the note directory — which is the obvious
+     * reading — destroys lectures three separate ways, because a note directory is something
+     * this app **moves and copies as a unit**:
+     *
+     * 1. [NoteTrash.trash] moves `notes/<id>/` wholesale into [TRASH_DIR], and
+     *    `purgeExpired` **hard-deletes** the entry after thirty days. An un-uploaded lecture
+     *    inside it is then gone for good — while doc §5 requires the opposite, that trashing
+     *    a note whose lecture has not uploaded yet still delivers the lecture.
+     * 2. `NoteDuplicate` copies the note directory, so duplicating a note would silently
+     *    duplicate every hour of audio in it.
+     * 3. [orphanedStub] and the merge paths both rewrite that directory's contents.
+     *
+     * Audio is the one thing in this app that cannot be re-derived from anything else
+     * (doc §9: *"you cannot re-record a lecture"*), so it lives where nothing sweeps.
+     * `recordings/` is a sibling for the same reason [FOLDERS_DIR] is: it is not a cache, and
+     * losing it loses something the user cannot get back.
+     *
+     * Which note a recording belongs to is a column on the `recording` row, never the path —
+     * CLAUDE.md's *"identity is never derived from a file path"*, and the same rule doc §6
+     * states for the remote side.
+     */
+    public const val RECORDINGS_DIR: String = "recordings"
+
+    /** Ogg, never MP4 — an MP4 killed mid-lecture is unplayable (doc §9). */
+    public const val AUDIO_EXTENSION: String = ".opus"
+
+    /** The append-only stroke↔audio log. Not an op, not a bundle entry (doc §3). */
+    public const val TIMELINE_EXTENSION: String = ".timeline"
+
+    public fun recordingAudio(recordingId: String): String = "$RECORDINGS_DIR/$recordingId$AUDIO_EXTENSION"
+
+    public fun recordingTimeline(recordingId: String): String = "$RECORDINGS_DIR/$recordingId$TIMELINE_EXTENSION"
 }

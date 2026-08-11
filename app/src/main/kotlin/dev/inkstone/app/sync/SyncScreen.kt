@@ -53,6 +53,14 @@ fun SyncScreen(state: SyncUiState, onBack: () -> Unit, actions: SyncActions, mod
                     style = MaterialTheme.typography.labelMedium,
                 )
             }
+            // ⭐ M12 §11 — the audio, counted separately and **with its size**, because the number
+            // that matters about a queue of lectures is how much of the tablet it is holding.
+            if (state.pendingRecordings > 0) {
+                Text(
+                    "${state.pendingRecordings} recording(s), ${megabytes(state.pendingRecordingBytes)}",
+                    style = MaterialTheme.typography.labelMedium,
+                )
+            }
             TextButton(onClick = actions.onSyncNow) { Text("Sync now") }
         }
         if (state.busy) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -312,3 +320,8 @@ data class SyncActions(
     val onCancelBrowse: () -> Unit,
     val onSyncNow: () -> Unit,
 )
+
+/** Whole megabytes. A lecture is tens of them, so a decimal place would be noise. */
+private fun megabytes(bytes: Long): String = "${bytes / BYTES_PER_MEGABYTE} MB"
+
+private const val BYTES_PER_MEGABYTE = 1024L * 1024

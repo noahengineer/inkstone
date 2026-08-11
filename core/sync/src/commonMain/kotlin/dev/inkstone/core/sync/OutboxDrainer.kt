@@ -102,7 +102,7 @@ public class OutboxDrainer(
         if (binding == null) {
             // The note was unbound (or never bound) while this row waited. Nothing is owed,
             // and keeping the row would retry against a path we no longer claim.
-            outbox.remove(entry.noteId, entry.opType)
+            outbox.remove(entry.noteId, entry.key)
             return report
         }
         // ⭐ The account is gone entirely — signed out, or its credential is unreadable
@@ -117,7 +117,7 @@ public class OutboxDrainer(
         // on the server stays exactly where it is (CLAUDE.md rule 1).
         val account = accounts.find(binding.accountId)
         if (account == null) {
-            outbox.remove(entry.noteId, entry.opType)
+            outbox.remove(entry.noteId, entry.key)
             bindings.remove(entry.noteId)
             notes.setSyncState(entry.noteId, NoteSyncState.LOCAL_ONLY, null)
             return report.copy(orphaned = report.orphaned + 1)
@@ -137,7 +137,7 @@ public class OutboxDrainer(
         // So the row goes and the binding stays. `pauseAccount` already clears these at
         // sign-out; this is for a row that raced it, which is one autosave away.
         if (account.state == AccountState.SIGNED_OUT) {
-            outbox.remove(entry.noteId, entry.opType)
+            outbox.remove(entry.noteId, entry.key)
             notes.setSyncState(entry.noteId, NoteSyncState.PAUSED, null)
             return report.copy(paused = report.paused + 1)
         }
@@ -168,7 +168,7 @@ public class OutboxDrainer(
         report: DrainReport,
     ): DrainReport = when (outcome) {
         is OpOutcome.Done -> {
-            outbox.remove(entry.noteId, entry.opType)
+            outbox.remove(entry.noteId, entry.key)
             report.completed(entry.opType)
         }
 
@@ -178,7 +178,7 @@ public class OutboxDrainer(
 
         is OpOutcome.Deferred -> {
             // Not an error — `attempts` is untouched on purpose (rule 4).
-            outbox.reschedule(entry.noteId, entry.opType, entry.attempts, outcome.untilEpochMillis)
+            outbox.reschedule(entry.noteId, entry.key, entry.attempts, outcome.untilEpochMillis)
             report.copy(deferred = report.deferred + 1)
         }
 
@@ -186,7 +186,7 @@ public class OutboxDrainer(
             val attempts = entry.attempts + 1
             outbox.reschedule(
                 entry.noteId,
-                entry.opType,
+                entry.key,
                 attempts,
                 outcome.retryAfterMillis?.let { now + it } ?: Backoff.nextAttemptAt(attempts, now, jitter()),
             )
@@ -197,7 +197,7 @@ public class OutboxDrainer(
         is OpOutcome.Parked -> {
             // SPEC §7.7 rule 3: "a conflicted note is flagged and skipped; everything else
             // keeps syncing." The row stays so M6 can resolve it; it stops being due.
-            outbox.reschedule(entry.noteId, entry.opType, entry.attempts, now + PARK_MILLIS)
+            outbox.reschedule(entry.noteId, entry.key, entry.attempts, now + PARK_MILLIS)
             notes.setSyncState(entry.noteId, outcome.state, outcome.reason)
             report.copy(
                 parked = report.parked + 1,
@@ -240,7 +240,110 @@ public class OutboxDrainer(
 
             OutboxOpType.UPLOAD -> performUpload(entry, binding, session)
 
+            OutboxOpType.MEDIA_UPLOAD -> performMediaUpload(entry, binding, session)
+
             OutboxOpType.DELETE -> performDelete(binding, session)
+        }
+
+    /**
+     * ⭐ M12 — one recording's **audio and its timeline**, in one op (docs/M12-AUDIO.md §5).
+     *
+     * ## Why this is not [performUpload] with a different path
+     *
+     * It is the obvious refactor and every line of it would be wrong:
+     *
+     * - [performUpload] defers on `binding.lastUploadAtEpochMillis + 30 s`, SPEC §7.6's floor
+     *   between two publishes of *the same note*. A recording is not a republish of anything,
+     *   and making it wait behind the note's PDF — or worse, stamping that column and making
+     *   the note's next real save wait behind a lecture — is a rule applied to the wrong noun.
+     * - [finishUpload] writes `lastSyncedRev` and sets `SYNCED`. For a recording both are
+     *   lies, and the second is the expensive kind: a note whose PDF is still owed would read
+     *   as up to date, which is exactly the silence SPEC §7.6's mid-flight guard exists to
+     *   prevent, arrived at from a different direction.
+     *
+     * ## The order, and why the timeline goes first
+     *
+     * The audio is what doc §2's server-side watcher keys on, so it is written **last**: a
+     * `.opus` that appears before its `.timeline` is a lecture the server may start
+     * transcribing with no alignment data, and a transcript with no timeline is just a
+     * transcript. Same shape as materialize-before-publish (SPEC §5.1) and as doc §8's
+     * transcript-before-delete — write the thing that makes the work *discoverable* last.
+     *
+     * ## `If-None-Match: *`, and why a 412 here is success
+     *
+     * CLAUDE.md rule 1 forbids overwriting a remote file without a precondition, and this
+     * keeps it: every media PUT is a **create**. But a recording is a write-once immutable
+     * object named by a UUIDv7, so *"something is already at this path"* is not the conflict
+     * the rule is about — it is this op having partially succeeded before the connection
+     * dropped, which is the common retry. Treating that 412 as a conflict would park an
+     * uploaded lecture for a day and flag the note; treating it as success reaches the state
+     * we wanted. Nobody else writes these paths, so there is no third party to lose to.
+     */
+    private suspend fun performMediaUpload(
+        entry: OutboxEntry,
+        binding: RemoteBinding,
+        session: NextcloudSession,
+    ): OpOutcome {
+        // Null means the server already has it, or the recording was discarded under §10's
+        // thirty-second floor after this row was enqueued. Either way nothing is owed — and
+        // this is what closes the crash window between `markUploaded` and removing the row.
+        // See `RecordingUploads.find`.
+        val recording = stores.recordings.find(entry.subject) ?: return OpOutcome.Done
+
+        val audio = fs.readBytes(recording.audioPath)
+        if (audio.isEmpty()) {
+            // The row outlived its file. Retrying cannot produce bytes that are not there, but
+            // parking says so on the note rather than dropping the only trace of the lecture.
+            return OpOutcome.Parked(NoteSyncState.ERROR, MEDIA_MISSING)
+        }
+        // A recording with no strokes in it is ordinary — a lecture you listened to without
+        // writing — so an absent timeline is an empty one, not a failure.
+        val timeline = if (fs.exists(recording.timelinePath)) fs.readBytes(recording.timelinePath) else ByteArray(0)
+
+        val directory = RemoteMedia.directory(binding.remotePath, binding.noteId)
+        // Idempotent (405 is success), and needed on every attempt: the note's own folder may
+        // exist while `.inkstone-media/<id>/` does not. `performMove` does the same thing for
+        // the same reason.
+        session.dav.mkcolRecursive(directory)
+
+        val timelineOutcome = session.dav.put(
+            remotePath = RemoteMedia.timeline(binding.remotePath, binding.noteId, recording.recordingId),
+            bytes = timeline,
+            ifNoneMatchStar = true,
+            mtimeEpochSeconds = recording.startedAtEpochMillis / MILLIS_PER_SECOND,
+            md5Hex = Md5.hex(timeline),
+            contentType = WebDavClient.TIMELINE,
+        )
+        landed(timelineOutcome, session)?.let { return it }
+
+        val audioOutcome = session.dav.put(
+            remotePath = RemoteMedia.audio(binding.remotePath, binding.noteId, recording.recordingId),
+            bytes = audio,
+            ifNoneMatchStar = true,
+            mtimeEpochSeconds = recording.startedAtEpochMillis / MILLIS_PER_SECOND,
+            md5Hex = Md5.hex(audio),
+            contentType = WebDavClient.AUDIO_OGG,
+        )
+        landed(audioOutcome, session)?.let { return it }
+
+        stores.recordings.markUploaded(recording.recordingId, clock.nowEpochMillis())
+        return OpOutcome.Done
+    }
+
+    /**
+     * Null when [outcome] means *"this file is now on the server"* — a 2xx, or the 412 that a
+     * repeated `If-None-Match: *` create produces. Otherwise the failure, classified.
+     *
+     * Answers "carry on, or here is the outcome to return" rather than a boolean, so a caller
+     * cannot observe a failure and forget to stop: the only way to see one is to be handed the
+     * [OpOutcome] that reports it.
+     */
+    private suspend fun landed(outcome: DavOutcome<UploadReceipt>, session: NextcloudSession): OpOutcome? =
+        when (outcome) {
+            is DavOutcome.Ok -> null
+
+            is DavOutcome.Failed ->
+                if (outcome.error is DavFailure.PreconditionFailed) null else failureOutcome(outcome.error, session)
         }
 
     /**
@@ -259,6 +362,7 @@ public class OutboxDrainer(
         // The destination's folder may not exist yet — a move into a folder created on
         // this device while offline. MKCOL is idempotent (405 means "already there").
         session.dav.mkcolRecursive(parentOf(binding.remotePath))
+        moveMediaDirectory(from, binding, session)
         return classify(session.dav.move(from, binding.remotePath), session) { receipt ->
             bindings.upsert(
                 binding.copy(
@@ -271,6 +375,36 @@ public class OutboxDrainer(
             )
             OpOutcome.Done
         }
+    }
+
+    /**
+     * ⭐ M12 — carry the note's `.inkstone-media/<documentId>/` with it when the note moves.
+     *
+     * ⚠️ **`performMove` moved `binding.remotePath` and nothing else**, so a note dragged into
+     * another folder left its recordings behind — and the next recording's `mkcolRecursive` then
+     * created a *second* media directory beside the new location, splitting one note's lectures
+     * across two places with nothing reporting it. `RemoteMedia`'s KDoc claimed the binding "is
+     * what moves the directory if the note moves"; nothing implemented that half.
+     *
+     * **A rename is not a move here.** [RemoteMedia.directory] is built from the parent folder and
+     * the `documentId` — never the filename, which is the whole point of §6's identity rule — so
+     * renaming a note within its folder leaves the media path unchanged and this does nothing.
+     * Only a change of folder moves anything.
+     *
+     * ⚠️ **Failure is deliberately not fatal to the note's MOVE.** The recordings are still on the
+     * server either way, just in the old folder; the note moving is the user-visible thing and must
+     * not be held hostage to a sidecar. A 404 is the ordinary case — most notes have no recordings
+     * at all — and a 412 means the bug above already made a second directory, which is a state to
+     * leave alone rather than merge blindly. The server-side watcher keys on the `<documentId>`
+     * path segment rather than on "sits beside this PDF" precisely so that none of this can strand
+     * a lecture.
+     */
+    private suspend fun moveMediaDirectory(from: String, binding: RemoteBinding, session: NextcloudSession) {
+        val fromDir = RemoteMedia.directory(from, binding.noteId)
+        val toDir = RemoteMedia.directory(binding.remotePath, binding.noteId)
+        if (fromDir == toDir) return
+        session.dav.mkcolRecursive(parentOf(toDir))
+        session.dav.move(fromDir, toDir)
     }
 
     @Suppress("ReturnCount")
@@ -487,6 +621,17 @@ public class OutboxDrainer(
         const val PARK_MILLIS = 24L * 60 * 60 * 1000
 
         const val UNUSABLE_ACCOUNT = "Sign in to this Nextcloud account again to resume syncing."
+
+        /**
+         * M12 — the queued lecture's file is not on disk.
+         *
+         * Parked rather than dropped. The row is the last trace that a recording was made at
+         * all, and a user who is told *"a recording could not be uploaded"* can go looking;
+         * one whose row was silently removed cannot. Retrying would not help — no number of
+         * attempts produces bytes that are not there — which is why this is a park and not a
+         * [OpOutcome.Retry].
+         */
+        const val MEDIA_MISSING = "A recording could not be uploaded: its audio file is missing."
     }
 }
 
@@ -496,6 +641,14 @@ public data class DrainReport(
     val moved: Int = 0,
     val deleted: Int = 0,
     val foldersCreated: Int = 0,
+    /**
+     * M12 — recordings whose audio **and** timeline both reached the server.
+     *
+     * Its own counter rather than folded into [uploaded], because the two answer different
+     * questions and only one of them is *"is this note's published PDF current"*. A run that
+     * uploaded three lectures and no notes should not read as three note uploads.
+     */
+    val mediaUploaded: Int = 0,
     val requeued: Int = 0,
     val deferred: Int = 0,
     val failed: Int = 0,
@@ -537,6 +690,7 @@ public data class DrainReport(
         OutboxOpType.MKCOL -> copy(foldersCreated = foldersCreated + 1)
         OutboxOpType.MOVE -> copy(moved = moved + 1)
         OutboxOpType.UPLOAD -> copy(uploaded = uploaded + 1)
+        OutboxOpType.MEDIA_UPLOAD -> copy(mediaUploaded = mediaUploaded + 1)
         OutboxOpType.DELETE -> copy(deleted = deleted + 1)
     }
 }

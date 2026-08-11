@@ -252,6 +252,10 @@ private fun folderActions(folder: Folder, actions: LibraryActions, dialogs: Libr
     onStyle = { dialogs.stylingFolder = folder },
     onTrash = { actions.onTrashFolder(folder.id) },
     onSyncToFolder = { actions.onSyncFolderToNextcloud(folder.id) },
+    // M12 §10. Read from the state the view model already loaded, so opening a menu costs no
+    // query — the same reason a note tile reads `syncState` off its row rather than asking.
+    autoRecord = actions.autoRecordFolders[folder.id.value],
+    onSetAutoRecord = { value -> actions.onSetAutoRecord(folder.id, value) },
 )
 
 @Composable
@@ -539,6 +543,9 @@ data class LibraryActions(
     val onChangeSyncFolder: (DocumentId) -> Unit,
     /** M6 — pin a folder to a remote path, so everything under it syncs there (SPEC §9). */
     val onSyncFolderToNextcloud: (FolderId) -> Unit,
+    /** M12 §10 — the explicit per-folder setting, by folder id. Absent means *inherit*. */
+    val autoRecordFolders: Map<String, Boolean>,
+    val onSetAutoRecord: (FolderId, Boolean?) -> Unit,
     /** Stop syncing a bound note. Not a remote delete — the copy on the server stays. */
     val onStopSyncing: (DocumentId) -> Unit,
     val onOpenNextcloud: () -> Unit,

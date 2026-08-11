@@ -38,6 +38,7 @@ class OutboxDrainerTest {
         val credentials: FakeCredentialStore = FakeCredentialStore(testAccount.id to testCredential),
         val fs: FakeFileSystem = FakeFileSystem(),
         val recorded: RecordedRequests = RecordedRequests(),
+        val recordings: FakeRecordingUploads = FakeRecordingUploads(),
     ) {
         val materializer = FakeMaterializer(notes, fs)
 
@@ -46,7 +47,7 @@ class OutboxDrainerTest {
                 io.ktor.client.request.HttpRequestData,
             ) -> io.ktor.client.request.HttpResponseData,
         ) = OutboxDrainer(
-            stores = SyncStores(accounts, bindings, outbox, notes),
+            stores = SyncStores(accounts, bindings, outbox, notes, recordings),
             credentials = credentials,
             materializer = materializer,
             fs = fs,
@@ -71,7 +72,7 @@ class OutboxDrainerTest {
         harness.bindings.upsert(RemoteBinding(note, testAccount.id, "Inkstone/Lecture.pdf"))
 
         val engine = SyncEngine(
-            stores = SyncStores(harness.accounts, harness.bindings, harness.outbox, harness.notes),
+            stores = SyncStores(harness.accounts, harness.bindings, harness.outbox, harness.notes, harness.recordings),
             clock = harness.clock,
             scheduler = NoOpScheduler,
         )

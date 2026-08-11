@@ -144,8 +144,14 @@ public object RemoteWalk {
             if (child.path == here) continue
             when {
                 !child.isCollection -> if (isNote(child)) files += child
+
+                // ⭐ M12 — the note's own media directory, skipped by **name** (see [isMediaDir]).
+                isMediaDir(child) -> Unit
+
                 !allowDescend -> Unit
+
                 !force && unchanged(cached[child.path]?.etag, child.etag) -> pruned += child.path
+
                 else -> descend += child.path
             }
         }
@@ -177,6 +183,42 @@ public object RemoteWalk {
      */
     public fun isNote(resource: DavResource): Boolean =
         !resource.isCollection && resource.name.endsWith(PDF_EXTENSION, ignoreCase = true)
+
+    /**
+     * ⭐ M12 — `.inkstone-media/`, which the walk skips entirely.
+     *
+     * ## The files inside were already harmless. The **directory** was not.
+     *
+     * [isNote] filters on `.pdf`, so a `.opus`, a `.timeline` or the server's `.md` transcript is
+     * invisible to the classifier that writes `foreignRemote` rows: they cannot be adopted as
+     * notes and cannot be read as deletions. Doc §6 expected them to land in `foreignRemote` and
+     * they never reach it — which is a *better* answer, and the doc has been corrected.
+     *
+     * The collection is a different matter, and nothing in `:core:sync` has ever had a
+     * hidden-file rule — the leading dot buys nothing here. Left alone, the walk descends into
+     * `.inkstone-media/` and then into a `<documentId>/` under it, which costs:
+     *
+     * - **two extra `PROPFIND Depth:1` per note that has recordings, on every unpruned walk.**
+     *   Directory listings do not consume the pass's budget (`Reconciler.DEFAULT_LIMIT` counts
+     *   files acted on), so nothing bounds them.
+     * ⚠️ This KDoc used to claim the skip also protects `probeRoot`'s one-request poll. **It does
+     * not.** ETag propagation to the account root is the *server's* doing and happens when the file
+     * is written, whether or not this client ever descends — so a recording upload changes the root
+     * ETag and forces a walk regardless. What the skip saves is the extra requests *inside* a walk
+     * that was going to happen anyway, which is worth having and is not the same claim. Corrected
+     * rather than deleted, because a comment that overstates a mechanism is how the next person
+     * builds on something that is not there.
+     *
+     * Skipping it also makes *"not mistaken for a note"* a **guarantee** rather than a
+     * consequence of the extension filter, which is what ROADMAP M12 asks for.
+     *
+     * ⚠️ Skipped, and therefore deliberately **not** pruned either: a pruned child is recorded as
+     * *"nothing changed in there"*, and this one is never looked at at all. The distinction is the
+     * same one [plan]'s `allowDescend` documents, and getting it wrong writes a cache entry that
+     * would later make a subtree invisible.
+     */
+    public fun isMediaDir(resource: DavResource): Boolean =
+        resource.isCollection && resource.name.equals(RemoteMedia.MEDIA_DIR, ignoreCase = true)
 
     /** True when [candidate] is strictly inside [ancestor]. Callers exclude an empty ancestor. */
     private fun isUnder(candidate: String, ancestor: String): Boolean = candidate.startsWith("$ancestor/")

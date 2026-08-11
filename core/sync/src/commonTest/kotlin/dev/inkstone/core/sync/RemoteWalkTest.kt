@@ -234,6 +234,45 @@ class RemoteWalkTest {
         assertEquals(listOf("Inkstone"), withoutTopLevel)
     }
 
+    /**
+     * ⭐ M12 — the media directory is neither walked nor pruned, and its files are not notes.
+     *
+     * Three claims, and each fails differently:
+     *
+     * - **not descended**, or every note with recordings costs two extra `PROPFIND Depth:1` on
+     *   every unpruned walk, unbounded by the pass limit;
+     * - **not pruned**, because a pruned child is recorded as *"nothing changed in there"* and a
+     *   directory nobody looked at must not claim that (the same distinction `allowDescend` makes);
+     * - **not a note**, so a `.opus` can never be probed, adopted, or read as a deletion.
+     *
+     * ROADMAP M12 asks for the third; the first two are what stop a recording upload defeating
+     * `probeRoot`'s one-request poll for the whole account.
+     */
+    @Test
+    fun `the media directory is skipped entirely and its files are never notes`() {
+        val step = RemoteWalk.plan(
+            accountId = "acct",
+            path = "Notes",
+            listing = listOf(
+                collection("Notes", etag = "root"),
+                file("Notes/Physics.pdf"),
+                collection("Notes/.inkstone-media", etag = "media"),
+                collection("Notes/Chemistry", etag = "chem"),
+            ),
+            cached = emptyMap(),
+            nowEpochMillis = 1_000L,
+        )
+
+        assertEquals(listOf("Notes/Chemistry"), step.descend, "the media directory was walked into")
+        assertTrue(step.pruned.isEmpty(), "the media directory was recorded as unchanged, which it was never asked")
+        assertEquals(listOf("Notes/Physics.pdf"), step.files.map { it.path })
+
+        assertFalse(RemoteWalk.isNote(file("Notes/.inkstone-media/doc/rec.opus")))
+        assertFalse(RemoteWalk.isNote(file("Notes/.inkstone-media/doc/rec.timeline")))
+        // ⚠️ The transcript the server half writes is a .md, and it must not be a note either.
+        assertFalse(RemoteWalk.isNote(file("Notes/.inkstone-media/doc/rec.md")))
+    }
+
     @Test
     fun `the common ancestor is the one directory a Depth zero probe has to ask about`() {
         assertEquals("Notes", RemoteWalk.commonAncestor(listOf("Notes/Physics", "Notes/Chemistry")))

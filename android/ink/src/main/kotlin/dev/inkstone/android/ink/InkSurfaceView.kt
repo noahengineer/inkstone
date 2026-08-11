@@ -5,6 +5,7 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.os.Build
+import android.os.SystemClock
 import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.ViewGroup
@@ -223,6 +224,39 @@ public class InkSurfaceView @JvmOverloads constructor(
 
     public var onCameraChanged: ((Camera) -> Unit)? = null
     public var onStrokeCountChanged: ((Int) -> Unit)? = null
+
+    /**
+     * ⭐ M12 — a stroke the user just drew, and the monotonic time its **down event** arrived
+     * (docs/M12-AUDIO.md §3).
+     *
+     * ## Why it is a nullable callback here and not a method on `NoteEditor.NoteSurface`
+     *
+     * `NoteSurface` is the seam `:app` writes tests against, and a method added there acquires a
+     * `= Unit` default and a recording fake in front of it. That is M6's `setPageMeta` exactly —
+     * *"the milestone's most convincing invisible bug"*: every assertion true of the editor and
+     * false of the app, because the only production implementation did nothing. This callback has
+     * one implementation, it is this class, and there is nothing to stub.
+     *
+     * ## The down event, not the landing
+     *
+     * The alignment unit is a line of writing and §7's window is asymmetric — **writing lags
+     * speech** — so the anchor has to be when the mark *began*. A slow underline is a second long,
+     * which is a tenth of the asymmetry the window is built out of.
+     *
+     * ⚠️ Fired from [FinishedStrokes], **not** from `StrokeStore.add`. `addAll` loops `add` and is
+     * what the toolbar's "load 5,000 strokes" button drives, so firing from there would put five
+     * thousand entries in a lecture's timeline in one frame. Page loads, undo-of-delete and a
+     * peer's merged strokes all arrive through `applyOps` and never touch this path at all.
+     */
+    public var onStrokeCaptured: ((ObjectId, Long) -> Unit)? = null
+
+    /**
+     * When the live stroke's `ACTION_DOWN` arrived, on `SystemClock.elapsedRealtime`.
+     *
+     * One field is enough because [beginStroke] returns early while a stroke is already live —
+     * this surface never has two at once.
+     */
+    private var strokeStartedAtElapsed: Long = 0L
 
     /** Fired after any edit, so a toolbar can refresh its state and autosave can run. */
     public var onHistoryChanged: (() -> Unit)? = null
@@ -476,8 +510,12 @@ public class InkSurfaceView @JvmOverloads constructor(
      */
     private inner class FinishedStrokes : InProgressStrokesFinishedListener {
         override fun onStrokesFinished(strokes: Map<InProgressStrokeId, Stroke>) {
+            val startedAt = strokeStartedAtElapsed
             for (stroke in strokes.values) {
-                this@InkSurfaceView.strokes.add(stroke, activeStrokeKind)
+                val objectId = this@InkSurfaceView.strokes.add(stroke, activeStrokeKind)
+                // M12 — null only for the unbound fallback id, which never reaches disk and must
+                // never reach a timeline either.
+                if (objectId != null && startedAt != 0L) onStrokeCaptured?.invoke(objectId, startedAt)
             }
             dryView.onStoreChanged()
             // Hand off only after the dry layer has been told to redraw, so the
@@ -603,6 +641,11 @@ public class InkSurfaceView @JvmOverloads constructor(
 
     private fun beginStroke(event: MotionEvent, pointerId: Int) {
         if (activeStrokeId != null) return
+        // M12 — latched here, used when the stroke finishes. `elapsedRealtime` rather than
+        // `event.eventTime`, which is `uptimeMillis` and stops during deep sleep: a recording holds
+        // the CPU awake, so the two agree in practice, but only one of them is the clock the
+        // timeline's offsets are defined against.
+        strokeStartedAtElapsed = SystemClock.elapsedRealtime()
         // One undo entry per stroke. Opened here and committed when the stroke
         // finishes, so the entry exists by the time onStrokesFinished inserts.
         strokes.beginEdit()

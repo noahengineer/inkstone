@@ -55,31 +55,13 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     val ui = remember { InkUiState() }
     val scope = rememberCoroutineScope()
     val note by editor.state.collectAsState()
+    val recording by editor.recording.collectAsState()
     var surface by remember { mutableStateOf<InkSurfaceView?>(null) }
     var pageOverviewOpen by remember { mutableStateOf(false) }
     var exporting by remember { mutableStateOf(false) }
     val context = LocalContext.current
 
-    // The latency HUD (SPEC §3.6). Polled rather than pushed: ink reports a LatencyData for
-    // every input, and turning 240 of those a second into recompositions would be measuring the
-    // measurement.
-    LaunchedEffect(surface) {
-        val view = surface ?: return@LaunchedEffect
-        while (true) {
-            ui.latency = view.latency.snapshot()
-            ui.stylus = view.stylus.snapshot()
-            delay(LATENCY_POLL_MS)
-        }
-    }
-
-    // Undo state lives with the session now (SPEC §4.6 — undo is an op in the log), so it is
-    // pushed into the view rather than read out of it.
-    LaunchedEffect(note.canUndo, note.canRedo, surface) {
-        ui.canUndo = note.canUndo
-        ui.canRedo = note.canRedo
-        surface?.canUndo = note.canUndo
-        surface?.canRedo = note.canRedo
-    }
+    SurfaceEffects(ui = ui, note = note, surface = surface)
 
     DisposableEffect(surface) {
         surface?.let { editor.onSurfaceAttached(it.asNoteSurface(scope, editor)) }
@@ -95,18 +77,33 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
             actions = inkToolbarActions(surface, editor, ui, scope),
         )
 
+        // ⭐ M12 §10 — top-right, away from the pen tools, because it is not one. Unmistakable
+        // while running: a red pill counting up, not a tinted icon.
+        RecordButton(
+            state = recording,
+            onToggle = { editor.toggleRecording() },
+            modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
+        )
+
         PageBar(
             state = note,
             modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp),
-            actions = pageBarActions(editor, note, { pageOverviewOpen = true }) {
-                if (!exporting) {
-                    exporting = true
-                    scope.launch {
-                        exportAndShare(editor, context)
-                        exporting = false
-                    }
-                }
-            },
+            actions = pageBarActions(
+                editor = editor,
+                note = note,
+                onShowPages = { pageOverviewOpen = true },
+                // ⚠️ One `exporting` flag for **both** exports, not one each. They copy into the
+                // same share cache directory and each sweeps it before writing, so two running at
+                // once would have the second delete the first's files out from under a chooser the
+                // user already has open.
+                exports = Exports(
+                    busy = exporting,
+                    onBusy = { exporting = it },
+                    scope = scope,
+                    context = context,
+                    editor = editor,
+                ),
+            ),
             exporting = exporting,
         )
     }
@@ -140,11 +137,35 @@ private fun inkToolbarActions(
     },
 )
 
+/**
+ * What the two share buttons need, as one value.
+ *
+ * A parameter object because the pair is inseparable: they share the `busy` flag and the cache
+ * directory it protects, and passing them individually is how one of them ends up with its own
+ * flag and deletes the other's files mid-chooser.
+ */
+private class Exports(
+    val busy: Boolean,
+    val onBusy: (Boolean) -> Unit,
+    val scope: CoroutineScope,
+    val context: android.content.Context,
+    val editor: NoteEditorViewModel,
+) {
+    fun run(export: suspend (NoteEditorViewModel, android.content.Context) -> Unit) {
+        if (busy) return
+        onBusy(true)
+        scope.launch {
+            export(editor, context)
+            onBusy(false)
+        }
+    }
+}
+
 private fun pageBarActions(
     editor: NoteEditorViewModel,
     note: NoteEditorState,
     onShowPages: () -> Unit,
-    onShare: () -> Unit,
+    exports: Exports,
 ) = PageBarActions(
     onPrevious = { editor.goToPage(note.pageIndex - 1) },
     onNext = { editor.goToPage(note.pageIndex + 1) },
@@ -155,7 +176,8 @@ private fun pageBarActions(
     onMoveRight = { editor.movePage(note.pageIndex + 1) },
     onTemplate = { template -> editor.setTemplate(template) },
     onShowPages = onShowPages,
-    onShare = onShare,
+    onShare = { exports.run(::exportAndShare) },
+    onShareRecording = { exports.run(::exportRecordingAndShare) },
 )
 
 /**
@@ -178,6 +200,52 @@ private suspend fun exportAndShare(editor: NoteEditorViewModel, context: android
 }
 
 /**
+ * ⭐ M12 — hand this note's recordings to another app (docs/M12-AUDIO.md §15.5).
+ *
+ * The same shape as [exportAndShare] and here for the same reason: a chooser needs an Activity
+ * context and the view model deliberately holds none. No materialize first — a finished recording
+ * is immutable, which is the one way this is simpler than the PDF.
+ */
+private suspend fun exportRecordingAndShare(editor: NoteEditorViewModel, context: android.content.Context) {
+    val uris = editor.exportRecordings()
+    if (uris == null) {
+        editor.reportNoRecordings()
+        return
+    }
+    context.startActivity(editor.chooserForRecordings(uris))
+}
+
+/**
+ * The two effects that keep the surface and the UI state in step.
+ *
+ * Extracted from [InkScreen] so that it stays about layout. Neither is optional: the first is the
+ * only source of SPEC §3.6's HUD, and the second is what makes the undo button honest.
+ */
+@Composable
+private fun SurfaceEffects(ui: InkUiState, note: NoteEditorState, surface: InkSurfaceView?) {
+    // The latency HUD (SPEC §3.6). Polled rather than pushed: ink reports a LatencyData for
+    // every input, and turning 240 of those a second into recompositions would be measuring the
+    // measurement.
+    LaunchedEffect(surface) {
+        val view = surface ?: return@LaunchedEffect
+        while (true) {
+            ui.latency = view.latency.snapshot()
+            ui.stylus = view.stylus.snapshot()
+            delay(LATENCY_POLL_MS)
+        }
+    }
+
+    // Undo state lives with the session now (SPEC §4.6 — undo is an op in the log), so it is
+    // pushed into the view rather than read out of it.
+    LaunchedEffect(note.canUndo, note.canRedo, surface) {
+        ui.canUndo = note.canUndo
+        ui.canRedo = note.canRedo
+        surface?.canUndo = note.canUndo
+        surface?.canRedo = note.canRedo
+    }
+}
+
+/**
  * The ink surface itself — SPEC §3.2's `AndroidView` seam.
  *
  * Split out of [InkScreen] because the two halves have nothing to say to each other: this one
@@ -195,6 +263,10 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
                 onUndoRequested = { editor.undo() }
                 onRedoRequested = { editor.redo() }
                 onEraserAutoReleased = { ui.eraserSelected = false }
+                // ⭐ M12 §3 — the timeline's only input. Fired on the UI thread in the frame the
+                // dry layer redraws, so the view model does one subtraction and one enqueue and
+                // returns (CLAUDE.md rule 7); the file append rides the journal's own rhythm.
+                onStrokeCaptured = { objectId, atElapsed -> editor.strokeCaptured(objectId, atElapsed) }
                 onCreated(this)
             }
         },

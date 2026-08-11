@@ -115,7 +115,23 @@ CREATE TABLE outbox (
     -- is failing to upload into a hot loop against the user's server.
     nextAttemptAt     INTEGER NOT NULL DEFAULT 0,
     createdAt         INTEGER NOT NULL,
-    PRIMARY KEY (noteId, opType)
+    -- ⭐ M12 — the third of the coalescing key, added by 7.sqm and therefore **last** for the
+    -- reason `remoteBinding.lastSeenRemoteAt` and `syncCursor.refusedUntil` are last: a fresh
+    -- install has to produce the column order a migrated database does or `verifyMigrations`
+    -- fails the build.
+    --
+    -- '' for MKCOL, MOVE, UPLOAD and DELETE, which are one-per-note: a newer enqueue of one of
+    -- those strictly supersedes an older one, which is what makes 500 offline edits cost one
+    -- row (SPEC §7.6). The recording id for MEDIA_UPLOAD, which is not: every recording is a
+    -- distinct irreplaceable file and none supersedes another, so without this column two
+    -- lectures recorded into one notebook while offline UPSERT onto one row and exactly one of
+    -- them ever reaches the server — with nothing reporting anything (docs/M12-AUDIO.md §5).
+    --
+    -- ⚠️ DEFAULT '' is what makes the migration a no-op for every existing row, and it is also
+    -- what keeps the old behaviour exactly: three of the five op types can still only ever have
+    -- one row per note, because they can only ever be enqueued with an empty subject.
+    subject           TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (noteId, opType, subject)
 );
 
 CREATE INDEX outboxDue ON outbox(nextAttemptAt);
@@ -453,6 +469,18 @@ SELECT * FROM outbox ORDER BY createdAt;
 -- Drain order (SPEC §7.6): MKCOL before anything targeting a path inside it, MOVE before
 -- UPLOAD for the same note, DELETE last so a MOVE-then-DELETE deletes at the new path.
 --
+-- ⚠️ MEDIA_UPLOAD (M12) sits between UPLOAD and DELETE, and that is a **correctness** rule
+-- rather than a preference: `OutboxDrainer.performDelete` ends in `bindings.remove(noteId)`
+-- and `drainOne` drops any row whose note has no binding, so a DELETE draining first would
+-- silently discard a lecture that has not reached the server yet. Before this row existed,
+-- `ELSE 3` put every unknown type in DELETE's own bucket, tie-broken by `createdAt` — so a
+-- DELETE enqueued before the recording would have won.
+--
+-- ⚠️ This CASE **restates `OutboxOpType.drainPriority`**, because SQL cannot read a Kotlin
+-- enum's ordinal. Change the two together. `ELSE` is still last, which is the right answer
+-- for an op type written by a newer build: unknown work sorts behind work this build
+-- understands, and `toEntry()` refuses to drain it at all.
+--
 -- Ordered globally by priority rather than per note. Global order trivially implies the
 -- per-note order the spec requires, and it needs no window function — which SQLDelight
 -- would happily generate and older Android SQLite builds would not run.
@@ -460,23 +488,34 @@ selectDueOutbox:
 SELECT * FROM outbox
 WHERE nextAttemptAt <= :now
 ORDER BY CASE opType
-    WHEN 'MKCOL'  THEN 0
-    WHEN 'MOVE'   THEN 1
-    WHEN 'UPLOAD' THEN 2
-    ELSE 3
+    WHEN 'MKCOL'        THEN 0
+    WHEN 'MOVE'         THEN 1
+    WHEN 'UPLOAD'       THEN 2
+    WHEN 'MEDIA_UPLOAD' THEN 3
+    ELSE 4
 END, createdAt
 LIMIT :limit;
 
+-- ⚠️ The conflict target is the table's PRIMARY KEY, which since 7.sqm is
+-- `(noteId, opType, subject)`. That third column is the whole of M12's outbox change: with a
+-- two-column key this statement quietly replaces one recording's queued upload with another's.
 upsertOutbox:
-INSERT OR REPLACE INTO outbox(noteId, opType, localRevAtEnqueue, attempts, nextAttemptAt, createdAt)
-VALUES (?, ?, ?, ?, ?, ?);
+INSERT OR REPLACE INTO outbox(noteId, opType, localRevAtEnqueue, attempts, nextAttemptAt,
+                              createdAt, subject)
+VALUES (?, ?, ?, ?, ?, ?, ?);
 
 rescheduleOutbox:
 UPDATE outbox SET attempts = :attempts, nextAttemptAt = :nextAttemptAt
-WHERE noteId = :noteId AND opType = :opType;
+WHERE noteId = :noteId AND opType = :opType AND subject = :subject;
 
 deleteOutboxRow:
-DELETE FROM outbox WHERE noteId = :noteId AND opType = :opType;
+DELETE FROM outbox WHERE noteId = :noteId AND opType = :opType AND subject = :subject;
+
+-- Sign-out, unbind, and "somebody else deleted the remote file". One statement rather than a
+-- loop over the op-type vocabulary — see `OutboxStore.removeAll` for why that loop could not
+-- survive an op type keyed by something the caller does not know.
+deleteOutboxForNote:
+DELETE FROM outbox WHERE noteId = :noteId;
 
 countOutbox:
 SELECT count(*) FROM outbox;

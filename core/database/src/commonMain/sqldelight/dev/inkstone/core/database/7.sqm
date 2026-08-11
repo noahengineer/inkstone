@@ -1,0 +1,115 @@
+-- M12 — recorded lectures, the capture half (docs/M12-AUDIO.md).
+--
+-- Two changes, and only the second is interesting.
+
+-- ---------------------------------------------------------------------------
+-- 1. The recording index
+-- ---------------------------------------------------------------------------
+--
+-- Additive, like 6.sqm: one new table and two indices, nothing altered, so an upgrade
+-- cannot mis-default a column that already holds user data. It starts empty, which is the
+-- state of every install that has never pressed record.
+--
+-- See Recording.sq for what the columns mean and why no row is ever deleted.
+
+CREATE TABLE recording (
+    id            TEXT    NOT NULL PRIMARY KEY,
+    noteId        TEXT    NOT NULL,
+    state         TEXT    NOT NULL DEFAULT 'CAPTURING',
+    startedAt     INTEGER NOT NULL,
+    durationMs    INTEGER NOT NULL DEFAULT 0,
+    audioBytes    INTEGER NOT NULL DEFAULT 0,
+    uploadedAt    INTEGER NOT NULL DEFAULT 0,
+    discardReason TEXT
+);
+
+CREATE INDEX recordingByNote ON recording(noteId);
+
+CREATE INDEX recordingByState ON recording(state, uploadedAt);
+
+-- ---------------------------------------------------------------------------
+-- 1b. The app's first user setting (§10)
+-- ---------------------------------------------------------------------------
+--
+-- Also additive. See Setting.sq for why auto-record is a per-folder row rather than a key in a
+-- generic settings table, and why an explicit 0 differs from an absent row.
+
+CREATE TABLE folderSetting (
+    folderId   TEXT    NOT NULL PRIMARY KEY,
+    autoRecord INTEGER NOT NULL DEFAULT 0
+);
+
+-- ---------------------------------------------------------------------------
+-- 2. ⭐ The outbox's coalescing key gains a third column
+-- ---------------------------------------------------------------------------
+--
+-- ⚠️ **The first migration in this project that is not purely additive**, and the reason is
+-- that SQLite cannot alter a PRIMARY KEY. `ALTER TABLE … ADD COLUMN` can add `subject`; it
+-- cannot put it in the key, and the key is the entire point — `upsertOutbox` is
+-- `INSERT OR REPLACE`, which deletes whatever row conflicts on the primary key, so with
+-- `(noteId, opType)` a second recording's queued upload **replaces the first's** and one
+-- lecture is uploaded while the other sits on disk with nothing pointing at it and nothing
+-- reporting anything (docs/M12-AUDIO.md §5).
+--
+-- So this is SQLite's documented table-rebuild: create beside, copy, drop, rename. Three
+-- things about doing it here rather than anywhere else:
+--
+--   * **The outbox is the safest table in the database to rebuild.** Every row is a
+--     *marker* for work that is still owed and is re-derivable — a lost UPLOAD row is
+--     re-enqueued by the next `SyncEngine.noteChanged`, and a lost MEDIA_UPLOAD by
+--     `enqueuePendingRecordings`. No row here is anybody's data (CLAUDE.md rule 4: "rows are
+--     markers, never payloads"), which is exactly why there is nothing to lose. The copy is
+--     still done, because "re-derivable" is not "free": dropping the rows would restart every
+--     backoff ladder at once, and a fleet of retry timers becoming due together is how a
+--     device turns on its own server's brute-force protection (SPEC §7.2).
+--
+--   * **`verifyMigrations` cannot see a rebuild that loses rows.** It diffs DDL, so an
+--     `INSERT … SELECT` that copied nothing would pass it silently. What covers that is
+--     `MigrationOnDeviceTest`, which already asserts a v4 fixture's outbox row survives with
+--     `attempts == 2` — i.e. the row *and its backoff state*. That assertion is load-bearing
+--     now; it was a nice-to-have before.
+--
+--   * **The new column is last**, matching `Sync.sq`. `ALTER TABLE ADD COLUMN` appends, and
+--     the repo's convention is that a migrated database and a fresh install produce the same
+--     column order or `verifyMigrations` fails the build (`remoteBinding.lastSeenRemoteAt`
+--     and `syncCursor.refusedUntil` both say so). A rebuild could put it anywhere; keeping the
+--     convention means the next person does not have to work out which rule applied here.
+--
+-- `DEFAULT ''` makes every existing row keep exactly its old behaviour: MKCOL, MOVE, UPLOAD
+-- and DELETE can only ever be enqueued with an empty subject, so they still coalesce
+-- one-per-note. The key widened; nothing else did.
+
+CREATE TABLE outboxNew (
+    noteId            TEXT    NOT NULL,
+    opType            TEXT    NOT NULL,
+    localRevAtEnqueue INTEGER NOT NULL,
+    attempts          INTEGER NOT NULL DEFAULT 0,
+    nextAttemptAt     INTEGER NOT NULL DEFAULT 0,
+    createdAt         INTEGER NOT NULL,
+    subject           TEXT    NOT NULL DEFAULT '',
+    PRIMARY KEY (noteId, opType, subject)
+);
+
+-- Column list spelled out on both sides. `INSERT INTO … SELECT *` would silently depend on
+-- the old table's column order, which is the kind of thing that is correct until somebody
+-- adds a column to `Sync.sq` and forgets this file exists.
+INSERT INTO outboxNew(noteId, opType, localRevAtEnqueue, attempts, nextAttemptAt, createdAt, subject)
+SELECT noteId, opType, localRevAtEnqueue, attempts, nextAttemptAt, createdAt, ''
+FROM outbox;
+
+-- ⚠️ Explicit, and **required** — though not by SQLite, which drops a table's indices with the
+-- table. It is required by SQLDelight's migration verifier, which carries a cumulative model of
+-- the schema across .sqm files and does not model that cascade: without this line the
+-- `CREATE INDEX` at the bottom fails the build with *"Duplicate index name outboxDue"*, naming
+-- an index whose table is two statements dead. Dropping it first is a no-op on a real database
+-- and makes the file say what it means.
+DROP INDEX outboxDue;
+
+DROP TABLE outbox;
+
+ALTER TABLE outboxNew RENAME TO outbox;
+
+-- Recreated because the drop above really did take it. Without this the drain's
+-- `WHERE nextAttemptAt <= :now` becomes a table scan — invisible in every test, and growing
+-- with the user's library.
+CREATE INDEX outboxDue ON outbox(nextAttemptAt);

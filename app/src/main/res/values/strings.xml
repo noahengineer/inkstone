@@ -5,4 +5,24 @@
     <string name="recovered_from_crash">Recovered after an unexpected close. At most the stroke in progress was lost.</string>
     <!-- A picked image that could not be decoded — a content URI can always turn out not to be one. -->
     <string name="cover_image_failed">That image could not be read</string>
+
+    <!--
+      M12 — lecture recording (docs/M12-AUDIO.md §§9, 10, 12).
+
+      The notification wording is a privacy decision, not copy: §12 states plainly that class
+      audio reaches two companies and that many institutions restrict recording lectures at all.
+      It says "This note is recording" rather than anything softer because the person who needs
+      to read it at a glance is the one who forgot they started it.
+    -->
+    <string name="recording_channel_name">Recording</string>
+    <string name="recording_channel_description">Shown while a note is recording audio.</string>
+    <string name="recording_notification_title">Inkstone is recording</string>
+    <string name="recording_notification_text">Audio is being captured into your note.</string>
+    <string name="recording_start">Record</string>
+    <string name="recording_stop">Stop recording</string>
+    <!-- §9 — the microphone was taken by something else (a call). The gap is marked in the timeline. -->
+    <string name="recording_silenced">Paused — another app is using the microphone</string>
+    <!-- Refused because the runtime permission was declined. Not an error state; just nothing happens. -->
+    <string name="recording_needs_permission">Recording needs permission to use the microphone.</string>
+    <string name="auto_record_folder">Auto-record in this folder</string>
 </resources>

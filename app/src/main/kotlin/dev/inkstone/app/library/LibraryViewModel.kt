@@ -7,6 +7,7 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.inkstone.android.ocr.MlKitRecogniser
 import dev.inkstone.android.pdf.PdfOpenResult
+import dev.inkstone.app.audio.AutoRecordFolders
 import dev.inkstone.app.platform.WorkManagerScheduler
 import dev.inkstone.app.sync.NoteSessionHost
 import dev.inkstone.core.model.DocumentId
@@ -81,6 +82,8 @@ class LibraryViewModel @Inject constructor(
      * this"* and *"did I write this down"* — because the user is asking one.
      */
     private val searchIndex: SearchIndex,
+    /** M12 §10's per-folder setting — read for the folder menu, written by it. */
+    private val autoRecord: AutoRecordFolders,
     /**
      * SPEC §8.1's downloadable language models (M7).
      *
@@ -116,7 +119,11 @@ class LibraryViewModel @Inject constructor(
         repository.pinnedFolders,
         repository.notesNeedingAttention,
         repository.openAttentionCount,
-    ) { pinned, flagged, count -> SyncOverlay(pinned, flagged, count) }
+        // M12 §10. A fourth overlay of the same shape — a per-folder fact the tiles draw — and it
+        // belongs here for the same reason the pins do: the alternative is a query when a menu
+        // opens, on the screen SPEC §5.7 exists to keep queries off.
+        autoRecord.explicitByFolder(),
+    ) { pinned, flagged, count, recording -> SyncOverlay(pinned, flagged, count, recording) }
 
     /**
      * SPEC §8.4's handwriting hits for the current query.
@@ -142,6 +149,19 @@ class LibraryViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), emptyList())
 
     private val modelState = MutableStateFlow(RecognitionModelState())
+
+    /**
+     * ⭐ M12 §10 — turn auto-record on, off, or back to inheriting for one folder.
+     *
+     * Null is a real value and not "unset": *"record in Maths, but not in Maths/Revision"* needs an
+     * explicit off that overrides the on above it, and without it the only way to stop recording in
+     * a subfolder would be to move it out of the tree.
+     */
+    fun setAutoRecord(folderId: FolderId, autoRecordOn: Boolean?) {
+        viewModelScope.launch {
+            if (autoRecordOn == null) autoRecord.clear(folderId) else autoRecord.set(folderId, autoRecordOn)
+        }
+    }
 
     /**
      * ⚠️ **Asked once, not polled.** `isModelDownloaded` is a Play Services round trip; putting
@@ -487,6 +507,7 @@ private fun uiStateOf(
         // just as much, and a cloud on only the folder holding the mapping row would describe
         // the implementation rather than the outcome.
         syncedFolders = coveredByPins(overlay.pinnedFolders, folders),
+        autoRecordFolders = overlay.autoRecordFolders,
         notesNeedingAttention = overlay.flaggedNotes,
         attentionCount = overlay.attentionCount,
         folderId = controls.folderId,
@@ -583,6 +604,8 @@ private data class SyncOverlay(
     val pinnedFolders: Set<FolderId>,
     val flaggedNotes: Set<DocumentId>,
     val attentionCount: Long,
+    /** M12 §10 — folders with an **explicit** auto-record setting. Absent means inherit. */
+    val autoRecordFolders: Map<String, Boolean> = emptyMap(),
 )
 
 /** Everything the library screen draws. */
@@ -595,6 +618,8 @@ data class LibraryUiState(
     val allNotes: List<NoteSummary> = emptyList(),
     /** Folders whose notes sync, pinned or beneath a pin (M6). Drives the cloud badge. */
     val syncedFolders: Set<FolderId> = emptySet(),
+    /** M12 §10 — folders with an explicit auto-record setting. Absent means inherit. */
+    val autoRecordFolders: Map<String, Boolean> = emptyMap(),
     /** Notes with an open SPEC §7.7 entry (M6). Drives the flag on a tile. */
     val notesNeedingAttention: Set<DocumentId> = emptySet(),
     /** How many entries are open. Zero hides the toolbar's button entirely. */

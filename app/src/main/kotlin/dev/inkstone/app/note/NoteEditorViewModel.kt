@@ -4,6 +4,8 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.inkstone.app.audio.RecordingController
+import dev.inkstone.app.audio.RecordingUiState
 import dev.inkstone.app.library.LibraryRepository
 import dev.inkstone.app.library.Thumbnails
 import dev.inkstone.app.search.NoteRecogniser
@@ -39,6 +41,11 @@ import javax.inject.Inject
  * which note this is, which after a process kill it is not.
  */
 @HiltViewModel
+// Eleven collaborators, and the shell holds none of them itself — every one is handed straight to
+// `NoteEditor` or to a lifecycle hook below. Grouping them into a parameter object would make the
+// graph harder to read for a class whose whole job is to be the wiring, which is the same
+// judgement `SyncModule` and `Reconciler` get.
+@Suppress("LongParameterList")
 class NoteEditorViewModel @Inject constructor(
     fs: FileSystem,
     clock: Clock,
@@ -50,6 +57,14 @@ class NoteEditorViewModel @Inject constructor(
      * through the session already open here rather than opening a second one.
      */
     private val sessions: NoteSessionHost,
+    /**
+     * M12's capture half. A process-wide singleton, deliberately — see [RecordingController]: a
+     * lecture has to survive this view model being cleared, and the *stop* has to be able to
+     * suspend, which `onCleared` cannot.
+     */
+    private val recordings: RecordingController,
+    /** M12 — read for the export below; the controller owns writing to it. */
+    private val recordingIndex: dev.inkstone.core.database.recording.RecordingIndex,
     publisher: PdfPublisher,
     /** SPEC §8.3's recogniser (M7), handed to the editor so its debounce has something to run. */
     recogniser: NoteRecogniser,
@@ -127,8 +142,67 @@ class NoteEditorViewModel @Inject constructor(
         override suspend fun recognise() = editor.recogniseInSession()
     }
 
+    /**
+     * ⭐ M12 — what the record button draws (docs/M12-AUDIO.md §10).
+     *
+     * ⚠️ A **pass-through of the controller's own flow**, never a field on [NoteEditorState].
+     * `NoteEditor.publish()` reconstructs that object rather than copying it, so a recording field
+     * added there would be reset to its default on every autosave tick, every page change, every
+     * undo and every merge — an elapsed timer that blanks itself every two seconds while passing
+     * any test that calls `publish` once. It also has a different lifetime: the recording outlives
+     * this view model, which is the entire point of it.
+     */
+    val recording: StateFlow<RecordingUiState> = recordings.state
+
+    /** §10 — one press. The permission is asked for by the screen before this is reached. */
+    fun toggleRecording() {
+        noteId?.let { recordings.toggle(it) }
+    }
+
+    /**
+     * ⭐ M12 — this note's recordings, out of the app (docs/M12-AUDIO.md §15.5).
+     *
+     * A recording lives in app-private storage: MTP cannot see it and `adb` needs USB debugging,
+     * which a managed device may not offer at all. Until the note is bound to Nextcloud and the
+     * outbox has drained, this is the **only** way the one irreplaceable file in the app can be
+     * moved, backed up, or even listened to elsewhere.
+     *
+     * @return null when there is nothing finished to share; the caller says so rather than opening
+     *   an empty chooser.
+     */
+    suspend fun exportRecordings(): List<android.net.Uri>? {
+        val id = noteId ?: return null
+        val uris = sharing.snapshotRecordings(recordingIndex.forNote(id), state.value.title)
+        return uris.ifEmpty { null }
+    }
+
+    fun chooserForRecordings(uris: List<android.net.Uri>) = sharing.chooserForRecordings(uris, state.value.title)
+
+    /** Tell the user there was nothing to hand over, through the editor's own snackbar. */
+    fun reportNoRecordings() = editor.showMessage(NO_RECORDINGS)
+
+    /** Shown by `NoteActivity`'s snackbar, then cleared. See [RecordingController.dismissMessage]. */
+    fun dismissRecordingMessage() = recordings.dismissMessage()
+
+    /**
+     * M12 — a stroke was just drawn, with the monotonic time its down event arrived.
+     *
+     * The page comes from the editor's published state rather than from the ink surface: the
+     * surface draws a page but does not own which one it is, and the state is updated by the same
+     * `display` that loads it. §15.6 made the page the alignment unit, so this is the field the
+     * whole server half reads.
+     */
+    fun strokeCaptured(objectId: dev.inkstone.core.model.ObjectId, atElapsedRealtime: Long) {
+        val current = state.value
+        recordings.strokeCaptured(objectId, atElapsedRealtime, current.pageIds.getOrNull(current.pageIndex))
+    }
+
     init {
         noteId?.let { sessions.register(it, handle) }
+        // §10's per-folder auto-record, and the stop for a recording still running in a *different*
+        // note — `NoteActivity` is `launchMode="standard"`, so opening note B from inside note A
+        // stacks a second editor and note A's `onCleared` never fires.
+        noteId?.let { recordings.noteOpened(it) }
         // SPEC §8.4 — arrive at the word, not at the note. Queued rather than applied: the
         // editor is still opening, and `showPage` takes the same lock the open holds.
         val pageId = savedState.get<String>(ARG_PAGE_ID)?.let(::PageId)
@@ -258,6 +332,16 @@ class NoteEditorViewModel @Inject constructor(
         // editor's scope was cancelled would hand the merge to a session that can no longer run it,
         // and `mergeRemoteBundle` would never return.
         noteId?.let { sessions.unregister(it, handle) }
+        // ⭐ **This is "the user left the note"**, and it is the only callback that means it.
+        // `onStop` fires for a screen timeout, a lock and a glance at a message; rotation fires
+        // nothing at all, because `NoteActivity` declares `configChanges` for it. Hanging the
+        // recorder off `onStop` is docs/M12-AUDIO.md §9's named failure: the screen dims at minute
+        // 8 and you lose the other 42 and do not find out until you look.
+        //
+        // Non-suspending on purpose — `ViewModel.clear()` has already cancelled `viewModelScope`
+        // by the time this runs (`NoteSessionHost.unregister` documents the same trap), and
+        // finalising an Ogg container is I/O. The controller has its own scope for exactly this.
+        noteId?.let { recordings.noteLeft(it) }
         sourcePages.clear()
         // Ends the autosave loop. Not a substitute for `materialize()` from the Activity —
         // `onCleared` is not guaranteed to run before the process dies, which is why the journal
@@ -272,6 +356,8 @@ class NoteEditorViewModel @Inject constructor(
 
         /** SPEC §8.4 — the page a search hit is on. */
         const val ARG_PAGE_ID: String = "pageId"
+
+        const val NO_RECORDINGS: String = "This note has no recording to share yet."
 
         /** The hit's page-space box, `[left, top, right, bottom]`. */
         const val ARG_HIT_BOX: String = "hitBox"

@@ -6,6 +6,8 @@ import android.net.Uri
 import androidx.core.content.FileProvider
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.Recording
+import dev.inkstone.core.model.RecordingState
 import dev.inkstone.core.model.RemoteName
 import dev.inkstone.core.storage.NoteLayout
 import kotlinx.coroutines.Dispatchers
@@ -95,8 +97,86 @@ class NoteSharing @Inject constructor(@ApplicationContext private val context: C
         return Intent.createChooser(send, null).apply { addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }
     }
 
+    /**
+     * ⭐ M12 — get a lecture **out of the app** (docs/M12-AUDIO.md §15.5).
+     *
+     * ## Why this exists, and why it is a rule 1 concern rather than a convenience
+     *
+     * Found the first time a real lecture was recorded on the tablet: a recording lives in
+     * app-private storage, so MTP cannot see it, and `adb` needs USB debugging — which a
+     * managed device may simply not offer. Until the note is bound to Nextcloud and the outbox
+     * has drained, **the only copy of the one file this app cannot re-make is on one device**,
+     * with no way to move it, back it up, or even listen to it elsewhere. That is not a missing
+     * nicety; it is CLAUDE.md rule 1 with no route out.
+     *
+     * ## Copied, like the PDF, but for only one of the two reasons
+     *
+     * [snapshot]'s first reason does **not** apply: a finished recording is immutable — nothing
+     * in the app ever rewrites it — so there is no torn read to prevent. The second does, and
+     * harder: `019fede0-dd02-7000-….opus` is a useless thing to find in a mail client a year
+     * later, and this is somebody's archive. So each one is copied under
+     * `<note title> <date>.opus`.
+     *
+     * ⚠️ The copy transiently doubles the disk a recording takes, which for a three-hour lecture
+     * is ~45 MB. That is why this shares **one note's** recordings rather than offering a
+     * library-wide export: a term of lectures copied into the cache at once is exactly the
+     * "discovered when the device fills up" outcome §11 exists to prevent.
+     *
+     * @return the audio Uris, and the timeline beside each one. Empty when the note has no
+     *   finished recording — the caller says so rather than opening an empty chooser.
+     */
+    suspend fun snapshotRecordings(recordings: List<Recording>, title: String): List<Uri> =
+        withContext(Dispatchers.IO) {
+            val kept = recordings.filter { it.state == RecordingState.READY }
+            if (kept.isEmpty()) return@withContext emptyList()
+
+            val outbox = File(context.cacheDir, SHARE_DIR)
+            outbox.deleteRecursively()
+            if (!outbox.mkdirs()) return@withContext emptyList()
+
+            val base = RemoteName.sanitise(title)
+            kept.flatMapIndexed { index, recording ->
+                // The index rather than the timestamp: two recordings in one sitting would
+                // collide on a minute-resolution name, which is the same trap §6's remote
+                // filename hit. The order is `startedAt`, so `1` is the earlier one.
+                val stem = if (kept.size == 1) base else "$base ${index + 1}"
+                listOfNotNull(
+                    copyForShare(NoteLayout.recordingAudio(recording.id), File(outbox, "$stem.opus")),
+                    copyForShare(NoteLayout.recordingTimeline(recording.id), File(outbox, "$stem.timeline")),
+                )
+            }
+        }
+
+    /** Null when the source is missing — a timeline is absent for a lecture nobody wrote in. */
+    private fun copyForShare(relativePath: String, destination: File): Uri? {
+        val source = File(context.filesDir, relativePath)
+        if (!source.isFile || source.length() == 0L) return null
+        source.copyTo(destination, overwrite = true)
+        return FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", destination)
+    }
+
+    /**
+     * The chooser for [snapshotRecordings].
+     *
+     * `ACTION_SEND_MULTIPLE`, because the timeline travels with its audio — the same reason they
+     * ride in one outbox op (§5): a lecture whose alignment data was left behind is just a
+     * recording.
+     */
+    fun chooserForRecordings(uris: List<Uri>, title: String): Intent {
+        val send = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
+            // The common denominator of an .opus and a .timeline. A stricter type here would hide
+            // every app that can take one but not the other.
+            type = ANY_MIME
+            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+            putExtra(Intent.EXTRA_TITLE, title)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        return Intent.createChooser(send, null).apply { addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+    }
+
     private companion object {
         const val SHARE_DIR = "share"
         const val PDF_MIME = "application/pdf"
+        const val ANY_MIME = "*/*"
     }
 }

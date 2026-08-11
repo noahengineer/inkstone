@@ -30,7 +30,8 @@ class OutboxCoalescingTest {
         localRev: Long = 5L,
         everUploaded: Boolean = true,
         now: Long = 2000L,
-    ) = OutboxCoalescing.plan(pending, request, note, localRev, everUploaded, now)
+        subject: String = NO_SUBJECT,
+    ) = OutboxCoalescing.plan(pending, request, note, localRev, everUploaded, now, subject)
 
     private fun row(
         opType: OutboxOpType,
@@ -38,7 +39,8 @@ class OutboxCoalescingTest {
         attempts: Int = 0,
         nextAttemptAt: Long = 0L,
         createdAt: Long = 100L,
-    ) = OutboxEntry(note, opType, rev, attempts, nextAttemptAt, createdAt)
+        subject: String = NO_SUBJECT,
+    ) = OutboxEntry(note, opType, rev, subject, attempts, nextAttemptAt, createdAt)
 
     @Test
     fun `a first upload becomes one row`() {
@@ -106,13 +108,84 @@ class OutboxCoalescingTest {
         )
     }
 
+    /**
+     * ⚠️ MEDIA_UPLOAD sits between UPLOAD and DELETE, and that position is **load-bearing**
+     * rather than tidy (M12). `OutboxDrainer.performDelete` ends in `bindings.remove(noteId)`,
+     * and `drainOne` drops any row whose note has no binding — so a DELETE draining first
+     * silently discards a lecture that has not reached the server yet, which is the opposite of
+     * what docs/M12-AUDIO.md §5 requires.
+     *
+     * `Sync.sq`'s `selectDueOutbox` restates this as a `CASE`, because SQL cannot read an
+     * ordinal. If this assertion is ever edited, that query is the other half of the edit.
+     */
     @Test
     fun `mkcol drains before everything else and delete drains last`() {
         val order = OutboxOpType.entries.sortedBy { it.drainPriority }
 
         assertEquals(
-            listOf(OutboxOpType.MKCOL, OutboxOpType.MOVE, OutboxOpType.UPLOAD, OutboxOpType.DELETE),
+            listOf(
+                OutboxOpType.MKCOL,
+                OutboxOpType.MOVE,
+                OutboxOpType.UPLOAD,
+                OutboxOpType.MEDIA_UPLOAD,
+                OutboxOpType.DELETE,
+            ),
             order,
+        )
+    }
+
+    /**
+     * ⭐ M12's headline rule, at the level where it is decided (docs/M12-AUDIO.md §5).
+     *
+     * Two recordings in one note are two rows. The end-to-end proof — that both files reach a
+     * real server — is `MergeMatrixMediaTest`; this is the unit that says the *decision* is
+     * right, and it is the one that fails first if the subject is ever dropped from the key.
+     */
+    @Test
+    fun `two recordings in one note are two rows and neither supersedes the other`() {
+        val first = plan(emptyList(), OutboxOpType.MEDIA_UPLOAD, subject = "rec-1").upserts.single()
+
+        val second = plan(listOf(first), OutboxOpType.MEDIA_UPLOAD, subject = "rec-2")
+
+        assertEquals(1, second.upserts.size, "a second recording produced more than its own row")
+        assertEquals("rec-2", second.upserts.single().subject)
+        assertTrue(
+            second.removals.isEmpty(),
+            "enqueuing a second recording removed the first one's row — one lecture would never upload",
+        )
+    }
+
+    /** A retry of the *same* recording is still one row, and still inherits its backoff. */
+    @Test
+    fun `re-enqueuing one recording coalesces onto its own row`() {
+        val existing = row(OutboxOpType.MEDIA_UPLOAD, attempts = 2, nextAttemptAt = 900_000L, subject = "rec-1")
+
+        val result = plan(listOf(existing), OutboxOpType.MEDIA_UPLOAD, subject = "rec-1")
+
+        val entry = result.upserts.single()
+        assertEquals("rec-1", entry.subject)
+        assertEquals(2, entry.attempts, "the sweep in noteChanged consumed an attempt")
+        assertEquals(900_000L, entry.nextAttemptAt, "re-enqueuing reset the backoff into a hot retry loop")
+    }
+
+    /**
+     * ⚠️ Doc §5: *"Trashing a note whose lecture has not uploaded yet should still deliver the
+     * lecture."* A DELETE annihilates the queued UPLOAD, MOVE and MKCOL — and must leave the
+     * recording alone. The three are an opt-in list precisely so this stays true.
+     */
+    @Test
+    fun `delete does not annihilate a queued recording`() {
+        val pending = listOf(
+            row(OutboxOpType.UPLOAD),
+            row(OutboxOpType.MEDIA_UPLOAD, subject = "rec-1"),
+        )
+
+        val result = plan(pending, OutboxOpType.DELETE, everUploaded = true)
+
+        assertTrue(OutboxKey(OutboxOpType.UPLOAD) in result.removals, "the queued upload survived a delete")
+        assertTrue(
+            OutboxKey(OutboxOpType.MEDIA_UPLOAD, "rec-1") !in result.removals,
+            "trashing the note destroyed the only queued route the lecture had to the server",
         )
     }
 
@@ -122,8 +195,11 @@ class OutboxCoalescingTest {
 
         val result = plan(pending, OutboxOpType.DELETE, everUploaded = true)
 
-        assertTrue(OutboxOpType.UPLOAD in result.removals, "a queued upload would re-create the deleted file")
-        assertTrue(OutboxOpType.MOVE in result.removals)
+        assertTrue(
+            OutboxKey(OutboxOpType.UPLOAD) in result.removals,
+            "a queued upload would re-create the deleted file",
+        )
+        assertTrue(OutboxKey(OutboxOpType.MOVE) in result.removals)
         assertEquals(listOf(OutboxOpType.DELETE), result.upserts.map { it.opType })
     }
 
@@ -136,7 +212,7 @@ class OutboxCoalescingTest {
         val result = plan(pending, OutboxOpType.DELETE, everUploaded = false)
 
         assertTrue(result.upserts.isEmpty())
-        assertTrue(OutboxOpType.UPLOAD in result.removals)
+        assertTrue(OutboxKey(OutboxOpType.UPLOAD) in result.removals)
     }
 
     @Test
@@ -156,17 +232,36 @@ class OutboxCoalescingTest {
         // SPEC §7.6: "rows are markers, never payloads. Never store note bytes in the
         // outbox — that's a second copy of every note." Stated as a test because the
         // pressure to add one arrives with the first feature that would find it convenient.
-        val entry = plan(emptyList(), OutboxOpType.UPLOAD).upserts.single()
+        //
+        // ⚠️ **M12 was that feature, and the count went 6 → 7 rather than the invariant going.**
+        // `subject` is an **identifier** — a recording id — and the two things that make it not
+        // a payload are worth stating, because "it is only a String" is exactly how the first
+        // path or filename gets in:
+        //
+        //   * the drainer resolves it through `RecordingUploads.find` to get the paths, so the
+        //     row names *which* object and never *where* or *what* it is;
+        //   * nothing here is derived from it — `RemoteMedia` builds the remote path from the
+        //     binding and the note id, so a row could not address a file on its own.
+        //
+        // The bound below is therefore "no bytes **and** no path", which is the invariant SPEC
+        // §7.6 actually wants; the field count is what makes a new field impossible to add
+        // without reading this.
+        val entry = plan(emptyList(), OutboxOpType.MEDIA_UPLOAD, subject = "rec-1").upserts.single()
 
         val fields = listOf<Any?>(
             entry.noteId,
             entry.opType,
             entry.localRevAtEnqueue,
+            entry.subject,
             entry.attempts,
             entry.nextAttemptAt,
             entry.createdAt,
         )
-        assertEquals(6, fields.size)
+        assertEquals(7, fields.size)
         assertNull(fields.firstOrNull { it is ByteArray }, "an outbox row must not carry bytes")
+        assertTrue(
+            fields.none { it is String && ('/' in it || '.' in it) },
+            "an outbox row must not carry a path — resolve identifiers through their own store",
+        )
     }
 }

@@ -43,6 +43,31 @@ public enum class OutboxOpType {
     /** Publish `document.pdf`. The common case, and the one that coalesces. */
     UPLOAD,
 
+    /**
+     * ⭐ M12 — one recording's audio **and its timeline**, uploaded together
+     * (docs/M12-AUDIO.md §5).
+     *
+     * ⚠️ **The one op type that must not coalesce.** Every other row here says *"this note
+     * owes the server the current version of one thing"*, and a newer enqueue strictly
+     * supersedes an older one — which is what makes 500 offline edits cost one upload. A
+     * recording is the opposite: every one is a **distinct, irreplaceable object and none
+     * supersedes another**. Two lectures recorded into one notebook while offline would
+     * UPSERT onto one row, one would upload, and the other would sit on disk with nothing
+     * pointing at it and nothing reporting anything.
+     *
+     * That is why [OutboxEntry.subject] exists and why this is the only op type that fills
+     * it. See `MediaUploadTest`, which is the row that fails without it.
+     *
+     * ## Why it drains before [DELETE], which is a correctness rule and not a preference
+     *
+     * `OutboxDrainer.performDelete` ends in `bindings.remove(noteId)`, and `drainOne` drops
+     * any row whose note has no binding. So a DELETE draining first would silently discard
+     * the queued lecture — while doc §5 requires the opposite: trashing a note whose lecture
+     * has not uploaded yet must still deliver the lecture. (The media files themselves
+     * survive a DELETE regardless; they are in a sibling directory, not in the note's file.)
+     */
+    MEDIA_UPLOAD,
+
     /** Remote delete — soft on Nextcloud, so it lands in the server's trash (SPEC §7.7). */
     DELETE,
 
@@ -53,8 +78,13 @@ public enum class OutboxOpType {
      *
      * MKCOL before everything (there is nowhere to PUT to otherwise), MOVE before UPLOAD
      * (SPEC §7.6 says so explicitly — uploading first would write to the old path and
-     * leave the move to shuffle stale bytes), DELETE last so a MOVE-then-DELETE deletes
-     * what is at the *new* path rather than 404ing on the old one.
+     * leave the move to shuffle stale bytes), MEDIA_UPLOAD before DELETE (see its KDoc —
+     * a drained DELETE removes the binding the media upload needs), DELETE last so a
+     * MOVE-then-DELETE deletes what is at the *new* path rather than 404ing on the old one.
+     *
+     * ⚠️ `Sync.sq`'s `selectDueOutbox` restates this as a `CASE`, because SQL cannot read a
+     * Kotlin enum's ordinal. The two must be changed together; the migration comment on
+     * `7.sqm` says so as well.
      */
     public val drainPriority: Int get() = ordinal
 }
@@ -63,6 +93,18 @@ public enum class OutboxOpType {
  * One row. Every field is either the coalescing key or scheduling state — there is
  * deliberately nowhere to put bytes.
  *
+ * @property subject ⭐ **M12 — the third of the coalescing key**, and empty for every op
+ *   type but [OutboxOpType.MEDIA_UPLOAD].
+ *
+ *   Empty means *"one of these per note"*, which is the correct rule for MKCOL, MOVE,
+ *   UPLOAD and DELETE: each says "the note owes the server the current version of one
+ *   thing", so a newer enqueue supersedes an older one and 500 offline edits leave one row.
+ *
+ *   Non-empty means *"one of these per **object**"* — the recording id, for audio. Every
+ *   recording is a distinct, irreplaceable file and none supersedes another, so an UPSERT
+ *   that collapsed two of them would upload one lecture and silently strand the other
+ *   (docs/M12-AUDIO.md §5). This column is what makes the two rules one mechanism instead
+ *   of a special case in the drainer.
  * @property localRevAtEnqueue what `note.local_rev` was when this was enqueued. SPEC
  *   §7.6's mid-flight guard compares it against the note's *current* rev on 2xx: if they
  *   differ the note changed while the PUT was in the air, and marking SYNCED would make
@@ -74,10 +116,28 @@ public data class OutboxEntry(
     val noteId: DocumentId,
     val opType: OutboxOpType,
     val localRevAtEnqueue: Long,
+    val subject: String = NO_SUBJECT,
     val attempts: Int = 0,
     val nextAttemptAt: Long = 0L,
     val createdAt: Long = 0L,
-)
+) {
+    /** This row's identity in the table — what a remove or a reschedule has to name. */
+    public val key: OutboxKey get() = OutboxKey(opType, subject)
+}
+
+/**
+ * ⭐ A row's identity within one note: the op type **and** its subject.
+ *
+ * A type rather than two parameters, because every place that removes or reschedules a row
+ * has to carry both and *"forgot the subject"* would otherwise be a legal call that deletes
+ * the wrong lecture's queue entry — or, with an empty default, quietly deletes nothing. Same
+ * reasoning as `NoteSession.apply`'s deleted `undoable` default: make the wrong call
+ * unrepresentable rather than documented.
+ */
+public data class OutboxKey(val opType: OutboxOpType, val subject: String = NO_SUBJECT)
+
+/** The subject of a row that is one-per-note. See [OutboxEntry.subject]. */
+public const val NO_SUBJECT: String = ""
 
 /**
  * The change [OutboxCoalescing] decided on, ready to apply in one transaction.
@@ -87,7 +147,7 @@ public data class OutboxEntry(
  */
 public data class OutboxPlan(
     val upserts: List<OutboxEntry> = emptyList(),
-    val removals: List<OutboxOpType> = emptyList(),
+    val removals: List<OutboxKey> = emptyList(),
 ) {
     public val isEmpty: Boolean get() = upserts.isEmpty() && removals.isEmpty()
 
@@ -115,6 +175,7 @@ public object OutboxCoalescing {
      *   nothing on the server to delete and the DELETE row would be a guaranteed 404.
      * @param now epoch millis, for a newly created row's `created_at` / `next_attempt_at`.
      */
+    @Suppress("LongParameterList") // The request, its subject, and the three facts it is decided against.
     public fun plan(
         pending: List<OutboxEntry>,
         request: OutboxOpType,
@@ -122,11 +183,17 @@ public object OutboxCoalescing {
         localRev: Long,
         everUploaded: Boolean,
         now: Long,
+        /** M12 — the recording id for [OutboxOpType.MEDIA_UPLOAD]; empty for everything else. */
+        subject: String = NO_SUBJECT,
     ): OutboxPlan {
-        val existing = pending.associateBy { it.opType }
+        // ⚠️ Keyed by the **whole** key, not by op type. Keying this map by `opType` alone was
+        // the bug in miniature: two MEDIA_UPLOADs for one note would find each other here, and
+        // the second would be treated as a newer version of the first.
+        val existing = pending.associateBy { it.key }
+        val key = OutboxKey(request, subject)
         return when (request) {
             OutboxOpType.DELETE -> planDelete(existing, noteId, localRev, everUploaded, now)
-            else -> OutboxPlan(upserts = listOf(coalesce(existing[request], noteId, request, localRev, now)))
+            else -> OutboxPlan(upserts = listOf(coalesce(existing[key], noteId, key, localRev, now)))
         }
     }
 
@@ -141,15 +208,16 @@ public object OutboxCoalescing {
     private fun coalesce(
         existing: OutboxEntry?,
         noteId: DocumentId,
-        opType: OutboxOpType,
+        key: OutboxKey,
         localRev: Long,
         now: Long,
     ): OutboxEntry = OutboxEntry(
         noteId = noteId,
-        opType = opType,
+        opType = key.opType,
         // The only field that always takes the new value: the drainer must upload the
         // newest revision, and the mid-flight guard has to compare against it.
         localRevAtEnqueue = localRev,
+        subject = key.subject,
         attempts = existing?.attempts ?: 0,
         nextAttemptAt = existing?.nextAttemptAt ?: now,
         createdAt = existing?.createdAt ?: now,
@@ -165,22 +233,34 @@ public object OutboxCoalescing {
      *
      * MOVE is annihilated too, for the same reason and with less ceremony: moving a file
      * you are about to delete is two requests to reach the same place as one.
+     *
+     * ⚠️ **[OutboxOpType.MEDIA_UPLOAD] is deliberately not in this list** (docs/M12-AUDIO.md
+     * §5). Annihilation is right when the queued op would put back something the user has just
+     * removed; a lecture is not that. Its files are in a sibling directory that the note's
+     * DELETE does not touch, the recording is the one thing in this app that cannot be
+     * re-made, and *"trashed the note the lecture was in"* is a thing people do the same
+     * evening they recorded it.
+     *
+     * The list is written as an **opt-in** — three named types, not "everything except
+     * DELETE" — so a new op type is excluded until somebody decides otherwise, which is the
+     * safe direction for a rule whose failure mode is destroying queued work. M6 found the
+     * same shape from the other side: `noteDeletedRemotely` must not be `noteTrashed`,
+     * because that annihilated the UPLOAD carrying a note's only unsynced edits.
      */
     private fun planDelete(
-        existing: Map<OutboxOpType, OutboxEntry>,
+        existing: Map<OutboxKey, OutboxEntry>,
         noteId: DocumentId,
         localRev: Long,
         everUploaded: Boolean,
         now: Long,
     ): OutboxPlan {
-        val removals = listOfNotNull(
-            OutboxOpType.UPLOAD.takeIf { it in existing },
-            OutboxOpType.MOVE.takeIf { it in existing },
+        val removals = listOf(OutboxOpType.UPLOAD, OutboxOpType.MOVE, OutboxOpType.MKCOL)
             // A folder that was only ever created for a note now being deleted.
-            OutboxOpType.MKCOL.takeIf { it in existing },
-        )
+            .map { OutboxKey(it) }
+            .filter { it in existing }
+        val deleteKey = OutboxKey(OutboxOpType.DELETE)
         val upserts = if (everUploaded) {
-            listOf(coalesce(existing[OutboxOpType.DELETE], noteId, OutboxOpType.DELETE, localRev, now))
+            listOf(coalesce(existing[deleteKey], noteId, deleteKey, localRev, now))
         } else {
             emptyList()
         }
@@ -216,10 +296,27 @@ public interface OutboxStore {
     public suspend fun all(): List<OutboxEntry>
 
     /** Reschedule after a failure, keeping the row. */
-    public suspend fun reschedule(noteId: DocumentId, opType: OutboxOpType, attempts: Int, nextAttemptAt: Long)
+    public suspend fun reschedule(noteId: DocumentId, key: OutboxKey, attempts: Int, nextAttemptAt: Long)
 
     /** The op completed and is no longer owed. */
-    public suspend fun remove(noteId: DocumentId, opType: OutboxOpType)
+    public suspend fun remove(noteId: DocumentId, key: OutboxKey)
+
+    /**
+     * ⭐ Every row this note owes, gone — sign-out, unbind, and *"the remote file was deleted
+     * by somebody else"*.
+     *
+     * A method rather than the `for (opType in OutboxOpType.entries) remove(noteId, opType)`
+     * that three call sites used to spell out. That loop was already a hazard — it silently
+     * needs editing whenever the vocabulary grows — and M12 broke it outright: a
+     * [OutboxOpType.MEDIA_UPLOAD] row is keyed by a recording id the loop cannot know, so the
+     * loop would have left it behind, pointing at an account that can no longer send it. One
+     * statement over `noteId` cannot have that bug.
+     *
+     * ⚠️ It **is** destructive, and the recordings it drops are re-derived rather than
+     * remembered: `SyncEngine.resumeAccount` reads [RecordingUploads.pendingFor] and enqueues
+     * them again. That is why the recording table exists as well as the queue.
+     */
+    public suspend fun removeAll(noteId: DocumentId)
 
     public suspend fun count(): Int
 }

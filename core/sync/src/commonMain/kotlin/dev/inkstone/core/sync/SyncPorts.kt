@@ -178,13 +178,85 @@ public data class RemoteBinding(
  * is the linter noticing something true. These four always travel together, they always come
  * from the same database, and a caller that had three of them and not the fourth could not do
  * anything correct with them.
+ *
+ * [recordings] is M12's, and is **not defaulted**. A default would be an empty store, which
+ * makes "this build cannot upload a lecture" the silent behaviour of every construction site
+ * somebody forgot — the exact shape of the six inert-but-green features CLAUDE.md lists.
  */
 public class SyncStores(
     public val accounts: AccountStore,
     public val bindings: BindingStore,
     public val outbox: OutboxStore,
     public val notes: SyncNotes,
+    public val recordings: RecordingUploads,
 )
+
+/**
+ * ⭐ M12 — one recording that has been captured and may still owe the server a copy.
+ *
+ * **Paths, not bytes** (the same rule [OutboxEntry] states for the outbox row itself, and the
+ * same one [dev.inkstone.core.model.RemoteBundleExtractor] states for a downloaded PDF). An
+ * hour of voice-grade Opus is ~11 MB and a lecture day is three of them; carrying that through
+ * a value class would put the largest object in the app on the heap for as long as a query
+ * result lives.
+ *
+ * @property audioPath `recordings/<id>.opus` — Ogg, so a process killed at minute 50 leaves
+ *   fifty playable minutes rather than an unreadable MP4 (doc §9).
+ * @property timelinePath `recordings/<id>.timeline` — the append-only stroke↔audio log.
+ *   ⚠️ It travels in the **same** outbox op as the audio: two ops means one can land without
+ *   the other, and a transcript with no timeline is just a transcript (doc §5).
+ * @property durationMillis elapsed-realtime, from the recording's start. Never wall clock —
+ *   though the reason here is not CLAUDE.md's (no two devices are ever compared) but that a
+ *   clock correction mid-lecture would otherwise change how long the lecture was.
+ */
+public data class PendingRecording(
+    val recordingId: String,
+    val noteId: DocumentId,
+    val audioPath: String,
+    val timelinePath: String,
+    val audioBytes: Long,
+    val startedAtEpochMillis: Long,
+    val durationMillis: Long,
+)
+
+/**
+ * What `:core:sync` needs to know about recordings — deliberately four questions and no more.
+ *
+ * Narrow for the reason [SyncNotes] is narrow: the drainer's business is *"what does this note
+ * owe the server, and where are the bytes"*. Starting, stopping and discarding a recording are
+ * `:app`'s, and a port that exposed them would let the sync layer open a microphone.
+ */
+public interface RecordingUploads {
+
+    /**
+     * The recording an outbox row names — **and only while it still owes the server a copy.**
+     *
+     * ⚠️ Null once it has been uploaded, and that is the contract rather than an accident.
+     * [markUploaded] and removing the outbox row are two stores and therefore not one
+     * transaction; a process killed between them leaves a row pointing at files the server
+     * already has. Answering null there costs one wasted drain and nothing else. Answering
+     * *"here it is"* costs an 11 MB re-upload and, once doc §8's server half has trashed the
+     * audio it transcribed, **a second transcription of the same lecture**.
+     *
+     * Also null for a recording discarded under the thirty-second floor after its row was
+     * enqueued, which is the same question arriving a different way.
+     */
+    public suspend fun find(recordingId: String): PendingRecording?
+
+    /**
+     * Finished recordings on [noteId] that the server does not have.
+     *
+     * ⚠️ Read by [SyncEngine.resumeAccount]. Signing out drops every outbox row (see
+     * [SyncEngine.pauseAccount], and the M5 stall it exists to prevent), so without this a
+     * lecture captured before a sign-out would never upload — and nothing would report it.
+     * The rows are the queue; **this table is the record of what is owed**, which is what
+     * makes the queue rebuildable.
+     */
+    public suspend fun pendingFor(noteId: DocumentId): List<PendingRecording>
+
+    /** The server now has both files. Does not change the recording's state; see `Recording.sq`. */
+    public suspend fun markUploaded(recordingId: String, atEpochMillis: Long)
+}
 
 public interface AccountStore {
     public suspend fun all(): List<SyncAccount>

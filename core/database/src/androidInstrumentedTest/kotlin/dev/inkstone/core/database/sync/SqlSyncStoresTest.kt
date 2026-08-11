@@ -11,6 +11,7 @@ import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.sync.AccountState
 import dev.inkstone.core.sync.ETag
 import dev.inkstone.core.sync.OutboxCoalescing
+import dev.inkstone.core.sync.OutboxKey
 import dev.inkstone.core.sync.OutboxOpType
 import dev.inkstone.core.sync.RemoteBinding
 import dev.inkstone.core.sync.SyncAccount
@@ -188,10 +189,72 @@ class SqlSyncStoresTest {
         )
     }
 
+    /**
+     * ⭐ M12 — the widened coalescing key, against **Android's own SQLite**.
+     *
+     * The JVM matrix proves the semantics; this proves the schema on the engine the tablet runs.
+     * Two things only a real device can answer: that `7.sqm`'s table rebuild leaves a primary key
+     * of `(noteId, opType, subject)` so `INSERT OR REPLACE` no longer collapses two recordings,
+     * and that `selectDueOutbox`'s `CASE` puts MEDIA_UPLOAD before DELETE — which is what stops a
+     * drained DELETE removing the binding a queued lecture needs.
+     */
+    @Test
+    fun `two recordings on one note are two rows and drain before a delete`() = runTest {
+        enqueueMedia(note, "rec-1", now = 10L)
+        enqueueMedia(note, "rec-2", now = 20L)
+        enqueue(note, OutboxOpType.DELETE, 1L, everUploaded = true, now = 5L)
+
+        val pending = outbox.pendingFor(note)
+        assertEquals(
+            setOf("rec-1", "rec-2"),
+            pending.filter { it.opType == OutboxOpType.MEDIA_UPLOAD }.mapTo(HashSet()) { it.subject },
+            "one recording replaced the other — Android's SQLite coalesced on the old key",
+        )
+
+        val due = outbox.due(nowEpochMillis = 1_000L, limit = 10).map { it.opType }
+        assertTrue(
+            due.indexOf(OutboxOpType.MEDIA_UPLOAD) < due.indexOf(OutboxOpType.DELETE),
+            "a DELETE would drain first and take the binding the lecture needs with it",
+        )
+
+        // And the row is removable by its whole key, which is what the drainer does on success.
+        outbox.remove(note, OutboxKey(OutboxOpType.MEDIA_UPLOAD, "rec-1"))
+        assertEquals(
+            listOf("rec-2"),
+            outbox.pendingFor(note).filter { it.opType == OutboxOpType.MEDIA_UPLOAD }.map { it.subject },
+            "removing one recording removed the other as well",
+        )
+    }
+
+    /** ⚠️ `removeAll` — the loop over `OutboxOpType.entries` could not name a recording's row. */
+    @Test
+    fun `removeAll clears rows the op-type vocabulary cannot name`() = runTest {
+        enqueue(note, OutboxOpType.UPLOAD, 1L, now = 10L)
+        enqueueMedia(note, "rec-1", now = 20L)
+
+        outbox.removeAll(note)
+
+        assertTrue(outbox.pendingFor(note).isEmpty())
+    }
+
+    private suspend fun enqueueMedia(noteId: DocumentId, recordingId: String, now: Long) {
+        outbox.mutate(noteId) { pending ->
+            OutboxCoalescing.plan(
+                pending = pending,
+                request = OutboxOpType.MEDIA_UPLOAD,
+                noteId = noteId,
+                localRev = 1L,
+                everUploaded = true,
+                now = now,
+                subject = recordingId,
+            )
+        }
+    }
+
     @Test
     fun `a row that is not due yet is not returned`() = runTest {
         enqueue(note, OutboxOpType.UPLOAD, 1L, now = 100L)
-        outbox.reschedule(note, OutboxOpType.UPLOAD, attempts = 2, nextAttemptAt = 5_000L)
+        outbox.reschedule(note, OutboxKey(OutboxOpType.UPLOAD), attempts = 2, nextAttemptAt = 5_000L)
 
         assertTrue(outbox.due(nowEpochMillis = 4_999L, limit = 10).isEmpty())
         val due = outbox.due(nowEpochMillis = 5_000L, limit = 10).single()

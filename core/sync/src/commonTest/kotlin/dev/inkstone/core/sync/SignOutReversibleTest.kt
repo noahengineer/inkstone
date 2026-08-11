@@ -40,9 +40,10 @@ class SignOutReversibleTest {
         val outbox = FakeOutboxStore()
         val accounts = FakeAccountStore(testAccount)
         val bindings = FakeBindingStore()
+        val recordings = FakeRecordingUploads()
         val scheduler = RecordingScheduler()
 
-        val stores = SyncStores(accounts, bindings, outbox, notes)
+        val stores = SyncStores(accounts, bindings, outbox, notes, recordings)
         val engine = SyncEngine(stores, clock, scheduler)
 
         suspend fun bind(noteId: DocumentId, rev: Long, syncedRev: Long, path: String) {
@@ -242,7 +243,8 @@ class MoveSyncedNoteTest {
         val outbox = FakeOutboxStore()
         val accounts = FakeAccountStore(testAccount)
         val bindings = FakeBindingStore()
-        val engine = SyncEngine(SyncStores(accounts, bindings, outbox, notes), clock, NoopScheduler())
+        val recordings = FakeRecordingUploads()
+        val engine = SyncEngine(SyncStores(accounts, bindings, outbox, notes, recordings), clock, NoopScheduler())
 
         suspend fun bind(noteId: DocumentId, path: String) {
             notes.setRev(noteId, 5)
@@ -278,7 +280,7 @@ class MoveSyncedNoteTest {
         // Where the file still is, so the MOVE has a source. Losing this is how a move becomes a
         // copy: the drainer would have nothing to move *from* and the UPLOAD would create a second.
         assertEquals("Inkstone/Physics.pdf", binding.movedFromPath)
-        assertNotNull(h.outbox.rows[note.value to OutboxOpType.MOVE], "no MOVE was queued")
+        assertNotNull(h.outbox.rows[Triple(note.value, OutboxOpType.MOVE, NO_SUBJECT)], "no MOVE was queued")
         // SPEC §7.4 rule 2 — a file's ETag does not change when it moves, so the stored one stays
         // valid and nothing re-downloads.
         assertEquals("etag-1", binding.lastSyncedEtag?.value)

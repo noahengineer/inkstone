@@ -1,0 +1,56 @@
+-- M12 — ⭐ **the app's first real user setting** (docs/M12-AUDIO.md §10).
+--
+-- There was no settings store of any kind before this: no DataStore, no SharedPreferences, no
+-- table. `InkUiState` says so in as many words — *"plain in-memory Compose state with no
+-- repository, no DataStore"*. So this file is a decision about shape as much as about audio.
+--
+-- WHY PER-FOLDER AND NOT A GLOBAL KEY-VALUE TABLE
+--
+-- The doc suggests *"a `setting` table beside `account`"*, and a generic `setting(key, value)` is
+-- what that sounds like. It is the wrong fit for the only setting that exists:
+--
+--   * **The setting is per folder by design, not by accident.** §10: *"Auto-record in Maths is
+--     what is actually wanted — you record in lectures, not when reviewing at home."* A global
+--     flag means the microphone turns itself on whenever any note opens, which is a materially
+--     different thing from a button and makes the notification the only signal.
+--   * A generic store would spell this `autoRecord.folder.<folderId> = "1"`, which makes *"which
+--     folders auto-record"* a `LIKE` scan over stringly-typed keys, and makes a folder id a
+--     substring of a key rather than a column.
+--   * `folderBinding` (M6) is already exactly this shape — one row per folder, resolved by
+--     walking a note's ancestry for the deepest match — so the resolver, the tests and the
+--     mental model are all reused rather than invented.
+--
+-- A generic `setting` table can arrive with the first genuinely global setting. Adding one now to
+-- hold a per-folder flag would be machinery for a caller that does not exist.
+--
+-- NO FOREIGN KEY on `folderId`, for the reason Library.sq and Sync.sq both give: SQLite does not
+-- enforce one without `PRAGMA foreign_keys = ON`. A row whose folder has been trashed resolves to
+-- nothing and costs nothing.
+
+CREATE TABLE folderSetting (
+    folderId   TEXT    NOT NULL PRIMARY KEY,
+    -- 1 = start recording when a note in this folder (or below it) is opened.
+    --
+    -- ⚠️ Absence is not the same as 0 in the resolver: the *deepest* ancestor with a row wins, so
+    -- an explicit 0 on a subfolder turns auto-record **off** underneath a folder that has it on.
+    -- Without that, "record in Maths but not in Maths/Revision" is unsayable — and a setting that
+    -- can only be turned on is one people turn off by deleting the folder.
+    autoRecord INTEGER NOT NULL DEFAULT 0
+);
+
+-- The whole set, for the resolver. Deliberately not one query per level: which ancestor governs is
+-- not known until the chain has been walked, and a query per level is one round trip per folder
+-- depth on the path a note's open waits behind. The same argument `selectFolderBindingsForAccount`
+-- makes, and the set is the same handful of rows.
+selectFolderSettings:
+SELECT * FROM folderSetting;
+
+selectFolderSetting:
+SELECT * FROM folderSetting WHERE folderId = ?;
+
+upsertFolderSetting:
+INSERT OR REPLACE INTO folderSetting(folderId, autoRecord) VALUES (?, ?);
+
+-- Back to "inherit from whatever is above me", which is a third state and not the same as 0.
+clearFolderSetting:
+DELETE FROM folderSetting WHERE folderId = ?;

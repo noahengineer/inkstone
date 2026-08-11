@@ -1,0 +1,160 @@
+-- M12 — recorded lectures (docs/M12-AUDIO.md). The **capture** half.
+--
+-- WHAT THIS IS, AND WHAT IT IS NOT
+--
+-- One row per recording the device has made. It is the index of the two sidecar files on
+-- disk — `recordings/<recordingId>.opus` and `recordings/<recordingId>.timeline` — and it
+-- is what makes four separate questions answerable without listing a directory:
+--
+--   * which recordings still owe the server an upload (`uploadedAt = 0`);
+--   * how much disk they are using, so §11's *"pending recordings and their sizes"* is a
+--     query and not a directory walk on the library's main thread;
+--   * which recording a `MEDIA_UPLOAD` outbox row is about — the row is a **marker**
+--     (CLAUDE.md rule 4), so `outbox.subject` holds an id and the paths are resolved here;
+--   * which recordings were interrupted by process death (`state = CAPTURING` at launch),
+--     which is §9's orphan recovery and is the reason a recording is written down *before*
+--     the microphone is opened rather than after it is closed.
+--
+-- ⚠️ **NOT the truth about the audio.** The .opus file is. This table is an index in
+-- exactly the sense `Library.sq` is one: if it were lost the recordings would still be on
+-- disk, and `recordings/` can be walked to rebuild it. What cannot be rebuilt is the
+-- *audio*, which is why nothing here ever deletes a file.
+--
+-- ⚠️ **NO ROW IS EVER DELETED**, and this is CLAUDE.md rule 1 rather than tidiness. A
+-- recording that has been uploaded is still the only record that a lecture was captured at
+-- all, and the local .opus is still on disk (see `uploadedAt`). Dropping the row would
+-- orphan the file — a file nothing can name, which is the leak `pendingDownload.tempPath`
+-- documents one milestone earlier.
+--
+-- NO FOREIGN KEY on `noteId`, for the reason `Library.sq` and `Sync.sq` both give: SQLite
+-- does not enforce one without `PRAGMA foreign_keys = ON`, so it would be documentation
+-- dressed as a guarantee. A recording whose note has gone is still a lecture; it is shown
+-- in the pending list and it still uploads if it was bound.
+
+CREATE TABLE recording (
+    -- UUIDv7, minted when the microphone is opened. This is also `outbox.subject` for the
+    -- row that uploads it, and the remote filename — never a timestamp, because
+    -- `2026-08-11T09-05.opus` collides for two recordings in one minute and "two recordings
+    -- into one note" is the acceptance criterion this whole feature is checked against.
+    id            TEXT    NOT NULL PRIMARY KEY,
+    -- Which note the microphone was open inside. The recording is *about* this note; it is
+    -- not part of it (audio never enters the bundle — doc §4).
+    noteId        TEXT    NOT NULL,
+    -- CAPTURING | READY | DISCARDED. There is no UPLOADED state: whether the server has it
+    -- is `uploadedAt`, and collapsing the two would make "finished but not yet uploaded"
+    -- and "finished and uploaded" the same column with two meanings.
+    --
+    -- ⚠️ A row is written as CAPTURING **before** the first byte of audio, so a process
+    -- killed mid-lecture leaves a row that says so. That is §9's orphan recovery, and it is
+    -- the whole reason the state is stored rather than inferred from the file.
+    state         TEXT    NOT NULL DEFAULT 'CAPTURING',
+    -- Wall clock, for display only — "your lecture from Tuesday morning". Never an
+    -- ordering (CLAUDE.md): the alignment offsets are elapsed-realtime and live in the
+    -- .timeline file, and nothing compares two devices' recordings at all.
+    startedAt     INTEGER NOT NULL,
+    -- How long the audio runs, from `SystemClock.elapsedRealtime`. 0 while CAPTURING.
+    -- §10's thirty-second floor is applied against this at stop.
+    durationMs    INTEGER NOT NULL DEFAULT 0,
+    -- The .opus file's length. Kept here as well as on disk so §11's list is one query.
+    -- Refreshed at stop and after recovery; a stale value costs a wrong number in a list,
+    -- never a wrong upload — the drainer reads the real file.
+    audioBytes    INTEGER NOT NULL DEFAULT 0,
+    -- 0 means "the server does not have it". Never NULL, for the reason
+    -- `syncAttention.acknowledgedAt` is not: `IS NULL` in one query makes SQLDelight infer a
+    -- different nullability for the column and generate a second row type and mapper.
+    uploadedAt    INTEGER NOT NULL DEFAULT 0,
+    -- Why a recording was discarded, for the one case a human needs told: it was under
+    -- thirty seconds (§10), or the recorder failed. NULL for an ordinary recording.
+    discardReason TEXT
+);
+
+-- The drainer's and the pending list's question: what does this note still owe?
+CREATE INDEX recordingByNote ON recording(noteId);
+
+-- §11's list, and §9's recovery sweep, both scan on this.
+CREATE INDEX recordingByState ON recording(state, uploadedAt);
+
+-- ---------------------------------------------------------------------------
+-- Writes
+-- ---------------------------------------------------------------------------
+
+-- ⚠️ A plain INSERT, not `INSERT OR REPLACE`. An id collision here would mean two
+-- recordings sharing one pair of files, and the second silently overwriting the first's
+-- audio — which is the one failure this feature cannot come back from. A UUIDv7 does not
+-- collide; if one ever did, a constraint violation at the moment the microphone opens is
+-- infinitely better than discovering it after the lecture.
+insertRecording:
+INSERT INTO recording(id, noteId, state, startedAt)
+VALUES (?, ?, 'CAPTURING', ?);
+
+-- The recording finished and is kept. Only these three columns move, so nothing else can
+-- be reset by omission — the `INSERT OR REPLACE` trap `upsertBinding` documents.
+finishRecording:
+UPDATE recording SET state = 'READY', durationMs = :durationMs, audioBytes = :audioBytes
+WHERE id = :id;
+
+-- Under the thirty-second floor, or the recorder never produced anything. The row stays
+-- (nothing here is ever deleted) and says why.
+discardRecording:
+UPDATE recording SET state = 'DISCARDED', durationMs = :durationMs, audioBytes = :audioBytes,
+                     discardReason = :discardReason
+WHERE id = :id;
+
+-- The one write the drainer makes. Not `state`: whether the file is on the server is a
+-- different fact from whether the capture finished, and a recording is still READY after
+-- it has been uploaded — the local .opus is still there.
+markRecordingUploaded:
+UPDATE recording SET uploadedAt = :uploadedAt WHERE id = :id;
+
+-- ---------------------------------------------------------------------------
+-- Reads
+-- ---------------------------------------------------------------------------
+
+selectRecording:
+SELECT * FROM recording WHERE id = ?;
+
+-- ⭐ The drainer's lookup, and the filter is the point: **a recording the server already has
+-- is not found here.**
+--
+-- `OutboxDrainer` marks the recording uploaded and then removes the outbox row, which are two
+-- stores and therefore not one transaction. A process killed between them leaves a row whose
+-- files are already on the server, and a lookup that answered "here it is" would re-PUT 11 MB
+-- — and, because the server half trashes the audio once it has transcribed it (doc §8), a
+-- re-PUT after that point re-creates the file and buys a **second transcription of the same
+-- lecture**. Making the absence the answer closes that window without a second flag: the
+-- drainer reads null, concludes there is nothing owed, and drops the row.
+--
+-- The same filter also covers a recording DISCARDED under §10's thirty-second floor after its
+-- row was enqueued, which is the same question with a different cause.
+selectRecordingOwingUpload:
+SELECT * FROM recording WHERE id = ? AND state = 'READY' AND uploadedAt = 0;
+
+-- What this note owes the server. READY only: a CAPTURING row is a microphone that is
+-- still open (or a recovery that has not run yet) and uploading it would PUT a file that
+-- is still being written to — CLAUDE.md rule 10's whole subject.
+selectPendingRecordingsForNote:
+SELECT * FROM recording
+WHERE noteId = :noteId AND state = 'READY' AND uploadedAt = 0
+ORDER BY startedAt;
+
+-- §11 — every recording still waiting, newest first, for the pending list and its sizes.
+selectPendingRecordings:
+SELECT * FROM recording WHERE state = 'READY' AND uploadedAt = 0 ORDER BY startedAt DESC;
+
+-- §9's orphan recovery, run once at launch. A row still CAPTURING means the process died
+-- with the microphone open: the Ogg stream on disk is playable up to the last page written
+-- (which is the entire reason the container is Ogg and not MP4), so this is offered rather
+-- than discarded.
+selectInterruptedRecordings:
+SELECT * FROM recording WHERE state = 'CAPTURING' ORDER BY startedAt;
+
+-- Everything for one note, whatever its state — the note's own "recordings" list.
+selectRecordingsForNote:
+SELECT * FROM recording WHERE noteId = :noteId ORDER BY startedAt DESC;
+
+-- The badge: how many recordings are waiting, and how much disk they hold.
+-- `coalesce`, because `sum()` over no rows is NULL and a NULL would have to be told apart
+-- from a genuine zero after the row count that distinguishes them had been thrown away.
+countPendingRecordings:
+SELECT count(*) AS pending, coalesce(sum(audioBytes), 0) AS bytes
+FROM recording WHERE state = 'READY' AND uploadedAt = 0;

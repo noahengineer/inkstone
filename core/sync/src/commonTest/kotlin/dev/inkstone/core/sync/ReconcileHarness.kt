@@ -305,6 +305,7 @@ internal class ReconcileHarness(
     val folders = FakeFolderBindingStore()
     val peers = FakePeerClockStore()
     val foreign = FakeForeignRemoteCache()
+    val recordings = FakeRecordingUploads()
     val gate = FakeMergeGate(
         report = report,
         localRev = mergedRev,
@@ -315,7 +316,7 @@ internal class ReconcileHarness(
     val extractor = FakeExtractor(fs = fs, verdictFor = verdict)
     val scheduler = CountingScheduler()
 
-    private val stores = SyncStores(accounts, bindings, outbox, notes)
+    private val stores = SyncStores(accounts, bindings, outbox, notes, recordings)
     private val pull = ReconcileStores(directories, cursors, downloads, attention, folders, peers, foreign)
     val engine: SyncEngine = SyncEngine(stores, clock, scheduler)
 

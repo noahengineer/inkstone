@@ -50,6 +50,20 @@ public class IdFactory(private val clock: Clock, private val random: Random = Ra
     public fun newDeviceId(): String = newUuid7()
 
     /**
+     * M12 — one recording (docs/M12-AUDIO.md).
+     *
+     * A plain [String] rather than a value class, because it is not an identity the op log or
+     * any fold ever sees: a recording is capture data, never document data (§3). It is three
+     * things at once, and they must be the same string — the `recording` row's primary key,
+     * `outbox.subject` for the row that uploads it, and the remote filename.
+     *
+     * UUIDv7, so a listing of a note's media directory is in chronological order without the
+     * name being a timestamp — which §6 sketched and which collides for two recordings in one
+     * minute, the exact case this feature is checked against.
+     */
+    public fun newRecordingId(): String = newUuid7()
+
+    /**
      * `xxxxxxxx-xxxx-7xxx-Nxxx-xxxxxxxxxxxx`, lowercase hex.
      *
      * A clock that reports a negative epoch (an unset device clock) is clamped to

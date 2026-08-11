@@ -26,6 +26,12 @@ graphify-out/
 # never needs the file to exist; a developer's copy must never be committed.
 nextcloud-test.local.properties
 
+# ⚠️ Every `*.local.properties`, by pattern rather than by name. The two above were listed
+# individually, which works right up until somebody adds a third — and M12's third one holds a
+# live AssemblyAI key that bills a real card. A credential file that is ignored only if someone
+# remembered to list it is a credential file that gets committed.
+*.local.properties
+
 # M7's accuracy corpus. IAMonDo v1.0 is licensed for NON-COMMERCIAL RESEARCH USE and confers no
 # redistribution right, so it must never be committed — only the aggregate numbers, which live in
 # docs/M7-RECOGNITION.md. `tools/m7-accuracy.ps1` fetches it into a scratch directory outside the
@@ -34,5 +40,29 @@ IAMonDo-db-1.0/
 IAMonDo-db-1.0.tar.gz
 
 # Python bytecode from tools/m7.
+__pycache__/
+*.pyc
+
+# ⚠️ M12 — recorded lectures. NEVER commit these.
+#
+# A recording is a classroom: a teacher and other students, very likely minors, none of whom
+# agreed to be in a git history. It is also the one file this app holds that cannot be re-made,
+# so a commit is not just a privacy problem but a permanent one — git keeps it after a delete.
+# `tools/pull-recordings.ps1` defaults to `recordings-pulled/`, which is one `git add .` away
+# from exactly that.
+#
+# The transcript is the same data in a form that is easier to read and easier to search, so it
+# is listed too.
+recordings-pulled/
+*.opus
+*.timeline
+
+# Unpacked AAR contents from reading androidx.ink with `javap` — the only way to settle what is
+# `@RestrictTo` and what a package is really called (see CLAUDE.md's notes on M1, M4 and M7).
+# Scratch, reproducible from the Gradle cache, and 4.8 MB of it.
+/nl/
+/strokes/
+
+# Python bytecode from the M12 tools.
 __pycache__/
 *.pyc

@@ -43,14 +43,27 @@ internal class FakeClock(var now: Long = 1_000_000L) : Clock {
     }
 }
 
+/**
+ * ⚠️ **The map's key is the table's PRIMARY KEY, and keeping the two in step is not cosmetic.**
+ *
+ * It was `Pair<String, OutboxOpType>` — exactly as lossy as the two-column key it modelled — so a
+ * test asking *"do two recordings survive?"* would have watched the fake collapse them and called
+ * that correct. That is the fixture failure CLAUDE.md warns about, inverted: a fixture that is
+ * exactly as wrong as production hides nothing **and proves nothing**, and it is the harder one to
+ * notice because every existing test stays green.
+ *
+ * So the key is `(noteId, opType, subject)` here for the same reason it is there.
+ */
 internal class FakeOutboxStore : OutboxStore {
-    val rows = LinkedHashMap<Pair<String, OutboxOpType>, OutboxEntry>()
+    val rows = LinkedHashMap<Triple<String, OutboxOpType, String>, OutboxEntry>()
+
+    private fun keyOf(noteId: DocumentId, key: OutboxKey) = Triple(noteId.value, key.opType, key.subject)
 
     override suspend fun mutate(noteId: DocumentId, plan: (List<OutboxEntry>) -> OutboxPlan) {
         val pending = rows.values.filter { it.noteId == noteId }
         val decided = plan(pending)
-        for (opType in decided.removals) rows.remove(noteId.value to opType)
-        for (entry in decided.upserts) rows[entry.noteId.value to entry.opType] = entry
+        for (key in decided.removals) rows.remove(keyOf(noteId, key))
+        for (entry in decided.upserts) rows[keyOf(entry.noteId, entry.key)] = entry
     }
 
     override suspend fun due(nowEpochMillis: Long, limit: Int): List<OutboxEntry> = rows.values
@@ -62,18 +75,48 @@ internal class FakeOutboxStore : OutboxStore {
 
     override suspend fun all(): List<OutboxEntry> = rows.values.toList()
 
-    override suspend fun reschedule(noteId: DocumentId, opType: OutboxOpType, attempts: Int, nextAttemptAt: Long) {
-        val key = noteId.value to opType
-        rows[key]?.let { rows[key] = it.copy(attempts = attempts, nextAttemptAt = nextAttemptAt) }
+    override suspend fun reschedule(noteId: DocumentId, key: OutboxKey, attempts: Int, nextAttemptAt: Long) {
+        val mapKey = keyOf(noteId, key)
+        rows[mapKey]?.let { rows[mapKey] = it.copy(attempts = attempts, nextAttemptAt = nextAttemptAt) }
     }
 
-    override suspend fun remove(noteId: DocumentId, opType: OutboxOpType) {
-        rows.remove(noteId.value to opType)
+    override suspend fun remove(noteId: DocumentId, key: OutboxKey) {
+        rows.remove(keyOf(noteId, key))
+    }
+
+    override suspend fun removeAll(noteId: DocumentId) {
+        rows.keys.removeAll { it.first == noteId.value }
     }
 
     override suspend fun count(): Int = rows.size
 
-    fun upload(noteId: DocumentId): OutboxEntry? = rows[noteId.value to OutboxOpType.UPLOAD]
+    fun upload(noteId: DocumentId): OutboxEntry? = rows[Triple(noteId.value, OutboxOpType.UPLOAD, NO_SUBJECT)]
+}
+
+/**
+ * M12's [RecordingUploads], in memory.
+ *
+ * ⚠️ [find] reproduces the real store's filter — **null once uploaded** — because that is the
+ * contract the drainer's crash window depends on, not an implementation detail of the SQL. A fake
+ * that answered from the map regardless would let a re-PUT of an uploaded lecture pass.
+ */
+internal class FakeRecordingUploads(vararg initial: PendingRecording) : RecordingUploads {
+
+    val rows = LinkedHashMap<String, PendingRecording>().apply {
+        initial.forEach { put(it.recordingId, it) }
+    }
+
+    val uploadedAt = LinkedHashMap<String, Long>()
+
+    override suspend fun find(recordingId: String): PendingRecording? =
+        rows[recordingId]?.takeIf { recordingId !in uploadedAt }
+
+    override suspend fun pendingFor(noteId: DocumentId): List<PendingRecording> =
+        rows.values.filter { it.noteId == noteId && it.recordingId !in uploadedAt }
+
+    override suspend fun markUploaded(recordingId: String, atEpochMillis: Long) {
+        uploadedAt[recordingId] = atEpochMillis
+    }
 }
 
 /**

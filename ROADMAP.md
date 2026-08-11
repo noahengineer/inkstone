@@ -1072,7 +1072,7 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 
 ---
 
-## M12 — recorded lectures, aligned to the notes 🟡
+## M12 — recorded lectures, aligned to the notes 🟡 (both halves built; never run end to end live)
 
 **Goal:** press record in a lecture, and afterwards the note carries what was *said* around each
 line you wrote — readable by you, and by an assistant with access to your Nextcloud.
@@ -1119,22 +1119,60 @@ is a statement about what v1 contains, not about what to build when.
 
 ### Acceptance
 
+⚠️ Buckets per `docs/M12-AUDIO.md` §15.1: **written**, **automated**, **automated against the real
+dependency**, **run on a device**. A real 48-minute lesson has now been recorded on the **Galaxy
+Tab** (§15.6), so definition-of-done #4 is met for capture — but **not** for ink feel, which nobody
+has measured, and the audio has not been listened to.
+
+**Capture**
+
+- [x] ⚠️ **Two recordings in one note, both made offline, both arrive.** *Run on a device* (the
+      widened key, on Android's own SQLite) and *automated against the real dependency* (the whole
+      path, in `MergeMatrixMediaTest`). Written first and **watched to fail**: one row where there
+      should have been two
+- [x] Screen off mid-lecture → still recording. *Run on a device*: `mWakefulness=Dozing`, the
+      `.opus` grew 112,260 → 131,387 bytes over 12 s
+- [x] Leave the note → stopped. *Run on a device* — and the signal is `onCleared`, not `onStop`
+- [x] `am force-stop` at minute N → the audio up to N is recoverable and playable. *Run on a
+      device*, verified by `tools/verify-ogg-opus.py`, which is **not** the encoder that wrote it:
+      1,154 complete pages, 0 CRC failures, 23.03 s recoverable, 0 torn bytes
+- [x] Open a note for 20 s with auto-record on → nothing uploaded, nothing billed. *Run on a
+      device*: an 8.1 s recording became `DISCARDED` with the outbox empty — and its audio kept
+- [x] A process killed mid-lecture is finalised and offered on the next launch. *Run on a device*
+- [x] The reconciler does not mistake the media folder for a note, does not trash it, **and does not
+      walk into it** — the walk was descending, which costs two PROPFINDs per note and defeats the
+      root-ETag poll for the whole account. *Automated*
+- [x] Record a real lesson end to end on the tablet. *Run on a device*: 48 m 48 s, 146,410 Ogg
+      pages, 0 CRC failures, 0 torn bytes, and 867 unique monotonic stroke offsets with none past
+      the end of the audio (§15.6). Storage measured at **14.7 MB/hour**, not the ~11 MB budgeted
+- [ ] A phone call mid-lecture leaves a marked gap, not an hour of silence. ⚠️ **Automated only** —
+      the real lesson marked zero gaps because the microphone was never taken
+- [ ] Airplane mode for a whole lecture → recording is kept, uploads on reconnect. ⚠️ The outbox
+      half is *automated*; the airplane-mode walk itself has not been driven
+- [ ] Pending recordings and their sizes, visible. ⚠️ **Written only** — on the Nextcloud screen
+
+**Alignment and transcript — the server half** (`tools/m12/watch.py`, docs §16)
+
+⚠️ **Docker was not available**, so the 14 tests in `test_watch.py` drive the production WebDAV
+client over a real socket against a hand-rolled server — the same answer SPEC §13.2's harness
+reached, and it found three real bugs a mock would have agreed with (§16.4). AssemblyAI is faked
+at `transcribe.run`, because a suite must not bill a card or ship a classroom recording.
+
+- [x] Audio is in Nextcloud's trash, and only after the transcript was **verified present**.
+      *Automated against a real HTTP server*, asserted off the server's own storage — and the
+      soft-delete is modelled, so "trashed not deleted" is a claim the test can actually make
+- [x] Rename the note's PDF in the Nextcloud web UI → its recording is still found and its new
+      title reaches the transcript. *Automated* — identity is the `documentId` path segment
+- [x] Two recordings in one note both transcribe. *Automated* — §5's trap, from the server side
+- [x] A failed transcription leaves the audio untouched and writes no blank file. *Automated*
+- [x] A 401 halts the pass rather than retrying it. *Automated* (CLAUDE.md rule 5)
+- [ ] ⚠️ **One real pass against a live Nextcloud.** Everything above is proven in halves: the
+      transcription against the real API (§15.7), the WebDAV against a real server. **This loop has
+      never made both calls in one pass.** Needs `watcher.local.properties`; start with `-DryRun`
 - [ ] Record a real lecture end to end; the transcript lands in Nextcloud and reads correctly
-- [ ] **The teacher's emphasis lands on the right line.** Write something while it is being
-      explained, and check the transcript attached to that line is the explanation — **report the
-      window constants you tuned to, with the before and after**
-- [ ] ⚠️ **Two recordings in one note, both made offline, both arrive.** This is the coalescing
-      trap in doc §5 — the outbox's `(note_id, op_type)` UPSERT eats the first one unless the key
-      carries the recording id
-- [ ] Airplane mode for a whole lecture → recording is kept, uploads on reconnect
-- [ ] Screen off mid-lecture → still recording. Leave the note → stopped
-- [ ] `am force-stop` at minute N → the audio up to N is recoverable and playable
-- [ ] A phone call mid-lecture leaves a marked gap, not an hour of silence
-- [ ] Open a note for 20 s with auto-record on → nothing uploaded, nothing billed
-- [ ] Rename the note's PDF in the Nextcloud web UI → its transcript is still found
-- [ ] Audio is in Nextcloud's trash, and only after the transcript was verified
-- [ ] The reconciler treats the media folder as foreign, does not trash it, and does not mistake it
-      for a note
+- [ ] **The teacher's emphasis lands on the right page** — **report the constants you tuned to,
+      with the before and after**. `PAGE_LEAD_IN_MS` 30 s / `PAGE_LEAD_OUT_MS` 10 s / `DEAD_RUN_MS`
+      30 s are still guesses; the 48-minute lesson predates the page column and cannot tune them
 - [ ] Ask Claude to read the Nextcloud folder and explain what a lecture covered
 
 ### Prompt

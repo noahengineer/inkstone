@@ -14,6 +14,7 @@ import dev.inkstone.core.database.sync.SqlForeignRemoteStore
 import dev.inkstone.core.database.sync.SqlOutboxStore
 import dev.inkstone.core.database.sync.SqlPeerClockStore
 import dev.inkstone.core.database.sync.SqlPendingDownloadStore
+import dev.inkstone.core.database.sync.SqlRecordingUploads
 import dev.inkstone.core.database.sync.SqlRemoteDirectoryStore
 import dev.inkstone.core.database.sync.SqlSyncCursorStore
 import dev.inkstone.core.database.sync.SqlSyncNotes
@@ -36,6 +37,7 @@ import dev.inkstone.core.sync.PeerClockStore
 import dev.inkstone.core.sync.PendingDownloadStore
 import dev.inkstone.core.sync.ReconcileStores
 import dev.inkstone.core.sync.Reconciler
+import dev.inkstone.core.sync.RecordingUploads
 import dev.inkstone.core.sync.RemoteMergeGate
 import dev.inkstone.core.sync.SyncCursorStore
 import dev.inkstone.core.sync.SyncEngine
@@ -90,7 +92,19 @@ object SyncModule {
     fun provideSyncNotes(database: InkstoneDatabase): SyncNotes = SqlSyncNotes(database, Dispatchers.IO)
 
     /**
-     * The four stores as one value. They always come from the same database and always
+     * M12 — what a note still owes the server in recordings (docs/M12-AUDIO.md §5).
+     *
+     * The *narrow* half of the recording table. `RecordingIndex` is the other half and is
+     * provided by `RecordingModule`; the sync layer gets this one, which has four methods and no
+     * way to start anything.
+     */
+    @Provides
+    @Singleton
+    fun provideRecordingUploads(database: InkstoneDatabase): RecordingUploads =
+        SqlRecordingUploads(database, Dispatchers.IO)
+
+    /**
+     * The five stores as one value. They always come from the same database and always
      * travel together — see [SyncStores].
      */
     @Provides
@@ -100,7 +114,8 @@ object SyncModule {
         bindings: BindingStore,
         outbox: OutboxStore,
         notes: SyncNotes,
-    ): SyncStores = SyncStores(accounts, bindings, outbox, notes)
+        recordings: RecordingUploads,
+    ): SyncStores = SyncStores(accounts, bindings, outbox, notes, recordings)
 
     @Provides
     @Singleton

@@ -131,6 +131,15 @@ public class WebDavClient(transport: NextcloudTransport, private val credential:
      *   clobber an existing file.
      * @param md5Hex the body's MD5, for `OC-Checksum`. Nextcloud verifies it, which turns
      *   a truncated upload into a 400 instead of a corrupt note.
+     * @param contentType ⚠️ **a parameter since M12, and it was hard-coded to
+     *   `application/pdf` before.** Everything this app uploaded was a PDF, so nothing
+     *   noticed — until a recording's `.opus` and `.timeline` went up the same path and were
+     *   announced to the server as PDFs. Nextcloud stores whatever it is given and reports
+     *   the declared type back in `d:getcontenttype`, so the file is *fine* and every
+     *   assertion about its bytes passes; what breaks is anything downstream that selects by
+     *   type — which is precisely what the server half of this feature is (doc §2: a watched
+     *   folder). A wrong label that only a *different* component notices is the same shape as
+     *   M4's PDFs that were valid, parseable and blank in every viewer but PdfBox.
      */
     @Suppress("LongParameterList") // Each one is a distinct header SPEC §7.5 names.
     public suspend fun put(
@@ -140,12 +149,13 @@ public class WebDavClient(transport: NextcloudTransport, private val credential:
         ifNoneMatchStar: Boolean = false,
         mtimeEpochSeconds: Long? = null,
         md5Hex: String? = null,
+        contentType: ContentType = ContentType.Application.Pdf,
     ): DavOutcome<UploadReceipt> = callRaw(HttpMethod.Put, remotePath) {
         ifMatch?.asIfMatch?.let { header("If-Match", it) }
         if (ifNoneMatchStar) header("If-None-Match", "*")
         mtimeEpochSeconds?.let { header("X-OC-Mtime", it.toString()) }
         md5Hex?.let { header("OC-Checksum", "md5:$it") }
-        contentType(ContentType.Application.Pdf)
+        contentType(contentType)
         setBody(bytes)
     }.map { it.receipt() }
 
@@ -312,21 +322,36 @@ public class WebDavClient(transport: NextcloudTransport, private val credential:
         fun receipt() = UploadReceipt(status, etag, ocId)
     }
 
-    private companion object {
-        const val SUCCESS_FLOOR = 200
-        const val REDIRECT_FLOOR = 300
-        const val UNAUTHORIZED = 401
-        const val FORBIDDEN = 403
-        const val NOT_FOUND = 404
-        const val METHOD_NOT_ALLOWED = 405
-        const val PRECONDITION_FAILED = 412
-        const val LOCKED = 423
-        const val TOO_MANY_REQUESTS = 429
-        const val INSUFFICIENT_STORAGE = 507
-        const val DETAIL_LIMIT = 500
+    public companion object {
+
+        /**
+         * ⭐ M12 — the audio media type, so no call site spells it as a string.
+         *
+         * `audio/ogg`, **not** `audio/opus`: the file is an *Ogg container* carrying an Opus
+         * stream, which is what `MediaRecorder.OutputFormat.OGG` writes. `audio/opus` names a
+         * bare Opus stream that nothing here produces. Getting this backwards costs nothing
+         * locally — the bytes are identical and every player sniffs the container — and is
+         * refused by whichever single tool downstream selects by declared type.
+         */
+        public val AUDIO_OGG: ContentType = ContentType("audio", "ogg")
+
+        /** The timeline: one `objectId offsetMs` pair per line (doc §3). Nothing parses it here. */
+        public val TIMELINE: ContentType = ContentType.Text.Plain
+
+        private const val SUCCESS_FLOOR = 200
+        private const val REDIRECT_FLOOR = 300
+        private const val UNAUTHORIZED = 401
+        private const val FORBIDDEN = 403
+        private const val NOT_FOUND = 404
+        private const val METHOD_NOT_ALLOWED = 405
+        private const val PRECONDITION_FAILED = 412
+        private const val LOCKED = 423
+        private const val TOO_MANY_REQUESTS = 429
+        private const val INSUFFICIENT_STORAGE = 507
+        private const val DETAIL_LIMIT = 500
 
         /** What a `SEARCH` failure is reported as. It addresses the DAV root, not a file. */
-        const val SEARCH_TARGET = "(search)"
+        private const val SEARCH_TARGET = "(search)"
     }
 }
 

@@ -27,6 +27,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import dagger.hilt.android.AndroidEntryPoint
+import dev.inkstone.app.audio.RecordingController
 import dev.inkstone.app.library.FolderCoverImage
 import dev.inkstone.app.library.LibraryActions
 import dev.inkstone.app.library.LibraryScreen
@@ -95,6 +96,18 @@ class MainActivity : ComponentActivity() {
     lateinit var clock: Clock
 
     /**
+     * M12 §9 — *"a process killed mid-lecture leaves an orphaned recording. The next launch
+     * finalises it and offers to process it rather than discarding it."*
+     *
+     * Here rather than in `InkstoneApplication.onCreate` for M6's reason: `onCreate` runs in
+     * **every** process, and eager work there is what broke the app's ability to start in a
+     * secondary one at all. This is the first screen of the default process, which is exactly
+     * where "on next launch" means what it says.
+     */
+    @Inject
+    lateinit var recordings: RecordingController
+
+    /**
      * The folder whose cover the photo picker is being opened for.
      *
      * A field rather than Compose state: the picker is an activity, so this process can be
@@ -108,8 +121,12 @@ class MainActivity : ComponentActivity() {
      *
      * The modern one, not `ACTION_GET_CONTENT`: it needs **no permission at all**, shows only
      * images, and the user chooses exactly what this app can see. Asking for
-     * `READ_MEDIA_IMAGES` to set a folder icon would be wildly out of proportion — and this
-     * app has no permissions at all today, which is worth keeping.
+     * `READ_MEDIA_IMAGES` to set a folder icon would be wildly out of proportion.
+     *
+     * ⚠️ *"This app has no permissions at all today"* was true until M12, which adds
+     * `RECORD_AUDIO` and `POST_NOTIFICATIONS` — both asked for at the first press of the record
+     * button, never at launch. The argument here is unchanged and is if anything stronger: an app
+     * that now asks for a microphone should not also be asking for the photo library.
      */
     private val pickCoverImage = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         val folderId = pickingCoverFor ?: return@registerForActivityResult
@@ -121,6 +138,9 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         pickingCoverFor = savedInstanceState?.getString(STATE_PICKING_COVER_FOR)?.let(::FolderId)
+        // Only on a genuinely fresh start, not after a rotation: a saved instance state means this
+        // process has been alive all along and anything interrupted has already been dealt with.
+        if (savedInstanceState == null) recordings.recoverInterrupted()
         setContent { InkstoneTheme { Content() } }
     }
 
@@ -268,6 +288,7 @@ class MainActivity : ComponentActivity() {
                 state = libraryState,
                 modifier = padding,
                 actions = libraryActions(
+                    autoRecordFolders = libraryState.autoRecordFolders,
                     onOpenTrash = { onShow(Showing.TRASH) },
                     onOpenSync = { noteId ->
                         sync.open(noteId)
@@ -321,7 +342,10 @@ class MainActivity : ComponentActivity() {
             .onFailure { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
     }
 
+    @Suppress("LongParameterList") // One per thing the library screen routes somewhere else.
     private fun libraryActions(
+        /** M12 §10 — read off the state the screen already holds, so a menu costs no query. */
+        autoRecordFolders: Map<String, Boolean>,
         onOpenTrash: () -> Unit,
         onOpenSync: (DocumentId?) -> Unit,
         onOpenSyncForFolder: (FolderId) -> Unit,
@@ -361,6 +385,9 @@ class MainActivity : ComponentActivity() {
         onSaveToNextcloud = { noteId -> onOpenSync(noteId) },
         onChangeSyncFolder = { noteId -> onMoveSyncedNote(noteId) },
         onSyncFolderToNextcloud = { folderId -> onOpenSyncForFolder(folderId) },
+        // M12 §10 — the per-folder setting, on the folder's own menu.
+        autoRecordFolders = autoRecordFolders,
+        onSetAutoRecord = library::setAutoRecord,
         onStopSyncing = sync::unbind,
         onOpenNextcloud = { onOpenSync(null) },
         onFillForMeasurement = library::fillForMeasurement,

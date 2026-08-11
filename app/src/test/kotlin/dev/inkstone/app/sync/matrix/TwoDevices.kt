@@ -5,6 +5,7 @@ import dev.inkstone.android.pdf.InkstonePdfMaterializer
 import dev.inkstone.android.pdf.PulledPdfExtractor
 import dev.inkstone.core.database.InkstoneDatabase
 import dev.inkstone.core.database.library.LibraryIndex
+import dev.inkstone.core.database.recording.RecordingIndex
 import dev.inkstone.core.database.sync.SqlAccountStore
 import dev.inkstone.core.database.sync.SqlAttentionStore
 import dev.inkstone.core.database.sync.SqlBindingStore
@@ -13,6 +14,7 @@ import dev.inkstone.core.database.sync.SqlForeignRemoteStore
 import dev.inkstone.core.database.sync.SqlOutboxStore
 import dev.inkstone.core.database.sync.SqlPeerClockStore
 import dev.inkstone.core.database.sync.SqlPendingDownloadStore
+import dev.inkstone.core.database.sync.SqlRecordingUploads
 import dev.inkstone.core.database.sync.SqlRemoteDirectoryStore
 import dev.inkstone.core.database.sync.SqlSyncCursorStore
 import dev.inkstone.core.database.sync.SqlSyncNotes
@@ -107,10 +109,20 @@ internal class Device(
     val peers: SqlPeerClockStore = SqlPeerClockStore(database, dispatcher)
     val foreignFiles: SqlForeignRemoteStore = SqlForeignRemoteStore(database, dispatcher)
 
+    /**
+     * M12 — the two halves of the recording table, both real.
+     *
+     * [recordings] is what the drainer reads; [recordingIndex] is what `:app` writes with. A test
+     * that made a recording by inserting a row by hand would be testing its own SQL, so the
+     * matrix's media row goes through the same index the app does.
+     */
+    val recordings: SqlRecordingUploads = SqlRecordingUploads(database, dispatcher)
+    val recordingIndex: RecordingIndex = RecordingIndex(database, dispatcher)
+
     val credentials: MatrixCredentials = MatrixCredentials(server.credential)
     val scheduler: CountingScheduler = CountingScheduler()
 
-    private val syncStores = SyncStores(accounts, bindings, outbox, notes)
+    private val syncStores = SyncStores(accounts, bindings, outbox, notes, recordings)
     private val pullStores =
         ReconcileStores(directories, cursors, downloads, attentionLog, folderBindings, peers, foreignFiles)
 
@@ -421,6 +433,17 @@ internal class TwoDevices private constructor(
     suspend fun remoteChecksum(remotePath: String): String? =
         ((raw.propfind(remotePath, WebDavClient.Depth.Zero) as? DavOutcome.Ok)?.value)
             ?.firstOrNull()?.checksum("md5")
+
+    /**
+     * ⭐ M12 — the `Content-Type` the PUT that stored [remotePath] declared.
+     *
+     * In-process only. Live, this would need `d:getcontenttype` in the PROPFIND body, and
+     * widening the walk's XML for one assertion is a change to the code path every reconcile
+     * pass takes — a poor trade against a claim the local server can make honestly. Null is
+     * reported as unchecked by the caller rather than passing quietly, which is the same rule
+     * [assertRequests] follows.
+     */
+    fun declaredContentType(remotePath: String): String? = (server as? LocalMatrixServer)?.contentTypeAt(remotePath)
 
     suspend fun rawOcId(remotePath: String): String? {
         val local = server as? LocalMatrixServer

@@ -10,6 +10,7 @@ import dev.inkstone.core.model.StrokeGeometry
 import dev.inkstone.core.model.StrokeObject
 import dev.inkstone.core.sync.AccountState
 import dev.inkstone.core.sync.OutboxCoalescing
+import dev.inkstone.core.sync.OutboxKey
 import dev.inkstone.core.sync.OutboxOpType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.test.runTest
@@ -167,7 +168,7 @@ class MergeMatrixOutboxTest {
         first.mutate(noteId) { pending ->
             OutboxCoalescing.plan(pending, OutboxOpType.UPLOAD, noteId, localRev = 7L, everUploaded = true, now = 100L)
         }
-        first.reschedule(noteId, OutboxOpType.UPLOAD, attempts = 3, nextAttemptAt = 999_000L)
+        first.reschedule(noteId, OutboxKey(OutboxOpType.UPLOAD), attempts = 3, nextAttemptAt = 999_000L)
         val before = assertNotNull(first.pendingFor(noteId).firstOrNull())
         opening.close()
 

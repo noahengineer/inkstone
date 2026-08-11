@@ -99,6 +99,15 @@ fun PageBar(
                 Text(if (exporting) "Exporting…" else "Share PDF")
             }
 
+            // ⭐ M12 — the only route a recording has out of the app when Nextcloud is not set up
+            // (docs/M12-AUDIO.md §15.5). Always offered rather than hidden when the note has none:
+            // whether a lecture is there is a database read, and putting one behind every
+            // recomposition of this bar is what SPEC §5.7 keeps off the drawing path. It says so
+            // instead when there is nothing to hand over.
+            TextButton(onClick = actions.onShareRecording, enabled = !exporting) {
+                Text("Share recording")
+            }
+
             // The autosave heartbeat. `local_rev` is bumped on every committed change
             // (SPEC §7.6), so a number that stops moving while you write is a bug you can see.
             Text(
@@ -131,4 +140,11 @@ data class PageBarActions(
     val onShowPages: () -> Unit,
     /** ROADMAP M4 — materialize and hand the published PDF to another app (SPEC §5.2). */
     val onShare: () -> Unit,
+    /**
+     * ⭐ M12 — hand this note's lecture recordings to another app.
+     *
+     * Not a convenience: a recording is in app-private storage, so without this the only copy of
+     * the one file this app cannot re-make sits on one device with no way off it (§15.5).
+     */
+    val onShareRecording: () -> Unit,
 )

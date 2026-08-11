@@ -3,15 +3,19 @@ package dev.inkstone.core.database.sync
 import dev.inkstone.core.database.InkstoneDatabase
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.NoteSyncState
+import dev.inkstone.core.storage.NoteLayout
 import dev.inkstone.core.sync.AccountState
 import dev.inkstone.core.sync.AccountStore
 import dev.inkstone.core.sync.BindingStore
 import dev.inkstone.core.sync.ETag
 import dev.inkstone.core.sync.NextcloudCapabilities
 import dev.inkstone.core.sync.OutboxEntry
+import dev.inkstone.core.sync.OutboxKey
 import dev.inkstone.core.sync.OutboxOpType
 import dev.inkstone.core.sync.OutboxPlan
 import dev.inkstone.core.sync.OutboxStore
+import dev.inkstone.core.sync.PendingRecording
+import dev.inkstone.core.sync.RecordingUploads
 import dev.inkstone.core.sync.RemoteBinding
 import dev.inkstone.core.sync.StaleBinding
 import dev.inkstone.core.sync.SyncAccount
@@ -178,7 +182,7 @@ public class SqlOutboxStore(private val database: InkstoneDatabase, private val 
             database.transaction {
                 val pending = queries.selectOutboxForNote(noteId.value).executeAsList().mapNotNull { it.toEntry() }
                 val decided = plan(pending)
-                for (opType in decided.removals) queries.deleteOutboxRow(noteId.value, opType.name)
+                for (key in decided.removals) queries.deleteOutboxRow(noteId.value, key.opType.name, key.subject)
                 for (entry in decided.upserts) {
                     queries.upsertOutbox(
                         noteId = entry.noteId.value,
@@ -187,6 +191,7 @@ public class SqlOutboxStore(private val database: InkstoneDatabase, private val 
                         attempts = entry.attempts.toLong(),
                         nextAttemptAt = entry.nextAttemptAt,
                         createdAt = entry.createdAt,
+                        subject = entry.subject,
                     )
                 }
             }
@@ -203,20 +208,64 @@ public class SqlOutboxStore(private val database: InkstoneDatabase, private val 
     override suspend fun all(): List<OutboxEntry> =
         withContext(dispatcher) { queries.selectAllOutbox().executeAsList().mapNotNull { it.toEntry() } }
 
-    override suspend fun reschedule(
-        noteId: DocumentId,
-        opType: OutboxOpType,
-        attempts: Int,
-        nextAttemptAt: Long,
-    ): Unit = withContext(dispatcher) {
-        queries.rescheduleOutbox(attempts.toLong(), nextAttemptAt, noteId.value, opType.name)
-    }
+    override suspend fun reschedule(noteId: DocumentId, key: OutboxKey, attempts: Int, nextAttemptAt: Long): Unit =
+        withContext(dispatcher) {
+            queries.rescheduleOutbox(attempts.toLong(), nextAttemptAt, noteId.value, key.opType.name, key.subject)
+        }
 
-    override suspend fun remove(noteId: DocumentId, opType: OutboxOpType): Unit =
-        withContext(dispatcher) { queries.deleteOutboxRow(noteId.value, opType.name) }
+    override suspend fun remove(noteId: DocumentId, key: OutboxKey): Unit =
+        withContext(dispatcher) { queries.deleteOutboxRow(noteId.value, key.opType.name, key.subject) }
+
+    override suspend fun removeAll(noteId: DocumentId): Unit =
+        withContext(dispatcher) { queries.deleteOutboxForNote(noteId.value) }
 
     override suspend fun count(): Int = withContext(dispatcher) { queries.countOutbox().executeAsOne().toInt() }
 }
+
+/**
+ * M12 — [RecordingUploads] over the `recording` table.
+ *
+ * Narrow on purpose, like [SqlSyncNotes]: the four columns the drainer and
+ * [dev.inkstone.core.sync.SyncEngine] need, and nothing that could let the sync layer start a
+ * microphone. `:app`'s `Recordings` owns the rest of the table.
+ */
+public class SqlRecordingUploads(private val database: InkstoneDatabase, private val dispatcher: CoroutineDispatcher) :
+    RecordingUploads {
+
+    private val queries = database.recordingQueries
+
+    override suspend fun find(recordingId: String): PendingRecording? = withContext(dispatcher) {
+        // `selectRecordingOwingUpload`, never `selectRecording` — the filter *is* the contract.
+        // See [RecordingUploads.find] for what re-answering an uploaded recording costs.
+        queries.selectRecordingOwingUpload(recordingId).executeAsOneOrNull()?.toPending()
+    }
+
+    override suspend fun pendingFor(noteId: DocumentId): List<PendingRecording> = withContext(dispatcher) {
+        queries.selectPendingRecordingsForNote(noteId.value).executeAsList().map { it.toPending() }
+    }
+
+    override suspend fun markUploaded(recordingId: String, atEpochMillis: Long): Unit =
+        withContext(dispatcher) { queries.markRecordingUploaded(atEpochMillis, recordingId) }
+}
+
+/**
+ * The paths are **derived** from the id, never stored.
+ *
+ * A column holding `recordings/<id>.opus` would be a second place the layout is written down,
+ * and the two would disagree the first time [NoteLayout] changed — with the row winning, because
+ * it is what the uploader reads. Deriving them also keeps CLAUDE.md's *"identity is never a file
+ * path"* true in the direction that actually bites: the id is the identity, and the path is a
+ * function of it.
+ */
+private fun dev.inkstone.core.database.Recording.toPending() = PendingRecording(
+    recordingId = id,
+    noteId = DocumentId(noteId),
+    audioPath = NoteLayout.recordingAudio(id),
+    timelinePath = NoteLayout.recordingTimeline(id),
+    audioBytes = audioBytes,
+    startedAtEpochMillis = startedAt,
+    durationMillis = durationMs,
+)
 
 /**
  * [SyncNotes] over the library index's `note` table.
@@ -281,6 +330,7 @@ private fun dev.inkstone.core.database.Outbox.toEntry(): OutboxEntry? {
         noteId = DocumentId(noteId),
         opType = type,
         localRevAtEnqueue = localRevAtEnqueue,
+        subject = subject,
         attempts = attempts.toInt(),
         nextAttemptAt = nextAttemptAt,
         createdAt = createdAt,

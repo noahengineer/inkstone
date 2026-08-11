@@ -95,7 +95,7 @@ A tablet note-taking app where:
 
 ### 1.2 Not in v1
 
-No real-time collaboration. No AI. No infinite canvas. No audio recording — designed for M12, see §12.
+No real-time collaboration. No AI. No infinite canvas. Audio recording — designed for M12, **capture half built**; see §12 and `docs/M12-AUDIO.md` §15.
 
 ### 1.3 The design principle
 
@@ -1220,8 +1220,26 @@ remote_binding(note_id, account_id, remote_path,
                last_synced_etag, last_synced_rev)
 
 outbox(note_id, op_type, local_rev_at_enqueue, attempts, next_attempt_at, created_at,
-       PRIMARY KEY (note_id, op_type))     -- the coalescing key
+       subject,                              -- M12; '' for everything but MEDIA_UPLOAD
+       PRIMARY KEY (note_id, op_type, subject))     -- the coalescing key
 ```
+
+⚠️ **`subject` is M12's, and the key was `(note_id, op_type)` until it.** It is empty for MKCOL,
+MOVE, UPLOAD and DELETE, which are one-per-note: each says *"this note owes the server the current
+version of one thing"*, so a newer enqueue strictly supersedes an older one and 500 offline edits
+still leave one row.
+
+It holds the **recording id** for `MEDIA_UPLOAD`, which is not that. Every recording is a distinct,
+irreplaceable object and none supersedes another, so with the two-column key an `INSERT OR REPLACE`
+of a second lecture's row **deletes the first's** — one lecture uploads, the other sits on disk with
+nothing pointing at it, and nothing reports anything. `docs/M12-AUDIO.md` §5 predicted it; the test
+was written first and watched to fail. `7.sqm` rebuilds the table, because SQLite cannot alter a
+primary key.
+
+`MEDIA_UPLOAD` drains **between UPLOAD and DELETE**, and that ordering is a correctness rule rather
+than a preference: `OutboxDrainer.performDelete` ends in `bindings.remove(noteId)` and `drainOne`
+drops any row whose note has no binding, so a DELETE draining first would silently discard a lecture
+that has not reached the server yet.
 
 `sync_state ∈ { LOCAL_ONLY, SYNCED, PENDING_UPLOAD, PENDING_DOWNLOAD, CONFLICT, ERROR, NEEDS_REAUTH }`
 
@@ -1857,7 +1875,7 @@ Toolchain is ready: Kotlin 2.3.20, Compose Multiplatform iOS stable since 1.8.0,
 | Real-time collaboration | The op-log supports it; transport and presence UI are their own project |
 | AI features | ML Kit GenAI can't do handwriting; cloud AI contradicts offline-first |
 | Infinite canvas | Different rendering and viewport model |
-| Audio + stroke sync | Large surface, and a data-loss risk area. **Designed for M12 — `docs/M12-AUDIO.md`.** Still out of scope for v1, which ends at M11; the reason above turned out to be exactly right, and the design is mostly the answer to it |
+| Audio + stroke sync | Large surface, and a data-loss risk area. **Designed for M12 — `docs/M12-AUDIO.md`. The capture half is now built (§15); alignment and transcription are not.** Still out of scope for v1, which ends at M11; the reason above turned out to be exactly right, and the design is mostly the answer to it — the one thing it under-rated is the outbox's coalescing key, which would have eaten a lecture in silence |
 | Tags / backlinks | Worth doing properly later |
 | Handwriting→text replace-in-place | Recognition exists in M7; the editing UX is its own design problem |
 | Editing annotations from imported PDFs | Render and preserve only in v1 |

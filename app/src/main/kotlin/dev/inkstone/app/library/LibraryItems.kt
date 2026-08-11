@@ -429,6 +429,20 @@ data class FolderActions(
      * beneath it) syncs there. SPEC §9's folder mirror.
      */
     val onSyncToFolder: () -> Unit,
+    /**
+     * ⭐ M12 §10 — *"Auto-record is per folder, not global."*
+     *
+     * *"Auto-record in Maths"* is what is actually wanted: you record in lectures, not when
+     * reviewing at home. It is on the **folder's** menu and nowhere else, because a global switch
+     * would mean the microphone turns itself on whenever any note opens — a materially different
+     * thing from a button, and one that makes the notification the only signal.
+     *
+     * @param autoRecord what this folder itself says, ignoring its ancestors. Null means *inherit*,
+     *   which is a third state and not the same as off: *"record in Maths, but not in
+     *   Maths/Revision"* needs an explicit off that overrides the on above it.
+     */
+    val autoRecord: Boolean?,
+    val onSetAutoRecord: (Boolean?) -> Unit,
 )
 
 @Composable
@@ -536,6 +550,7 @@ private fun FolderMenu(expanded: Boolean, onDismiss: () -> Unit, actions: Folder
                 onDismiss()
             },
         )
+        AutoRecordItem(actions = actions, onDismiss = onDismiss)
         DropdownMenuItem(
             text = { Text("Colour and icon") },
             onClick = {
@@ -597,3 +612,35 @@ private val BADGE_SIZE = 18.dp
 
 /** The folder's picture in the list layout. */
 private val ROW_TILE_SIZE = 44.dp
+
+/**
+ * ⭐ M12 §10 — auto-record for this folder, cycled by tapping: inherit → on → off → inherit.
+ *
+ * Three states, so not a checkbox. *"Inherit"* is what every folder starts in and is the commonest
+ * answer; an explicit **off** is what makes *"record in Maths, but not in Maths/Revision"* sayable,
+ * and without it the only way to stop recording in a subfolder is to move it out of the tree.
+ */
+@Composable
+private fun AutoRecordItem(actions: FolderActions, onDismiss: () -> Unit) {
+    DropdownMenuItem(
+        text = {
+            Text(
+                when (actions.autoRecord) {
+                    true -> "Auto-record: on"
+                    false -> "Auto-record: off"
+                    null -> "Auto-record: inherit"
+                },
+            )
+        },
+        onClick = {
+            actions.onSetAutoRecord(
+                when (actions.autoRecord) {
+                    null -> true
+                    true -> false
+                    false -> null
+                },
+            )
+            onDismiss()
+        },
+    )
+}

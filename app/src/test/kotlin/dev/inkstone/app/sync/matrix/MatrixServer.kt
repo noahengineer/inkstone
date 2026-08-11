@@ -213,7 +213,24 @@ internal class LiveMatrixServer(private val live: LiveNextcloud) : MatrixServer 
 // a second file whose only member is `readRequest`.
 internal class LocalMatrixServer(uid: String = "matrixuser") : MatrixServer {
 
-    private class Stored(var bytes: ByteArray, var etag: String, var ocId: String, var md5: String?)
+    private class Stored(
+        var bytes: ByteArray,
+        var etag: String,
+        var ocId: String,
+        var md5: String?,
+        /**
+         * ⭐ M12 — the `Content-Type` the client **declared**, kept so a test can read back what
+         * went on the wire rather than what the code says it sends.
+         *
+         * `WebDavClient.put` hard-coded `application/pdf` for two milestones and nothing noticed,
+         * because everything this app uploaded really was a PDF. A recording's `.opus` announced
+         * as a PDF stores perfectly and reads back byte-identical — the only component that can
+         * tell is one that selects by declared type, which is exactly what doc §2's watched
+         * folder is. Same shape as M4's PDFs: valid, parseable, and blank in every viewer that
+         * was not the library that wrote them.
+         */
+        var contentType: String?,
+    )
 
     private class Request(
         val method: String,
@@ -315,6 +332,9 @@ internal class LocalMatrixServer(uid: String = "matrixuser") : MatrixServer {
 
     fun ocIdAt(path: String): String? = synchronized(lock) { files[path]?.ocId }
 
+    /** The `Content-Type` the PUT that stored [path] declared. See [Stored.contentType]. */
+    fun contentTypeAt(path: String): String? = synchronized(lock) { files[path]?.contentType }
+
     /**
      * Replace a file's bytes **without** going through the app.
      *
@@ -326,7 +346,9 @@ internal class LocalMatrixServer(uid: String = "matrixuser") : MatrixServer {
         mkdirs(path.substringBeforeLast('/', ""))
         val existing = files[path]
         if (existing == null) {
-            files[path] = Stored(bytes.copyOf(), nextEtag(), nextOcId(), md5Hex(bytes))
+            // No declared type: `writeDirectly` is the Nextcloud web UI standing in for a third
+            // party, and a browser upload is not this app announcing a content type.
+            files[path] = Stored(bytes.copyOf(), nextEtag(), nextOcId(), md5Hex(bytes), contentType = null)
         } else {
             existing.bytes = bytes.copyOf()
             existing.etag = nextEtag()
@@ -609,11 +631,14 @@ internal class LocalMatrixServer(uid: String = "matrixuser") : MatrixServer {
         // ⭐ A new `oc:id` for a path with nothing at it. Row 21: after a trash-restore the path
         // is free and the fileid is different, which is why the binding is repaired from the PUT
         // response rather than assumed to have survived.
+        val declaredType = request.header("Content-Type")?.substringBefore(';')?.trim()
         val stored = existing?.also {
             it.bytes = request.body.copyOf()
             it.etag = etag
             it.md5 = md5Hex(request.body)
-        } ?: Stored(request.body.copyOf(), etag, nextOcId(), md5Hex(request.body)).also { files[path] = it }
+            it.contentType = declaredType
+        } ?: Stored(request.body.copyOf(), etag, nextOcId(), md5Hex(request.body), declaredType)
+            .also { files[path] = it }
 
         Response(
             if (existing == null) CREATED else NO_CONTENT,

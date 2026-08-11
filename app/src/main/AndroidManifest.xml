@@ -10,6 +10,32 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!--
+      M12 — lecture recording (docs/M12-AUDIO.md §9).
+
+      Four permissions and each is a different requirement, which is worth spelling out because
+      three of them are new kinds of thing for this app:
+
+        RECORD_AUDIO             runtime, dangerous. Asked for at the first press of the record
+                                 button — this is the app's first runtime permission of any kind.
+        FOREGROUND_SERVICE       normal. Required to run one at all since API 28.
+        FOREGROUND_SERVICE_MICROPHONE
+                                 normal, but required *per type* since API 34 — and targetSdk is
+                                 36, so without it `startForeground(..., TYPE_MICROPHONE)` throws
+                                 SecurityException rather than degrading. The service is what
+                                 keeps capture alive when the screen goes off, which is the whole
+                                 of §9's "the first screen timeout mid-lecture costs the rest of
+                                 the lecture".
+        POST_NOTIFICATIONS       runtime since API 33. ⚠️ Denying it does **not** stop the
+                                 recording — a foreground service still runs — it only hides the
+                                 notification. That is the privacy version of §10's failure, so
+                                 it is requested alongside the microphone rather than deferred.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:name=".InkstoneApplication"
         android:allowBackup="false"
@@ -53,6 +79,24 @@
           provider, and one only gets access to the single Uri handed to it by a chooser,
           for as long as that grant lasts.
         -->
+        <!--
+          M12 §9 — the foreground service that keeps a lecture recording.
+
+          `foregroundServiceType="microphone"` is what permits capture to continue once the app is
+          not visible; without it the audio silently becomes silence the moment the screen dims.
+          Not exported and not bound: it is started, it holds the notification, and
+          `RecordingController` owns everything else (see RecordingService's KDoc).
+
+          Deliberately in the **default** process. M6's lesson is the opposite case — the app could
+          not start in a secondary process at all, because WorkManager's ContentProvider initializer
+          only runs in the default one — and a recorder in its own process would meet the same wall
+          and would also be unable to see the controller that owns its state.
+        -->
+        <service
+            android:name=".audio.RecordingService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
+
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.fileprovider"
