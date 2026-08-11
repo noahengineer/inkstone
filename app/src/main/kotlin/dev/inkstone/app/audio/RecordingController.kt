@@ -281,7 +281,6 @@ class RecordingController(
         // silently claims to be audio.
         running.silencedAt?.let { running.timeline.addGap(it, elapsedRealtime() - running.anchorElapsed) }
         running.timeline.flush()
-        foreground.stop()
 
         val duration = elapsedRealtime() - running.anchorElapsed
         if (duration < MINIMUM_DURATION_MILLIS || audioBytes == 0L) {
@@ -290,6 +289,7 @@ class RecordingController(
             // no exception for a short recording, and a genuinely important twenty-five seconds is
             // exactly as unrepeatable as an hour.
             recordings.discard(running.recordingId, duration, audioBytes, reason = TOO_SHORT)
+            foreground.stop()
             _state.value = RecordingUiState(message = if (reason == StopReason.USER) TOO_SHORT_MESSAGE else null)
             return
         }
@@ -300,6 +300,19 @@ class RecordingController(
         // was silently local for a whole session because of it. Finishing a lecture is exactly the
         // kind of thing a user does and then puts the tablet down.
         sync.recordingCaptured(running.noteId, running.recordingId)
+        // ⚠️ **Last, not first.** `foreground.stop()` used to run before both writes above, which
+        // dropped the process out of foreground importance while the lecture was still only on
+        // disk — leaving Android free to kill it in the gap between `recordings.finish` (the
+        // recording becomes READY) and `recordingCaptured` (the outbox row appears).
+        //
+        // That gap produces exactly the state M12 met on the first real device: READY,
+        // `uploadedAt = 0`, counted in the Sync screen's header, and **no outbox row** — a lecture
+        // the app can see and no button in the app could queue. `SyncEngine.syncNowRequested`
+        // repairs it after the fact; this ordering is what stops it happening.
+        //
+        // The service is worth ~a hundred milliseconds of extra lifetime. The lecture is not
+        // repeatable.
+        foreground.stop()
         _state.value = RecordingUiState()
     }
 

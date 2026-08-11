@@ -411,3 +411,39 @@ Collected during research so they don't get reintroduced from stale training dat
   not dropped** (M12). Dropping it in the listing helper is the tidier API and silently breaks the
   existence probe, which asks with `Depth: 0` and receives precisely that one entry — so "filter
   out self" and "does this exist" become the same operation with opposite needs.
+- ⚠️ **`readBytes` throws; it does not return empty — so an `isEmpty()` "missing file" guard is
+  unreachable in production and the throw eats the whole pass** (M12, found on the first real
+  device). `performMediaUpload` read a recording with `fs.readBytes` and tested `audio.isEmpty()`,
+  which reads exactly like a missing-file check. `AndroidFileSystem.readBytes` is
+  `File.readBytes()` → `FileNotFoundException`; only `FakeFileSystem` ever answered empty, so
+  `MEDIA_MISSING` could not fire and the throw escaped `performMediaUpload`, `drain` **and**
+  `OutboxDrainWorker` — from 14 lines *above* `mkcolRecursive`, so not even the media directory
+  appeared on the server. No park, no note state, no `DrainReport`, nothing on screen, and every
+  later "Sync now" repeating it exactly. Two rules: **write it as
+  `if (exists) readBytes else ByteArray(0)`** (the same line the timeline beside it already used),
+  and **`drain` must try/catch per row** — an unmodelled throw took every row queued behind it,
+  including the note's own DELETEs.
+- ⚠️ **A park had no lifter for any op type but `UPLOAD`, and "Sync now" could not lift it** (M12).
+  `unparkUpload` filtered `it.opType == OutboxOpType.UPLOAD`, so a `MEDIA_UPLOAD` parked for 24 h
+  was structurally unreachable — `due()` filters on `next_attempt_at`, coalescing *inherits* it, and
+  the only caller of the lifter is a completed reconcile, which a lecture with no note edit behind
+  it never triggers. Every press opened no socket at all. `SyncEngine.syncNowRequested` lifts parks
+  across the outbox, and the reasoning that keeps it safe is narrow: **coalescing's inheritance is
+  unchanged** (resetting a park per save is a hot retry loop against the user's own server), and a
+  person pressing a button is the one signal in the system that is *not* a loop. If that method ever
+  gains a caller which is not a user gesture, the argument is void.
+- ⚠️ **"Sync now" must reconcile what is owed, not just drain what is queued** (M12). It was
+  `scheduler.enqueueOutboxDrain()` plus a hard-coded `"Syncing…"` that nothing ever cleared — so it
+  looked identical after a successful sync and after doing nothing, and it could repair neither of
+  the two ways a recording gets stuck. The Sync screen counts the **recording** table
+  (`state='READY' AND uploadedAt=0`), which knows nothing about the outbox, so a lecture whose row
+  was never written showed in the header forever while the only repair was `bind` / `noteRestored` /
+  `resumeAccount` / `noteChanged` — i.e. *draw a stroke in that note and save*, and finishing a
+  lecture is the archetypal moment somebody puts the tablet down. Any button whose two states are
+  indistinguishable is a button that cannot be debugged from the outside.
+- ⚠️ **Release the foreground service *after* the work that must survive, not before** (M12).
+  `RecordingController.stopLocked` called `foreground.stop()` before `recordings.finish` and
+  `sync.recordingCaptured`, dropping the process's importance in exactly the window where the
+  lecture is on disk but not yet queued. A kill there yields READY / `uploadedAt = 0` / **no outbox
+  row** — a recording the app can see and no button in the app could send. The service is worth a
+  hundred milliseconds; the lecture is not repeatable.

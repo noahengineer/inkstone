@@ -2,6 +2,7 @@ package dev.inkstone.app.sync.matrix
 
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.storage.NoteLayout
+import dev.inkstone.core.sync.Backoff
 import dev.inkstone.core.sync.OutboxOpType
 import dev.inkstone.core.sync.RemoteMedia
 import kotlin.test.Test
@@ -163,6 +164,129 @@ class MergeMatrixMediaTest {
             devices.rawBytes(audioPath),
             "the lecture is not on the server — the DELETE drained first and took its binding with it",
         )
+    }
+
+    /**
+     * ⚠️ **A recording whose audio has gone parks that row and leaves every other row alone.**
+     *
+     * The bug this pins is the one M12 met on the first real device, and it was invisible twice
+     * over. `performMediaUpload` read the file with `fs.readBytes` and tested `audio.isEmpty()` —
+     * which reads exactly like a missing-file guard and is not one, because `AndroidFileSystem`
+     * uses `File.readBytes()`, which **throws**. Only the test double ever returned empty, so
+     * `MEDIA_MISSING` was unreachable in production: a fixture more generous than production, the
+     * failure mode CLAUDE.md names.
+     *
+     * The throw then escaped `drain` and the worker from a line **14 above** `mkcolRecursive` — so
+     * not even the media directory appeared on the server, no row was parked, no note state was
+     * written and nothing was reported. Every later "Sync now" did the same nothing. That is why
+     * the second assertion matters more than the first: one unreadable lecture must not silently
+     * abandon the queue behind it, which on a real device includes the note's own DELETEs.
+     */
+    @Test
+    fun `a recording whose audio is missing parks without abandoning the rest of the queue`() = matrixRow(
+        row = "M12 (an unreadable recording is one row's problem)",
+        proven = "the missing file parks its own row and the sibling recording still uploads",
+        notProven = "the Android FileSystem's throwing behaviour itself - TempFileSystem is not AndroidFileSystem",
+    ) { devices ->
+        val note = devices.share("Two lectures, one lost")
+        val lost = devices.a.recordLecture(note, "lost", audioBytes = 1_024)
+        val kept = devices.a.recordLecture(note, "kept", audioBytes = 2_048)
+
+        // The file goes away after the row was enqueued: a user clearing app storage, or the
+        // crash-recovery path deciding it was unusable.
+        devices.a.fs.delete(NoteLayout.recordingAudio(lost))
+
+        val drained = devices.a.drain()
+
+        assertEquals(1, drained.mediaUploaded, "the surviving lecture did not upload")
+        assertNotNull(
+            devices.rawBytes(devices.a.remoteAudio(note, kept)),
+            "one unreadable recording took the whole pass with it",
+        )
+        val lostRow = devices.a.outboxRows()
+            .firstOrNull { it.opType == OutboxOpType.MEDIA_UPLOAD && it.subject == lost }
+        assertNotNull(lostRow, "the unreadable recording's row was dropped rather than parked - its only trace is gone")
+        // ⚠️ **Parked, not merely retried**, and the difference is what the `fs.exists` guard buys.
+        // A park is a day; the longest ordinary backoff is `Backoff.MAX_MILLIS` (6 h). Without the
+        // guard the throw is caught by `drain`'s safety net and becomes a *transport retry*, which
+        // says "the network glitched" about a file that does not exist and will hammer for it
+        // forever. `MEDIA_MISSING` says the true thing, on the note, where a user can see it.
+        assertTrue(
+            lostRow.nextAttemptAt > devices.a.clock.nowEpochMillis() + Backoff.MAX_MILLIS,
+            "a missing recording was retried like a network blip instead of parked as MEDIA_MISSING",
+        )
+    }
+
+    /**
+     * ⭐ **"Sync now" rebuilds a queue that lost a row**, which nothing in the app could do before.
+     *
+     * The Sync screen counts the **recording** table (`state='READY' AND uploadedAt=0`), which
+     * knows nothing about the outbox. So a lecture whose `MEDIA_UPLOAD` row was never written —
+     * the process killed between `recordings.finish` and `recordingCaptured`, or a sign-out
+     * dropping every row — shows in the header forever while the drainer has nothing to do. Until
+     * `syncNowRequested`, the only repair was `bind` / `noteRestored` / `resumeAccount` /
+     * `noteChanged`: the user had to *draw a stroke in that note and save it*, and finishing a
+     * lecture is the archetypal moment somebody puts the tablet down instead.
+     */
+    @Test
+    fun `sync now re-derives a recording whose outbox row was lost`() = matrixRow(
+        row = "M12 (Sync now reconciles what is owed)",
+        proven = "a recording with no outbox row is re-queued by the engine call the button makes, and uploads",
+        notProven = "that the Sync screen calls it - that is SyncViewModel, and a JVM test cannot press a button",
+    ) { devices ->
+        val note = devices.share("Orphaned lecture")
+        val recordingId = devices.a.recordLecture(note, "orphan", audioBytes = 1_536)
+
+        // Exactly the state the real device was found in: READY, uploadedAt=0, and no row.
+        devices.a.outbox.removeAll(note)
+        assertTrue(
+            devices.a.outboxRows().none { it.opType == OutboxOpType.MEDIA_UPLOAD },
+            "the fixture did not clear the row",
+        )
+        assertEquals(0, devices.a.drain().mediaUploaded, "a drain invented a row that was not there")
+
+        devices.a.engine.syncNowRequested()
+
+        assertTrue(
+            devices.a.outboxRows().any { it.opType == OutboxOpType.MEDIA_UPLOAD && it.subject == recordingId },
+            "Sync now did not re-derive the missing row",
+        )
+        assertEquals(1, devices.a.drain().mediaUploaded, "the re-derived row did not upload")
+        assertNotNull(devices.rawBytes(devices.a.remoteAudio(note, recordingId)), "the lecture is not on the server")
+    }
+
+    /**
+     * ⚠️ **A parked `MEDIA_UPLOAD` was unliftable by anything in the app.**
+     *
+     * A park is 24 h, `due()` filters on `next_attempt_at`, and coalescing *inherits* it — so
+     * every later sweep re-UPSERTs the same row at the same park and every "Sync now" opened no
+     * socket at all. The only lifter, `unparkUpload`, filtered `opType == UPLOAD`, so a media row
+     * was structurally excluded; and its one caller is a completed reconcile, which a lecture with
+     * no note edit behind it never triggers.
+     *
+     * Coalescing's inheritance is deliberately **not** changed — resetting a park on every save is
+     * a hot retry loop against the user's own server. A person pressing a button is the one signal
+     * in the system that is not a loop.
+     */
+    @Test
+    fun `sync now lifts a parked recording that nothing else could`() = matrixRow(
+        row = "M12 (a park is not a life sentence)",
+        proven = "a parked MEDIA_UPLOAD is invisible to a drain, and a user press makes it due again",
+        notProven = "nothing extra",
+    ) { devices ->
+        val note = devices.share("Parked lecture")
+        val recordingId = devices.a.recordLecture(note, "parked", audioBytes = 1_280)
+
+        val row = devices.a.outboxRows().first { it.opType == OutboxOpType.MEDIA_UPLOAD }
+        val aDayAway = devices.a.clock.nowEpochMillis() + 24L * 60 * 60 * 1000
+        devices.a.outbox.reschedule(note, row.key, row.attempts, aDayAway)
+
+        assertEquals(0, devices.a.drain().mediaUploaded, "a parked row drained anyway - the park is not real")
+
+        devices.a.engine.syncNowRequested()
+
+        assertEquals(1, devices.a.drain().mediaUploaded, "Sync now could not lift the park")
+        assertNotNull(devices.rawBytes(devices.a.remoteAudio(note, recordingId)), "the lecture is not on the server")
     }
 }
 

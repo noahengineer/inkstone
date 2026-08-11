@@ -7,6 +7,7 @@ import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.NextcloudCredential
 import dev.inkstone.core.model.NoteSyncState
+import kotlin.coroutines.cancellation.CancellationException
 
 /**
  * SPEC §7.6 — the drainer. Everything that talks to the server on the app's behalf
@@ -73,7 +74,35 @@ public class OutboxDrainer(
         val halted = HashSet<String>()
 
         for (entry in due) {
-            report = drainOne(entry, sessions, halted, now, report)
+            // ⚠️ **One bad row must cost one row, not the whole pass.** Every failure this drainer
+            // *models* comes back as an `OpOutcome`; an unmodelled one — a `FileNotFoundException`
+            // from a recording whose file went missing, an `OutOfMemoryError` on a 15 MB read —
+            // used to propagate out of here, out of the worker, and abandon every row behind it,
+            // including the DELETEs. Silently: no report, no note state, nothing on screen.
+            //
+            // A row that throws is treated as a transport failure, so it takes an ordinary bounded
+            // backoff rather than being dropped (CLAUDE.md rule 1 — never lose the only trace) or
+            // retried hot. `CancellationException` is rethrown, or cancelling the worker would be
+            // caught here and turned into a retry.
+            report = try {
+                drainOne(entry, sessions, halted, now, report)
+            } catch (cancellation: CancellationException) {
+                throw cancellation
+            } catch (@Suppress("TooGenericExceptionCaught") unexpected: Throwable) {
+                val attempts = entry.attempts + 1
+                outbox.reschedule(
+                    entry.noteId,
+                    entry.key,
+                    attempts,
+                    Backoff.nextAttemptAt(attempts, now, jitter()),
+                )
+                notes.setSyncState(
+                    entry.noteId,
+                    NoteSyncState.PENDING_UPLOAD,
+                    unexpected.message ?: unexpected::class.simpleName.orEmpty(),
+                )
+                report.copy(failed = report.failed + 1)
+            }
         }
         return report
     }
@@ -290,7 +319,33 @@ public class OutboxDrainer(
         // See `RecordingUploads.find`.
         val recording = stores.recordings.find(entry.subject) ?: return OpOutcome.Done
 
-        val audio = fs.readBytes(recording.audioPath)
+        // ⚠️ **`exists` first, because `readBytes` throws rather than returning empty.**
+        //
+        // The `isEmpty()` check below reads like the missing-file guard and is not one: on Android
+        // `readBytes` is `File.readBytes()`, which throws `FileNotFoundException`. Only the test
+        // double ever returned empty, so `MEDIA_MISSING` was **unreachable in production** and a
+        // missing recording threw instead — out of `performMediaUpload`, out of `drain`, out of
+        // the worker, before `mkcolRecursive` on the line below and therefore before any request.
+        //
+        // That is a whole silent sync: no directory on the server, no park, no note state, no
+        // report — and every later "Sync now" doing exactly the same nothing. Precisely the
+        // symptom M12 hit on the first real device (docs/M12-AUDIO.md §16.6). A fixture more
+        // generous than production, one more time.
+        // ⚠️ **`exists` first, because `readBytes` throws rather than returning empty.**
+        //
+        // The `isEmpty()` check below reads like the missing-file guard and, on its own, was not
+        // one: `AndroidFileSystem.readBytes` is `File.readBytes()`, which throws
+        // `FileNotFoundException`. Only the test double ever returned empty, so `MEDIA_MISSING`
+        // was **unreachable in production** — a fixture more generous than production, which is
+        // the failure CLAUDE.md names — and a missing recording threw instead: out of here, out of
+        // `drain`, out of the worker, from **14 lines above** `mkcolRecursive` and therefore
+        // before any request at all. No directory on the server, no park, no note state, no
+        // report, and every later "Sync now" repeating it. That is the silence M12 met on the
+        // first real device.
+        //
+        // Absent and zero-length are deliberately the same answer: both mean there is no audio to
+        // send, and both should say so on the note rather than retry for bytes that do not exist.
+        val audio = if (fs.exists(recording.audioPath)) fs.readBytes(recording.audioPath) else ByteArray(0)
         if (audio.isEmpty()) {
             // The row outlived its file. Retrying cannot produce bytes that are not there, but
             // parking says so on the note rather than dropping the only trace of the lecture.

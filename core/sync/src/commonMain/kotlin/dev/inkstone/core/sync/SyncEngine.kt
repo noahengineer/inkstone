@@ -525,6 +525,44 @@ public class SyncEngine(
         outbox.reschedule(noteId, row.key, row.attempts, now)
     }
 
+    /**
+     * ⭐ **"Sync now" means *reconcile what is owed, then drain* — not *drain whatever happens to
+     * be queued*.** The one entry point a user's explicit press may use, and nothing else may.
+     *
+     * Before this existed, [SyncViewModel.syncNow] was `scheduler.enqueueOutboxDrain()` and a
+     * hard-coded *"Syncing…"*, which is a no-op against both of M12's real failure modes:
+     *
+     * 1. **A row that is not due.** A park is 24 h and [unparkUpload] only ever lifted an
+     *    `UPLOAD` — a `MEDIA_UPLOAD` park was structurally unliftable, and `due()` filters on
+     *    `next_attempt_at`, so every later press opened no socket at all.
+     * 2. **A row that was never written.** The Sync screen counts the **recording** table, which
+     *    knows nothing about the outbox, so a lecture with no row shows in the header forever
+     *    while no button in the app can queue it. Only [bind], [noteRestored], [resumeAccount]
+     *    and [noteChanged] rebuilt the queue — i.e. the user had to *draw a stroke in that note
+     *    and save*, and finishing a lecture is the archetypal moment someone puts the tablet down.
+     *
+     * ⚠️ **Why lifting parks is safe here and nowhere else.** [OutboxCoalescing] inherits
+     * `next_attempt_at` on purpose: resetting it on every save is a hot retry loop against the
+     * user's own server, and that rule stays exactly as it is. A person pressing a button is the
+     * one signal in the system that is **not** a loop — it is rate-limited by a human — so it is
+     * the one place a park may be retired without a resolved conflict behind it. Keep it that way:
+     * if this ever acquires a second caller that is not a user gesture, the reasoning is void.
+     */
+    public suspend fun syncNowRequested() {
+        val now = clock.nowEpochMillis()
+        for (row in outbox.all()) {
+            if (row.nextAttemptAt > now) outbox.reschedule(row.noteId, row.key, row.attempts, now)
+        }
+        // Rebuild the queue from the record of what is owed. `pendingFor` is the table that makes
+        // this possible at all, and `enqueuePendingRecordings` is already idempotent per recording.
+        for (account in accounts.all()) {
+            for (binding in bindings.forAccount(account.id)) {
+                enqueuePendingRecordings(binding.noteId)
+            }
+        }
+        scheduler.enqueueOutboxDrain()
+    }
+
     @Suppress("LongParameterList") // The op, and the four facts coalescing decides against.
     private suspend fun enqueue(
         noteId: DocumentId,

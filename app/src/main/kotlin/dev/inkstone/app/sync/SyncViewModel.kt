@@ -8,13 +8,13 @@ import dev.inkstone.core.database.recording.RecordingIndex
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.RemoteName
-import dev.inkstone.core.model.WorkScheduler
 import dev.inkstone.core.sync.AccountState
 import dev.inkstone.core.sync.DavResource
 import dev.inkstone.core.sync.LoginFlowResult
 import dev.inkstone.core.sync.LoginFlowStart
 import dev.inkstone.core.sync.OutboxStore
 import dev.inkstone.core.sync.SyncAccount
+import dev.inkstone.core.sync.SyncEngine
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -42,7 +42,8 @@ class SyncViewModel @Inject constructor(
     private val outbox: OutboxStore,
     /** M12 §11 — how many lectures are waiting, and how much of the tablet they hold. */
     private val recordings: RecordingIndex,
-    private val scheduler: WorkScheduler,
+    /** ⚠️ For [syncNow] only. "Sync now" has to be able to *repair* the queue, not just poke it. */
+    private val sync: SyncEngine,
 ) : ViewModel() {
 
     private val mutable = MutableStateFlow(SyncUiState())
@@ -436,10 +437,28 @@ class SyncViewModel @Inject constructor(
         }
     }
 
-    /** "Sync now". Still goes through the outbox — this only wakes the drainer. */
+    /**
+     * "Sync now". Still goes through the outbox (CLAUDE.md rule 4) — it never writes directly.
+     *
+     * ⚠️ **Reconcile, then drain, then re-read.** All three, because the button was all talk.
+     *
+     * It used to be `enqueueOutboxDrain()` plus a hard-coded *"Syncing…"* — which is a no-op
+     * against both ways a recording gets stuck (a park nothing could lift, and a row that was
+     * never written; see [SyncEngine.syncNowRequested]) *and* invisible when it works, because
+     * nothing re-read the counts afterwards. A press produced the same screen whether it had
+     * uploaded a lecture or done absolutely nothing, which is how M12's first real upload
+     * attempt looked identical to a healthy queue.
+     *
+     * [refresh] afterwards is what makes the header honest: if the recording count drops, it
+     * worked; if it does not move, it genuinely did not, and that is now visible rather than
+     * hidden behind a present participle that never cleared.
+     */
     fun syncNow() {
-        scheduler.enqueueOutboxDrain()
-        mutable.update { it.copy(message = "Syncing…") }
+        viewModelScope.launch {
+            mutable.update { it.copy(message = "Syncing…") }
+            sync.syncNowRequested()
+            refresh()
+        }
     }
 
     fun dismissMessage() {
