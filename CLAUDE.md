@@ -395,3 +395,19 @@ Collected during research so they don't get reintroduced from stale training dat
   authority.
 - **`MediaRecorder(Context)` is API 31 and this project's `minSdk` is 30.** The context-taking
   constructor exists for privacy attribution; on 30 the no-argument one is the only one there is.
+- ⚠️ **A second client for a protocol the project already speaks is where the old bugs come back —
+  diff it against the first one** (M12). `tools/m12/nextcloud.py` is a stdlib WebDAV client for the
+  transcript watcher, and it shipped three bugs that `:core:sync` had already got right years
+  earlier: it never percent-encoded the DAV path (so a folder named `Chemistry Y12` raised
+  `InvalidURL` before a socket was opened — `NextcloudUrls.encodePath` does it per segment); it
+  matched the `Depth: 1` **self-entry by name**, which at the account root is the *uid* and so
+  matches no child, walking the root as its own child to the depth bound (`RemoteWalk` compares
+  `it.path == here`); and it split on `/<MEDIA_DIR>/` for the parent folder, which matches nothing
+  for a note in the root. All three were found by a **real HTTP server** in the test
+  (`tools/m12/test_watch.py`), and none of them by reading. The rule: a mock of a client agrees
+  with every mistake that client makes, so test a client against a server — and before writing the
+  second implementation, read the first.
+- ⚠️ **A `Depth: 1` listing includes the collection itself, and the self-entry must be *flagged*,
+  not dropped** (M12). Dropping it in the listing helper is the tidier API and silently breaks the
+  existence probe, which asks with `Depth: 0` and receives precisely that one entry — so "filter
+  out self" and "does this exist" become the same operation with opposite needs.
