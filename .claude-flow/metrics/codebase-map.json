@@ -1,0 +1,11 @@
+{
+  "timestamp": "2026-08-11T15:06:49.688Z",
+  "projectRoot": "C:\\Users\\NoahB\\OneDrive\\Documents\\Dev\\Claude\\Notes app",
+  "structure": {
+    "hasPackageJson": false,
+    "hasTsConfig": false,
+    "hasClaudeConfig": true,
+    "hasClaudeFlow": true
+  },
+  "scannedAt": 1786460809689
+}

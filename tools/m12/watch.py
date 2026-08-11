@@ -58,6 +58,17 @@ TRANSCRIPT_EXT = ".md"
 # reasoning ("the user's Nextcloud contains their photo library") does not stop being true here.
 MAX_DEPTH = 3
 
+# 34.3 kbit/s measured on a real lesson (§15.3), not the 24 that was asked for. Used only to turn
+# a byte count into "how long is this and what will it cost" before anything is sent.
+BITS_PER_SECOND = 34_300
+USD_PER_HOUR = 0.23
+
+# ⚠️ Above this, a real pass needs `--yes`. `transcribe.py` has the same guard, but it lives in
+# that file's `main()` — so the watcher, which calls the library entry directly, had **no spend
+# gate at all** and would bill a card unprompted on its first non-dry run. A dry run is free and
+# always allowed; this only ever stops a pass that was about to spend real money.
+CONFIRM_ABOVE_USD = 1.00
+
 
 class Recording:
     """One `.opus` found on the server, and where everything about it lives."""
@@ -143,10 +154,16 @@ def note_title(nc: Nextcloud, recording: Recording) -> str:
     return pdfs[0][:-4] if len(pdfs) == 1 else recording.document_id
 
 
+def estimate(size_bytes: int) -> tuple[float, float]:
+    """(minutes, dollars) for a recording of this size. A guess, and labelled as one wherever shown."""
+    minutes = size_bytes * 8 / BITS_PER_SECOND / 60
+    return minutes, minutes / 60 * USD_PER_HOUR
+
+
 def process(nc: Nextcloud, recording: Recording, api_key: str, dry_run: bool) -> bool:
     """One recording, end to end. Returns True if a transcript was written."""
-    minutes = recording.size * 8 / 34_300 / 60
-    print(f"  {recording.id} — {recording.size:,} bytes ~ {minutes:.1f} min ~ ${minutes / 60 * 0.23:.2f}")
+    minutes, cost = estimate(recording.size)
+    print(f"  {recording.id} — {recording.size:,} bytes ~ {minutes:.1f} min ~ ${cost:.2f}")
     if dry_run:
         print("    (dry run — nothing sent, nothing written)")
         return False
@@ -191,12 +208,27 @@ def process(nc: Nextcloud, recording: Recording, api_key: str, dry_run: bool) ->
     return True
 
 
-def pass_once(nc: Nextcloud, api_key: str, dry_run: bool) -> int:
+def pass_once(nc: Nextcloud, api_key: str, dry_run: bool, assume_yes: bool = True) -> int:
     recordings = discover(nc)
     if not recordings:
         print("nothing to do")
         return 0
-    print(f"{len(recordings)} recording(s) awaiting a transcript")
+
+    total = sum(estimate(r.size)[1] for r in recordings)
+    print(f"{len(recordings)} recording(s) awaiting a transcript, ~${total:.2f} to transcribe")
+
+    # ⚠️ The gate is on the *pass*, not the recording: a term of lectures discovered at once is
+    # exactly the case where a per-file threshold waves everything through.
+    if not dry_run and not assume_yes and total > CONFIRM_ABOVE_USD:
+        for recording in recordings:
+            minutes, cost = estimate(recording.size)
+            print(f"  {recording.id} ~ {minutes:.1f} min ~ ${cost:.2f}")
+        print(
+            f"\nRefusing without --yes: this would upload {len(recordings)} classroom "
+            f"recording(s) to a third party and spend about ${total:.2f}.",
+            file=sys.stderr,
+        )
+        return 0
     done = 0
     for recording in recordings:
         try:
@@ -212,11 +244,45 @@ def pass_once(nc: Nextcloud, api_key: str, dry_run: bool) -> int:
     return done
 
 
+def connect(nc: Nextcloud, url: str, uid: str) -> dict:
+    """SPEC §7.2's confirmation call, with the three failures a user actually hits told apart.
+
+    ⚠️ **Unreachable is not "credentials dead"** (CLAUDE.md rule 5). The app's own reason for that
+    rule — concluding a signed-out account every time the user walks into a lift — applies here as
+    the difference between "you typed the address wrong" and "your password is wrong". Getting
+    those two the wrong way round is an afternoon of changing the right setting for the wrong
+    reason, and the raw `URLError` traceback this replaced said neither.
+    """
+    try:
+        return nc.whoami()
+    except urllib.error.HTTPError as error:
+        if error.code == 401:
+            raise SystemExit(
+                f"401 from {url}: the server rejected the credentials.\n"
+                "  - nextcloud.password must be an APP PASSWORD (Settings -> Security), not your\n"
+                "    account password. An account password is refused outright when 2FA is on.\n"
+                "  - if your login name differs from your uid, add nextcloud.login=<login name>;\n"
+                "    nextcloud.uid stays the uid, because every DAV path is built from it.\n"
+                "Not retrying: Nextcloud's brute-force protection is on by default and counts\n"
+                "failures by IP, so a retry loop is how you get your own server to block you."
+            ) from None
+        raise SystemExit(f"HTTP {error.code} from {url} — {error.reason}") from None
+    except urllib.error.URLError as error:
+        raise SystemExit(
+            f"Could not reach {url} — {error.reason}\n"
+            "  This is a network or address problem, NOT a credentials problem. Check the address\n"
+            "  is exactly what you type into a browser (scheme and host, no trailing path), that\n"
+            "  the server is up, and that you are not behind a captive portal or a TLS-inspecting\n"
+            "  proxy. Nothing has been sent."
+        ) from None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--interval", type=int, default=300, help="seconds between passes")
     ap.add_argument("--dry-run", action="store_true", help="find work, send nothing, change nothing")
+    ap.add_argument("--yes", action="store_true", help=f"confirm spending over ${CONFIRM_ABOVE_USD:.2f}")
     args = ap.parse_args()
 
     url = os.environ.get("INKSTONE_NC_URL")
@@ -229,15 +295,20 @@ def main() -> int:
     api_key = "" if args.dry_run else transcribe.api_key(repo_root)
 
     nc = Nextcloud(url, uid, password, login=os.environ.get("INKSTONE_NC_LOGIN"))
-    who = nc.whoami()
+    who = connect(nc, url, uid)
     print(f"connected as {who.get('id')} ({who.get('display-name')}) at {url}")
+    if who.get("id") and who["id"] != uid:
+        # ⚠️ Not fatal, but it is the difference between finding your notes and finding nothing:
+        # every DAV path is built from the uid, and Nextcloud's login name is not it (SPEC §0.1 #3).
+        print(f"  ⚠️ the server calls this account '{who['id']}', not '{uid}'.")
+        print(f"     Set nextcloud.uid={who['id']} — every path is built from it.")
 
     if args.once:
-        pass_once(nc, api_key, args.dry_run)
+        pass_once(nc, api_key, args.dry_run, assume_yes=args.yes)
         return 0
     while True:
         try:
-            pass_once(nc, api_key, args.dry_run)
+            pass_once(nc, api_key, args.dry_run, assume_yes=args.yes)
         except SystemExit:
             raise
         except Exception as failure:  # noqa: BLE001 — a watcher that dies on one bad pass is useless

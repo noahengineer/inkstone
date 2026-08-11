@@ -401,6 +401,46 @@ def _():
         assert f"{MEDIA}/{REC}.md" not in server.store.files
 
 
+@test("⚠️ a real pass over an hour of audio refuses to bill without --yes")
+def _():
+    """The gate `transcribe.py` has in its CLI and the watcher did not have at all.
+
+    `watch.py` calls `transcribe.run` directly, so `transcribe.main`'s `--yes` guard never applied
+    to it: the first non-dry run would have uploaded every recording it found and billed for them
+    with no prompt. Asserted on the **pass**, not the file, because a term of lectures discovered
+    at once is precisely what a per-file threshold waves through.
+    """
+    with Server() as server:
+        # ⚠️ One lecture never trips this and is not meant to: an hour is ~$0.23. The gate is for
+        # the backlog — a term of recordings discovered on the first real run — so the fixture is
+        # six lecture-hours, ~$1.38, which is over the threshold and is the realistic case.
+        hour = 15_000_000
+        for n in range(6):
+            server.store.add_file(f"{MEDIA}/rec-{n}.opus", b"OggS" + bytes(hour), "audio/ogg")
+        calls = install_fake_transcriber(fake_transcript([("x", 0, 1)], 3600.0))
+
+        blocked = watch.pass_once(server.client(), "key", dry_run=False, assume_yes=False)
+
+        assert blocked == 0, blocked
+        assert not calls, "billed a card without confirmation"
+        assert f"{MEDIA}/rec-0.opus" in server.store.files
+        assert f"{MEDIA}/rec-0.md" not in server.store.files
+
+        # ...and with --yes it goes through.
+        assert watch.pass_once(server.client(), "key", dry_run=False, assume_yes=True) == 6
+        assert len(calls) == 6
+
+
+@test("a short recording is under the threshold and needs no confirmation")
+def _():
+    with Server() as server:
+        seed(server.store)  # 204 bytes: fractions of a cent
+        calls = install_fake_transcriber(fake_transcript([("Cheap", 0, 500)], 60.0))
+
+        assert watch.pass_once(server.client(), "key", dry_run=False, assume_yes=False) == 1
+        assert len(calls) == 1
+
+
 @test("a lecture nobody wrote in still transcribes")
 def _():
     with Server() as server:
