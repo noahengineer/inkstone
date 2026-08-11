@@ -20,6 +20,20 @@ import xml.etree.ElementTree as ET
 DAV_NS = "{DAV:}"
 OC_NS = "{http://owncloud.org/ns}"
 
+# ⚠️ **Set a User-Agent, or a Cloudflare-fronted Nextcloud answers 403 to everything.**
+#
+# `urllib` sends `Python-urllib/3.x` by default, which Cloudflare's managed rules treat as a bot
+# signature and refuse with `error code: 1010` — before the request ever reaches Nextcloud. It is a
+# 403, not a 401, and it arrives identically for `status.php` with no credentials at all, so it
+# says nothing about the password. Self-hosting behind Cloudflare is common enough that this is the
+# normal case rather than an exotic one; it was the very first thing hit against a real server.
+#
+# Deliberately identifying rather than a copied browser string. `Mozilla/5.0` also works and is
+# what most snippets reach for, but pretending to be Chrome to get through a filter is both a lie
+# and unnecessary — the filter is aimed at anonymous bots, and anything named passes. A real name
+# also means the server's owner can allowlist or rate-limit *this tool* rather than everything.
+USER_AGENT = "Inkstone-Watcher/1.0 (+M12 lecture transcript watcher)"
+
 
 def parse_multistatus(xml: bytes) -> ET.Element:
     """Parse a WebDAV multistatus, refusing any document that declares a DTD.
@@ -73,6 +87,7 @@ class Nextcloud:
     def _call(self, method: str, url: str, body: bytes | None = None, headers: dict | None = None):
         request = urllib.request.Request(url, data=body, method=method)
         request.add_header("Authorization", self.auth)
+        request.add_header("User-Agent", USER_AGENT)
         for k, v in (headers or {}).items():
             request.add_header(k, v)
         return urllib.request.urlopen(request)

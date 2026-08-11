@@ -48,6 +48,10 @@ class Store:
         self.dirs: set[str] = {""}
         self.trash: dict[str, bytes] = {}
         self.reject_auth = False
+        self.user_agents: list[str] = []
+        # ⚠️ Mimics a Cloudflare-fronted server: `Python-urllib/*` is refused with 403 before any
+        # authentication is considered. Off by default so it is opt-in per test.
+        self.block_default_user_agent = False
 
     def add_dir(self, path: str) -> None:
         parts = path.strip("/").split("/")
@@ -83,6 +87,11 @@ def make_handler(store: Store):
             pass
 
         def _authed(self) -> bool:
+            agent = self.headers.get("User-Agent", "")
+            store.user_agents.append(agent)
+            if store.block_default_user_agent and agent.startswith("Python-urllib"):
+                self._send(403, b"error code: 1010")
+                return False
             if store.reject_auth:
                 self._send(401, b"")
                 return False
@@ -358,6 +367,31 @@ def _():
         body = server.store.files[f"{MEDIA}/{REC}.md"].decode("utf-8")
         assert f"documentId: {DOC}" in body
         assert "note: Redox and half-equations" in body, body[:300]
+
+
+@test("⚠️ every request identifies itself, so a Cloudflare-fronted server does not 403 it")
+def _():
+    """Found against a real Nextcloud on the very first connection attempt.
+
+    `urllib` defaults to `Python-urllib/3.x`, which Cloudflare's managed rules refuse with
+    `error code: 1010` — a **403**, arriving identically for an unauthenticated `status.php`, so it
+    looks nothing like a credentials problem and is easy to chase in the wrong direction. Nextcloud
+    behind Cloudflare is an ordinary self-hosting setup, not an edge case.
+    """
+    with Server() as server:
+        server.store.block_default_user_agent = True
+        seed(server.store)
+        install_fake_transcriber(fake_transcript([("Identified", 0, 500)], 60.0))
+
+        assert watch.pass_once(server.client(), "key", dry_run=False) == 1
+
+        assert server.store.user_agents, "no request was made"
+        for agent in server.store.user_agents:
+            assert agent and not agent.startswith("Python-urllib"), f"unidentified request: {agent!r}"
+        # Identifying, not impersonating: a copied browser string would also get through the
+        # filter, and would be a lie that stops the server's owner allowlisting this tool.
+        assert "Inkstone" in server.store.user_agents[0], server.store.user_agents[0]
+        assert "Mozilla" not in server.store.user_agents[0], "impersonating a browser"
 
 
 @test("a second pass does nothing — the transcript is the idempotency marker")
