@@ -935,17 +935,31 @@ app plus a search backend, which a default install does not have.
 - **Lasso** — freehand and rectangular; selects ink, images, text boxes, shapes
 - Actions: cut/copy/duplicate/delete, resize, rotate, change colour, bring-to-front/send-to-back
 - Alignment guides on move (dashed = centre, solid = edge)
-- **Partial/precision erase** — splits a stroke, expressed as `DeleteObject + AddObject(fragments)` per SPEC §3.5. Never in-place mutation.
+- ~~**Partial/precision erase** — splits a stroke, expressed as `DeleteObject + AddObject(fragments)`~~
+  — **superseded before this milestone started, by SPEC §3.5 in M1.** Nothing splits: the eraser
+  records the *area* it swept, absolutely, as `SetErasedRegion`. What M8a actually owed erasing is
+  the consequence of things being able to **move**: the region is in the object's own space, so an
+  eraser's page-space sweep is mapped through the inverse transform before it is recorded. See
+  `docs/M8-SELECTION.md` §3.
 - All of it emitting the ops defined in M2 — `SetTransform` (absolute), `SetStyle`, `SetZOrder`
 
 ### Acceptance
 
-- [ ] Lasso selects mixed content and every action works on the mixed selection
-- [ ] Partial erase splits a stroke; both fragments are independently selectable and erasable
-- [ ] **Transform survives a sync round-trip and merges LWW** (SPEC §13.2 rows 3, 7)
-- [ ] Works identically on a PDF-backed page and a template page
+- [x] Lasso selects mixed content and every action works on the mixed selection
+- [x] ~~Partial erase splits a stroke; both fragments are independently selectable and erasable~~ —
+      superseded (above). Replaced by: **erasing a moved stroke hits it, and the bite travels with
+      it** (`StrokeStoreSelectionTest`, on a device)
+- [x] **Transform survives a sync round-trip and merges LWW** (SPEC §13.2 rows 3, 7)
+- [x] Works identically on a PDF-backed page and a template page
 
 ### Prompt
+
+⚠️ **The prompt below is the one M8a was given, and its erase paragraph is wrong.** It is kept
+verbatim rather than edited, because the instruction it opens with — *"Read SPEC.md §3.5"* — is
+what makes the contradiction discoverable, and the next milestone's prompt may have the same
+shape. §3.5 says *"M8a's 'partial erase splits a stroke into fragments' is superseded. Nothing
+splits."* Implementing the prompt as written fails SPEC §13.2 row 7, which asserts that a partial
+erase and a concurrent transform leave **one** object.
 
 ```
 Read SPEC.md §3.5, §4.2 and §4.6, then implement Milestone M8a.
@@ -981,6 +995,75 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 - [ ] Deleting a shape leaves its connectors in a defined state (detached, not dangling or crashing)
 - [ ] Connector attachment survives a sync round-trip
 
+### Prompt
+
+```
+Read SPEC.md §4.2, §4.3, §5.8 and §13.2, then docs/M8-SELECTION.md, and only
+then M8b's scope list above — in that order. M8a's prompt contradicted SPEC
+§3.5 and implementing it as written fails SPEC §13.2 row 7. Where ROADMAP and
+SPEC disagree, SPEC wins; tell me about the disagreement.
+
+Three disagreements are already known and must be resolved BEFORE any code:
+- The scope list names POLYGON. ShapeKind was frozen in M2 as
+  {LINE, ARROW, RECTANGLE, ELLIPSE, TRIANGLE}.
+- SPEC does not contain the word "connector" anywhere, so this milestone's
+  central data structure is unspecified. Decide it, write it into SPEC, and
+  commit that in the same commit as the code.
+- Acceptance says a deleted shape leaves its connectors "detached", which reads
+  as persisting a detachment. SPEC §4.2 says a delete of an object that has not
+  arrived still records its tombstone, and ops targeting a tombstone are
+  no-ops. Derive detachment; never store it.
+
+Four things that will bite:
+
+1. NO NEW OBJECT KINDS AND NO NEW OP TYPES. OpCodec.decodeObject ends in
+   error("Unknown object kind"), reads shapes with ShapeKind.valueOf, and
+   BundleReader decodes a page's ops unguarded. A note this milestone writes
+   would not DEGRADE on the other tablet's older build — it would fail to open,
+   after it had already synced. Unknown-field preservation does not save you:
+   OpExtras collects unknown keys at the op's TOP level only, so anything hung
+   inside the object payload is dropped on the next two-second autosave and
+   uploaded that way.
+
+2. A REROUTE WRITES NO OP. A connector's path, and whether it is attached, are
+   derived from the fold at draw time and never persisted. Moving a shape emits
+   that shape's absolute SetTransform and nothing else, however many connectors
+   touch it. Persisting routes puts two devices' independent edits into one LWW
+   register, and an absolute value wins whole — so the connector ends up
+   attached at one end and visibly detached at the other, identically on both
+   devices, with every op present and no error.
+
+3. THE AddObject PAYLOAD IS FIRST-WRITE-WINS. PageFolder.absorb does
+   payloads.getOrPut(id) deliberately, so a re-add cannot overwrite geometry.
+   Anything the user can change afterwards must be a register, not payload.
+   Decide up front whether an endpoint can be re-attached: if it can, payload is
+   the wrong home, and re-emitting AddObject for the same id looks right on
+   screen, lands in journal.ops, passes every test, and is discarded by the next
+   fold from empty.
+
+4. SHAPES LIVE IN StrokeStore, NOT A NEW STORE. StrokeStore.addObject opens with
+   `as? StrokeObject ?: return false`, so a shape arriving from a peer, from an
+   undo's re-add or from a page reload is dropped from the screen while being
+   perfectly correct in the log. StrokeStore also owns the top z key — a shape
+   controller with its own counter goes stale the moment SetZOrder exists, which
+   is M8a's recorded regression.
+
+Draw-and-hold snapping runs while the user is still drawing, so it is on the ink
+path: no allocation in a loop, no I/O, no recognition (SPEC §2.4, CLAUDE.md
+rule 7).
+
+Not this milestone: text boxes, images, ruler, laser, Elements (M8c);
+cut/copy/paste across pages; page virtualisation (M9).
+
+Run `adb devices` FIRST, before planning verification. Finish by telling me:
+where connector attachment lives in the bundle, and what an M8a-era build does
+when it opens such a note; what a connector does when its endpoint is tombstoned
+versus not yet arrived; a connector tracking a RESIZE and a ROTATE, not just a
+translate; the ink-path cost of draw-and-hold against SPEC §3.6; what a
+non-PdfBox viewer shows for a translucent filled shape; and test counts as
+`tests=` summed over the result XML, never Gradle's "actionable tasks" line.
+```
+
 ---
 
 ## M8c — Text, images, and tools
@@ -999,6 +1082,67 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 - [ ] Image flip works and survives a round-trip
 - [ ] A saved Element re-inserts fully editable with formatting preserved
 - [ ] Every tool works identically on PDF-backed and template pages
+
+### Prompt
+
+```
+Read SPEC.md §4.2, §5.3, §5.5, §6.4 and §12, then docs/M4-PDF.md §7.1 and §9 and
+docs/M8-SELECTION.md §6–§7, and only then M8c's scope list above. Where ROADMAP
+and SPEC disagree, SPEC wins; tell me about the disagreement.
+
+Two disagreements are already known and are blocking, not cosmetic:
+- The scope says text boxes have "font, size, colour, alignment, lists", and
+  images have "crop". SPEC §4.2's op vocabulary — declared complete and closed
+  since M2 — has no register that can carry ANY of those. Decide how they are
+  represented before writing code, and write the decision into SPEC.
+- The font decision was booked against M4, deferred to M7, and never made.
+  WinAnsi covers Latin-1; anything else needs a CID font. M8c is where it lands.
+
+Four things that will bite:
+
+1. AN ELEMENT RE-INSERT MINTS NEW ObjectIds. An Element stores a template —
+   payloads, relative geometry, style, copies of any image bytes — and every
+   insertion mints a fresh UUIDv7 per object and a fresh assets/img-<newId>.webp
+   per asset. It is never a stored list of AddObject ops that gets replayed.
+   PageFolder.absorb is first-write-wins on payload, so stamping one Element
+   twice gives you ONE object carrying the first stamp's payload at the second
+   stamp's transform — the first stamp visibly vanishes. This is SPEC §5.6's
+   duplicate-ObjectId corruption from the other direction.
+
+2. IMAGE BYTES NEVER ENTER THE OP LOG, and a merge must carry the PEER's
+   assets/. ImageObject names its asset by string, and that string survives
+   re-identification — so a conflicted copy or a merge that drops the peer's
+   assets/ shows a blank rectangle where the picture was, which is invisible by
+   definition. Today assets/ rides through only as a carried unknown entry;
+   the moment M8c makes it a known entry family, the union becomes M8c's job.
+
+3. A TEXT BOX IS REAL PAGE CONTENT, AND THE CURRENT WRITER TRUNCATES TO
+   LATIN-1. PdfContent.toByteArray is `ByteArray(out.length) { out[it].code
+   .toByte() }`, so every character above U+00FF becomes a different byte — and
+   "IME handling" in the scope line is exactly how such characters get typed.
+   The font must be resolvable through the PAGE dictionary's /Resources, copied
+   down from any inherited /Pages node and merged into a copy; a page content
+   stream has no /Resources of its own. Do not verify with PdfBox — it wrote it.
+
+4. ONE STORE OWNS Z, AND IT CURRENTLY DROPS EVERY NON-STROKE OP.
+   StrokeStore.addObject filters `as? StrokeObject`, so an inserted image or
+   text box takes its z from StrokeStore.allocateTopZ and goes through the same
+   store, render order and NoteEditor.reconcile diff as strokes — otherwise you
+   insert an image, draw a stroke, and the stroke lands underneath it on screen,
+   in the PDF's /Annots order, and on every peer.
+
+Not this milestone: shapes and connectors (M8b); handwriting→text
+replace-in-place, infinite canvas and editing imported-PDF annotations
+(SPEC §12); performance work (M9).
+
+Run `adb devices` FIRST. Finish by telling me: the op-format decision, stated
+explicitly, for font/size/alignment/list level and for crop; PDF evidence from a
+reader that is NOT PdfBox, including pdftotext or pdfgrep against a text box
+containing non-Latin-1 characters; the image byte numbers (source photo, after
+insert-time downscale, resulting bundle); two-peer evidence for the
+Element/asset merge from two AVDs whose files/device.id actually differ; and a
+per-feature check table like docs/M8-SELECTION.md §5.
+```
 
 ---
 
@@ -1026,6 +1170,73 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 - [ ] Macrobenchmarks in CI, failing on regression
 - [ ] Delete the SQLite DB → library rebuilds correctly from the PDFs on disk
 
+### Prompt
+
+```
+Read SPEC.md §10, §13.1, §13.3, §4.7, §5.6 and §5.7, then CLAUDE.md's Testing
+section in full, then docs/M1-INK.md §4.1–4.2 and docs/M3-LIBRARY.md §10, and
+only then M9's scope list above.
+
+⚠️ AUDIT THE SCOPE LIST BEFORE PLANNING — some of it is already done, and this
+milestone's characteristic failure is re-reporting existing work as new:
+- Crash-safety instrumentation for all four of SPEC §13.3's kill points already
+  exists (CrashSafetyTest + CrashPointService). Run it; do not rebuild it.
+- An on-device schema migration test already exists, though SPEC §13.1's ⚠️
+  still claims otherwise. Fix the ⚠️ in the same commit.
+- "Macrobenchmarks in CI, failing on regression" is not reachable on the CI that
+  exists: GitHub-hosted runners have no attached device, and the frame-rate
+  numbers are meaningless on an emulator anyway. Say what you actually did.
+- SPEC §10 assigns the frame-rate row to `dumpsys gfxinfo` and only cold start
+  to Macrobenchmark, while this scope list says "Macrobenchmark suite in CI".
+  Resolve it explicitly rather than quietly picking one.
+
+Four things that will bite:
+
+1. THE LIBRARY REBUILD IS AN IDENTITY OPERATION, NOT A SCAN. Rebuilding from a
+   folder of PDFs reads identity out of the XMP marker: the existing documentId,
+   the existing PageId and sort key per page, the ObjectId from each /NM. It
+   re-binds a note that had a remote file AT THE VERSION ALREADY ON THE SERVER,
+   and it never touches files/device.id. Mint a new documentId and the peer's
+   grow-only union gives every stroke twice; mint new PageIds and the page count
+   doubles, because SPEC §4.3 appends any page missing from a merged order;
+   re-mint device.id and every tiebreak that device ever took part in reopens.
+
+2. IN SPEC §4.7, ONLY THE BYTE THRESHOLD IS A PERFORMANCE KNOB. The syncState
+   gate, the causal-stability horizon (30 days OR the oldest clock any peer has
+   acked, whichever is more conservative, measured from the oldest op BEING
+   FOLDED), and the snapshot-is-a-cache rule are data-loss guards, not tuning
+   parameters. "Compaction tuning" means the ≈2 MB threshold and nothing else.
+   M6 already found this guard inverted once, and the symptom was two tablets
+   quietly disagreeing rather than any error.
+
+3. A FRAME BENCHMARK ON THE EMULATOR MEASURES NEITHER THING SPEC §10 ASKS
+   ABOUT — and the stress fixtures do not even build there. Both the
+   5,000-stroke ink fill and the 500-note library fixture are built by
+   SyntheticInk, whose orientations are a thousandth outside [0, 2π) under
+   x86_64 rounding, which androidx.ink rejects. The frame-rate row is
+   `dumpsys gfxinfo` on the physical Galaxy Tab; the latency row is a 240 fps
+   camera against Samsung Notes. Pass bars are in docs/M1-INK.md §4.1–4.2
+   (janky ≤ 5 %, 99th ≤ 16.67 ms) and docs/M3-LIBRARY.md §10.
+
+4. NEW DEPENDENCIES BEND TO THE PINNED AGP, NEVER THE REVERSE. Macrobenchmark,
+   LeakCanary, uiautomator and profileinstaller are all new coordinates. Read
+   each one's aar-metadata.properties (minCompileSdk, minCompileSdkExtension,
+   minAndroidGradlePluginVersion) and pick the newest that BUILDS against AGP
+   8.13.0 and compileSdk 36. This collided three times in M0 alone. compileSdk
+   staying at 36 is a recorded decision, not inertia.
+
+Not this milestone: R8, signing and the keystore (M10); the iOS link and Swift
+harness (M11); anything in SPEC §12.
+
+Finish by reproducing SPEC §10's table row by row with the number measured, the
+device it was measured on, and how — including the raw `dumpsys gfxinfo` output
+for both frame-rate gates, the 4 GB-device result, and the before/after of a
+real delete-the-database rebuild. Give test counts as `tests=` summed over the
+result XML per task, say which instrumented suites were actually executed by
+`connectedDebugAndroidTest` rather than merely compiled by `check`, and say
+which half of guardrail 2 ran.
+```
+
 ---
 
 ## M10 — Polish
@@ -1050,6 +1261,70 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 - [ ] A first-time user can create a note, bind it to Nextcloud, and write — without instructions
 - [ ] A signed release build runs correctly with R8 enabled
 
+### Prompt
+
+```
+Read SPEC.md §14, §3.3, §5.7, §8.3, §8.4 and §12, then app/proguard-rules.pro
+and PalmGuard.kt's KDoc, and only then M10's scope list above. Where ROADMAP and
+SPEC disagree, SPEC wins; tell me about the disagreement.
+
+Three omissions from the scope list are already known:
+- The colour-picker EYEDROPPER. SPEC §3.4 assigns it here explicitly: "needs to
+  sample the rendered canvas and belongs with M10's toolbar work".
+- The PENCIL GRAIN TEXTURE, marked "Deferred to M10" in SPEC §3.4's brush table.
+- The sync-status screen, which M12 already shipped. Do not rebuild it; extend
+  it, and keep SyncEngine.syncNowRequested's park-lifting semantics intact.
+
+Four things that will bite:
+
+1. NEVER UNINSTALL THE TABLET'S BUILD TO LAND THE SIGNED APK. This milestone
+   introduces the first non-debug signing key, and applicationId has no debug
+   suffix — so the release cannot upgrade an install signed with the debug key.
+   Uninstalling takes filesDir with it, which means files/device.id, which means
+   a new identity is minted and every Lamport tiebreak that device took part in
+   reopens, with an empty database and no remote bindings. Decide how the
+   release reaches the tablet BEFORE generating the keystore.
+
+2. LOCKING A NOTE MUST DELETE ITS ARTIFACTS, NOT FILTER THEM. The lock always
+   arrives after the thumbnail and the index rows exist. Locking deletes
+   cache/thumbs/<documentId>.webp and the per-page directory, evicts the
+   in-memory bitmap LRU, and calls SearchIndex.forgetNote — and every writer
+   that would regenerate them must refuse a locked note. Filtering at the read
+   site means the first path that forgets the filter shows them (the widget, a
+   share sheet, search-jump thumbnails), and the recognition worker refills the
+   rows overnight regardless.
+
+3. VERIFY R8 BY SIGNING IN AND SYNCING, NOT BY OPENING A NOTE. The note format
+   touches no generated serializer — OpCodec, Bundle, Journal, NoteStore and
+   PageTextCodec all build JsonObject by hand. There are six @Serializable
+   classes in the app and all six are on the ACCOUNT path. So a note round-trip
+   is exactly the check that cannot fail this way. What breaks release-only is
+   StoredCredential failing to decode, after which the app concludes it has no
+   account and silently signs out a user who has been signed in for months.
+   Correct proguard-rules.pro's closing sentence while you are there.
+
+4. THE HOVER PREVIEW LANDS IN THE METHOD PALM REJECTION RUNS IN.
+   InkSurfaceView.onGenericMotionEvent exists today for exactly one purpose —
+   palmGuard.noteStylusEvent(event) — and its KDoc already says the hover
+   preview belongs there. Call noteStylusEvent FIRST, still return
+   super.onGenericMotionEvent(event), and allocate nothing. PalmGuard's only
+   signal is "has the stylus been near the glass in the last 300 ms"; starve it
+   and a resting palm starts panning the page.
+
+Zero telemetry (SPEC §14): no analytics SDK, no crash reporter on by default.
+The per-note lock is a local UI gate — encrypting the bundle is out of scope.
+Not this milestone: performance, LeakCanary, macrobenchmarks and the a11y pass
+(M9); the iPad work (M11).
+
+Finish by naming every toolbar item and stating that each can be hidden AND
+moved; proving the lock from outside the app with `run-as dev.inkstone ls
+cache/thumbs` and a query against the search index; giving the signed release's
+mapping.txt path with isMinifyEnabled and isShrinkResources both true; stating
+the tablet install plan actually used with files/device.id read before and
+after; hover cost as `dumpsys gfxinfo` numbers rather than an assertion; and the
+measured tap-to-writable-note time against the "under 1 s" criterion.
+```
+
 ---
 
 ## M11 — iPad readiness
@@ -1069,6 +1344,69 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 - [ ] The Swift harness reads a real bundle produced by the Android app
 - [ ] A merge test runs on iOS and produces the same result as on Android
 - [ ] A written doc listing exactly what an iOS app would still need
+
+### Prompt
+
+```
+Read SPEC.md §2.3, §11, §5.4, §8.4 and §13.2, then docs/M0-VERIFICATION.md §3,
+then CLAUDE.md's definition of done #3, and only then M11's scope list above.
+
+⚠️ THE SCOPE LIST'S FIRST BULLET IS FALSE, AND IT IS THE MILESTONE'S PREMISE.
+It says the iOS targets "have been in CI since M0". docs/M0-VERIFICATION.md §3
+says the framework link has never executed: the CI job exists but no macOS
+runner has ever run it, and on Windows every link*IosSimulatorArm64 task logs
+SKIPPED while Gradle prints BUILD SUCCESSFUL. Establish first, from the literal
+`> Task …` lines, whether the link has EVER run. Then treat the first real
+framework link as NEW work carrying five milestones of unlinked :core: code —
+Ktor+Darwin in :core:sync, Zip/Sha256/OggOpus in :core:storage, SQLDelight
+native in :core:database — not as a re-check. Correct the bullet in SPEC and
+ROADMAP in the same commit. The map's "Low" risk rating depends on the claim you
+are about to test.
+
+Four things that will bite:
+
+1. A SKIPPED TASK PRINTS BUILD SUCCESSFUL. Read every `> Task …` line back and
+   say which host ran it. This is the same shape as the green build that
+   executes zero tests, applied to the one criterion this milestone exists for.
+
+2. THE SWIFT HARNESS MUST CALL :core:storage, NOT RE-IMPLEMENT IT. Swift
+   supplies a file path and prints numbers; the Kotlin framework does the ZIP
+   and manifest reading through the real BundleReader. That needs a genuine iOS
+   FileSystem in iosMain — there is none today, only AndroidFileSystem in :app
+   and a fake in tests. A Swift-side ZIP reader is a second implementation of a
+   format this project already speaks, which is exactly where the old bugs come
+   back: M6's BundleReader rebuilt the manifest from a fixed field list and
+   silently dropped the peer's unknown members.
+
+3. THE 21-ROW MERGE MATRIX CANNOT RUN ON iOS — DO NOT MOVE IT. It lives in
+   :app's unit tests because that is the only source set seeing :core:sync,
+   :core:storage and :android:pdf together, and it stands on JdbcSqliteDriver,
+   isReturnDefaultValues, a hand-rolled ServerSocket server and PdfBox. Satisfy
+   "a merge test runs on iOS" with the merge tests already in commonTest — run
+   as iosSimulatorArm64Test and compared against the same tests on the JVM.
+
+4. GREEN ON THE SIMULATOR IS ONE-WAY EVIDENCE. It proves no JVM-only dependency
+   has landed in shared code. It proves nothing about whether a :core:
+   capability works, and it can actively mislead: iOS's SQLite has FTS5 and
+   Android's does not, so a :core: module using it compiles, links and PASSES on
+   the simulator while failing on every Android device — guardrail 2 pointing
+   the one direction it cannot see. Never let the simulator be the platform on
+   which a core capability is first proven.
+
+Not this milestone: any UI, PencilKit, Metal, or Compose Multiplatform iOS
+target. Do NOT write the stroke-geometry decoder or add a portable secondary
+encoding — SPEC §5.4's cost is accepted and documenting it is the deliverable.
+No op-format or schemaVersion changes to make iOS easier, and no version bumps
+to make a link succeed (CLAUDE.md rule 3).
+
+Finish by telling me: which host ran each iOS task, with OS and Xcode versions;
+a plain yes/no on whether the link had ever executed before this milestone; per
+:core: module whether its framework links, and for any that does not, the actual
+error; the provenance of the bundle the Swift harness read; the named merge
+tests that ran on iOS beside the same tests on the JVM; and docs/M11-IPAD.md
+listing what an iOS app would still need. If no macOS host is available at all,
+say so plainly, list which acceptance boxes are therefore unmet, and stop.
+```
 
 ---
 
