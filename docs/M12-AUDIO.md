@@ -762,3 +762,64 @@ fixture could not see it, and only the root case could.
    correct in every test and inert in the app"* — is not retired by a matching string.
 3. **Page anchoring has never run on real data** (§15.8 already says this). The 48-minute lesson
    predates the page column.
+
+---
+
+## 17. ⭐ It ran, end to end, on real lessons
+
+2026-08-12. Two lectures captured on the Galaxy Tab, uploaded by the app to a live Nextcloud,
+transcribed by the watcher running as a systemd service on the user's own always-on machine, and
+the transcripts written back beside the notes. **Nobody pressed anything.** This is the first time
+every link in §2's diagram has carried real data in one pass.
+
+| | 48-minute lecture | 18-minute lecture |
+|---|---|---|
+| Audio | 12,545,686 bytes | 4,848,171 bytes |
+| Transcript | 20,898 bytes | 8,776 bytes |
+| Model | `universal-3-5-pro` | `universal-3-5-pro` |
+| Speakers | **A and B, correctly split** | ⚠️ all `A` — diarization failed |
+| Pages anchored | ❌ predates the page column | ✅ **3 pages** |
+| Dead runs collapsed | ✅ 7, about ten minutes | 0 (none long enough) |
+
+### 17.1 ⭐ Page anchoring works, and it lands on *topic* boundaries
+
+The claim §15.6 made when the alignment unit was changed from a recognised line to a page was that
+a page break is a **pedagogically meaningful** unit, not an arbitrary one. On the first real
+recording that carried page ids, the three spans were:
+
+```
+page …701e   00:01:43 → 00:15:47   the entire contaminated-nickel problem, start to finish
+page …7020   00:17:47              the "we are NOT doing percentage composition" aside
+page …7022   00:18:17              moving on to the next set of questions
+```
+
+One page, one problem. The aside that is explicitly examinable-or-not gets its own page. That is
+the design goal met on real data rather than argued for, and it is the evidence §15.8 said was
+missing.
+
+### 17.2 What the recogniser got wrong, and the shape of it
+
+The numbers survived almost perfectly — every calculation in both lessons checks out against the
+chemistry, including `84.03%`, `67.53 g`, `95.21%` and `2.67 dm³`. What breaks is **domain
+vocabulary**, and it breaks in a way worth recording because it is systematic:
+
+| Heard | Actually | Kind |
+|---|---|---|
+| `200 out of 258` | 238 | a digit, in a spoken number |
+| `MgO2` | MgO | a formula read aloud from `2MgO` |
+| `magnesium fluoride` | chloride | a similar-sounding anion |
+| `a base and an acid` | a metal and an acid | a near-homophone that inverts the chemistry |
+| `volume nitrogen gas` | hydrogen gas | wrong element, plausible sentence |
+
+⚠️ **None of these are detectable from the transcript alone** — every one is a grammatical, plausible
+sentence. They are only catchable against the *working on the page*, which is exactly the argument
+§15.6 made for anchoring to pages rather than shipping the transcript on its own. The transcript is
+a companion to the PDF, and this is the concrete reason it can never be a replacement.
+
+### 17.3 Still open
+
+- **Diarization is unreliable on shorter recordings.** The 18-minute lecture attributed every
+  student question to the teacher, so the dialogue reads as one person contradicting themselves.
+  `likelyTeacher` is labelled a heuristic in the front matter and remains one.
+- **The 48-minute lecture cannot be re-anchored.** Its timeline has two columns and never will
+  have three; §15.6's fixture caveat stands.

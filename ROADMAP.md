@@ -1072,7 +1072,7 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 
 ---
 
-## M12 — recorded lectures, aligned to the notes 🟡 (both halves built; never run end to end live)
+## M12 — recorded lectures, aligned to the notes 🟢 (ran end to end on real lessons, 2026-08-12)
 
 **Goal:** press record in a lecture, and afterwards the note carries what was *said* around each
 line you wrote — readable by you, and by an assistant with access to your Nextcloud.
@@ -1166,14 +1166,25 @@ at `transcribe.run`, because a suite must not bill a card or ship a classroom re
 - [x] Two recordings in one note both transcribe. *Automated* — §5's trap, from the server side
 - [x] A failed transcription leaves the audio untouched and writes no blank file. *Automated*
 - [x] A 401 halts the pass rather than retrying it. *Automated* (CLAUDE.md rule 5)
-- [ ] ⚠️ **One real pass against a live Nextcloud.** Everything above is proven in halves: the
-      transcription against the real API (§15.7), the WebDAV against a real server. **This loop has
-      never made both calls in one pass.** Needs `watcher.local.properties`; start with `-DryRun`
-- [ ] Record a real lecture end to end; the transcript lands in Nextcloud and reads correctly
-- [ ] **The teacher's emphasis lands on the right page** — **report the constants you tuned to,
-      with the before and after**. `PAGE_LEAD_IN_MS` 30 s / `PAGE_LEAD_OUT_MS` 10 s / `DEAD_RUN_MS`
-      30 s are still guesses; the 48-minute lesson predates the page column and cannot tune them
-- [ ] Ask Claude to read the Nextcloud folder and explain what a lecture covered
+- [x] ⚠️ **One real pass against a live Nextcloud.** *Run for real* — two lectures captured on the
+      tablet, uploaded by the app, transcribed by the watcher as a **systemd service on the user's
+      own always-on machine**, transcripts written back, audio trashed. Nobody pressed anything
+      (docs §17)
+- [x] Record a real lecture end to end; the transcript lands in Nextcloud and reads correctly.
+      *Run for real*: every calculation in both lessons checks out against the chemistry —
+      84.03 %, 67.53 g, 95.21 %, 2.67 dm³
+- [x] **The teacher's emphasis lands on the right page.** *Run for real* on the first recording
+      carrying page ids: one page held the whole contaminated-nickel problem (01:43 → 15:47), and
+      the two short pages after it are the "not examinable" aside and the move to new questions.
+      Topic boundaries, not arbitrary cuts (docs §17.1)
+- [x] Ask Claude to read the Nextcloud folder and explain what a lecture covered. *Run for real*,
+      through the Nextcloud connector — both lessons followed end to end, and the seven
+      domain-vocabulary errors found are catalogued in docs §17.2
+- [ ] ⚠️ **Diarization on shorter recordings.** The 18-minute lecture put every student question in
+      the teacher's mouth. Not tuned, and `likelyTeacher` remains a labelled heuristic
+- [ ] The window constants are **still untuned**: `PAGE_LEAD_IN_MS` 30 s / `PAGE_LEAD_OUT_MS` 10 s /
+      `DEAD_RUN_MS` 30 s were never varied, because the first real run read well enough that there
+      was nothing to tune *against*. Report before/after if they are ever changed
 
 ### Prompt
 

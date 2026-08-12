@@ -66,3 +66,6 @@ recordings-pulled/
 # Python bytecode from the M12 tools.
 __pycache__/
 *.pyc
+
+# A stray file my own shell quoting kept creating. Belt and braces.
+$LOG

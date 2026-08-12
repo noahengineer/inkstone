@@ -23,6 +23,6 @@
     <!-- §9 — the microphone was taken by something else (a call). The gap is marked in the timeline. -->
     <string name="recording_silenced">Paused — another app is using the microphone</string>
     <!-- Refused because the runtime permission was declined. Not an error state; just nothing happens. -->
-    <string name="recording_needs_permission">Recording needs permission to use the microphone.</string>
+    <string name="recording_needs_permission">Inkstone needs microphone permission to record. If you are not asked, turn it on in Settings → Apps → Inkstone → Permissions → Microphone.</string>
     <string name="auto_record_folder">Auto-record in this folder</string>
 </resources>

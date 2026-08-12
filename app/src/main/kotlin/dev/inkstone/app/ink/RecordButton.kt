@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.SystemClock
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Row
@@ -64,9 +65,22 @@ fun RecordButton(state: RecordingUiState, onToggle: () -> Unit, modifier: Modifi
      * are requested together and the recording starts either way, since Android will not let the
      * capture happen silently in the first place.
      */
+    // ⚠️ **A refused microphone must say so.** This callback used to be
+    // `if (granted) onToggle()` and nothing else, so a denial — or Android's "don't ask again",
+    // which returns denied instantly without showing a dialog at all — left the button doing
+    // **absolutely nothing, forever, in silence**. `recording_needs_permission` had been written
+    // in strings.xml since M12 and referenced from no Kotlin file: a message nobody could ever
+    // see. Same shape as the `= Unit` stub CLAUDE.md records from M6.
+    //
+    // Once permanently denied, no in-app request can re-prompt; only Settings can. So the message
+    // says that, rather than inviting the user to press a button that cannot work.
     val permissions =
         rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
-            if (granted[Manifest.permission.RECORD_AUDIO] == true) onToggle()
+            if (granted[Manifest.permission.RECORD_AUDIO] == true) {
+                onToggle()
+            } else {
+                Toast.makeText(context, R.string.recording_needs_permission, Toast.LENGTH_LONG).show()
+            }
         }
 
     if (state.isRecording) {

@@ -1,0 +1,72 @@
+# M12's transcript watcher, as a systemd service (docs/M12-AUDIO.md §16).
+#
+#   sudo cp inkstone-watcher.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now inkstone-watcher
+#   journalctl -u inkstone-watcher -f
+#
+# ⚠️ A long-running process rather than a systemd timer, deliberately. `watch.py` catches per-pass
+# failures and keeps going, so the loop is the resilient part; a timer firing `--once` would also
+# work but adds a unit file and loses the "connected as …" line that makes a credential problem
+# obvious on the first start. `Restart=always` covers the case the loop cannot: the process dying.
+#
+# ⚠️ **It holds no state.** The server is the state — a recording with a transcript beside it is
+# finished work — so this may be stopped, restarted, moved to another machine or run twice by
+# accident without losing or duplicating anything. The only cost of a duplicate pass is one
+# repeated download.
+
+[Unit]
+Description=Inkstone lecture transcript watcher
+Documentation=https://github.com/noahengineer/inkstone/blob/main/docs/M12-AUDIO.md
+# It needs the network and it needs DNS. `network-online` rather than `network`, or the first
+# pass after a reboot fails its whoami and waits a full interval for no reason.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ⚠️ Not root. It needs to read four Python files and talk to two HTTPS hosts; nothing else.
+User=inkstone
+Group=inkstone
+
+# ⚠️ Credentials live here, not in the unit and not in the repo. Create it with mode 0600 owned
+# by root — `systemd` reads it before dropping privileges, so the service user never needs to be
+# able to read the file at all.
+#   INKSTONE_NC_URL=https://your-nextcloud
+#   INKSTONE_NC_UID=your-uid
+#   INKSTONE_NC_PASSWORD=your-app-password
+#   ASSEMBLYAI_API_KEY=...
+EnvironmentFile=/etc/inkstone-watcher.env
+
+WorkingDirectory=/opt/inkstone-watcher
+ExecStart=/usr/bin/python3 /opt/inkstone-watcher/watch.py --interval 900
+
+# A pass that cannot reach the server is not fatal — it logs and waits — so a restart here means
+# the process itself died. Backing off avoids a hot loop if that is something permanent.
+Restart=always
+RestartSec=60
+
+# Line-buffered, or journalctl shows nothing until the buffer fills and a stuck pass looks
+# identical to a quiet one.
+Environment=PYTHONUNBUFFERED=1
+
+# Hardening. This process reads four files and makes HTTPS requests; it has no business doing
+# anything else, and a transcript watcher is an odd thing to leave with write access to /usr.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+# Outbound TCP only.
+RestrictAddressFamilies=AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
