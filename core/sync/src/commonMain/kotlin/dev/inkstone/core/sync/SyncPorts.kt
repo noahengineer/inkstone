@@ -254,6 +254,17 @@ public interface RecordingUploads {
      */
     public suspend fun pendingFor(noteId: DocumentId): List<PendingRecording>
 
+    /**
+     * ⭐ Every finished recording the server does not have, across all notes.
+     *
+     * ⚠️ Deliberately **not** filtered by binding, because the recordings that are stuck are
+     * exactly the ones a binding-shaped query cannot see. This is what lets `syncNowRequested`
+     * say *"3 recordings are waiting, and here is what is stopping them"* rather than doing
+     * nothing indistinguishable from doing nothing successfully — which is how M12's first real
+     * upload attempt spent an evening.
+     */
+    public suspend fun allPending(): List<PendingRecording>
+
     /** The server now has both files. Does not change the recording's state; see `Recording.sq`. */
     public suspend fun markUploaded(recordingId: String, atEpochMillis: Long)
 }

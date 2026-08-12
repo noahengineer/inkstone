@@ -288,6 +288,59 @@ class MergeMatrixMediaTest {
         assertEquals(1, devices.a.drain().mediaUploaded, "Sync now could not lift the park")
         assertNotNull(devices.rawBytes(devices.a.remoteAudio(note, recordingId)), "the lecture is not on the server")
     }
+
+    /**
+     * ⭐ **"Sync now" says why a lecture is not moving**, which is the whole reason this report
+     * type exists.
+     *
+     * ⚠️ Written after an evening in which a real tablet held a real 48-minute lecture, the Sync
+     * screen counted it correctly, the button was wired correctly, and pressing it produced **no
+     * observable change of any kind** — no upload, no error, no state anywhere. Every hypothesis
+     * fitted the evidence equally well because the evidence was *nothing*, and the one instrument
+     * that would have settled it — reading the database over `adb` — was unavailable on that
+     * device. A refusal that cannot be counted cannot be debugged from outside the app.
+     *
+     * The two silent refusals are the ones asserted here: a recording in an **unbound** note can
+     * never upload, and one whose **account cannot send** is waiting on a sign-in. Both used to
+     * look exactly like a healthy queue.
+     */
+    @Test
+    fun `sync now reports a recording that cannot upload because its note is unbound`() = matrixRow(
+        row = "M12 (a refusal must be countable)",
+        proven = "an unbound note's recording is reported as such rather than silently skipped",
+        notProven = "the wording on the Sync screen - that is SyncViewModel.describe",
+    ) { devices ->
+        val note = devices.share("Unbound lecture")
+        devices.a.recordLecture(note, "orphan", audioBytes = 1_024)
+
+        // `unbind` drops the binding and every queued row, which is exactly the state a recording
+        // is in when its note was never saved to Nextcloud in the first place.
+        devices.a.engine.unbind(note)
+
+        val report = devices.a.engine.syncNowRequested()
+
+        assertEquals(1, report.recordingsUnbound, "an unbound recording was not reported")
+        assertEquals(0, report.recordingsQueued, "an unbound recording was counted as queued")
+        assertEquals(1, report.stuck, "the summary count is wrong")
+        assertEquals(0, devices.a.drain().mediaUploaded, "an unbound note uploaded a recording")
+    }
+
+    /** The happy case, so the report cannot pass by reporting "stuck" for everything. */
+    @Test
+    fun `sync now reports a queued recording as queued`() = matrixRow(
+        row = "M12 (the report distinguishes queued from stuck)",
+        proven = "a bound, signed-in recording counts as queued and none as stuck",
+        notProven = "nothing extra",
+    ) { devices ->
+        val note = devices.share("Ordinary lecture")
+        devices.a.recordLecture(note, "ordinary", audioBytes = 1_024)
+
+        val report = devices.a.engine.syncNowRequested()
+
+        assertEquals(1, report.recordingsQueued, "a perfectly good recording was not counted")
+        assertEquals(0, report.stuck, "a healthy recording was reported as stuck")
+        assertEquals(1, devices.a.drain().mediaUploaded, "the queued recording did not upload")
+    }
 }
 
 /** The note's media directory on the server, from the binding this device holds. */

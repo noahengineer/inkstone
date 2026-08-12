@@ -548,19 +548,45 @@ public class SyncEngine(
      * the one place a park may be retired without a resolved conflict behind it. Keep it that way:
      * if this ever acquires a second caller that is not a user gesture, the reasoning is void.
      */
-    public suspend fun syncNowRequested() {
+    public suspend fun syncNowRequested(): SyncNowReport {
         val now = clock.nowEpochMillis()
+        var lifted = 0
         for (row in outbox.all()) {
-            if (row.nextAttemptAt > now) outbox.reschedule(row.noteId, row.key, row.attempts, now)
+            if (row.nextAttemptAt > now) {
+                outbox.reschedule(row.noteId, row.key, row.attempts, now)
+                lifted++
+            }
         }
-        // Rebuild the queue from the record of what is owed. `pendingFor` is the table that makes
-        // this possible at all, and `enqueuePendingRecordings` is already idempotent per recording.
+
+        // ⚠️ Counted from `allPending()` — every recording the server does not have, **regardless
+        // of binding** — because the ones that are stuck are exactly the ones a binding-shaped
+        // walk cannot see. Walking bindings would report "0 waiting" for a recording in an unbound
+        // note, which is the single most likely reason a lecture is not moving.
+        var queued = 0
+        var unbound = 0
+        var notSignedIn = 0
+        for (recording in stores.recordings.allPending()) {
+            val binding = bindings.find(recording.noteId)
+            when {
+                binding == null -> unbound++
+                !canSend(binding.accountId) -> notSignedIn++
+                else -> queued++
+            }
+        }
         for (account in accounts.all()) {
             for (binding in bindings.forAccount(account.id)) {
                 enqueuePendingRecordings(binding.noteId)
             }
         }
+
         scheduler.enqueueOutboxDrain()
+        return SyncNowReport(
+            parksLifted = lifted,
+            recordingsQueued = queued,
+            recordingsUnbound = unbound,
+            recordingsNotSignedIn = notSignedIn,
+            outboxRows = outbox.all().size,
+        )
     }
 
     @Suppress("LongParameterList") // The op, and the four facts coalescing decides against.
@@ -634,3 +660,41 @@ public class SyncEngine(
  *   not ahead of the remote bytes. See the KDoc above.
  */
 public data class RemoteVersion(val etag: ETag?, val ocId: String?, val checksum: String?, val syncedRev: Long?)
+
+/**
+ * ⭐ What a press of **"Sync now"** actually found — so the button can say it.
+ *
+ * ⚠️ This type exists because of a specific evening. A lecture sat on a tablet, the Sync screen
+ * counted it correctly, the button was wired correctly, and pressing it produced **no observable
+ * change of any kind** — no upload, no error, no state. Every hypothesis was equally consistent
+ * with the evidence, because the evidence was nothing, and the only instrument left was reading
+ * the database over `adb` — which that tablet did not allow.
+ *
+ * So the fix is not another guess: it is that a refusal must be *countable*. Each field is one
+ * reason a recording is not moving, and they are mutually exclusive per recording, so a user can
+ * read the sentence and know which thing to do next:
+ *
+ * | Field | What the user must do |
+ * |---|---|
+ * | [recordingsUnbound] | Save that note to Nextcloud — nothing can upload from an unbound note |
+ * | [recordingsNotSignedIn] | Sign in again; the account is not in a state that can send |
+ * | [recordingsQueued] | Nothing — it is queued, and the drain will take it |
+ *
+ * CLAUDE.md's rule, restated: *a button whose two states are indistinguishable is a button that
+ * cannot be debugged from the outside.*
+ */
+public data class SyncNowReport(
+    /** Rows whose park or backoff was retired because a human asked. */
+    val parksLifted: Int = 0,
+    /** Pending recordings that are bound to a usable account, and so are now queued. */
+    val recordingsQueued: Int = 0,
+    /** ⚠️ Pending recordings in a note that is not synced at all. These can never upload. */
+    val recordingsUnbound: Int = 0,
+    /** ⚠️ Pending recordings whose account cannot send — signed out, or `NEEDS_REAUTH`. */
+    val recordingsNotSignedIn: Int = 0,
+    /** Rows in the outbox after the sweep. Zero here with recordings waiting is the alarm. */
+    val outboxRows: Int = 0,
+) {
+    /** Every recording still not moving, for the one-line summary. */
+    public val stuck: Int get() = recordingsUnbound + recordingsNotSignedIn
+}

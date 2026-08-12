@@ -114,6 +114,11 @@ internal class FakeRecordingUploads(vararg initial: PendingRecording) : Recordin
     override suspend fun pendingFor(noteId: DocumentId): List<PendingRecording> =
         rows.values.filter { it.noteId == noteId && it.recordingId !in uploadedAt }
 
+    // ⚠️ Same `uploadedAt` filter as [pendingFor] and [find], and deliberately **no binding
+    // filter** — the real query is `state='READY' AND uploadedAt=0` over the whole table, and the
+    // recordings this is for are precisely the ones no binding-shaped query can see.
+    override suspend fun allPending(): List<PendingRecording> = rows.values.filter { it.recordingId !in uploadedAt }
+
     override suspend fun markUploaded(recordingId: String, atEpochMillis: Long) {
         uploadedAt[recordingId] = atEpochMillis
     }

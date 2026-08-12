@@ -15,6 +15,7 @@ import dev.inkstone.core.sync.LoginFlowStart
 import dev.inkstone.core.sync.OutboxStore
 import dev.inkstone.core.sync.SyncAccount
 import dev.inkstone.core.sync.SyncEngine
+import dev.inkstone.core.sync.SyncNowReport
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -456,10 +457,48 @@ class SyncViewModel @Inject constructor(
     fun syncNow() {
         viewModelScope.launch {
             mutable.update { it.copy(message = "Syncing…") }
-            sync.syncNowRequested()
+            val report = sync.syncNowRequested()
             refresh()
+            mutable.update { it.copy(message = describe(report)) }
         }
     }
+
+    /**
+     * ⚠️ **Say which of the reasons applies, and what to do about it.**
+     *
+     * Every branch here is a distinct action for the user, and the two that matter are the two
+     * that used to be silent: a recording in an unbound note can *never* upload, and one whose
+     * account cannot send is waiting on a sign-in. Both looked exactly like a healthy queue.
+     */
+    private fun describe(report: SyncNowReport): String = when {
+        report.recordingsUnbound > 0 -> {
+            val n = report.recordingsUnbound
+            "$n recording${plural(n)} ${isAre(n)} in a note that is not synced. Open the note in " +
+                "your library and choose \"Save to Nextcloud…\" — nothing can upload until then."
+        }
+
+        report.recordingsNotSignedIn > 0 -> {
+            val n = report.recordingsNotSignedIn
+            "$n recording${plural(n)} cannot upload because this account is signed out or needs " +
+                "signing in again."
+        }
+
+        report.recordingsQueued > 0 -> {
+            val n = report.recordingsQueued
+            "Uploading $n recording${plural(n)}." +
+                if (report.parksLifted > 0) " Retrying ${report.parksLifted} that had been put off." else ""
+        }
+
+        report.outboxRows > 0 -> "Syncing ${report.outboxRows} pending change${plural(report.outboxRows)}."
+
+        // ⚠️ Never "Syncing…" left on screen forever. "Nothing waiting" is a real answer and the
+        // user is entitled to it; it is also the answer that tells them the problem is elsewhere.
+        else -> "Everything is up to date."
+    }
+
+    private fun plural(n: Int) = if (n == 1) "" else "s"
+
+    private fun isAre(n: Int) = if (n == 1) "is" else "are"
 
     fun dismissMessage() {
         mutable.update { it.copy(message = null) }

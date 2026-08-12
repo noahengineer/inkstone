@@ -244,6 +244,10 @@ public class SqlRecordingUploads(private val database: InkstoneDatabase, private
         queries.selectPendingRecordingsForNote(noteId.value).executeAsList().map { it.toPending() }
     }
 
+    override suspend fun allPending(): List<PendingRecording> = withContext(dispatcher) {
+        queries.selectPendingRecordings().executeAsList().map { it.toPending() }
+    }
+
     override suspend fun markUploaded(recordingId: String, atEpochMillis: Long): Unit =
         withContext(dispatcher) { queries.markRecordingUploaded(atEpochMillis, recordingId) }
 }
