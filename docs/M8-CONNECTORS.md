@@ -1,7 +1,8 @@
 # M8b — Shapes and connectors
 
-**Status: the format half is built and verified; the renderer and the UI are not started.**
-§6 is the remaining work with the traps each step inherits.
+**Status: shapes are drawn, draw-and-hold works and is reachable from the toolbar. Connectors
+are specified, implemented and unit-tested, but nothing in the UI creates one yet.**
+§7 is the remaining work with the traps each step inherits.
 
 This document is what was decided and why, in the order the milestone's prompt asked for it —
 the three known disagreements first, because they had to be resolved before any code.
@@ -56,7 +57,7 @@ that an end re-attaches by itself when its target arrives and when a delete is u
 | **No new kinds or ops** | The whole design above. Nothing was added to `ShapeKind`, `InkObject` or `PageOp`. |
 | **A reroute writes no op** | The route is a pure function of the fold. An anchor is a **normalised point in the target's own box**, so it is carried by the target's absolute matrix — which is why a connector tracks a resize and a rotation and not merely a translate, with nothing written. |
 | **`AddObject` payload is first-write-wins** | Decided up front: an endpoint **can** be re-attached, so the binding is a register and not payload. The payload is used for one thing only — the fallback geometry, which must never change, and where first-write-wins is exactly right. |
-| **Shapes live in `StrokeStore`** | Not yet reached — §6. Recorded as the first constraint on the renderer. |
+| **Shapes live in `StrokeStore`** | Done, on M8c's `DryObject` hierarchy: `DryShape` is a sibling of `DryStroke`, in the one `(z, id)` order, taking its key from the store's `topZ`. No second store and no second counter. |
 
 ---
 
@@ -172,11 +173,69 @@ were read back — none logged `UP-TO-DATE` or `FROM-CACHE`.
 
 ---
 
-## 5. What was checked, and how
+## 5. Draw-and-hold, on the emulator
+
+Built after the format half, on the same branch, against M8c's `DryObject` hierarchy. Four pieces:
+
+- **`DryShape`** — the [DryPlaceholder] replacement its own KDoc asks for: *"a kind that paints
+  itself replaces this type rather than configuring it"*. A shape now has a silhouette, a coverage
+  test and a branch in `PagePainter`, and the sealed hierarchy made each of those a compile error
+  until it was written.
+- **`ShapeSnapDetector` / `ShapeSnapController`** — the dwell detector and the gesture it turns
+  into ops. A controller for the reason `EraserController` and `SelectionController` are ones:
+  `InkSurfaceView` owns `MotionEvent` dispatch, and dispatch is the thing that has to stay
+  readable. The surface keeps two call sites.
+- **`ShapeHit`** in `:core:model` — the erase and tap predicate, as arithmetic. A stroke's painted
+  area is a tessellated mesh only `androidx.ink` can measure; a shape's is a few segments, and the
+  decision belongs where a JVM test can reach it.
+- **Toolbar chips** — *Hold to snap* and *Arrow*, in the main row rather than behind **Measure**,
+  because they change what the pen does.
+
+### ⚠️ The bug that would have made it work on nothing
+
+`DryObject.hitBy` took only the swept parallelogram, which is the query `androidx.ink` wants. A
+shape needs the capsule. Passing both — and using exactly one per kind — was preferred to
+reconstructing either from the other, because a second definition of *"what the eraser swept"* can
+drift from the one the erased region actually records.
+
+The larger one: **`sample()` returns a delay, not a boolean.** Android delivers `ACTION_MOVE` when
+the digitiser reports a change, so a pen held genuinely still can stop producing events — and
+holding still is exactly what the user was asked to do. A per-sample check alone would have worked
+on a trembling hand and failed on a steady one, intermittently and by hardware. The controller
+schedules a `postDelayed` when a sample says *"settled, N ms to go"* and cancels it on movement.
+The emulator run below exercises **that path**, not the sampled one: the gesture holds through a
+`sleep 1.5` with no events at all.
+
+### The walk, on `emulator-5554`
+
+Drawn with `adb shell input stylus motionevent` — `PalmGuard` accepts only `TOOL_TYPE_STYLUS`, so
+an ordinary `input` swipe draws nothing and says nothing.
+
+| Gesture | On screen | In `journal.ops` |
+|---|---|---|
+| Straight drag, hold | "snapped to line", 5 → 6 objects | `"k":"p","sh":"LINE"`, `m` = `[1,0,143.4,0,1,149.5]` |
+| Closed box, hold | "snapped to rectangle", 6 → 7 | `"k":"p","sh":"RECTANGLE"` |
+| **Zigzag squiggle, hold** | **no snap**, label unchanged, 7 → 8 | `"k":"s"` — it stayed ink |
+| *Arrow* chip on, drag, hold | "snapped to arrow", 8 → 9 | — |
+| Undo | arrow gone from the screen, 9 → 8 | — |
+
+Two things worth reading off that table. The line's matrix has **determinant 1** — an axis-aligned
+line, which is precisely the case a diagonal-in-the-box local geometry would have made singular
+(§4.8.6). And there are **zero `"t":"txt"` ops**: a plain shape writes no record, because
+`ShapeEdit.create` omits it when the record is default, so drawing a line does not put a string in
+the file.
+
+The squiggle row is the acceptance criterion *"no fighting it to draw a freehand curve"*, and it is
+the only row a JVM test could not have produced.
+
+---
+
+## 6. What was checked, and how
 
 CLAUDE.md asks which of *written*, *automated*, *automated against the real dependency* and *run on
-a device* each claim is. Being blunt: **nothing here has been run on a device, and nothing here is
-reachable from the app.** The column exists to say so.
+a device* each claim is. **The shape half is reachable and was driven through the UI; the connector
+half is not reachable at all** — nothing in the app creates one, so every connector row below is
+arithmetic that has never had a user in front of it.
 
 | Claim | Unit (JVM) | Through storage | On a device / in the app |
 |---|---|---|---|
@@ -190,7 +249,10 @@ reachable from the app.** The column exists to say so.
 | Routing is order-independent | `ConnectorTest` ✅ | — | ❌ |
 | Shape outlines, boundaries, placement | `ShapesTest` ✅ | — | ❌ |
 | An axis-aligned line has an invertible matrix | `ShapesTest` ✅ | — | ❌ |
-| Draw-and-hold classifies; a squiggle snaps to nothing | `ShapesTest` ✅ **synthetic only** | — | ❌ |
+| Draw-and-hold classifies; a squiggle snaps to nothing | `ShapesTest` ✅ synthetic | — | ✅ **driven over adb** |
+| A shape is drawn, not an invisible placeholder | — | — | ✅ screenshot |
+| Erase / tap predicate for a shape | `ShapeHitTest` ✅ | — | ❌ |
+| Undo of a snap | — | — | ✅ screen changed, 9 → 8 |
 | Record survives a bundle round trip | — | `ShapeRecordStorageTest` ✅ | ❌ |
 | Record survives a compaction snapshot | — | `ShapeRecordStorageTest` ✅ | ❌ |
 | Page duplicate re-targets bindings | — | `ShapeRecordStorageTest` ✅ | ❌ |
@@ -203,15 +265,42 @@ its unit test and produced 105 false positives on 20 real pages. `ShapesTest` pr
 perfect ellipse classifies as an ellipse. It proves nothing about a person's ellipse, and the
 acceptance criterion *"no fighting it to draw a freehand curve"* is a device question.
 
-⚠️ **`adb devices` lists `emulator-5554` (a Pixel Tablet x86_64 image), and two AVDs exist.** It was
-checked first, as the prompt asked. It is **unused**, and the reason is not availability: there is
-nothing to drive. No tool creates a shape, so there is no button to press and no framebuffer to
-compare. That is the honest version of definition-of-done #6, and it is why the ROADMAP boxes are
-unticked.
+⚠️ **`adb devices` lists `emulator-5554` (a Pixel Tablet x86_64 image), and two AVDs exist.** The
+shape walk above ran on it. **Definition of done #4 is still not met**: an emulator does not
+substitute for the Galaxy Tab, and ink feel, latency and frame timing under draw-and-hold are
+unmeasured — including SPEC §3.6's two gates, which §4 records as owed.
+
+⚠️ **The dwell and confidence constants are guesses.** `DEFAULT_HOLD_MILLIS = 550`,
+`FILL_WINDOW = 0.14`, `DEFAULT_CONFIDENCE = 0.55`. They classify synthetic shapes correctly and
+they classified four real adb-drawn gestures correctly, which is not the same as behaving well
+under a hand. SPEC §4.8.7 says so explicitly, and M7's rotated-text detector — unit-test green,
+105 false positives on real pages — is why.
 
 ### Gates
 
-- **`detekt`, `spotlessCheck`, `checkCoreIsPlatformFree`: green**, all executed.
+⛔ **`:app:testDebugUnitTest` is NOT green, and the failures split two ways.** 21 of 95 fail. The
+attribution was measured, not assumed:
+
+| Rows | Fail with | Attribution |
+|---|---|---|
+| 13 — `MergeMatrixLayerOneTest` (7), `…FoldTest` (4), `…ConvergenceTest` (2) | `assertNotNull(store.open(id))` | **12063a6's**, and its own commit message says so: *"This commit is NOT green"*, root-caused there to a throw in `BundleWriter.write` |
+| 8 — `MergeMatrixMediaTest` (6), `…OutboxTest` (2) | *"could not lift the park"*, *"owes the server no DELETE"* | **Cascade.** Both classes **pass in isolation on 12063a6 and on this branch** — `--tests "*MergeMatrixMediaTest" --tests "*MergeMatrixOutboxTest"`, green on both |
+
+⚠️ **A count from the whole suite is not 21 independent facts.** The matrix shares one in-process
+server across all 95 tests, so a row that dies early takes unrelated rows with it — and the rows it
+takes are the ones that assert on *server state* rather than on a fold. Checking out the parent
+commit and running the same subset is what separates them; the difference between "21 failures" and
+"13 failures and 8 knock-ons" is the difference between a regression and a symptom.
+
+`:core:model` (232) and `:core:storage` (153) are green, including 9 new `ShapeHitTest` cases.
+
+- **`detekt`: green for `:android:ink`, `:app` and `:core:model`.** ⚠️ Five findings survive
+  elsewhere — `ObjectFormat.applyKnown` complexity 23, `PageFold`'s 10-parameter constructor,
+  `OpCodec` at 20 functions, and two magic numbers. All **pre-existing on 12063a6**, confirmed by
+  running `detekt` against a stashed tree before touching anything. The two this work introduced
+  (`InkSurfaceView` and `StrokeStore` over the function count) are suppressed **per class with a
+  justification**, not by raising the shared threshold, so nothing else inherits the exemption.
+- **`spotlessCheck`, `checkCoreIsPlatformFree`: green**, executed.
 - **Guardrail 2 — the klib compile half only, and it caught a real defect.** `toSortedMap` is
   `java.util.SortedMap` and does not exist in common Kotlin: `compileDebugKotlinAndroid` passed it
   and `compileKotlinIosSimulatorArm64` failed it. Exactly the class of thing CLAUDE.md says the
@@ -223,29 +312,30 @@ unticked.
 
 ---
 
-## 6. What is left, in order, and what each step inherits
+## 7. What is left, in order, and what each step inherits
 
-1. **`StrokeStore` must hold shapes.** `addObject` opens with `as? StrokeObject ?: return false`, so
-   a shape arriving from a peer, from an undo's re-add or from a page reload is dropped from the
-   screen while being perfectly correct in the log. It needs a `DryObject` that `DryStroke` and a
-   new `DryShape` both satisfy — **not a second store**, because `StrokeStore` owns the top z key
-   and a controller with its own counter goes stale the moment `SetZOrder` exists (M8a's recorded
-   regression), and because one list is what lets `(z, id)` interleave a shape and a stroke.
-2. **`PagePainter` draws them**, sharing the `saveLayer`/`DST_OUT` erase compositing that already
-   works for any drawn content. `ConnectorRouting.route` takes a `ConnectorTargets` rather than a
-   `FoldedPage` precisely so the surface can answer from its own render cache — it does not hold
-   `InkObject`s and must not be given a signature it can only satisfy by fabricating one.
-3. **`NoteEditor.reconcile` must diff the record.** It compares presence and the four object
-   registers; a record is a fifth, and it lives outside `InkObject`. A peer's *re-attachment* would
-   otherwise arrive invisibly. Note that a peer's *move* re-routes for free — that is a
-   `SetTransform` the diff already carries, and the route is derived — which is the payoff of
-   §1.2, and also the reason this gap is easy to miss.
-4. **A tool that creates one**, and `InkToolbarActions` wiring. Until this exists nothing above is
-   reachable, and a green suite establishes nothing (CLAUDE.md definition-of-done #6).
-5. **Draw-and-hold**, per SPEC §4.8.7's split. The per-sample buffer belongs to the surface.
-6. **The PDF**, with `PdfViewerCompatTest` and not PdfBox as the witness — see §4's last question.
-7. **A merge-matrix row for a record under concurrency.** Rows 2, 3 and 4 have connector analogues
-   that nothing currently exercises: a `SetTextContent` on a tombstoned connector, two concurrent
-   record writes, and a record write concurrent with a `SetTransform` on its target (which must
-   *both* apply — different registers).
-8. **Then the device**, including SPEC §3.6's two measurements, which §4 records as owed.
+Items 1, 2 and 5 of the original list are done — `DryShape`, its painter, and draw-and-hold. What
+remains:
+
+1. **A tool that creates a connector.** Everything under it works and none of it is reachable: the
+   record, the routing, the re-attachment, the derived detachment. Until a gesture writes a
+   `ShapeRecord` with an end in it, `ConnectorRouting` has no production caller and a green suite
+   establishes nothing (CLAUDE.md definition-of-done #6). This is the single largest gap.
+2. **`NoteEditor.reconcile` must diff the record.** It compares presence and the four object
+   registers; a record is a fifth and it lives outside `InkObject`, so a peer's *re-attachment*
+   arrives invisibly. ⚠️ A peer's *move* already re-routes for free — that is a `SetTransform` the
+   diff carries, and `StrokeStore.applyRegister` sets `routesDirty` — which is the payoff of §1.2
+   and also exactly why this gap is easy to miss: the obvious test passes.
+3. **Fill, corner radius and route pickers.** The record carries all three and nothing sets them,
+   so `DryShape.fillable` is false for every shape the app can currently make. The painter's fill
+   path has therefore **never drawn a pixel in the app** — only in `ShapeHitTest`'s arithmetic.
+4. **The PDF**, with `PdfViewerCompatTest` and not PdfBox as the witness — see §4's last question.
+   Nothing writes a shape to a PDF yet, so a published note loses them.
+5. **A merge-matrix row for a record under concurrency.** Rows 2, 3 and 4 have connector analogues
+   that nothing exercises: a `SetTextContent` on a tombstoned connector, two concurrent record
+   writes, and a record write concurrent with a `SetTransform` on its target (which must *both*
+   apply — different registers).
+6. **Selecting a shape.** `SelectionQueries.objectAt` now hit-tests one through the shared
+   predicate, but the lasso and the transform handles have not been tried against a shape on a
+   device, and `StrokeStore.duplicate` is still strokes-only.
+7. **The tablet**, including SPEC §3.6's two measurements, which §4 records as owed.

@@ -73,7 +73,12 @@ internal fun StrokeStore.objectAt(x: Float, y: Float, slopPageUnits: Float): Obj
             ImmutableSegment(ImmutableVec(local.x, local.y), ImmutableVec(local.x, local.y)),
             slop,
         )
-        if (dry.hitBy(tip)) hit = dry.id
+        // A tap is a zero-length sweep, and it is handed over in both forms for the reason
+        // [DryObject.hitBy] gives: a mesh is measured by ink, a shape's outline by arithmetic.
+        // Using one predicate for the tap and the eraser is what stops a shape you can erase from
+        // being a shape you cannot select.
+        val dab = ErasedRegion.Capsule(local.x, local.y, local.x, local.y, slop)
+        if (dry.hitBy(tip, dab)) hit = dry.id
     }
     return hit
 }

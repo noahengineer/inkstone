@@ -981,15 +981,16 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 
 **Bigger than it looks.** Connectors that stay attached and reroute when a shape moves is a small diagramming engine.
 
-> ⚠️ **Partially delivered. The format half is done; the renderer and the UI are not.**
+> ⚠️ **Partially delivered. Shapes work; connectors are built but unreachable.**
 > What exists: the connector data structure decided, specified (SPEC §4.8) and implemented in
 > `:core:model`; routing, anchoring and detachment derived and tested; the record carried safely
-> through every storage path that rebuilds a page from something other than its raw log — bundle,
-> compaction snapshot, page duplicate, note duplicate and conflicted copy. 47 new JVM tests, all
-> green, plus the iOS klib.
-> What does **not** exist: shapes and connectors are not drawn, no tool creates one, and nothing is
-> reachable from the app. `docs/M8-CONNECTORS.md` §6 is the remaining work, in order, with the
-> traps each step inherits. **No acceptance criterion below is met yet** — each needs the renderer.
+> through every storage path that rebuilds a page from something other than its raw log. **Shapes
+> are drawn** (`DryShape`), and **draw-and-hold works and is reachable** — the *Hold to snap* and
+> *Arrow* chips are in the toolbar, and a line, a rectangle, an arrow, a refused squiggle and an
+> undo were all driven over `adb` on `emulator-5554`.
+> What does **not** exist: **nothing in the UI creates a connector**, so the routing has no
+> production caller; no fill or corner-radius picker, so the painter's fill path has never run in
+> the app; shapes do not reach the published PDF. `docs/M8-CONNECTORS.md` §7 is the remaining work.
 
 ### Scope
 
@@ -1012,10 +1013,17 @@ arrow. SPEC §4.8.7.
 
 ### Acceptance
 
-- [ ] Shape snapping is predictable — no fighting it to draw a freehand curve
-- [ ] Connectors stay attached and reroute when a connected shape is moved or resized
+- [x] Shape snapping is predictable — no fighting it to draw a freehand curve *(emulator: a line, a
+      box and an arrow snapped; a zigzag squiggle did not, and stayed ink in `journal.ops`. **Not
+      yet judged by a hand on the tablet**, which is the only place the confidence bar can be
+      settled — SPEC §4.8.7.)*
+- [ ] Connectors stay attached and reroute when a connected shape is moved or resized *(implemented
+      and unit-tested against translate, resize and rotate; **no UI creates a connector**, so this
+      has never run in the app)*
 - [ ] Deleting a shape leaves its connectors in a defined state (detached, not dangling or crashing)
-- [ ] Connector attachment survives a sync round-trip
+      *(derived, tested in `ConnectorTest` and `ShapeRecordStorageTest`; same caveat)*
+- [ ] Connector attachment survives a sync round-trip *(survives a bundle round trip, a compaction
+      snapshot and both duplicate paths; **not yet exercised through `:core:sync`**)*
 
 ⚠️ **The third criterion must not be read as "persist a detachment"** (M8b). SPEC §4.2 already
 says a delete of an object that has not arrived records its tombstone anyway, and that an op

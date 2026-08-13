@@ -72,6 +72,26 @@ class InkUiState {
 
     var fingerDrawingEnabled by mutableStateOf(false)
 
+    /**
+     * ⭐ ROADMAP M8b — draw a shape, hold still, and the ink becomes the shape.
+     *
+     * On by default and switchable, because the acceptance criterion is *"no fighting it to draw a
+     * freehand curve"*: the honest answer to somebody it still fights is a switch, not a promise
+     * that the classifier's confidence bar is tuned correctly for their handwriting.
+     */
+    var shapeSnapEnabled by mutableStateOf(true)
+
+    /**
+     * Whether a snapped straight line gets an arrowhead.
+     *
+     * SPEC §4.8.7 — an arrowhead is a few samples at the end of a gesture and is indistinguishable
+     * from a hooked pen-lift, so it is never recognised. This is the choosing.
+     */
+    var arrowHeads by mutableStateOf(false)
+
+    /** What the last gesture snapped to, for the toolbar's one-line acknowledgement. Null once seen. */
+    var lastSnapped by mutableStateOf<String?>(null)
+
     var latency by mutableStateOf(LatencyStats.Snapshot(0, 0f, 0f))
 
     /** SPEC §3.3 — what the digitiser reports. See [StylusStats]; polled with [latency]. */

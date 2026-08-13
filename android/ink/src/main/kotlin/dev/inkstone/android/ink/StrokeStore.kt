@@ -9,6 +9,9 @@ import androidx.ink.geometry.ImmutableVec
 import androidx.ink.geometry.MutableVec
 import androidx.ink.geometry.Parallelogram
 import androidx.ink.strokes.Stroke
+import dev.inkstone.core.model.AnchorTarget
+import dev.inkstone.core.model.ConnectorEndState
+import dev.inkstone.core.model.ConnectorTargets
 import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.InkObject
 import dev.inkstone.core.model.Lasso
@@ -19,7 +22,10 @@ import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.SelectionEdit
+import dev.inkstone.core.model.ShapeObject
+import dev.inkstone.core.model.ShapeRecord
 import dev.inkstone.core.model.StrokeObject
+import dev.inkstone.core.model.asAnchorTarget
 import kotlin.math.abs
 import kotlin.math.sqrt
 
@@ -129,8 +135,11 @@ internal class DryStroke(
      * genuine [Parallelogram] (an affine image of one is, but ink's constructors build them
      * from a segment and a padding, so re-expressing a sheared one is not free), and the
      * erased region this test decides to extend is in that space anyway.
+     *
+     * [capsule] is the same sweep in the form a vector outline needs and is unused here — a
+     * tessellated mesh is measured by ink's own coverage test. See [DryObject.hitBy].
      */
-    override fun hitBy(sweptTip: Parallelogram): Boolean {
+    override fun hitBy(sweptTip: Parallelogram, capsule: ErasedRegion.Capsule): Boolean {
         ensureSpatialIndex()
         return stroke.shape.computeCoverageIsGreaterThan(sweptTip, 0f, AffineTransform.IDENTITY)
     }
@@ -203,6 +212,12 @@ internal class DryStroke(
  *
  * Not thread-safe: everything here runs on the UI thread, alongside ink capture.
  */
+// This class is the render side of the whole op vocabulary, so it has one small function per op
+// kind by construction — and SPEC §4.2 froze that vocabulary, which is what bounds the count.
+// Merging branches to satisfy a total is the opposite of what makes it checkable: the value of
+// `applyRegister` and its two helpers is that each writes one whole absolute value, visibly.
+// Suppressed rather than raising the shared threshold so nothing else inherits the exemption.
+@Suppress("TooManyFunctions")
 internal class StrokeStore {
 
     /**
@@ -226,6 +241,27 @@ internal class StrokeStore {
 
     /** Set when a z key changed or an object was inserted out of order. See [ink]. */
     private var orderDirty = false
+
+    /**
+     * ⭐ M8b — set whenever anything a connector's route could depend on changed.
+     *
+     * Re-routing is lazy and happens at most once per frame, in [forEachInRenderOrder], because a
+     * drag emits a `previewTransform` per frame and re-routing eagerly on each would do the work
+     * twice for the frames that never get drawn. It is O(connectors), not O(objects): a page has a
+     * handful of connectors and thousands of strokes.
+     *
+     * ⚠️ **This is not a cache of a persisted value.** Nothing about a route is ever written down
+     * (SPEC §4.8.3); this flag only decides *when* to recompute something that is always derived.
+     */
+    private var routesDirty = false
+
+    /**
+     * Ids this store has seen deleted, so a detached connector can say *which* kind of detached.
+     *
+     * Grows with the page's deletions and is cleared by [reset], which is the same lifetime as
+     * everything else here. See [remove].
+     */
+    private val tombstones = HashSet<ObjectId>()
 
     /**
      * ⭐ The highest z key on the page — where the **next** stroke goes.
@@ -366,11 +402,20 @@ internal class StrokeStore {
         // is a key `topZ` has not seen, and the next stroke then lands below it.
         raiseTop(dry.z)
         orderDirty = true
+        // An object arriving is a target appearing: a connector bound to it must re-resolve, which
+        // is how a detached end re-attaches with no op at all (SPEC §4.8.4).
+        tombstones -= dry.id
+        routesDirty = true
     }
 
     private fun remove(dry: DryObject) {
         (if (dry.drawsOverInk) highlight else ink).remove(dry)
         byId.remove(dry.id)
+        // ⚠️ Kept, so `unresolvedState` can tell a *deleted* target from one whose `AddObject` has
+        // not arrived (SPEC §4.8.4). The geometry is identical either way; only the label differs,
+        // and a store that dropped the id could never say which.
+        tombstones += dry.id
+        routesDirty = true
     }
 
     /**
@@ -430,6 +475,9 @@ internal class StrokeStore {
 
             is PageOp.SetTransform -> {
                 dry.setTransform(op.absolute)
+                // A peer's move re-routes every connector attached to it, here, with no op of its
+                // own — which is why `NoteEditor.reconcile` needs no connector case at all.
+                routesDirty = true
                 true
             }
 
@@ -451,25 +499,51 @@ internal class StrokeStore {
             // sealed kind is exhaustive on purpose — a kind added without deciding what a record
             // means for it will not compile, which is the alternative to it being dropped in
             // silence.
-            is PageOp.SetTextContent -> when (dry) {
-                is DryStroke -> false
+            is PageOp.SetTextContent -> applyContent(dry, op.text)
 
-                is DryPlaceholder -> {
-                    dry.setContent(op.text)
-                    true
-                }
-            }
-
-            is PageOp.SetFormat -> when (dry) {
-                is DryStroke -> false
-
-                is DryPlaceholder -> {
-                    dry.setFormat(op.record)
-                    true
-                }
-            }
+            is PageOp.SetFormat -> applyFormat(dry, op.record)
 
             else -> false
+        }
+    }
+
+    /**
+     * `SetTextContent` — a text box's words, or a shape's [ShapeRecord] (SPEC §4.8.2).
+     *
+     * Split out of [applyRegister] with [applyFormat] so that the thing worth reading there —
+     * *every branch writes a whole absolute value* — stays visible in one screen. The `when` over
+     * the sealed kind is exhaustive on purpose: a kind added without deciding what a record means
+     * for it will not compile, which is the alternative to it being dropped in silence.
+     */
+    private fun applyContent(dry: DryObject, text: String): Boolean = when (dry) {
+        is DryStroke -> false
+
+        // ⭐ M8b — for a shape this register *is* the fill, the corner radius and the connector's
+        // attachment, so a record arriving from a peer, from an undo, or a moment after its own
+        // `AddObject` has to reach the screen.
+        is DryShape -> {
+            dry.setRecord(text)
+            routesDirty = true
+            true
+        }
+
+        is DryPlaceholder -> {
+            dry.setContent(text)
+            true
+        }
+    }
+
+    /** `SetFormat` — SPEC §4.9.2's presentation record. */
+    private fun applyFormat(dry: DryObject, record: String): Boolean = when (dry) {
+        is DryStroke -> false
+
+        // Nothing yet: a format record is a text box's font and an image's crop, and a shape has
+        // neither. Carried in the log by the fold either way.
+        is DryShape -> false
+
+        is DryPlaceholder -> {
+            dry.setFormat(record)
+            true
         }
     }
 
@@ -500,8 +574,18 @@ internal class StrokeStore {
      * @return null only when the object has geometry that could not be decoded, which is a stroke
      *   whose blob this build cannot read. Everything else is held.
      */
-    private fun dryObjectFor(obj: InkObject, brushes: InkBrushFactory): DryObject? =
-        if (obj is StrokeObject) dryStrokeFor(obj, brushes) else DryPlaceholder.of(obj)
+    private fun dryObjectFor(obj: InkObject, brushes: InkBrushFactory): DryObject? = when (obj) {
+        is StrokeObject -> dryStrokeFor(obj, brushes)
+
+        // ⭐ M8b — a shape paints itself now. It arrives with no record: the `SetTextContent` that
+        // carries one is a separate op and may sort either side of this `AddObject` (SPEC §4.2),
+        // so the record is applied by `applyRegister` whenever it turns up and the shape is drawn
+        // plain until it does. A connector therefore appears as its own authored segment first and
+        // routes on the next op — which is exactly what it does for a detached end anyway.
+        is ShapeObject -> DryShape(obj).also { routesDirty = true }
+
+        else -> DryPlaceholder.of(obj)
+    }
 
     private fun dryStrokeFor(obj: StrokeObject, brushes: InkBrushFactory): DryStroke? {
         val decoded = StrokeGeometryCodec.decode(obj.geometry, brushes) ?: return null
@@ -528,6 +612,10 @@ internal class StrokeStore {
         erasedThisGesture.clear()
         inGesture = false
         orderDirty = false
+        // Another page's tombstones would make a connector on *this* page report a target as
+        // deleted when it had merely never been here — the wrong half of SPEC §4.8.4's pair.
+        tombstones.clear()
+        routesDirty = false
         // A different page's keys say nothing about this one's. Leaving it would put the first
         // stroke on the new page above or below everything for no reason the user could see.
         topZ = null
@@ -569,7 +657,65 @@ internal class StrokeStore {
     fun previewTransform(id: ObjectId, absolute: Matrix3) {
         val dry = byId[id] ?: return
         dry.setTransform(absolute)
+        // ⭐ Dragging a shape re-routes every connector attached to it, live, while the finger is
+        // down — and writes nothing (SPEC §4.8.3). This one line is what makes that visible; the
+        // op count is unchanged because a preview emits no ops at all.
+        routesDirty = true
         revision++
+    }
+
+    // --- Shapes and connectors (M8b) ----------------------------------------
+
+    /**
+     * A shape the user just made — draw-and-hold's render half.
+     *
+     * ⚠️ **Takes the ops rather than building them**, unlike [add]. A stroke's `AddObject` carries
+     * a geometry blob that only `androidx.ink`'s encoder can produce, so [add] mints the id here
+     * and defers the encoding to a worker. A shape's payload is a kind and two extents, so
+     * `ShapeEdit.create` builds the whole gesture in `:core:model` where a JVM test can reach it —
+     * and this method exists to put the *result* on screen without a second construction path that
+     * could disagree with it.
+     */
+    fun addShape(shape: ShapeObject, record: ShapeRecord) {
+        insert(DryShape(shape, record))
+        revision++
+    }
+
+    /**
+     * Re-derive every connector's path from the page as it stands.
+     *
+     * ⭐ **This writes nothing** (SPEC §4.8.3). It is called from [forEachInRenderOrder] when
+     * something has moved, so a re-route costs at most one pass per drawn frame; a connector whose
+     * geometry did not actually change is skipped, which is most of them on most frames.
+     */
+    private fun rerouteConnectors() {
+        routesDirty = false
+        var changed = false
+        for (dry in ink) {
+            if (dry is DryShape && dry.isConnector && dry.reroute(targets)) changed = true
+        }
+        if (changed) revision++
+    }
+
+    /**
+     * How [ConnectorRouting] sees this page.
+     *
+     * ⚠️ Answers from the **render state**, not from a fold — the surface does not hold one (see
+     * `ConnectorRouting.route`). `anchorable` reads the live [DryObject.transform] rather than the
+     * payload's, which is the whole point: the payload is first-write-wins and the live one is what
+     * a drag and a peer's `SetTransform` have moved.
+     */
+    private val targets = object : ConnectorTargets {
+        override fun anchorable(id: ObjectId): AnchorTarget? {
+            val shape = byId[id] as? DryShape ?: return null
+            return shape.obj.asAnchorTarget().copy(transform = shape.transform)
+        }
+
+        override fun unresolvedState(id: ObjectId): ConnectorEndState = when {
+            id in tombstones -> ConnectorEndState.DETACHED_TOMBSTONED
+            byId.containsKey(id) -> ConnectorEndState.DETACHED_UNANCHORABLE
+            else -> ConnectorEndState.DETACHED_ABSENT
+        }
     }
 
     /**
@@ -632,6 +778,10 @@ internal class StrokeStore {
      * visible stroke covers more pixels.
      */
     fun forEachInRenderOrder(visibleBounds: Box?, action: (DryObject) -> Unit) {
+        // ⭐ Before the cull, because a re-route changes `pageBounds` — routing after culling would
+        // drop a connector whose old box was off screen and whose new one is not, which reads as a
+        // connector that disappears when you drag the shape it is attached to.
+        if (routesDirty) rerouteConnectors()
         if (orderDirty) {
             // `(z, id)`, and not z alone: two devices can pick the same key, and a tie broken
             // by insertion order is a tie broken differently on each device — the same
@@ -751,7 +901,7 @@ internal class StrokeStore {
         if (!overlaps(dry.pageBounds, coarse)) return null
 
         if (dry.transform == Matrix3.Identity) {
-            return if (dry.hitBy(sweep.pageTip)) sweep.pageCapsule else null
+            return if (dry.hitBy(sweep.pageTip, sweep.pageCapsule)) sweep.pageCapsule else null
         }
 
         // Both ends or neither: a half-mapped segment is not a shorter erase, it is a wrong one.
@@ -766,11 +916,8 @@ internal class StrokeStore {
             ),
             radius,
         )
-        return if (dry.hitBy(tip)) {
-            ErasedRegion.Capsule(scratch.from.x, scratch.from.y, scratch.to.x, scratch.to.y, radius)
-        } else {
-            null
-        }
+        val local = ErasedRegion.Capsule(scratch.from.x, scratch.from.y, scratch.to.x, scratch.to.y, radius)
+        return if (dry.hitBy(tip, local)) local else null
     }
 
     private fun applyErase(

@@ -70,6 +70,27 @@ fun InkToolbar(state: InkUiState, actions: InkToolbarActions, modifier: Modifier
                 TextButton(onClick = { measurePanelOpen = !measurePanelOpen }) { Text("Measure") }
             }
 
+            // ⭐ ROADMAP M8b — draw-and-hold. In the main row rather than behind "Measure",
+            // because it changes what the pen does and a setting that changes the pen has to be
+            // where the pen is. The acknowledgement is what makes the feature discoverable: the
+            // first time it fires, the user finds out *why* their line straightened.
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                FilterChip(
+                    selected = state.shapeSnapEnabled,
+                    onClick = { state.shapeSnapEnabled = !state.shapeSnapEnabled },
+                    label = { Text("Hold to snap") },
+                )
+                FilterChip(
+                    selected = state.arrowHeads,
+                    onClick = { state.arrowHeads = !state.arrowHeads },
+                    enabled = state.shapeSnapEnabled,
+                    label = { Text("Arrow") },
+                )
+                state.lastSnapped?.let {
+                    Text("snapped to $it", style = MaterialTheme.typography.labelSmall)
+                }
+            }
+
             // ⭐ ROADMAP M8a. Shown only when something is selected: an action row that is
             // always there but usually disabled says the tool is broken rather than idle.
             AnimatedVisibility(visible = state.selectionSize > 0) {

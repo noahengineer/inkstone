@@ -371,6 +371,15 @@ Collected during research so they don't get reintroduced from stale training dat
   top of the page, so **the next stroke the user draws lands underneath it** — on screen, in the
   PDF's `/Annots` order, and on every peer, with nothing connecting the two actions. The maximum
   belongs to whatever sees *every* writer, which is `StrokeStore`.
+- ⚠️ **"Hold still" cannot be detected from input samples alone, and the version that can't is the
+  one that works on your hand** (M8b). Android delivers `ACTION_MOVE` when the digitiser reports a
+  change, so a stylus held genuinely still can stop producing events altogether — and holding still
+  is exactly what draw-and-hold asks the user to do. A dwell check that only runs inside `onMove`
+  therefore fires for a trembling hand and never for a steady one: intermittent, hardware-dependent,
+  and it demos perfectly. `ShapeSnapDetector.sample` returns *milliseconds remaining* rather than a
+  boolean so the caller can `postDelayed` the fallback and cancel it on movement. The emulator walk
+  exercises the timer path specifically, by holding through a `sleep 1.5` with no events at all —
+  which is also the only way `adb shell input motionevent` can express a hold.
 - ⚠️ **A register that only one object kind can carry is a register three copy paths will drop**
   (M8b). `SetTextContent` was a text box's field for six milestones: `PageFolder.materialise`
   applied it only to a `TextBoxObject`, `Undo.inverseOf` cast the target to one, and

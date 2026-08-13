@@ -110,12 +110,7 @@ public enum class ListStyle { NONE, BULLET, NUMBERED }
 public sealed interface ImageCrop {
 
     /** The common case, and the one with drag handles. Fractions in `[0,1]`, `left < right`. */
-    public data class Rect(
-        val left: Float,
-        val top: Float,
-        val right: Float,
-        val bottom: Float,
-    ) : ImageCrop {
+    public data class Rect(val left: Float, val top: Float, val right: Float, val bottom: Float) : ImageCrop {
         public val isWhole: Boolean
             get() = left <= 0f && top <= 0f && right >= 1f && bottom >= 1f
     }
@@ -251,7 +246,10 @@ internal object ObjectFormatCodec {
     }
 
     private fun encodeRect(crop: ImageCrop.Rect): String = listOf(
-        crop.left, crop.top, crop.right, crop.bottom,
+        crop.left,
+        crop.top,
+        crop.right,
+        crop.bottom,
     ).joinToString(PART.toString()) { RecordText.number(it) }
 
     private fun decodeRect(value: String): ImageCrop.Rect? {

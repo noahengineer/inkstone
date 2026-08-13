@@ -21,9 +21,12 @@ import dev.inkstone.core.model.FitMode
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.Offset
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
+import dev.inkstone.core.model.ShapeEdit
+import dev.inkstone.core.model.ShapeKind
 import dev.inkstone.core.model.Viewport
 import dev.inkstone.core.model.ZoomLimits
 import dev.inkstone.core.model.cameraFor
@@ -77,6 +80,14 @@ import dev.inkstone.core.model.zoomedAround
  * [predictionEnabled] exists so the difference can still be felt on the device.
  * See `docs/M1-INK.md`.
  */
+// The project's detekt config already records why this rule judges this class worst: its members
+// are lifecycle, camera, strokes, history, and one small named handler per input transition, and
+// collapsing them into fewer larger methods to satisfy a count would make the ink path harder to
+// read — which is the one place in this app where reading it easily matters most. M8b added two
+// (`toPageSpace`, `trySnap`) and put the rest of draw-and-hold in `ShapeSnapController`, which is
+// the extraction the rule is actually asking for. Suppressed here rather than by raising the
+// shared threshold, so no other class inherits the exemption.
+@Suppress("TooManyFunctions")
 public class InkSurfaceView @JvmOverloads constructor(
     context: Context,
     attrs: AttributeSet? = null,
@@ -196,6 +207,27 @@ public class InkSurfaceView @JvmOverloads constructor(
 
     /** The A/B switch for the SPEC Appendix B #2 spike. */
     public var predictionEnabled: Boolean = true
+
+    /**
+     * ⭐ ROADMAP M8b — draw a shape, hold still, and the ink becomes the shape.
+     *
+     * A **setting**, and on by default, because the acceptance criterion is *"no fighting it to
+     * draw a freehand curve"* and the honest answer to somebody it still fights is a switch rather
+     * than a promise. It costs nothing when off: [ShapeSnapDetector.begin] is simply not called,
+     * so the per-sample path is byte-for-byte what it was.
+     */
+    public var shapeSnapEnabled: Boolean
+        get() = snap.enabled
+        set(value) {
+            snap.enabled = value
+        }
+
+    /** When on, a snapped straight line gets an arrowhead. See `ShapeSnapController`. */
+    public var arrowHeads: Boolean
+        get() = snap.arrowHeads
+        set(value) {
+            snap.arrowHeads = value
+        }
 
     /**
      * The input smoothing model — the "does it track the nib or chase a
@@ -739,6 +771,9 @@ public class InkSurfaceView @JvmOverloads constructor(
         strokes.beginEdit()
         activeStrokeKind = pen.kind
         strokePointerId = pointerId
+        // ⭐ M8b — armed here, fed in `onMove`, and it allocates nothing on either path.
+        toPageSpace(event.getX(event.actionIndex), event.getY(event.actionIndex), snapPoint)
+        snap.begin(snapPoint.x, snapPoint.y, event.eventTime)
         activeStrokeId = wetView.startStroke(
             event = event,
             pointerId = pointerId,
@@ -749,6 +784,90 @@ public class InkSurfaceView @JvmOverloads constructor(
             strokeToWorldTransform = IDENTITY,
         )
     }
+
+    /**
+     * ⭐ ROADMAP M8b — draw-and-hold. Two call sites: armed in [beginStroke], fed in [onMove].
+     *
+     * A controller rather than four more methods here, for the reason [eraser] and
+     * [selectionController] are: this class owns `MotionEvent` dispatch, and dispatch is the one
+     * thing in the app that has to stay readable.
+     */
+    private val snap = ShapeSnapController(
+        store = strokes,
+        brushes = brushFactory,
+        cancelWetStroke = {
+            // Null event: on the timer path there is no event, because the whole reason the timer
+            // exists is that the digitiser stopped sending them. `cancelStroke` takes one only to
+            // release its own pointer bookkeeping and tolerates its absence.
+            activeStrokeId?.let { wetView.cancelStroke(it, null) }
+            activeStrokeId = null
+            strokePointerId = MotionEvent.INVALID_POINTER_ID
+        },
+        onSnapped = { kind ->
+            dryView.onStoreChanged()
+            onStrokeCountChanged?.invoke(strokes.size)
+            onHistoryChanged?.invoke()
+            onShapeSnapped?.invoke(kind)
+        },
+    )
+
+    private val snapPoint = PagePointF()
+
+    /**
+     * View coordinates -> page space.
+     *
+     * The same two divisions `SelectionController` uses, and deliberately not a `Matrix.mapPoints`:
+     * this runs per input sample and a `Matrix` round trip allocates a `FloatArray` unless the
+     * caller keeps one, which is a second thing to get wrong for arithmetic this short.
+     */
+    private fun toPageSpace(viewX: Float, viewY: Float, into: PagePointF) {
+        into.set((viewX - camera.translate.x) / camera.scale, (viewY - camera.translate.y) / camera.scale)
+    }
+
+    /**
+     * One sample into the dwell detector, and the timer that covers a pen too still to report.
+     *
+     * ⚠️ The timer is not belt and braces. Android delivers `ACTION_MOVE` when the digitiser
+     * reports a change, so a pen held genuinely still can stop producing events — and holding
+     * perfectly still is exactly what the user was asked to do. See [ShapeSnapDetector.sample].
+     */
+    private fun trySnap(event: MotionEvent) {
+        toPageSpace(event.getX(event.actionIndex), event.getY(event.actionIndex), snapPoint)
+        when (val remaining = snap.sample(snapPoint.x, snapPoint.y, event.eventTime)) {
+            ShapeSnapDetector.NOT_HOLDING -> removeCallbacks(snapTimer)
+
+            ShapeSnapDetector.FIRE_NOW -> {
+                removeCallbacks(snapTimer)
+                snapNow()
+            }
+
+            // Settled but not for long enough. Re-posted per sample while still, which is a
+            // message-queue swap and not work on the pen-to-pixel path.
+            else -> {
+                removeCallbacks(snapTimer)
+                postDelayed(snapTimer, remaining)
+            }
+        }
+    }
+
+    /** One instance, reused — a fresh lambda per sample would allocate on the ink path (rule 7). */
+    private val snapTimer = Runnable {
+        if (snap.holdElapsed(SystemClock.uptimeMillis())) snapNow()
+    }
+
+    /**
+     * ⚠️ **Closes the gesture bracket [beginStroke] opened**, which `onStrokesFinished` normally
+     * would — and it will never fire, because the stroke is cancelled rather than finished.
+     * Leaving it open folds the *next* stroke into the same undo entry, so "draw a box, hold,
+     * draw a line, undo" would remove both.
+     */
+    private fun snapNow() {
+        val widthPt = pen.widthDp * displayMetrics.density / pixelsPerPoint
+        if (snap.snap(pen.colorArgb, widthPt)) strokes.endEdit()
+    }
+
+    /** Fired after a gesture snapped, so the toolbar can say what it became. */
+    public var onShapeSnapped: ((ShapeKind) -> Unit)? = null
 
     private fun onMove(event: MotionEvent): Boolean {
         val strokeId = activeStrokeId
@@ -763,6 +882,10 @@ public class InkSurfaceView @JvmOverloads constructor(
             // would silently drop every one of those (SPEC §3.3).
             val prediction = if (predictionEnabled) predictor?.predict() else null
             wetView.addToStroke(event, strokePointerId, strokeId, prediction)
+            // ⭐ M8b — after the ink, never before it. Two float writes and a distance compare
+            // (see [ShapeSnapDetector]); putting it ahead of `addToStroke` would add its cost to
+            // the pen-to-pixel path that SPEC §3.6 measures, for no benefit at all.
+            if (snap.isArmed) trySnap(event)
             return true
         }
         if (eraser.isActive) {
@@ -796,6 +919,11 @@ public class InkSurfaceView @JvmOverloads constructor(
                     }
                 }
                 if (cancelled) strokes.endEdit()
+                // ⭐ M8b — disarmed whichever way the gesture ended. A detector left armed would
+                // measure the *next* stroke's dwell against this one's anchor and travel, and a
+                // timer left posted would snap a gesture the user had already finished.
+                snap.cancel()
+                removeCallbacks(snapTimer)
                 activeStrokeId = null
                 strokePointerId = MotionEvent.INVALID_POINTER_ID
             }

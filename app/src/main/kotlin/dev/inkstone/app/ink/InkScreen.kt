@@ -278,6 +278,9 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
                 onEraserAutoReleased = { ui.tool = InkTool.PEN }
                 // ⭐ M8a — what the selection action row is shown and enabled by.
                 onSelectionChanged = { count -> ui.selectionSize = count }
+                // ⭐ M8b — the acknowledgement. Without it the first snap is indistinguishable
+                // from the app having eaten the stroke and drawn something else.
+                onShapeSnapped = { kind -> ui.lastSnapped = kind.name.lowercase() }
                 // ⭐ M12 §3 — the timeline's only input. Fired on the UI thread in the frame the
                 // dry layer redraws, so the view model does one subtraction and one enqueue and
                 // returns (CLAUDE.md rule 7); the file append rides the journal's own rhythm.
@@ -295,6 +298,10 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
             view.predictionEnabled = ui.predictionEnabled
             view.inputModel = ui.inputModel
             view.fingerDrawingEnabled = ui.fingerDrawingEnabled
+            // ⭐ M8b — the same missing-assignment trap the `tool` line above records. Two chips
+            // that highlight and change nothing is exactly what definition-of-done #6 is about.
+            view.shapeSnapEnabled = ui.shapeSnapEnabled
+            view.arrowHeads = ui.arrowHeads
         },
     )
 }

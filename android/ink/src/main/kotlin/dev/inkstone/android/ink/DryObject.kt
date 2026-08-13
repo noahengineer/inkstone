@@ -190,13 +190,21 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
     fun asSelected(): SelectedObject = SelectedObject(id, transform, z)
 
     /**
-     * True when [sweptTip] — in **this object's own space** — covers any painted part of it.
+     * True when the eraser's sweep — in **this object's own space** — covers any painted part of it.
      *
      * The caller maps the query here with [toLocal] rather than handing a `meshToQuery` transform
      * down, so the query stays a genuine [Parallelogram] and the erased region this decides to
      * extend is already in the right space.
+     *
+     * ⚠️ **The same sweep arrives twice, in two forms, and each kind uses exactly one** (M8b).
+     * [DryStroke]'s painted area is a tessellated mesh, and only `androidx.ink` can measure it —
+     * it takes [sweptTip]. [DryShape]'s painted area is a handful of segments and cubics, and the
+     * answer is arithmetic over [capsule] (see `ShapeHit`). Passing both is deliberately preferred
+     * to reconstructing one from the other: a parallelogram rebuilt from a capsule, or vice versa,
+     * is a second definition of "what the eraser swept" that could drift from the one the region
+     * actually records.
      */
-    abstract fun hitBy(sweptTip: Parallelogram): Boolean
+    abstract fun hitBy(sweptTip: Parallelogram, capsule: ErasedRegion.Capsule): Boolean
 
     /**
      * Every silhouette vertex, in **page space** — what a lasso is tested against.
@@ -302,7 +310,7 @@ internal class DryPlaceholder(val obj: InkObject, widthPt: Float, heightPt: Floa
     }
 
     /** False, always — see the class KDoc. An eraser must not bite what it cannot draw. */
-    override fun hitBy(sweptTip: Parallelogram): Boolean = false
+    override fun hitBy(sweptTip: Parallelogram, capsule: ErasedRegion.Capsule): Boolean = false
 
     /**
      * Emits nothing, and the emptiness is the decision rather than an omission — see the class

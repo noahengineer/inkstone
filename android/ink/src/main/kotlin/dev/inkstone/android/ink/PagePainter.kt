@@ -250,12 +250,66 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
         when (dry) {
             is DryStroke -> renderer.draw(canvas, dry.stroke, strokeToCanvas)
 
+            is DryShape -> paintShape(canvas, dry)
+
             // Nothing, on purpose — see [DryPlaceholder]. It holds its place in the z-order and
             // carries its registers; a painter for images and text boxes is the next step owed,
             // and it arrives as a new [DryObject] kind with a branch here, not as a flag on this
             // one.
             is DryPlaceholder -> Unit
         }
+    }
+
+    /**
+     * ⭐ M8b — a shape or a connector, in its own space.
+     *
+     * **Fill first, then the outline**, so a stroke of the same colour reads as an edge rather than
+     * thickening the fill inwards and outwards unevenly. The fill is skipped for a kind with no
+     * interior (`ShapeGeometry.isFillable`) whatever colour the record asks for — a line has no
+     * inside, and filling its degenerate path draws a hairline artefact along it.
+     *
+     * ⚠️ **The opacity is multiplied into the colour's own alpha**, exactly as `DryStroke` does for
+     * a restyled highlighter, rather than set on the paint: `ObjectStyle.opacity` and
+     * `ShapeRecord.fillOpacity` are both *"this fraction of what it already was"*, so replacing the
+     * alpha would make a 50% wash of an already-translucent colour come out more opaque than the
+     * colour it started from.
+     *
+     * ⚠️ **No blend mode, deliberately.** SPEC §3.4 and CLAUDE.md: `InProgressStrokesView`
+     * front-buffers through a `SurfaceView` that only alpha-blends, so anything whose dry rendering
+     * used a blend mode would visibly change the instant the gesture landed. A translucent fill is
+     * plain alpha for the same reason the highlighter is.
+     */
+    private fun paintShape(canvas: Canvas, dry: DryShape) {
+        val record = dry.record
+        val style = dry.style ?: dry.obj.style
+        if (dry.fillable) {
+            val fill = record.fillArgb ?: 0
+            fillPaint.color = fill.withOpacity(record.fillOpacity)
+            canvas.drawPath(dry.path, fillPaint)
+        }
+        val width = style?.widthPt ?: DEFAULT_SHAPE_WIDTH_PT
+        if (width <= 0f) return
+        shapePaint.color = (style?.colorArgb ?: DEFAULT_SHAPE_COLOR).withOpacity(style?.opacity ?: 1f)
+        shapePaint.strokeWidth = width
+        canvas.drawPath(dry.path, shapePaint)
+        // The head is rebuilt rather than cached because it is two lines and it depends on the
+        // stroke width the *style register* currently says — which a peer can change without the
+        // outline changing at all.
+        dry.arrowHead(width * ARROW_HEAD_WIDTHS)?.let { canvas.drawPath(it, shapePaint) }
+    }
+
+    /** Filled interior. Antialiased, no blend mode — see [paintShape]. */
+    private val fillPaint = Paint().apply {
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+
+    /** The outline and the arrowhead. Round joins, because a mitre on a tight corner spikes. */
+    private val shapePaint = Paint().apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+        isAntiAlias = true
     }
 
     /** Reused every frame — `onDraw` must not allocate (CLAUDE.md rule 7). */
@@ -289,8 +343,32 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
         out.setValues(matrixValues)
     }
 
+    /**
+     * An ARGB colour at [opacity] of its own alpha.
+     *
+     * The same arithmetic `StrokeStore` applies when a restyle reaches a brush, and duplicated here
+     * rather than shared because that one is private to a file about brushes and this is a paint.
+     * If a third appears, hoist all three.
+     */
+    private fun Int.withOpacity(opacity: Float): Int {
+        if (opacity >= 1f) return this
+        val alpha = ((this ushr ALPHA_SHIFT and BYTE_MAX) * opacity).toInt().coerceIn(0, BYTE_MAX)
+        return (alpha shl ALPHA_SHIFT) or (this and RGB_MASK)
+    }
+
     private companion object {
         const val PAGE_BORDER_COLOR = 0x22000000
+
+        /** What a shape drawn before anything restyled it looks like — the pen's default weight. */
+        const val DEFAULT_SHAPE_WIDTH_PT = 2f
+        const val DEFAULT_SHAPE_COLOR = 0xFF1A1A1A.toInt()
+
+        /** Barb length as a multiple of the line width — proportional, so it survives a resize. */
+        const val ARROW_HEAD_WIDTHS = 5f
+
+        const val ALPHA_SHIFT = 24
+        const val BYTE_MAX = 0xFF
+        const val RGB_MASK = 0x00FFFFFF
         const val LAYER_PADDING_PT = 2f
         const val MATRIX_VALUES = 9
     }

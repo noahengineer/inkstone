@@ -254,21 +254,19 @@ internal class PdfCidFont private constructor(
             }
         }
 
-        private fun bbox(header: com.tom_roush.fontbox.ttf.HeaderTable, scale: Double): COSArray =
-            COSArray().apply {
-                add(COSInteger.get((header.xMin * scale).toLong()))
-                add(COSInteger.get((header.yMin * scale).toLong()))
-                add(COSInteger.get((header.xMax * scale).toLong()))
-                add(COSInteger.get((header.yMax * scale).toLong()))
-                markUpdated(this)
-            }
+        private fun bbox(header: com.tom_roush.fontbox.ttf.HeaderTable, scale: Double): COSArray = COSArray().apply {
+            add(COSInteger.get((header.xMin * scale).toLong()))
+            add(COSInteger.get((header.yMin * scale).toLong()))
+            add(COSInteger.get((header.xMax * scale).toLong()))
+            add(COSInteger.get((header.yMax * scale).toLong()))
+            markUpdated(this)
+        }
 
-        private fun flate(document: PDDocument, bytes: ByteArray) =
-            com.tom_roush.pdfbox.pdmodel.common.PDStream(
-                document,
-                ByteArrayInputStream(bytes),
-                COSName.FLATE_DECODE,
-            ).cosObject.also { markUpdated(it) }
+        private fun flate(document: PDDocument, bytes: ByteArray) = com.tom_roush.pdfbox.pdmodel.common.PDStream(
+            document,
+            ByteArrayInputStream(bytes),
+            COSName.FLATE_DECODE,
+        ).cosObject.also { markUpdated(it) }
 
         /**
          * The six-letter subset tag PDF 32000-1 §9.6.4 requires on an embedded subset.
