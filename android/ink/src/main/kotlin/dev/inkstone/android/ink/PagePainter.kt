@@ -130,15 +130,15 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
     }
 
     /**
-     * Every stroke in [store], in render order.
+     * Every object in [store], in render order.
      *
      * @param pageToCanvas the transform the canvas already carries. Passed on to the ink
      *   renderer as its antialiasing scale — see the class KDoc, point 3.
      * @param visibleBounds page-space culling rect, or null to draw everything. A thumbnail
      *   passes null: the whole page is "on screen" by definition.
      */
-    fun paintStrokes(canvas: Canvas, store: StrokeStore, pageToCanvas: Matrix, visibleBounds: Box?) {
-        store.forEachInRenderOrder(visibleBounds) { dry -> paintStroke(canvas, dry, pageToCanvas) }
+    fun paintObjects(canvas: Canvas, store: StrokeStore, pageToCanvas: Matrix, visibleBounds: Box?) {
+        store.forEachInRenderOrder(visibleBounds) { dry -> paintObject(canvas, dry, pageToCanvas) }
     }
 
     /**
@@ -161,7 +161,7 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
     }
 
     /**
-     * ⭐ M8a — draws one stroke **through its own transform**.
+     * ⭐ M8a — draws one object **through its own transform**.
      *
      * The object's matrix is concatenated onto the canvas rather than applied to the geometry,
      * for the reason SPEC §3.5 gives about erasing and SPEC §5.4 about the blob: the stroke is
@@ -176,10 +176,10 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
      * resized it" and is not obviously a transform problem at all.
      *
      * Once concatenated, **the canvas is in the object's own space** — which is the space the
-     * erased region and the stroke's bounds are already in, so everything below this line is
-     * unchanged from before M8a and needs no mapping.
+     * erased region and the object's [DryObject.bounds] are already in, so everything below this
+     * line is unchanged from before M8a and needs no mapping.
      */
-    private fun paintStroke(canvas: Canvas, dry: DryStroke, pageToCanvas: Matrix) {
+    private fun paintObject(canvas: Canvas, dry: DryObject, pageToCanvas: Matrix) {
         val transform = dry.transform
         if (transform == Matrix3.Identity) {
             paintInObjectSpace(canvas, dry, pageToCanvas)
@@ -195,21 +195,27 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
     }
 
     /**
-     * Draws one stroke, minus whatever an eraser has taken out of it, onto a canvas that is
-     * already in the stroke's own space.
+     * Draws one object, minus whatever an eraser has taken out of it, onto a canvas that is
+     * already in the object's own space.
      *
-     * The layer is bounded to the stroke, and only strokes that have actually been erased
+     * The layer is bounded to the object, and only objects that have actually been erased
      * pay for one at all, so the common case is untouched.
+     *
+     * ⭐ **M8c — the compositing is the shared half and the content is not.** This
+     * `saveLayer`/`DST_OUT` sandwich is kind-agnostic by construction: it needs the object's own
+     * box and its swept region, both of which every [DryObject] has, and it punches the region out
+     * of whatever was drawn into the layer. Anything a later kind draws inherits erasing for free,
+     * which is `docs/M8-CONNECTORS.md` §6 item 2's stated payoff.
      */
-    private fun paintInObjectSpace(canvas: Canvas, dry: DryStroke, strokeToCanvas: Matrix) {
+    private fun paintInObjectSpace(canvas: Canvas, dry: DryObject, strokeToCanvas: Matrix) {
         val erased = dry.erased
         val bounds = dry.bounds
         if (erased == null || bounds == null) {
-            renderer.draw(canvas, dry.stroke, strokeToCanvas)
+            paintContent(canvas, dry, strokeToCanvas)
             return
         }
 
-        // The layer must cover the whole stroke, because the whole stroke is drawn into it.
+        // The layer must cover the whole object, because the whole object is drawn into it.
         // Padding keeps the brush's own antialiased edge from being cut off by the layer
         // boundary.
         layerBounds.set(
@@ -219,7 +225,7 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
             bounds.yMax + LAYER_PADDING_PT,
         )
         val layer = canvas.saveLayer(layerBounds, null)
-        renderer.draw(canvas, dry.stroke, strokeToCanvas)
+        paintContent(canvas, dry, strokeToCanvas)
         // One stroked draw per constant-radius run. Skia expands the polyline into the swept
         // capsule, caches the tessellation, and resolves the path's self-overlap in a single
         // coverage pass — so a scribbled erase does not double-darken its own crossings.
@@ -230,6 +236,26 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
             canvas.drawPath(run.path, eraserPaint)
         }
         canvas.restoreToCount(layer)
+    }
+
+    /**
+     * ⭐ M8c — what the object actually *is*, drawn in its own space.
+     *
+     * Exhaustive over the sealed [DryObject], and that is the point of it being sealed: a kind
+     * added without a painter is a compile error here rather than an object that is in the log, in
+     * the z-order and invisible on the glass. SPEC §4.9.3 describes exactly that state, and it is
+     * survivable only for as long as it is *deliberate*.
+     */
+    private fun paintContent(canvas: Canvas, dry: DryObject, strokeToCanvas: Matrix) {
+        when (dry) {
+            is DryStroke -> renderer.draw(canvas, dry.stroke, strokeToCanvas)
+
+            // Nothing, on purpose — see [DryPlaceholder]. It holds its place in the z-order and
+            // carries its registers; a painter for images and text boxes is the next step owed,
+            // and it arrives as a new [DryObject] kind with a branch here, not as a flag on this
+            // one.
+            is DryPlaceholder -> Unit
+        }
     }
 
     /** Reused every frame — `onDraw` must not allocate (CLAUDE.md rule 7). */

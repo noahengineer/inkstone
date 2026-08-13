@@ -5,6 +5,7 @@ import dev.inkstone.core.model.Document
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageRef
@@ -38,9 +39,9 @@ import kotlinx.serialization.json.long
  * 200-page notebook reads `manifest.json` and the page being drawn, and nothing else.
  * [BundleReader] is that; it never materialises a page it was not asked for.
  *
- * Assets and recognised text are M7/M8 material. Their paths are fixed here, and
- * [BundleWriter] carries any entry it was given through unchanged, so a note that
- * gains them later is not a format change.
+ * Every family above is **known** — written from [BundleContents] and excluded from
+ * [BundleReader.carriedNames]. Anything else is carried through unchanged, so a note that
+ * gains an entry from a newer build is not a format change (SPEC §5.8).
  */
 public object Bundle {
 
@@ -54,6 +55,35 @@ public object Bundle {
     public fun pageInk(id: PageId): String = "$PAGES_DIR${id.value}.ink"
 
     public fun pageText(id: PageId): String = "$TEXT_DIR${id.value}.json"
+
+    /**
+     * ⭐ **The name of an inserted image's bytes — SPEC §5.3, and a *written* family since M8c.**
+     *
+     * The id is the [ObjectId] of the [dev.inkstone.core.model.ImageObject] that first named it,
+     * which makes the name a UUIDv7 and therefore globally unique without any coordination. That
+     * is the whole of the merge rule in [NoteStore.materialize]: two devices cannot mint the same
+     * name for different bytes, so a union by name needs no comparison and no tiebreak.
+     *
+     * ⚠️ **The name outlives the object that minted it, and asset lifetime is therefore
+     * refcount-free: nothing in this app may ever delete an asset.** `ImageObject.asset` is a
+     * plain string, so it *survives re-identification* — `copiedObjectOps` mints a fresh
+     * [ObjectId] for the copy and leaves the asset string alone, and after one duplicate two
+     * objects name one entry. A collector that deleted `assets/img-<id>.webp` when object `<id>`
+     * was tombstoned would therefore blank the *copy*, not the original, and the failure would be
+     * a blank rectangle: defined, non-crashing and silent. The bytes are small, bounded by the
+     * number of pictures a person inserts, and cheaper than that bug.
+     */
+    public fun imageAsset(id: ObjectId): String = "${ASSETS_DIR}img-${id.value}.webp"
+
+    /**
+     * True for an entry belonging to the `assets/` family.
+     *
+     * A function rather than an inline `startsWith` at each site because it is asked in four
+     * places that must agree exactly — the writer, the reader's carried set, [BundleContents]'s
+     * normalisation and [NoteStore.materialize]'s union — and a family that is written by one of
+     * them and carried by another becomes two ZIP entries with one name (see [BundleWriter]).
+     */
+    public fun isAsset(name: String): Boolean = name.startsWith(ASSETS_DIR)
 
     internal const val F_SCHEMA = "schemaVersion"
     internal const val F_DOCUMENT_ID = "documentId"
@@ -124,8 +154,12 @@ public object Bundle {
  * @param highestClockCounter the highest Lamport counter across the note's **page ops**, so an
  *   open can seed its generator without folding every page (SPEC §4.1's `max + 1`). Raised to
  *   cover the title clock — see the property of the same name.
- * @property carried entries this build did not produce — recognised text, assets, and
- *   anything a newer version added. Copied through byte-for-byte (SPEC §5.8).
+ * @param carried entries this build did not produce — anything a newer version added. Copied
+ *   through byte-for-byte (SPEC §5.8). Entries under `assets/` handed in here are **moved** into
+ *   [assets]; see that property.
+ * @param assets SPEC §5.3's `assets/` family — inserted image bytes, keyed by full entry name
+ *   (`assets/img-<objectId>.webp`, [Bundle.imageAsset]), which is what
+ *   [dev.inkstone.core.model.ImageObject.asset] holds.
  * @property carriedManifest manifest members this build does not understand, kept so a
  *   round trip does not delete a newer version's document metadata (SPEC §5.8). See
  *   [Bundle.KNOWN_MANIFEST_FIELDS].
@@ -134,9 +168,34 @@ public class BundleContents(
     public val document: Document,
     public val pages: Map<PageId, PageContents>,
     highestClockCounter: Long,
-    public val carried: Map<String, ByteArray> = emptyMap(),
+    carried: Map<String, ByteArray> = emptyMap(),
     public val carriedManifest: Map<String, JsonElement> = emptyMap(),
+    assets: Map<String, ByteArray> = emptyMap(),
 ) {
+
+    /**
+     * ⭐ **`assets/`, normalised here so that "written *and* carried" is unrepresentable.**
+     *
+     * Until M8c nothing wrote an asset, so the family rode through as *carried unknown* bytes:
+     * [BundleReader.carriedNames] is defined by exclusion, and `assets/` was simply not on the
+     * excluded list. M8c gives it a writer, and SPEC §5.3 states the trap that creates —
+     * `Zip.write` neither de-duplicates nor complains, so an entry produced by both paths becomes
+     * **two ZIP entries with one name** and which one a reader sees depends on map iteration
+     * order. Two states, one file, no error. That is M7's `text/` trap verbatim.
+     *
+     * There are four writers of a bundle (a materialize, a compaction snapshot, a recovered
+     * import and a conflicted copy) and this invariant belongs to none of them, so it lives on
+     * the type they all go through — the same argument [highestClockCounter] makes just below.
+     * A caller may therefore hand assets in through either parameter, or through a map it has
+     * not inspected (`MergeReport.carried` is one such), and the bundle still gets one entry per
+     * name.
+     *
+     * Both initialisers read the **constructor parameters**, not these properties.
+     */
+    public val assets: Map<String, ByteArray> = carried.filterKeys { Bundle.isAsset(it) } + assets
+
+    /** Carried entries with the `assets/` family taken out of them — see [assets]. */
+    public val carried: Map<String, ByteArray> = carried.filterKeys { !Bundle.isAsset(it) }
 
     /**
      * ⭐ **The highest counter anywhere in the note — page ops *and*
@@ -178,10 +237,10 @@ public class PageContents(
 /**
  * Serialises a [BundleContents] to bytes.
  *
- * Deterministic: entry order is manifest, then pages in document order, then carried
- * entries by name; the ZIP is stored and unstamped (see [Zip]). Two bundles with the
- * same content are the same bytes, which is ROADMAP M2's *"save → load → save →
- * byte-identical"*.
+ * Deterministic: entry order is manifest, then pages in document order, then `assets/` by
+ * name, then carried entries by name; the ZIP is stored and unstamped (see [Zip]). Two
+ * bundles with the same content are the same bytes, which is ROADMAP M2's *"save → load →
+ * save → byte-identical"*.
  */
 public object BundleWriter {
 
@@ -209,6 +268,27 @@ public object BundleWriter {
             // decode to a `PageText` with no digest, which `PageTextMerge` would then have
             // to distinguish from "not recognised yet". Absent already means that.
             page.text?.let { entries += Zip.Entry(Bundle.pageText(ref.id), it) }
+        }
+
+        // SPEC §5.3 — `assets/` is a *written* family since M8c, not a carried unknown. Sorted
+        // by name for the same reason the carried block below is: `toSortedMap` is JVM-only, and
+        // two bundles with the same content have to be the same bytes.
+        for (entry in contents.assets.entries.sortedBy { it.key }) {
+            entries += Zip.Entry(entry.key, entry.value)
+        }
+
+        // ⚠️ SPEC §5.3's *"a family may not be both written and carried"*, as an executable
+        // check rather than a remembered rule. `Zip.write` appends whatever it is handed, so a
+        // name in both sets becomes two entries with one name and the reader's winner depends on
+        // map iteration order — silent, and the two devices need not agree. [BundleContents]
+        // already makes that unrepresentable for `assets/`; this catches the *next* family to
+        // gain a writer, which is how `text/` got here in M7 and `assets/` in M8c. A caller that
+        // hands a written name in as carried has made a programming error, so it throws.
+        val written = entries.mapTo(HashSet(entries.size)) { it.name }
+        val collisions = contents.carried.keys.filter { it in written }
+        require(collisions.isEmpty()) {
+            "carried entries collide with families this writer produces: ${collisions.sorted()} — " +
+                "each would be written twice into one ZIP (SPEC §5.3)"
         }
 
         // Sorted by name, not by map order: `toSortedMap` is JVM-only, and the point is
@@ -284,19 +364,31 @@ public class BundleReader private constructor(
     public val pageIds: List<PageId> get() = document.pages.map { it.id }
 
     /**
-     * Names of entries this build does not produce, to carry through on the next write.
+     * ⭐ **Names of entries this build cannot interpret** — the writer's verbatim pass-through set.
      *
-     * ⚠️ **`text/` is excluded, and that exclusion is load-bearing** (M7). It was carried
-     * data until recognition shipped; now [BundleWriter] emits it from [PageContents.text].
-     * Leaving it here as well would make every page's text *both* carried and written, and
-     * [Zip.write] neither de-duplicates nor complains — it would append two entries with one
-     * name, the central directory's last one would win on read, and which one that is
-     * depends on map iteration order. Two states, one file, no error.
+     * ⚠️ **`text/` and `assets/` are excluded, and both exclusions are load-bearing** (M7, M8c).
+     * Each was carried data until it gained a writer — recognition for the first, images for the
+     * second — and each had to leave this set in the same change. Leaving one here as well would
+     * make its entries *both* carried and written, and [Zip.write] neither de-duplicates nor
+     * complains: it would append two entries with one name, the central directory's last one
+     * would win on read, and which one that is depends on map iteration order. Two states, one
+     * file, no error.
+     *
+     * ⚠️ **This is not the same question as [carried], and the difference is the whole of M8c's
+     * bundle work.** *"Which entries does this build not understand"* and *"which entries must
+     * survive into the bundle I am about to write"* were one set for six milestones, and
+     * conflating them is exactly what made `assets/` merge under the wrong rule. See [carried].
      */
     public val carriedNames: List<String>
         get() = directory.names.filterNot { name ->
-            name == Bundle.MANIFEST || name.startsWith(Bundle.PAGES_DIR) || name.startsWith(Bundle.TEXT_DIR)
+            name == Bundle.MANIFEST ||
+                name.startsWith(Bundle.PAGES_DIR) ||
+                name.startsWith(Bundle.TEXT_DIR) ||
+                Bundle.isAsset(name)
         }
+
+    /** Names in SPEC §5.3's `assets/` family — inserted image bytes. */
+    public val assetNames: List<String> get() = directory.names.filter { Bundle.isAsset(it) }
 
     /**
      * SPEC §5.5's recognised text for one page, as stored — or null when it has none.
@@ -307,8 +399,35 @@ public class BundleReader private constructor(
      */
     public suspend fun pageText(id: PageId): ByteArray? = directory.read(Bundle.pageText(id))
 
-    public suspend fun carried(): Map<String, ByteArray> =
-        carriedNames.mapNotNull { name -> directory.read(name)?.let { name to it } }.toMap()
+    /**
+     * ⭐ **Everything from this bundle that a materialize of *another* bundle must keep** — the
+     * unrecognised entries **and** the images, in one map.
+     *
+     * Every caller of this is the same shape: a merge (`NoteMerge`) or a copy
+     * ([conflictedCopyOf]) reads a peer's bundle and hands the result to
+     * `NoteStore.materialize`, which routes the `assets/` half into the written family and the
+     * rest into the carried one. So the useful question at a call site is *"what must survive"*,
+     * not *"what do I fail to understand"*, and this answers that one.
+     *
+     * ⚠️ **It therefore returns more than [carriedNames] names, deliberately.** Narrowing it to
+     * the unknowns alone would be the tidier-looking API and would **delete every picture a peer
+     * has** on the first materialize after a merge — `assets/` left [carriedNames] the moment it
+     * gained a writer, and nothing else would put the bytes back. That loss is invisible by
+     * construction: an `ImageObject` whose asset is missing is a blank rectangle, defined and
+     * non-crashing and reported by nothing (SPEC §5.3). Ask [carriedUnknowns] when the question
+     * really is *"which entries does this build not understand"* — which is the writer's
+     * pass-through and, so far, nothing else.
+     */
+    public suspend fun carried(): Map<String, ByteArray> = read(carriedNames + assetNames)
+
+    /** Only the entries this build cannot interpret — [carriedNames]'s bytes. See [carried]. */
+    public suspend fun carriedUnknowns(): Map<String, ByteArray> = read(carriedNames)
+
+    /** SPEC §5.3's `assets/` family, by full entry name. */
+    public suspend fun assets(): Map<String, ByteArray> = read(assetNames)
+
+    private suspend fun read(names: List<String>): Map<String, ByteArray> =
+        names.mapNotNull { name -> directory.read(name)?.let { name to it } }.toMap()
 
     /** @return null when the bundle holds no such page — a manifest and pages can disagree. */
     public suspend fun page(id: PageId): PageContents? {

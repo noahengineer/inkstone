@@ -398,6 +398,44 @@ class NoteMergeTest {
     }
 
     @Test
+    fun `a merge unions the peers images with this devices own`() = runTest {
+        // ⭐ SPEC §5.3's M8c rule, over the **production path** — `NoteMerge.merge` then
+        // `session.materialize(report.carried, report.carriedManifest)`, which is verbatim what
+        // `NoteEditor` and `NoteSessionHost` do. Asserting the union against `NoteStore` alone
+        // would prove the rule and not that anything reaches it.
+        //
+        // Local-wins is exactly wrong here. An asset name embeds a UUIDv7, so a name only the
+        // peer has is a picture only the peer can draw — and keeping the local set alone deletes
+        // it into a blank rectangle, on a device that never sees an error.
+        val a = Device("device-a", clock)
+        val note = a.store.create("Diagram", "device-a")
+        val id = note.document.id
+        val pageId = note.document.pages.single().id
+        val ourImage = Bundle.imageAsset(ObjectId("obj-ours"))
+        val theirImage = Bundle.imageAsset(ObjectId("obj-theirs"))
+        val session = a.session(note)
+        // This device's own picture, already in its bundle — the half a naive union drops.
+        session.materialize(mapOf(ourImage to "ours".encodeToByteArray()))
+
+        val peer = BundleWriter.write(
+            BundleContents(
+                document = note.document,
+                pages = mapOf(pageId to PageContents(PageSize.Letter, Background.Blank, emptyList())),
+                highestClockCounter = 0L,
+                assets = mapOf(theirImage to "theirs".encodeToByteArray()),
+            ),
+        )
+
+        val report = assertIs<MergeReport.Merged>(NoteMerge.merge(session, a.readerOver(peer)))
+        session.materialize(report.carried, report.carriedManifest)
+
+        val merged = a.readerOver(a.bundleBytes(id)).assets()
+        assertEquals(setOf(ourImage, theirImage), merged.keys, "the merge did not union both devices' images")
+        assertContentEquals("ours".encodeToByteArray(), merged.getValue(ourImage))
+        assertContentEquals("theirs".encodeToByteArray(), merged.getValue(theirImage))
+    }
+
+    @Test
     fun `a pull that carries nothing new reports nothing new`() = runTest {
         // The termination argument for the ETag ping-pong. A poll whose remote ETag moved
         // because *this* device uploaded must report zero novel ops, so the reconciler does

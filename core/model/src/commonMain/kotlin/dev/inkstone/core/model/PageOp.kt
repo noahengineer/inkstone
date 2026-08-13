@@ -143,6 +143,46 @@ public sealed interface PageOp {
     ) : PageOp
 
     /**
+     * ⭐ Absolute presentation record — SPEC §4.9.2. **The one op added after M2.**
+     *
+     * A text box's font, size, alignment and list level; an image's crop. Encoded
+     * like [ShapeRecord] — a short ASCII `k=v;k=v` string with unknown keys kept
+     * verbatim — because the alternative is a fixed arity of numbers per kind, and
+     * the kinds do not agree on what the numbers are.
+     *
+     * ## Why this is a second register and not [SetTextContent]
+     *
+     * §4.8.2 put a *shape's* record in [SetTextContent], which is right there: every
+     * property in a `ShapeRecord` is comparably cheap to redo, so the LWW register's
+     * whole-value resolution costs at most one re-click.
+     *
+     * A text box is not that shape of problem. Its [SetTextContent] holds **the words
+     * the user typed**, and an LWW register resolves *whole* — so sharing it with the
+     * font would mean **changing the font on one device discards a paragraph typed on
+     * the other**, converged, with every op present and no error. That is the cheap
+     * edit destroying the expensive one, which is CLAUDE.md rule 1 written into the
+     * format. Two registers make the two edits commute.
+     *
+     * ## Why adding an op type was affordable, when adding an object kind is not
+     *
+     * An unknown **op type** is preserved verbatim and simply not applied — `OpCodec`
+     * re-emits [Unknown]'s own bytes, `PageFolder` carries it in `unknownOps`, and a
+     * compaction snapshot re-seeds it. An unknown **object kind** makes
+     * `OpCodec.decodeObject` throw inside an unguarded `BundleReader`, which is a note
+     * that will not open. §4.9.1 has the table; the two were conflated before M8c.
+     *
+     * No build before M8c can render a text box or an image at all, so the degrade
+     * here is invisible in every build that exists.
+     */
+    public data class SetFormat(
+        override val opId: String,
+        override val clock: LamportClock,
+        override val target: ObjectId,
+        val record: String,
+        override val extras: OpExtras = OpExtras.None,
+    ) : PageOp
+
+    /**
      * ⭐ The whole erased area, absolutely (SPEC §3.5, revised in M1; CLAUDE.md
      * rule 8).
      *

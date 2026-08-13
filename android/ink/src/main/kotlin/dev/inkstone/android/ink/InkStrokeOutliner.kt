@@ -74,7 +74,9 @@ public class InkStrokeOutliner(
         // the editor draws, and the published file disagreeing with the screen is the one
         // bug in this milestone the user would notice and could not explain. The highlight
         // tints rather than hides what it covers because of its alpha, exactly as on screen.
-        store.forEachInRenderOrder(visibleBounds = null) { dry -> result += outlineOf(dry) }
+        // Strokes only: a PDF `/Ink` annotation is ink, and M8c's non-stroke objects reach the
+        // published file by their own route or not at all (SPEC §4.9.5 for text).
+        store.forEachStrokeInRenderOrder(visibleBounds = null) { dry -> result += outlineOf(dry) }
         result
     }
 

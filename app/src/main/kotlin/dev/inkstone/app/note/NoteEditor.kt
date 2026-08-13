@@ -888,15 +888,22 @@ class NoteEditor(
         // carries has to be compared — an undone erase is the same object with a different
         // region, and since **M8a** the same is true of its transform, its style and its z key.
         //
-        // ⚠️ The three M8a registers were the whole of this milestone's inert-feature risk, and
+        // ⚠️ The three M8a registers were the whole of that milestone's inert-feature risk, and
         // in the most convincing form: `SetTransform` folds correctly, journals, uploads and
         // merges, and produces an **empty diff** here. So the undo of your own lasso-move would
         // have changed nothing on screen, and a peer's move would have arrived invisibly and
         // stayed invisible until the next page switch — with every test green, because the log
         // is right and only the screen is wrong. That is M6's `setPageMeta` exactly, and this
-        // method is where it was fixed then too.
+        // method is where it was fixed then too. ⭐ M8c adds the two that are not on the object
+        // at all — see [changedRecords].
         for (obj in after.objects) {
-            before.find(obj.id)?.let { ops += changedRegisters(it, obj) }
+            val was = before.find(obj.id)
+            if (was != null) ops += changedRegisters(was, obj)
+            // ⭐ M8c — and the two registers that are **not** on the payload at all. `before` is
+            // null for an object that has just arrived: its payload carries the four registers
+            // above (the fold materialises them onto it) and carries neither record, so both have
+            // to be pushed beside the `AddObject` rather than diffed against it.
+            ops += changedRecords(if (was == null) null else before, after, obj.id)
         }
         // An empty diff is the *common* case on the pull side, not an edge one: a poll re-delivers a
         // peer's whole page log, `NoteSession.merge` subtracts nearly all of it by opId, and the
@@ -930,6 +937,37 @@ class NoteEditor(
         if (was.transform != now.transform) ops += PageOp.SetTransform("", REPLAY_CLOCK, now.id, now.transform)
         now.style?.takeIf { it != was.style }?.let { ops += PageOp.SetStyle("", REPLAY_CLOCK, now.id, it) }
         if (was.z != now.z) ops += PageOp.SetZOrder("", REPLAY_CLOCK, now.id, now.z)
+        return ops
+    }
+
+    /**
+     * ⭐ M8c — the two registers [changedRegisters] cannot see, because they are not on the object.
+     *
+     * `SetTextContent` and `SetFormat` (SPEC §4.9.2) fold into **side tables** on [FoldedPage],
+     * not onto the payload: the payload is first-write-wins and both of these are values the user
+     * changes. `PageFolder.materialise` copies the winning text back onto a `TextBoxObject` and
+     * onto nothing else — so a *shape's* record (SPEC §4.8.2) and every object's format are
+     * invisible to a diff of two [InkObject]s.
+     *
+     * ⚠️ Which is the exact shape of M8a's recorded bug, one register further out. That method
+     * compared presence and the erased region only, so a peer's move produced an **empty diff**
+     * and arrived invisibly with every test green. Here it would be a peer re-attaching a
+     * connector, or changing a text box's font: folded, journaled, uploaded, merged, and not on
+     * the screen until the next page switch.
+     *
+     * A value going from set to **unset** is not pushed, for the same reason a null style is not:
+     * no op can say "unset" (SPEC §4.2), and a register never goes back there — so a null here is
+     * "nobody has written one", never "somebody cleared it".
+     *
+     * @param before the fold this object was already in, or **null** when it has just arrived —
+     *   in which case every record it has is new to the screen and all of them are pushed.
+     */
+    private fun changedRecords(before: FoldedPage?, after: FoldedPage, id: ObjectId): List<PageOp> {
+        val ops = ArrayList<PageOp>(RECORD_COUNT)
+        after.textOf(id)?.takeIf { it != before?.textOf(id) }
+            ?.let { ops += PageOp.SetTextContent("", REPLAY_CLOCK, id, it) }
+        after.formatOf(id)?.takeIf { it != before?.formatOf(id) }
+            ?.let { ops += PageOp.SetFormat("", REPLAY_CLOCK, id, it) }
         return ops
     }
 
@@ -1147,6 +1185,9 @@ class NoteEditor(
 
         /** Transform, style, z-order, erased region — see [NoteEditor.changedRegisters]. */
         const val REGISTER_COUNT = 4
+
+        /** Text content and format — see [NoteEditor.changedRecords]. */
+        const val RECORD_COUNT = 2
     }
 }
 

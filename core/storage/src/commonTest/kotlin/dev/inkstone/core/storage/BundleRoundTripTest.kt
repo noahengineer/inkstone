@@ -76,7 +76,7 @@ class BundleRoundTripTest {
                 PageOp.AddObject(
                     opId(),
                     clock(),
-                    ImageObject(ObjectId("obj-image"), "assets/img-1.webp", 100f, 80f, z = FractionalKey("W")),
+                    ImageObject(ObjectId("obj-image"), IMAGE_ASSET, 100f, 80f, z = FractionalKey("W")),
                 ),
                 PageOp.AddObject(
                     opId(),
@@ -104,25 +104,32 @@ class BundleRoundTripTest {
         )
     }
 
-    private fun contents(pages: Map<PageId, PageContents>) = BundleContents(
-        document = Document(
-            id = documentId,
-            title = "Lecture 4 — \"Fractional\" keys",
-            pages = pages.keys.mapIndexed { index, id ->
-                PageRef(id, FractionalKey.sequence(pages.size)[index])
-            },
-            localRev = 17,
-            deviceId = "device-a",
-            createdEpochMillis = 1_700_000_000_000,
-            modifiedEpochMillis = 1_800_000_000_000,
-        ),
-        pages = pages,
-        highestClockCounter = counter,
-    )
+    private fun contents(pages: Map<PageId, PageContents>, assets: Map<String, ByteArray> = emptyMap()) =
+        BundleContents(
+            document = Document(
+                id = documentId,
+                title = "Lecture 4 — \"Fractional\" keys",
+                pages = pages.keys.mapIndexed { index, id ->
+                    PageRef(id, FractionalKey.sequence(pages.size)[index])
+                },
+                localRev = 17,
+                deviceId = "device-a",
+                createdEpochMillis = 1_700_000_000_000,
+                modifiedEpochMillis = 1_800_000_000_000,
+            ),
+            pages = pages,
+            highestClockCounter = counter,
+            assets = assets,
+        )
 
     @Test
     fun `save load save is byte-identical`() = runTest {
-        val original = contents(mapOf(pageA to everythingPage(), pageB to everythingPage()))
+        // The asset is the one `everythingPage`'s ImageObject names, so the fixture is a note
+        // whose picture is actually in it rather than a dangling reference.
+        val original = contents(
+            mapOf(pageA to everythingPage(), pageB to everythingPage()),
+            assets = mapOf(IMAGE_ASSET to ByteArray(ASSET_BYTES) { (it * 5 % 256 - 128).toByte() }),
+        )
         val first = BundleWriter.write(original)
 
         val reader = assertNotNull(BundleReader.open(MemoryByteSource(first)))
@@ -130,6 +137,11 @@ class BundleRoundTripTest {
             document = reader.document,
             pages = reader.document.pages.associate { it.id to assertNotNull(reader.page(it.id)) },
             highestClockCounter = reader.highestClockCounter,
+            // ⚠️ `carried()`, which since M8c spans the unrecognised entries *and* `assets/` —
+            // `carriedUnknowns()` here would drop every picture and the second save would be a
+            // shorter file. Feeding them back through the `carried` parameter is deliberate:
+            // `BundleContents` routes them into the written family, which is what stops a name
+            // arriving by two routes being written twice.
             carried = reader.carried(),
         )
         val second = BundleWriter.write(reloaded)
@@ -242,21 +254,23 @@ class BundleRoundTripTest {
 
     @Test
     fun `entries this build does not produce are carried through`() = runTest {
-        // `assets/` is M8's, `future/` stands in for whatever comes after. A note that gains
-        // them must not lose them the next time an older build saves.
+        // `future/` stands in for whatever a later version adds. A note that gains one must not
+        // lose it the next time an older build saves.
         //
-        // ⚠️ This used to use `text/<pageId>.json`. M7 made that a KNOWN family (SPEC §5.5) —
-        // it is written from `PageContents` and excluded from `carriedNames` — so as a fixture
-        // for *unknown* data it now asserts the opposite of what it says.
-        val recognised = """{"anything":"a newer build understands this"}""".encodeToByteArray()
-        val image = ByteArray(64) { it.toByte() }
+        // ⚠️ This used to use `text/<pageId>.json`, and then `assets/img-1.webp` beside it. M7
+        // made the first a KNOWN family (SPEC §5.5) and M8c made the second one (SPEC §5.3) —
+        // both are written from [BundleContents] and excluded from `carriedNames` — so as
+        // fixtures for *unknown* data each in turn came to assert the opposite of what it said.
+        // The name here is one no build has ever claimed, which is the only kind that stays
+        // valid: a family with a writer is tested by `BundleAssetsTest`, not by this.
+        val fromTheFuture = """{"anything":"a newer build understands this"}""".encodeToByteArray()
         val first = BundleWriter.write(
             contents(mapOf(pageA to everythingPage())).let { base ->
                 BundleContents(
                     base.document,
                     base.pages,
                     base.highestClockCounter,
-                    carried = mapOf("future/${pageA.value}.bin" to recognised, "assets/img-1.webp" to image),
+                    carried = mapOf("future/${pageA.value}.bin" to fromTheFuture),
                 )
             },
         )
@@ -264,8 +278,7 @@ class BundleRoundTripTest {
         val reader = assertNotNull(BundleReader.open(MemoryByteSource(first)))
         val carried = reader.carried()
 
-        assertContentEquals(recognised, carried.getValue("future/${pageA.value}.bin"))
-        assertContentEquals(image, carried.getValue("assets/img-1.webp"))
+        assertContentEquals(fromTheFuture, carried.getValue("future/${pageA.value}.bin"))
         assertContentEquals(
             first,
             BundleWriter.write(
@@ -314,5 +327,9 @@ class BundleRoundTripTest {
         const val GEOMETRY_BYTES = 1024
         const val CAPSULES = 40
         const val MANY_PAGES = 50
+        const val ASSET_BYTES = 96
+
+        /** The entry `everythingPage`'s ImageObject names — SPEC §5.3's `assets/` family. */
+        const val IMAGE_ASSET = "assets/img-1.webp"
     }
 }

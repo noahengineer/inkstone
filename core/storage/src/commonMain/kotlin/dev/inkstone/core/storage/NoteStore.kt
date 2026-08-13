@@ -273,6 +273,10 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
      *   entry name yet: SPEC §5.5's recognised text is `text/<pageId>.json`, named per *page*, so
      *   once M7 writes it every device produces the same name and a clash is the normal case.
      *   **Ordering carried entries is M7's prerequisite, not its cleanup** — `docs/M6-SYNC.md`.
+     *
+     *   ⭐ **Entries under `assets/` are taken out of this map and unioned instead** — see below.
+     *   Passing them here is not a mistake; it is how [BundleReader.carried] delivers them, and
+     *   it is what lets a merge report reach this method unchanged.
      * @param extraCarriedManifest the same, for unrecognised manifest members.
      */
     public suspend fun materialize(
@@ -287,12 +291,33 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
         val highest = pages.values.flatMap { it.ops }.maxOfOrNull { it.clock.counter }
             ?: note.highestClockCounter
         val document = note.document.copy(modifiedEpochMillis = clock.nowEpochMillis())
+        // ⭐ **SPEC §5.3 — `assets/` is a union by name, and it is the one family where "the peer
+        // has an entry we do not" is the normal case rather than a conflict** (M8c).
+        //
+        // The carried rule above is *local-wins*, and local-wins is exactly wrong for a family
+        // both devices write: a name only the peer has is a picture only the peer can draw, and
+        // keeping the local map alone deletes it. The union is safe — not merely conservative —
+        // because an asset name embeds a UUIDv7 ([Bundle.imageAsset]), so **the same name on two
+        // devices is the same bytes**. There is therefore nothing to resolve, no clock to consult
+        // and no tiebreak to get wrong, and the two devices converge on the identical set in one
+        // step without exchanging anything further.
+        //
+        // ⚠️ The bytes of a clashing name are deliberately **not compared**. A comparison could
+        // only ever answer "equal", at the cost of reading every image on both sides of every
+        // merge; and if it somehow answered "not equal" the honest response would still be to
+        // keep one, because the *object* naming it cannot tell them apart.
+        //
+        // ⚠️ And the local half is not optional. Assets left `carriedNames` in this same change,
+        // so without `reader.assets()` the very first materialize after M8c would delete every
+        // image the note already has — invisibly, as a blank rectangle.
+        val everything = extraCarried + (note.reader?.carried() ?: emptyMap())
         val contents = BundleContents(
             document = document,
             pages = pages,
             highestClockCounter = maxOf(highest, note.highestClockCounter),
-            carried = extraCarried + (note.reader?.carried() ?: emptyMap()),
+            carried = everything.filterKeys { !Bundle.isAsset(it) },
             carriedManifest = extraCarriedManifest + (note.reader?.carriedManifest ?: emptyMap()),
+            assets = everything.filterKeys { Bundle.isAsset(it) },
         )
 
         fs.writeBytesAtomically(NoteLayout.bundle(id), BundleWriter.write(contents))
@@ -414,6 +439,13 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
         for (obj in page.objects) {
             val text = page.textOf(obj.id) ?: continue
             ops += PageOp.SetTextContent(opId = ids.newOpId(), clock = clockValue, target = obj.id, text = text)
+        }
+        // The format register (SPEC §4.9.2), M8c — same argument as the text register above, and
+        // the same reason it is a second loop: an object with a font and no text must not be
+        // skipped by a `continue` meant for the other register.
+        for (obj in page.objects) {
+            val format = page.formatOf(obj.id) ?: continue
+            ops += PageOp.SetFormat(opId = ids.newOpId(), clock = clockValue, target = obj.id, record = format)
         }
         val document = Document(
             id = id,

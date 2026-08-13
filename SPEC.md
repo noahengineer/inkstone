@@ -417,6 +417,15 @@ nothing else.
 
 **Define all of these in M2 even though M8 is the first user.** Extending the op vocabulary after sync is live is the classic "and then everything broke" moment.
 
+⚠️ **Amended in M8c: one op was added, `SetFormat`, and the heading is now a claim about intent
+rather than a count.** The rule this section exists to enforce is *"do not discover a missing
+register after sync is live and bolt it on"* — and eight milestones of use is a fair test of the
+vocabulary, which needed exactly one addition. **What makes that addition safe is measured, not
+assumed:** an unknown op type is preserved verbatim through decode, fold, compaction snapshot and
+re-encode, so an older build **degrades** (does not apply it) where an unknown *object kind* would
+**fail to open the note**. §4.9.1 has the table of which extensions do which, and it is the table
+to consult before extending anything here again.
+
 ```kotlin
 sealed interface PageOp {
     val opId: String                   // UUIDv7
@@ -432,6 +441,7 @@ sealed interface PageOp {
     data class SetStyle(val target: ObjectId, val style: ObjectStyle) : PageOp  // colour, width, opacity
     data class SetZOrder(val target: ObjectId, val z: FractionalKey) : PageOp
     data class SetTextContent(val target: ObjectId, val text: String) : PageOp
+    data class SetFormat(val target: ObjectId, val record: String) : PageOp   // M8c — §4.9
     data class SetErasedRegion(val target: ObjectId, val absolute: ErasedArea) : PageOp
     data class SetPageMeta(val background: Background?, val size: PageSize?) : PageOp
 
@@ -878,6 +888,156 @@ whole section is arranged to avoid. **SPEC wins; POLYGON is dropped.** A closed 
 segments remains expressible as an ordinary ink stroke with no format change at all, which is
 where it should go if it is ever wanted — it simply cannot carry a fill.
 
+### 4.9 Text boxes, images, and the format register ⭐
+
+*Added in M8c. ROADMAP M8c's scope list asks for text boxes with "font, size, colour, alignment,
+lists" and images with "crop", and §4.2 — closed since M2 — has no register that can carry any of
+them. This section is that decision.*
+
+#### 4.9.1 What §4.8.1 established, and the one thing it conflated
+
+§4.8.2 concluded that `SetTextContent` was the only home for a shape's record *"without a format
+change"*, on the strength of §4.8.1. That argument is correct about what it actually examined —
+**a new object kind** — and it silently generalised to a case it did not examine, **a new op
+type**. The two are not the same failure, and the difference is the whole of this section:
+
+| Extension | What an older build does | Evidence |
+|---|---|---|
+| A new `InkObject` kind, or a new `ShapeKind` | **Fails to open the note.** | `OpCodec.decodeObject` ends `error("Unknown object kind '$kind'")`; `ShapeKind.valueOf` throws; `BundleReader.page` decodes unguarded |
+| A new field **nested inside** the `obj` payload | **Silently dropped** on the next autosave | `OpExtras` is collected at the op's top level only |
+| A new field **inside** an encoded value array (e.g. a 4th `ObjectStyle` slot) | **Silently dropped** — the value is re-encoded from the decoded type | `decodeStyle` reads `array[0..2]`, `ObjectStyle` has three fields |
+| A new **top-level field on a known op** | **Preserved verbatim** | `OpExtras` collects it; `withExtras` merges it back on encode |
+| A new **op type** | **Preserved verbatim, not applied** | `encode` returns `Unknown`'s own bytes unchanged; `PageFolder` collects it into `unknownOps`; `seedFrom` re-seeds it from a compaction snapshot |
+
+The last row is what §5.8 has required since M2 — *"unknown op types … are preserved verbatim on
+round-trip"* — and `PageOp.Unknown` exists to satisfy it. **A new op type is a degrade, not a
+break.** That is the same class of degrade §4.8.5 already accepts for shapes, and it is strictly
+milder than the one §5.8 accepted when `titleClock` shipped additively.
+
+So the vocabulary has an escape hatch, it is load-bearing, and §4.2's *"complete, from M2"* should
+be read as *"complete enough that extending it is a deliberate act with a stated cost"* — not as a
+prohibition that forces every future property into whichever existing register is least occupied.
+
+#### 4.9.2 The decision
+
+**Two registers, not one, and the split is by who authored the value.**
+
+| Register | Op | Holds | Per object kind |
+|---|---|---|---|
+| **content** | `SetTextContent` (M2) | what the user authored | text box → **the words**; shape → `ShapeRecord` (§4.8.2, unchanged) |
+| **format** | `SetFormat` (**new in M8c**) | how it is presented | text box → font, size, alignment, list level; image → crop |
+
+`SetFormat(target, record)` is an absolute, object-keyed LWW register carrying a short ASCII
+record, encoded exactly like `ShapeRecord` and with the same unknown-key preservation (§4.8.2's
+last paragraph). Wire type `"fmt"`, value field `"fr"`.
+
+```
+it1;f=sans;sz=14;a=c;l=2          a text box: sans, 14pt, centred, list level 2
+ic1;cx=0.1;cy=0;cw=0.8;ch=1       an image: rectangular crop, fractions of the source
+ic1;cp=M0,0L1,0L1,1z              an image: freehand crop, a normalised path
+```
+
+**Why text does not share a register with its formatting.** An LWW register resolves *whole*.
+§4.8.2 accepted that cost for a shape because everything in a `ShapeRecord` is comparably cheap to
+redo — a fill, an opacity, a corner radius, an endpoint. A text box is not that shape of problem:
+put the words and the font in one register and *changing the font on one device discards a
+paragraph typed on the other*, converged, with every op present and no error. That is the cheap
+edit destroying the expensive one, and it is CLAUDE.md rule 1 written into the format. Two
+registers make the two edits commute, which is the behaviour a user would predict.
+
+**Colour is not in the record.** `ObjectStyle(colorArgb, widthPt, opacity)` already exists and
+`SetStyle` already carries it, so the scope line's "colour" needs nothing new. ⚠️ A text box and an
+image must be created with a **non-null** `style`, because `SetStyle` cannot express *"unset"* —
+ship one with `style = null` and the first recolour has no inverse, so *"change the colour, press
+undo"* silently eats the press (§4.2's own trap, in the register next door).
+
+**Rotate and flip are not in the record either.** Both are `SetTransform`, absolute, already in the
+vocabulary — a flip is a matrix negation. ROADMAP M8c says as much and it is right.
+
+**Crop is not `SetErasedRegion`.** An erased area is a union of eraser capsules and grows
+monotonically with the gesture; a crop is a single absolute region the user can widen again. They
+would fight over one register, and "erase part of a photo" and "crop a photo" are different
+operations a user can perform on the same image.
+
+#### 4.9.3 What an older build does with such a note
+
+An M8b-era build **opens the note, keeps every byte, and shows an unformatted text box and an
+uncropped image** — which in practice means it shows *nothing at all*, because `StrokeStore`
+drops every non-stroke object (§4.8.5) and no build before M8c can render either kind. The
+`SetFormat` op decodes to `PageOp.Unknown`, is carried in `FoldedPage.unknownOps`, survives a
+compaction snapshot, and is re-encoded byte-for-byte on save.
+
+The degrade is therefore **invisible in every build that exists**, which is the strongest possible
+version of §4.8.5's argument and the reason this is the milestone to spend the extension in.
+
+#### 4.9.4 Image bytes are not in the op log, and `assets/` becomes a known family
+
+`ImageObject` names its asset by string (§5.3), and that string **survives re-identification** —
+so a copy that renames every `ObjectId` still points at `assets/img-<oldId>.webp`. Three
+consequences, all of which produce a blank rectangle rather than an error:
+
+1. **A merge must union the peer's `assets/`.** Until M8c nothing wrote an asset, so `assets/`
+   rode through only as a *carried unknown* entry under `NoteStore.materialize`'s local-wins rule.
+   Local-wins is wrong for a family both devices write: an asset name is a UUID, so the same name
+   on two devices means the same bytes, and a name only one device has is a picture only that
+   device can draw. The union is by name, and identical names are not compared byte-for-byte.
+2. **An entry that is both carried and written is two ZIP entries with one name.** `Zip.write`
+   neither de-duplicates nor complains, and which one a reader wins depends on map iteration
+   order. This is M7's `text/` trap verbatim; `assets/` must leave `carriedNames` in the same
+   commit that gives it a writer.
+3. **Duplicating a note must copy the bytes.** `copiedObjectOps` copies the payload and the
+   content register; asset bytes are a *third* place, and `duplicateNote` closes `LOCAL_ONLY`
+   against a fresh note whose own reader is empty. Before M8c this was unreachable because nothing
+   wrote assets. It is reachable the moment M8c does.
+
+**An Element re-insert mints new ids and new assets.** An Element is a *template* — payloads,
+relative geometry, style, and its own copy of any image bytes — and every insertion mints a fresh
+UUIDv7 per object and a fresh `assets/img-<newId>.webp` per asset. It is never a stored list of
+`AddObject` ops replayed. `PageFolder.absorb` is first-write-wins on payload, so stamping one
+Element twice would otherwise give **one** object carrying the first stamp's payload at the second
+stamp's transform, and the first stamp visibly vanishes — §5.6's duplicate-`ObjectId` corruption
+arriving from the other direction.
+
+#### 4.9.5 Font: a subset-embedded CID font, decided here after M4 booked it and M7 deferred it
+
+**The decision: `PDType0Font`, `Identity-H`, subset-embedded, with a `/ToUnicode` CMap.** Not
+WinAnsi.
+
+WinAnsi covers Latin-1 and nothing else, and a text box is typed through an IME, which is exactly
+how a character above U+00FF arrives. The current writer does not even fail loudly at that point:
+`PdfContent`'s `toByteArray` is `ByteArray(out.length) { out[it].code.toByte() }`, so every
+character above U+00FF silently becomes a **different** byte.
+
+The cost that made this look expensive is not real. PdfBox-Android 2.0.27.0 already ships
+everything needed, in the AAR this project already depends on:
+
+- `PDType0Font.load(PDDocument, InputStream, boolean subset)`, `addToSubset`, `subset()`,
+  `willBeSubset()`, `hasGlyph(int)` — verified with `javap` against the shipped `classes.jar`
+- `PDCIDFontType2Embedder`, `ToUnicodeWriter`, `Subsetter`, and the `Identity-H` CMap resource
+- **`resources/ttf/LiberationSans-Regular.ttf`, 410,712 bytes, bundled in the AAR's own assets** —
+  so embedding costs **no new asset in the APK**
+
+Measured coverage (fontTools, against that exact file): Latin-1 Supplement 96/96, Latin Extended-A
+128/128, Latin Extended-B 208/208, Cyrillic 256/256, Greek 127/144. **No CJK, no emoji.**
+
+⚠️ **A `/ToUnicode` CMap is what makes the text *extractable*, and it is separate from what makes
+it render.** With `Identity-H` the content stream holds glyph indices, which mean nothing to a text
+extractor; `pdftotext` and `pdfgrep` recover characters only through `/ToUnicode`. A file can
+therefore look perfect on screen and extract as mojibake or as nothing, which is §5.5's whole
+feature failing while every visual check passes.
+
+**Characters the font cannot represent are reported, never guessed.** `hasGlyph` is the gate.
+Emitting `.notdef` would put a visible box in the PDF and nothing in the extraction, and
+substituting a lookalike would put the *wrong word* into search. CJK support is reachable —
+`/system/fonts/NotoSansCJK-Regular.ttc` exists and fontbox-android has `TrueTypeCollection` — and
+it is deliberately not in M8c, because font *fallback* means splitting a run across two embedded
+fonts, which is a different feature from embedding one.
+
+⚠️ **The font must be in the *page's* `/Resources`** — §5.5 and §6.4 both already say so, having
+been wrong about it once. A page content stream has none of its own; an inherited dictionary is
+copied down first and our entry merged into a **copy**, because source resource dictionaries are
+routinely shared between pages.
+
 ---
 
 ## 5. Storage and file format
@@ -972,6 +1132,26 @@ text/<pageId>.json      recognised text + per-word page-space bounding boxes
 **No thumbnail.** Thumbnails live in a local cache (§5.7).
 
 One file per page gives **lazy loading** — you can open a 500-page notebook without deserializing 500 pages. *(It does not give granular sync: the transport unit is the whole PDF. Don't build page-level sync plumbing that can't be used.)*
+
+⚠️ **`assets/` became a *known* entry family in M8c, and the union rule is not the one the other
+families use.** Until M8c nothing wrote an asset: `ASSETS_DIR` was a declared constant with no
+writer, and the directory survived a round-trip only because `carriedNames` is defined by
+*exclusion* — anything that is not `manifest.json`, `pages/` or `text/`. That made it a carried
+unknown, and carried unknowns merge **local-wins** (§7.7), which is exactly wrong here:
+
+- an asset name embeds a UUIDv7, so **the same name on two devices is the same bytes** — there is
+  nothing to resolve; and
+- **a name only one device has is a picture only that device can draw**, so local-wins deletes it.
+
+The merge is therefore a **union by name**, and it is the one family where "the peer has an entry
+we do not" is the normal case rather than a conflict. Getting this wrong is invisible by
+definition: an `ImageObject` whose asset is missing is a blank rectangle — defined, non-crashing,
+and silent.
+
+⚠️ **A family may not be both written and carried.** `Zip.write` neither de-duplicates nor
+complains, so an entry produced by both paths becomes two ZIP entries with one name and the winner
+depends on map iteration order. `assets/` leaves `carriedNames` in the same commit that gives it a
+writer — the same trap M7 hit when `text/` stopped being carried.
 
 ### 5.4 Stroke geometry is an opaque blob ⭐
 

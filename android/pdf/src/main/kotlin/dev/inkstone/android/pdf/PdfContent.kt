@@ -311,12 +311,36 @@ internal class ContentBuilder {
         out.append(text).append('\n')
     }
 
-    // Latin-1 rather than UTF-8: a content stream is a byte stream of PDF syntax,
-    // and a literal string's bytes are interpreted as PDFDocEncoding by the reader.
-    // UTF-8 would silently widen any non-ASCII character in recognised text.
-    fun toByteArray(): ByteArray = ByteArray(out.length) { out[it].code.toByte() }
+    /**
+     * ⭐ **ASCII only, and it is now checked rather than assumed** (M8c).
+     *
+     * This was `ByteArray(out.length) { out[it].code.toByte() }` with a comment explaining that
+     * Latin-1 was preferable to UTF-8 — which is true and was not the problem. The problem is that
+     * a `Char` above `U+00FF` truncates mod 256 into a **different, valid** byte: no exception, no
+     * corruption a parser would notice, just a different letter. M4 accepted that for an invisible
+     * layer holding recognised handwriting; M8c types into a text box through an IME, which is
+     * precisely how such characters arrive.
+     *
+     * Switching to UTF-8 would be *worse*, not better: a literal string's bytes are glyph codes in
+     * the font's encoding, so UTF-8 would widen one character into two wrong codes.
+     *
+     * The real answer is that **no character above ASCII belongs in a content stream at all**.
+     * Text is emitted as a hex string of CID codes ([hexString]) and everything else here is PDF
+     * syntax. So the invariant is checkable, and an unrepresentable character is a programming
+     * error upstream — the one thing CLAUDE.md keeps exceptions for.
+     */
+    fun toByteArray(): ByteArray = ByteArray(out.length) { index ->
+        val code = out[index].code
+        require(code <= MAX_ASCII) {
+            "content streams are ASCII; U+${code.toString(HEX).uppercase().padStart(4, '0')} " +
+                "reached the buffer. Text must go through PdfCidFont.hex, not a literal string."
+        }
+        code.toByte()
+    }
 
     private companion object {
         const val INITIAL_CAPACITY = 4096
+        const val MAX_ASCII = 0x7F
+        const val HEX = 16
     }
 }

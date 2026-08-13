@@ -24,7 +24,6 @@ import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.Offset
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
-import dev.inkstone.core.model.StrokeObject
 import dev.inkstone.core.model.Viewport
 import dev.inkstone.core.model.ZoomLimits
 import dev.inkstone.core.model.cameraFor
@@ -349,6 +348,11 @@ public class InkSurfaceView @JvmOverloads constructor(
      * The objects arrive already folded, so their absolute registers — including the erased
      * region — are the winning values and nothing here replays a log. Decoding the geometry
      * blobs is the cost, and it is a page-switch cost, not an ink-path one.
+     *
+     * ⭐ **M8c: every object, not `filterIsInstance<StrokeObject>()`.** That filter was the last
+     * place a text box or an image was dropped between the log and the screen — and dropped from
+     * the store's top z key with it, so the next stroke the user drew landed underneath one. See
+     * [DryObject].
      */
     public fun loadPage(page: FoldedPage) {
         wetView.cancelUnfinishedStrokes()
@@ -365,17 +369,36 @@ public class InkSurfaceView @JvmOverloads constructor(
         // Cleared, not kept: the next page's paper is not this one's, and leaving the
         // old bitmap up means an imported page briefly shows the previous page's scan.
         dryView.sourcePage = null
-        strokes.applyOps(
-            ops = page.objects.filterIsInstance<StrokeObject>().map { obj ->
-                // A synthetic AddObject: `applyOps` is the one path into the render state, so
-                // loading goes through it rather than around it.
-                PageOp.AddObject(opId = "", clock = LOAD_CLOCK, obj = obj)
-            },
-            brushes = brushFactory,
-            record = false,
-        )
+        strokes.applyOps(ops = loadOps(page), brushes = brushFactory, record = false)
         dryView.onStoreChanged()
         onStrokeCountChanged?.invoke(strokes.size)
+    }
+
+    /**
+     * A folded page as the ops that build it — synthetic, never journaled.
+     *
+     * `applyOps` is the one path into the render state, so loading goes through it rather than
+     * around it: one decoder, one erase model, one `(z, id)` order.
+     *
+     * ⚠️ **The two record registers are side tables on the fold, so they need their own ops.**
+     * `PageFolder.materialise` copies the winning transform, style, z and erased region onto each
+     * payload, and — for a text box — the winning text. It does **not** copy `SetFormat`, and it
+     * does not copy a *shape's* `SetTextContent` (SPEC §4.8.2's record lives there). Load the
+     * payloads alone and a text box comes back in the default font on every page turn while the
+     * log holds the right one: the fold is correct, the file is correct, and only the screen is
+     * wrong — which is the failure `NoteEditor.reconcile` was extended twice to close.
+     */
+    private fun loadOps(page: FoldedPage): List<PageOp> {
+        val ops = ArrayList<PageOp>(page.objects.size)
+        for (obj in page.objects) {
+            ops += PageOp.AddObject(opId = "", clock = LOAD_CLOCK, obj = obj)
+            // Only when the register has been written. A text box that has never been edited has
+            // its words on its payload and nothing in `texts`, and pushing an empty string here
+            // would wipe them.
+            page.textOf(obj.id)?.let { ops += PageOp.SetTextContent("", LOAD_CLOCK, obj.id, it) }
+            page.formatOf(obj.id)?.let { ops += PageOp.SetFormat("", LOAD_CLOCK, obj.id, it) }
+        }
+        return ops
     }
 
     /**

@@ -63,11 +63,21 @@ public class FoldedPage(
     public val opCount: Int,
     public val unknownOps: List<PageOp.Unknown> = emptyList(),
     public val texts: Map<ObjectId, String> = emptyMap(),
+    public val formats: Map<ObjectId, String> = emptyMap(),
 ) {
 
     public val isEmpty: Boolean get() = objects.isEmpty()
 
     public fun find(id: ObjectId): InkObject? = objects.firstOrNull { it.id == id }
+
+    /**
+     * The `SetFormat` register's winning value for [id] — SPEC §4.9.2.
+     *
+     * A side table for the same reason [textOf] is one: the payload is first-write-wins and
+     * this is a value the user changes. Deliberately *not* merged into [textOf]: the two
+     * registers are separate so that restyling a text box cannot discard its words.
+     */
+    public fun formatOf(id: ObjectId): String? = formats[id]
 
     /**
      * ⭐ The `SetTextContent` register's winning value for [id], whatever kind of object it is.
@@ -124,6 +134,7 @@ internal class PageFolder(
     private val styles = HashMap<ObjectId, Register<ObjectStyle>>()
     private val zOrders = HashMap<ObjectId, Register<FractionalKey>>()
     private val texts = HashMap<ObjectId, Register<String>>()
+    private val formats = HashMap<ObjectId, Register<String>>()
     private val erasures = HashMap<ObjectId, Register<ErasedArea>>()
 
     private var sizeClock: LamportClock? = null
@@ -161,6 +172,10 @@ internal class PageFolder(
         // record ([ShapeRecord]) lives only in this table, and a snapshot that dropped it would
         // hand back a fold in which every connector had quietly become a plain line.
         for ((id, text) in base.texts) texts[id] = Register(text, clock)
+        // Same reasoning as the text register, and the same consequence for missing it: a
+        // snapshot that dropped this would hand back a fold in which every text box had
+        // silently reverted to the default font and every crop had been undone (SPEC §4.9.2).
+        for ((id, format) in base.formats) formats[id] = Register(format, clock)
         unknown += base.unknownOps
         highest = clock
         count = base.opCount
@@ -204,6 +219,10 @@ internal class PageFolder(
             is PageOp.SetZOrder -> write(zOrders, op.target, op.z, clock)
 
             is PageOp.SetTextContent -> write(texts, op.target, op.text, clock)
+
+            // SPEC §4.9.2 — a second record register, deliberately independent of the
+            // one above so that restyling a text box cannot discard its words.
+            is PageOp.SetFormat -> write(formats, op.target, op.record, clock)
 
             is PageOp.SetErasedRegion -> write(erasures, op.target, op.absolute, clock)
 
@@ -270,6 +289,7 @@ internal class PageFolder(
             // may legitimately be folded before its `AddObject` (see the class KDoc), and a
             // connector's record is exactly the kind that can.
             texts = texts.mapValues { (_, register) -> register.value },
+            formats = formats.mapValues { (_, register) -> register.value },
         )
     }
 

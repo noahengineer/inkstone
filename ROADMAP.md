@@ -1097,6 +1097,41 @@ non-PdfBox viewer shows for a translucent filled shape; and test counts as
 
 ## M8c — Text, images, and tools
 
+⚠️ **Four disagreements with SPEC, all resolved in SPEC's favour (M8c). SPEC §4.9 is new and is
+the normative account.**
+
+1. **"font, size, colour, alignment, lists" and "crop" had nowhere to live.** §4.2's vocabulary,
+   closed since M2, has no register for any of them. **Resolved by adding one op —
+   `SetFormat` — and it is the only op added since M2.** The argument that made it affordable is
+   measured, not assumed: an unknown *op type* is preserved verbatim through decode, fold,
+   compaction snapshot and re-encode, so an older build **degrades**; an unknown *object kind*
+   throws inside an unguarded `BundleReader`, which is a note that will not open. §4.8.1 had
+   conflated the two, and that conflation is why §4.8.2 read as though `SetTextContent` were the
+   only possible home. See §4.9.1's table.
+
+   **"Colour" needed nothing at all** — `ObjectStyle(colorArgb, widthPt, opacity)` and `SetStyle`
+   already exist.
+
+2. **Text formatting must NOT share `SetTextContent` with the text**, even though §4.8.2 put a
+   *shape's* record there. An LWW register resolves whole, so one register for both would mean
+   changing the font on one device **discards a paragraph typed on the other** — the cheap edit
+   destroying the expensive one, which is CLAUDE.md rule 1 written into the format. §4.9.2.
+
+3. **The font decision, booked against M4 and deferred by M7, lands here: a subset-embedded CID
+   font, not WinAnsi.** It is cheaper than it looked — PdfBox-Android's AAR already bundles
+   `LiberationSans-Regular.ttf` (410,712 bytes), so embedding costs **no new APK asset**. What it
+   is *not* is `PDType0Font`: that parses the predefined `Identity-H` CMap out of the AAR's assets
+   and so needs `PDFBoxResourceLoader.init(Context)`, which would move every one of this module's
+   JVM PDF acceptance tests to instrumented. The font is written at the COS level, as `/Ink` and
+   the XMP marker already are. §4.9.5, and `CidFontSpikeTest` asserts the failure rather than
+   describing it.
+
+4. **M8b is decided but not built, and its remainder step 1 is this milestone's bite #4.**
+   `docs/M8-CONNECTORS.md` §6 asks for a `DryObject` that `DryStroke` and a new `DryShape` both
+   satisfy, for exactly the reason M8c needs one — `StrokeStore` owns the top z key, and a second
+   store goes stale the moment `SetZOrder` exists. M8c builds the abstraction; M8b inherits it.
+   Shapes and connectors themselves remain M8b's.
+
 ### Scope
 
 - **Text boxes** — font, size, colour, alignment, lists; IME handling; exported as real PDF text

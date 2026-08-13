@@ -77,6 +77,21 @@ public object Undo {
             PageOp.SetTextContent(opId, clock, op.target, it)
         }
 
+        // ⭐ The format register's previous value (M8c, SPEC §4.9.2).
+        //
+        // Unlike [PageOp.SetTextContent] above, this one has a usable "unset" — the empty
+        // record *is* the default presentation, and `ObjectFormat.Default.encode()` produces
+        // it. So the first format write on any object is invertible and the whole
+        // first-`SetStyle` trap does not apply here. That is a property worth stating rather
+        // than rediscovering: it is true only because the record's every field has a default,
+        // which is a constraint on [ObjectFormat], not an accident of this method.
+        is PageOp.SetFormat -> PageOp.SetFormat(
+            opId = opId,
+            clock = clock,
+            target = op.target,
+            record = before.formatOf(op.target).orEmpty(),
+        )
+
         // The region as it was — `None` for a first erase, which is why un-erasing is
         // cheap: nothing was destroyed, so nothing is reconstructed (SPEC §3.5).
         is PageOp.SetErasedRegion -> PageOp.SetErasedRegion(
@@ -125,6 +140,7 @@ public object Undo {
         is PageOp.SetStyle -> op.copy(opId = opId, clock = clock)
         is PageOp.SetZOrder -> op.copy(opId = opId, clock = clock)
         is PageOp.SetTextContent -> op.copy(opId = opId, clock = clock)
+        is PageOp.SetFormat -> op.copy(opId = opId, clock = clock)
         is PageOp.SetErasedRegion -> op.copy(opId = opId, clock = clock)
         is PageOp.SetPageMeta -> op.copy(opId = opId, clock = clock)
         is PageOp.Unknown -> op.copy(opId = opId, clock = clock)

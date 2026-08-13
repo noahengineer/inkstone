@@ -100,12 +100,20 @@ public suspend fun NoteStore.conflictedCopyOf(
         session.copyPage(remote, ref.id, targetPages[index].id, ids)
     }
 
-    // The peer's unrecognised entries and manifest members, carried onto the copy (SPEC §5.8).
-    // `assets/` is the one that would be *visible* if it were dropped — an `ImageObject` names
-    // its asset by string, and that string survives re-identification, so a copy without the
-    // assets shows a blank rectangle where the picture was. Carrying the manifest members is
-    // safe for the one reason that matters: `documentId` is a *known* field, so it is never in
-    // this map and there is no identity in it to leak onto the new note.
+    // The peer's unrecognised entries, its images and its manifest members, carried onto the
+    // copy (SPEC §5.8, SPEC §5.3). `assets/` is the one that would be *visible* if it were
+    // dropped — an `ImageObject` names its asset by string, and that string survives
+    // re-identification, so a copy without the assets shows a blank rectangle where the picture
+    // was.
+    //
+    // ⚠️ [BundleReader.carried] spans two families since M8c — the unrecognised entries and the
+    // images — and that is why this line did not have to change when `assets/` gained a writer.
+    // Narrowing it to `carriedUnknowns()` would compile, read as a tidy-up, and lose every
+    // picture in the note layer 3 exists to preserve.
+    //
+    // Carrying the manifest members is safe for the one reason that matters: `documentId` is a
+    // *known* field, so it is never in this map and there is no identity in it to leak onto the
+    // new note.
     //
     // Materialized here rather than through `close(syncState)`, which takes no carried
     // arguments and would therefore rewrite the whole bundle a second time — and which would

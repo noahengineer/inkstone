@@ -128,9 +128,17 @@ class StrokeStoreEraseTest {
         assertEquals(0, store.size)
     }
 
+    /**
+     * ⭐ M8c — `forEachStrokeInRenderOrder`, because this file's subject is ink.
+     *
+     * The store holds [DryObject]s now, so the general walk hands back something that may not have
+     * a mesh. The narrowed walk is not a convenience here: every assertion below reads
+     * `dry.stroke`, and a page with an image on it would otherwise fail on a cast rather than on
+     * the erase behaviour being tested.
+     */
     private fun onlyStroke(): DryStroke {
         var found: DryStroke? = null
-        store.forEachInRenderOrder(null) { found = it }
+        store.forEachStrokeInRenderOrder(null) { found = it }
         return checkNotNull(found)
     }
 
@@ -210,8 +218,10 @@ class StrokeStoreEraseTest {
     fun highlightersRenderBeforePens() {
         loadStrokes(SMALL_COUNT)
 
+        // Strokes only: `InkBrushKind` is a property of ink, and the band this asserts on is
+        // decided by `DryObject.drawsOverInk`, which every non-stroke kind answers false to.
         val order = ArrayList<InkBrushKind>()
-        store.forEachInRenderOrder(null) { order += it.kind }
+        store.forEachStrokeInRenderOrder(null) { order += it.kind }
 
         val lastHighlighter = order.indexOfLast { it == InkBrushKind.HIGHLIGHTER }
         val firstPen = order.indexOfFirst { it != InkBrushKind.HIGHLIGHTER }

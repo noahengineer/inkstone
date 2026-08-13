@@ -35,6 +35,27 @@ import dev.inkstone.core.model.foldPage
  *    means the copy starts as the shortest log that produces the current picture, which is
  *    also what compaction would have produced (SPEC §4.7).
  *
+ * ## ⚠️ The third place a note's content lives (M8c)
+ *
+ * An op log and a manifest are not all of a note. **Image bytes are in `assets/` and in no op**
+ * (SPEC §4.9.4), so folding a page and re-emitting its ops copies the `ImageObject` and not the
+ * picture. Before M8c that was unreachable, because nothing wrote an asset; the moment M8c does,
+ * a duplicate of a note containing an image would come back as an `ImageObject` naming an entry
+ * that does not exist — a blank rectangle, defined and non-crashing and reported by nothing.
+ *
+ * The bytes therefore go in with the copy's one materialize, below. They cannot arrive through
+ * `NoteStore.materialize`'s own carry-forward: that reads the *copy's* bundle, and a note created
+ * a moment ago has no assets in it.
+ *
+ * ⚠️ **`assets()` and not `carried()`, and the difference is not an oversight.** An asset is safe
+ * to copy verbatim precisely because the *reference* to it is copied verbatim too — `withCopiedId`
+ * leaves `ImageObject.asset` alone, so the name still resolves in the copy. An entry this build
+ * cannot interpret has no such guarantee: a `future/<pageId>.bin` from a newer build is keyed to
+ * ids this function has just re-minted, so copying it would leave it pointing at a page the copy
+ * does not contain. That is the same reason [conflictedCopyOf] cannot carry a `PageOp.Unknown`
+ * across a re-identification, and it is why a duplicate is a *new* note rather than a second copy
+ * of an old one.
+ *
  * The original is not touched. It is opened read-only and closed by going out of scope.
  *
  * @return the new document, or null when [sourceId] is not a note.
@@ -76,8 +97,20 @@ public suspend fun NoteStore.duplicateNote(
         session.replay(target, ops)
     }
 
-    // A duplicate has never been near a server, whatever its original's state was.
-    session.close(NoteSyncState.LOCAL_ONLY)
+    // ⭐ The picture bytes (see the KDoc). Read from the source's bundle, which is the only
+    // place they exist, and handed to the copy's materialize — where `NoteStore.materialize`
+    // routes the `assets/` half into the written family, so each one lands exactly once.
+    //
+    // ⚠️ `close(LOCAL_ONLY)` spelled out as its three steps, because `close` takes no carried
+    // arguments and this is the *one* materialize that writes the copy's bundle. Calling both
+    // would rewrite — and re-read — every page of the note a second time, which on a 200-page
+    // notebook is the whole cost of the duplicate again. `NoteEditor.materializeNow` spells the
+    // same three steps out for the same shape of reason. A duplicate has never been near a
+    // server whatever its original's state was, which is what makes LOCAL_ONLY the honest
+    // argument to the compaction gate.
+    session.materialize(extraCarried = source.reader?.assets().orEmpty())
+    assertNotStale(session.document.id)
+    session.compactIfDue(NoteSyncState.LOCAL_ONLY, oldestAckedCounter = null)
     return session.document
 }
 
@@ -143,6 +176,21 @@ internal fun InkObject.withCopiedId(id: ObjectId): InkObject = when (this) {
  * — keeps the original id, and therefore resolves in the copy as [ConnectorEndState.DETACHED_ABSENT]
  * rather than `DETACHED_TOMBSTONED`. The geometry is identical either way (see that type); only
  * the label the UI could show differs, and the copy genuinely does not contain the tombstone.
+ *
+ * ## ⚠️ An image's asset string is deliberately **not** re-identified (M8c)
+ *
+ * `ImageObject.asset` is copied verbatim by `withCopiedId`, so the copy names the *original's*
+ * `assets/img-<oldId>.webp`. That is correct and intended — the bytes are the same picture, and
+ * re-identifying the string would only rename an entry that the copier would then have to write
+ * a second copy of. What it means is that **asset lifetime is refcount-free**: after one page
+ * duplicate, two objects with two different [ObjectId]s name one entry, and after a note
+ * duplicate two *notes* do.
+ *
+ * **So nothing in this app may ever delete an asset**, and in particular not on the tombstone of
+ * the object whose id is in its name. Deleting `assets/img-<id>.webp` when object `<id>` is
+ * erased would blank the *copy* — which the user never touched — and the failure would be a
+ * blank rectangle: defined, non-crashing and reported by nothing. See [Bundle.imageAsset], where
+ * the same rule is stated at the place the name is minted.
  */
 internal fun copiedObjectOps(
     folded: FoldedPage,
@@ -165,6 +213,18 @@ internal fun copiedObjectOps(
         // data becomes geometry (see `ShapeRecord.decode`).
         val carried = ShapeRecord.decode(text)?.remapTargets { remap[it] }?.encode() ?: text
         ops += PageOp.SetTextContent(nextOpId(), nextClock(), id, carried)
+    }
+    // ⭐ The format register (SPEC §4.9.2), M8c. A *second* loop rather than a second statement in
+    // the one above, because a register with no value must not stop the next register being
+    // copied — `continue` in a merged loop would have made a text box with a font but no text
+    // silently lose its font, which is the shape of bug this whole function exists to prevent.
+    //
+    // Carried verbatim with no re-targeting: an `ObjectFormat` names no other object. If one ever
+    // does, it needs a `remapTargets` of its own here — and the test that would catch forgetting
+    // is `duplicate a page, check the copy is independent`, not a codec round-trip.
+    for (obj in folded.objects) {
+        val format = folded.formatOf(obj.id) ?: continue
+        ops += PageOp.SetFormat(nextOpId(), nextClock(), remap.getValue(obj.id), format)
     }
     return ops
 }

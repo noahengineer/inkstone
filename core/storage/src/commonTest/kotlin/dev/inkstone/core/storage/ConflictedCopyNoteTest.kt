@@ -295,6 +295,35 @@ class ConflictedCopyNoteTest {
     }
 
     @Test
+    fun `the peers image bytes survive into the copy`() = runTest {
+        // ⚠️ Layer 3's promise is that nothing is discarded, and `assets/` is the one family
+        // where dropping it is *visible* — an ImageObject names its asset by string, that string
+        // survives re-identification, and a copy without the bytes shows a blank rectangle where
+        // the picture was. This line read `remote.carried()` until M8c, which was right only
+        // while the family was a carried unknown; taking it out of `carriedNames` in the same
+        // commit that gave it a writer would otherwise have made a conflicted copy lose every
+        // picture in the note it exists to preserve.
+        val (remoteId, _) = peerPublished()
+        val document = peerDocument(remoteId)
+        val asset = Bundle.imageAsset(ObjectId("peer-picture"))
+        val bytes = ByteArray(48) { (it * 5).toByte() }
+        val remoteBundle = BundleWriter.write(
+            BundleContents(
+                document = document,
+                pages = document.livePages.associate { ref ->
+                    ref.id to PageContents(PageSize.Letter, Background.Blank, emptyList())
+                },
+                highestClockCounter = 12L,
+                assets = mapOf(asset to bytes),
+            ),
+        )
+
+        val copy = assertNotNull(copyFrom(remoteBundle))
+
+        assertContentEquals(bytes, assertNotNull(readerOf(copy.id).assets()[asset], "the copy has no picture bytes"))
+    }
+
+    @Test
     fun `bytes that are not a bundle produce no copy and write nothing`() = runTest {
         val paths = fs.paths.toSet()
 

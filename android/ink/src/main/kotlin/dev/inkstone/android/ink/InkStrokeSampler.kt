@@ -76,13 +76,15 @@ public class InkStrokeSampler(
         // between a background pass and a visible stall.
         val scratch = StrokeInput()
         var clock = 0L
-        store.forEachInRenderOrder(visibleBounds = null) { dry ->
-            if (dry.kind.drawsOverInk) return@forEachInRenderOrder
+        // Strokes only: the recogniser is given handwriting, and a text box's words are already
+        // text (SPEC §8). M8c's non-stroke kinds have no ink samples to give it.
+        store.forEachStrokeInRenderOrder(visibleBounds = null) { dry ->
+            if (dry.kind.drawsOverInk) return@forEachStrokeInRenderOrder
             val samples = samplesOf(dry, dry.transform, scratch, clock)
-            if (samples.isEmpty()) return@forEachInRenderOrder
+            if (samples.isEmpty()) return@forEachStrokeInRenderOrder
             clock = samples.last().tMillis + PEN_LIFT_MILLIS
             val bounds = PageRect.around(samples.map { PagePoint(it.x, it.y) })
-                ?: return@forEachInRenderOrder
+                ?: return@forEachStrokeInRenderOrder
             result += SampledStroke(id = dry.id, samples = samples, bounds = bounds)
         }
         result

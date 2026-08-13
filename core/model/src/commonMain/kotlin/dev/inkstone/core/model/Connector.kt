@@ -7,7 +7,11 @@ import kotlin.math.sqrt
 /**
  * ⭐ ROADMAP M8b — **a shape's extended record, and where a connector's attachment lives.**
  *
- * SPEC §4.9 is the normative account; this KDoc is the reasoning that produced it.
+ * SPEC **§4.8** is the normative account; this KDoc is the reasoning that produced it.
+ *
+ * ⚠️ This said "§4.9" until M8c, when a §4.9 came to exist and the reference started pointing at
+ * a real but different section — text boxes, images and the *format* register. The shape record
+ * is §4.8.2; §4.9.2 is where the two registers are told apart.
  *
  * ## The problem
  *
@@ -481,10 +485,17 @@ public object ConnectorRouting {
  *   same bytes on every platform this module compiles for. `Float.toString` is not specified to
  *   agree between Kotlin/JVM and Kotlin/Native, and a re-save that rewrites a register only
  *   because the formatter disagreed is churn the sync engine would faithfully upload.
- * - **A value containing a separator is rejected, not escaped.** The only values that could
- *   contain one are object ids, which are UUIDv7, so rejecting is unreachable for anything this
- *   build writes — and an escaping scheme that is never exercised is an escaping scheme that is
- *   wrong.
+ * - **No value this build writes can contain a separator**, because every one of them is a UUIDv7,
+ *   a fixed tag, or a hand-formatted float. There is no escaping scheme, deliberately: one that is
+ *   never exercised is one that is wrong.
+ *
+ *   ⚠️ **Corrected in M8c — this said values were "rejected, not escaped", and nothing rejected
+ *   anything.** `encode` is a plain concatenation. The claim was harmless only because it happened
+ *   to be true of every value that had ever reached it; a reader who believed it and added a
+ *   user-typed value to the record would have got silent truncation on the *peer*, one sync later.
+ *   The guard is the **types**, not a check — which is why `ObjectFormat`'s font is a closed enum
+ *   and not a family name. Adding a runtime check would be worse than useless here: it would fire
+ *   on a *later* build's extras value and turn forward compatibility into a crash on save.
  */
 internal object ShapeRecordCodec {
 
@@ -634,23 +645,10 @@ internal object ShapeRecordCodec {
     }
 
     /**
-     * Three decimal places, no exponent, platform-independent.
+     * Three decimal places, no exponent, platform-independent — see [RecordText.number].
      *
-     * Sub-micron at any page size, and the round-trip is stable: decoding this and re-encoding it
-     * produces the same string, which is what keeps an autosave from rewriting a register that
-     * nobody touched.
+     * Shared with `ObjectFormatCodec` since M8c. It was a private copy here, and a byte-stability
+     * rule with two implementations is only as strong as the one nobody is maintaining.
      */
-    private fun format(value: Float): String {
-        if (!value.isFinite()) return "0"
-        val scaled = (value.toDouble() * SCALE).roundToLong()
-        if (scaled % SCALE == 0L) return (scaled / SCALE).toString()
-        val negative = scaled < 0
-        val magnitude = if (negative) -scaled else scaled
-        val whole = magnitude / SCALE
-        val fraction = (magnitude % SCALE).toString().padStart(DECIMALS, '0').trimEnd('0')
-        return "${if (negative) "-" else ""}$whole.$fraction"
-    }
-
-    private const val DECIMALS = 3
-    private const val SCALE = 1000L
+    private fun format(value: Float): String = RecordText.number(value)
 }

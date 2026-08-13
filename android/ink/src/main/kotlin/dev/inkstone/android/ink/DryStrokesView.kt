@@ -103,7 +103,7 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
         val saved = canvas.save()
         canvas.concat(pageToView)
         painter.paintBackground(canvas, pageSize, pageBackground, sourcePage)
-        painter.paintStrokes(canvas, store, pageToView, visibleBoundsInPageSpace())
+        painter.paintObjects(canvas, store, pageToView, visibleBoundsInPageSpace())
         painter.paintBorder(canvas, pageSize)
         highlight?.let { painter.paintHighlight(canvas, it) }
         canvas.restoreToCount(saved)

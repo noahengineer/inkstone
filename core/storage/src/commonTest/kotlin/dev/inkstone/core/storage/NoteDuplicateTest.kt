@@ -116,6 +116,45 @@ class NoteDuplicateTest {
     }
 
     @Test
+    fun `a duplicate carries the source notes image bytes`() = runTest {
+        // ⚠️ SPEC §4.9.4's third consequence. Image bytes are in `assets/` and in **no op**, so
+        // folding a page and re-emitting its ops copies the `ImageObject` and not the picture —
+        // and `duplicateNote`'s materialize carries forward the *copy's* own bundle, which for a
+        // note created a moment earlier is empty. Get this wrong and the duplicate is an
+        // ImageObject naming an entry that does not exist: a blank rectangle, defined,
+        // non-crashing, and reported by nothing.
+        val sourceId = sourceNote()
+        val asset = Bundle.imageAsset(ObjectId("obj-picture"))
+        val bytes = ByteArray(64) { (it * 3).toByte() }
+        withAsset(sourceId, asset, bytes)
+
+        val copy = assertNotNull(store.duplicateNote(sourceId, "Lecture copy", "device-a", ids, clock))
+
+        val reader = assertNotNull(BundleReader.open(FileByteSource(fs, NoteLayout.bundle(copy.id))))
+        assertContentEquals(bytes, assertNotNull(reader.assets()[asset], "the copy has no picture bytes"))
+        // ⚠️ And the name is the *original's*, deliberately — an asset string survives
+        // re-identification (`copiedObjectOps`). Which is what makes asset lifetime refcount-free:
+        // two objects in two notes now name one entry, so nothing may ever delete one.
+        assertContentEquals(
+            bytes,
+            assertNotNull(
+                BundleReader.open(FileByteSource(fs, NoteLayout.bundle(sourceId)))?.assets()?.get(asset),
+                "the original lost its picture",
+            ),
+        )
+    }
+
+    /** Put an asset into [id]'s bundle the way M8c's image insert will — a rewrite that adds bytes. */
+    private suspend fun withAsset(id: dev.inkstone.core.model.DocumentId, asset: String, bytes: ByteArray) {
+        val note = assertNotNull(store.open(id))
+        val pages = note.document.livePages.associate { ref ->
+            val loaded = store.loadPage(note, ref.id)
+            ref.id to PageContents(loaded.size, loaded.background, loaded.ops)
+        }
+        store.materialize(note, pages, extraCarried = mapOf(asset to bytes))
+    }
+
+    @Test
     fun `a duplicate is not stale — its bundle is written before it is returned`() = runTest {
         // `duplicateNote` closes the session, which materializes. If it did not, the copy
         // would exist only as a journal and SPEC §5.1's staleness assertion would fire the

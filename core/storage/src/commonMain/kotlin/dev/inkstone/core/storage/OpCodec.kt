@@ -28,6 +28,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -87,6 +88,7 @@ internal object OpCodec {
     private const val F_STYLE = "s"
     private const val F_Z = "z"
     private const val F_TEXT = "x"
+    private const val F_FORMAT = "fr"
     private const val F_ERASED = "e"
     private const val F_BACKGROUND = "bg"
     private const val F_SIZE = "sz"
@@ -98,6 +100,16 @@ internal object OpCodec {
     private const val T_STYLE = "sty"
     private const val T_Z = "zo"
     private const val T_TEXT = "txt"
+
+    /**
+     * SPEC §4.9.2 — **the one op type added after M2.**
+     *
+     * A build that predates it decodes this to [PageOp.Unknown], carries it through the fold, and
+     * re-emits these exact bytes on save. That degrade is what made the addition affordable; an
+     * unknown *object kind* would instead throw inside an unguarded `BundleReader`.
+     */
+    private const val T_FORMAT = "fmt"
+
     private const val T_ERASED = "era"
     private const val T_PAGE_META = "meta"
 
@@ -110,6 +122,7 @@ internal object OpCodec {
         T_STYLE to setOf(F_TARGET, F_STYLE),
         T_Z to setOf(F_TARGET, F_Z),
         T_TEXT to setOf(F_TARGET, F_TEXT),
+        T_FORMAT to setOf(F_TARGET, F_FORMAT),
         T_ERASED to setOf(F_TARGET, F_ERASED),
         T_PAGE_META to setOf(F_BACKGROUND, F_SIZE),
     )
@@ -136,45 +149,63 @@ internal object OpCodec {
             put(F_DEVICE, JsonPrimitive(op.clock.deviceId))
             put(F_TYPE, JsonPrimitive(typeOf(op)))
             if (pageId != null) put(F_PAGE, JsonPrimitive(pageId))
-            when (op) {
-                is PageOp.AddObject -> put(F_OBJECT, encodeObject(op.obj, geometry))
-
-                is PageOp.DeleteObject -> put(F_TARGET, JsonPrimitive(op.target.value))
-
-                is PageOp.SetTransform -> {
-                    put(F_TARGET, JsonPrimitive(op.target.value))
-                    put(F_MATRIX, encodeMatrix(op.absolute))
-                }
-
-                is PageOp.SetStyle -> {
-                    put(F_TARGET, JsonPrimitive(op.target.value))
-                    put(F_STYLE, encodeStyle(op.style))
-                }
-
-                is PageOp.SetZOrder -> {
-                    put(F_TARGET, JsonPrimitive(op.target.value))
-                    put(F_Z, JsonPrimitive(op.z.value))
-                }
-
-                is PageOp.SetTextContent -> {
-                    put(F_TARGET, JsonPrimitive(op.target.value))
-                    put(F_TEXT, JsonPrimitive(op.text))
-                }
-
-                is PageOp.SetErasedRegion -> {
-                    put(F_TARGET, JsonPrimitive(op.target.value))
-                    put(F_ERASED, encodeErased(op.absolute))
-                }
-
-                is PageOp.SetPageMeta -> {
-                    op.background?.let { put(F_BACKGROUND, encodeBackground(it)) }
-                    op.size?.let { put(F_SIZE, encodeSize(it)) }
-                }
-
-                is PageOp.Unknown -> error("handled above")
-            }
+            putPayload(op, geometry)
         }
         return withExtras(body, op.extras)
+    }
+
+    /**
+     * The per-type half of [encode], extracted in M8c.
+     *
+     * Not a style preference: adding `SetFormat` took [encode] to detekt's cyclomatic-complexity
+     * threshold exactly. Splitting the envelope from the payload is the honest fix — the `when` is
+     * one branch per op type and is meant to be read as a table, so **suppressing the warning would
+     * have been the wrong half to keep**: the next op added would have hidden behind the
+     * suppression instead of being noticed here.
+     */
+    private fun JsonObjectBuilder.putPayload(op: PageOp, geometry: GeometryWriter) {
+        when (op) {
+            is PageOp.AddObject -> put(F_OBJECT, encodeObject(op.obj, geometry))
+
+            is PageOp.DeleteObject -> put(F_TARGET, JsonPrimitive(op.target.value))
+
+            is PageOp.SetTransform -> {
+                put(F_TARGET, JsonPrimitive(op.target.value))
+                put(F_MATRIX, encodeMatrix(op.absolute))
+            }
+
+            is PageOp.SetStyle -> {
+                put(F_TARGET, JsonPrimitive(op.target.value))
+                put(F_STYLE, encodeStyle(op.style))
+            }
+
+            is PageOp.SetZOrder -> {
+                put(F_TARGET, JsonPrimitive(op.target.value))
+                put(F_Z, JsonPrimitive(op.z.value))
+            }
+
+            is PageOp.SetTextContent -> {
+                put(F_TARGET, JsonPrimitive(op.target.value))
+                put(F_TEXT, JsonPrimitive(op.text))
+            }
+
+            is PageOp.SetFormat -> {
+                put(F_TARGET, JsonPrimitive(op.target.value))
+                put(F_FORMAT, JsonPrimitive(op.record))
+            }
+
+            is PageOp.SetErasedRegion -> {
+                put(F_TARGET, JsonPrimitive(op.target.value))
+                put(F_ERASED, encodeErased(op.absolute))
+            }
+
+            is PageOp.SetPageMeta -> {
+                op.background?.let { put(F_BACKGROUND, encodeBackground(it)) }
+                op.size?.let { put(F_SIZE, encodeSize(it)) }
+            }
+
+            is PageOp.Unknown -> error("handled above")
+        }
     }
 
     private fun withExtras(body: JsonObject, extras: OpExtras): JsonObject {
@@ -192,6 +223,7 @@ internal object OpCodec {
         is PageOp.SetStyle -> T_STYLE
         is PageOp.SetZOrder -> T_Z
         is PageOp.SetTextContent -> T_TEXT
+        is PageOp.SetFormat -> T_FORMAT
         is PageOp.SetErasedRegion -> T_ERASED
         is PageOp.SetPageMeta -> T_PAGE_META
         is PageOp.Unknown -> op.type
@@ -371,6 +403,14 @@ internal object OpCodec {
             clock,
             target(element),
             element.getValue(F_TEXT).jsonPrimitive.content,
+            opExtras,
+        )
+
+        T_FORMAT -> PageOp.SetFormat(
+            opId,
+            clock,
+            target(element),
+            element.getValue(F_FORMAT).jsonPrimitive.content,
             opExtras,
         )
 
