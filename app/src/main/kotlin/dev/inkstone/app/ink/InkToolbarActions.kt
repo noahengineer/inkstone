@@ -12,4 +12,14 @@ data class InkToolbarActions(
     val onClear: () -> Unit,
     val onLoadSyntheticPage: (Int) -> Unit,
     val onResetLatency: () -> Unit,
+    // ⭐ ROADMAP M8a — the actions a selection offers. Each is one gesture on the surface and
+    // therefore one undo entry; none of them writes a file, and all of them emit only ops M2
+    // already defined.
+    val onDeleteSelection: () -> Unit,
+    val onDuplicateSelection: () -> Unit,
+    val onRecolourSelection: (Int) -> Unit,
+    val onResizeSelectionStroke: (Float) -> Unit,
+    val onBringSelectionToFront: () -> Unit,
+    val onSendSelectionToBack: () -> Unit,
+    val onClearSelection: () -> Unit,
 )

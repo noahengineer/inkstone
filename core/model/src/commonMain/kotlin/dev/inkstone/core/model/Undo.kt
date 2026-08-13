@@ -61,8 +61,20 @@ public object Undo {
             PageOp.SetZOrder(opId, clock, op.target, it.z)
         }
 
-        is PageOp.SetTextContent -> (before.find(op.target) as? TextBoxObject)?.let {
-            PageOp.SetTextContent(opId, clock, op.target, it.text)
+        // ⭐ The register's previous value, whatever kind of object holds it (M8b).
+        //
+        // ⚠️ This used to read `(before.find(target) as? TextBoxObject)?.text`, which was complete
+        // for as long as a text box was the only thing that could carry one. A shape's record
+        // ([ShapeRecord]) lives in this register too, so the cast made *"change a fill, press
+        // undo"* return null — and an entry with no inverse is dropped by `UndoStack.commit`, so
+        // the press would have done nothing while looking as though it had worked. That is SPEC
+        // §4.2's first-`SetStyle` trap, in the register next door.
+        //
+        // Null when the register was unset before the op — the same honest answer, and the same
+        // reason: `SetTextContent.text` is non-null and cannot say "unset". `commit` drops it, so
+        // the button stays honest rather than eating a press.
+        is PageOp.SetTextContent -> before.textOf(op.target)?.let {
+            PageOp.SetTextContent(opId, clock, op.target, it)
         }
 
         // The region as it was — `None` for a first erase, which is why un-erasing is
@@ -142,6 +154,19 @@ public object Undo {
  */
 public data class UndoEntry(val pageId: PageId, val forward: List<PageOp>, val inverse: List<PageOp>) {
     public val isEmpty: Boolean get() = forward.isEmpty() && inverse.isEmpty()
+
+    /**
+     * True when this gesture cannot be undone — [Undo.inverseOf] found no inverse for any of
+     * its ops.
+     *
+     * Not the same as [isEmpty]: this entry *did* something, and pressing undo would do
+     * nothing about it. Reachable three ways, and M8a made the third one routine —
+     * a gesture of nothing but [PageOp.Unknown]s (a newer build's ops, replayed); a delete of
+     * an object whose `AddObject` has not arrived (legal, SPEC §4.2); and the **first restyle
+     * of a stroke**, where the previous value of the style register is *unset* and SPEC §4.2's
+     * `SetStyle` cannot carry "unset". See [UndoStack.commit].
+     */
+    public val isUndoable: Boolean get() = inverse.isNotEmpty()
 }
 
 /**
@@ -191,8 +216,29 @@ public class UndoStack(
      */
     public fun commit(entry: UndoEntry) {
         if (entry.isEmpty) return
-        undoable += entry
+        // ⚠️ **The redo branch dies whatever happens next**, and that is not the same question as
+        // whether this gesture can itself be undone. The page has moved on either way, so a redo
+        // stored against the old state would re-apply ops on top of something else. Clearing it
+        // before the `isUndoable` guard below is deliberate — putting the guard first would leave a
+        // stale redo reachable after an edit that is not undoable, which is worse than either.
         redoable.removeAll { it.pageId == entry.pageId }
+
+        // ⚠️ Not `isEmpty` — **`isUndoable`**, and the difference is a dishonest button (M8a).
+        //
+        // A gesture with ops but no inverse used to be committed, and pressing undo then popped
+        // it, applied nothing, and left the user's actual last edit one press further away. That
+        // was rare enough to go unnoticed until restyle: SPEC §4.2's `SetStyle` cannot express
+        // "back to as-captured", so the *first* recolour of any stroke has no inverse, and
+        // "change the colour, press undo" would have done nothing at all — the exact shape of
+        // bug CLAUDE.md's definition-of-done #6 is about, shipped in the headline action of the
+        // milestone that added it.
+        //
+        // `:android:ink` fixes the restyle case at the source by writing the capture-time style
+        // into the register first, as a gesture of its own — which lands here, has no inverse of
+        // its own, and is dropped by this line rather than becoming a second press the user has
+        // to make. The two halves are why both exist.
+        if (!entry.isUndoable) return
+        undoable += entry
         // The cap is a document-wide budget, so the oldest gesture anywhere is the one that goes.
         // What it bounds is `undo.json` and the cost of re-folding from it — **not** the bundle:
         // `undo.json` sits beside the bundle and is not inside it (SPEC §5.1).

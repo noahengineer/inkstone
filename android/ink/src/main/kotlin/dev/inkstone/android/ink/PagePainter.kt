@@ -12,6 +12,7 @@ import androidx.ink.brush.TextureBitmapStore
 import androidx.ink.geometry.Box
 import androidx.ink.rendering.android.canvas.CanvasStrokeRenderer
 import dev.inkstone.core.model.Background
+import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.PageSize
 
 /**
@@ -160,16 +161,51 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
     }
 
     /**
-     * Draws one stroke, minus whatever an eraser has taken out of it.
+     * ⭐ M8a — draws one stroke **through its own transform**.
+     *
+     * The object's matrix is concatenated onto the canvas rather than applied to the geometry,
+     * for the reason SPEC §3.5 gives about erasing and SPEC §5.4 about the blob: the stroke is
+     * never modified, so a move is a matrix and not a rewrite, and undo is writing back the
+     * previous matrix rather than reconstructing points.
+     *
+     * ⚠️ **`strokeToScreenTransform` must include the object matrix too.** It is not a drawing
+     * transform — the canvas carries that — but its linear component sizes the antialiasing
+     * feather in stroke units (see [DryStrokesView] for the device bug that taught us this).
+     * Pass the page→canvas matrix alone and a stroke scaled to 300% is feathered as though it
+     * were still at 100%: crisp at the wrong width, which reads as "the ink went blurry when I
+     * resized it" and is not obviously a transform problem at all.
+     *
+     * Once concatenated, **the canvas is in the object's own space** — which is the space the
+     * erased region and the stroke's bounds are already in, so everything below this line is
+     * unchanged from before M8a and needs no mapping.
+     */
+    private fun paintStroke(canvas: Canvas, dry: DryStroke, pageToCanvas: Matrix) {
+        val transform = dry.transform
+        if (transform == Matrix3.Identity) {
+            paintInObjectSpace(canvas, dry, pageToCanvas)
+            return
+        }
+        transform.into(objectMatrix)
+        objectToCanvas.set(pageToCanvas)
+        objectToCanvas.preConcat(objectMatrix)
+        val saved = canvas.save()
+        canvas.concat(objectMatrix)
+        paintInObjectSpace(canvas, dry, objectToCanvas)
+        canvas.restoreToCount(saved)
+    }
+
+    /**
+     * Draws one stroke, minus whatever an eraser has taken out of it, onto a canvas that is
+     * already in the stroke's own space.
      *
      * The layer is bounded to the stroke, and only strokes that have actually been erased
      * pay for one at all, so the common case is untouched.
      */
-    private fun paintStroke(canvas: Canvas, dry: DryStroke, pageToCanvas: Matrix) {
+    private fun paintInObjectSpace(canvas: Canvas, dry: DryStroke, strokeToCanvas: Matrix) {
         val erased = dry.erased
         val bounds = dry.bounds
         if (erased == null || bounds == null) {
-            renderer.draw(canvas, dry.stroke, pageToCanvas)
+            renderer.draw(canvas, dry.stroke, strokeToCanvas)
             return
         }
 
@@ -183,7 +219,7 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
             bounds.yMax + LAYER_PADDING_PT,
         )
         val layer = canvas.saveLayer(layerBounds, null)
-        renderer.draw(canvas, dry.stroke, pageToCanvas)
+        renderer.draw(canvas, dry.stroke, strokeToCanvas)
         // One stroked draw per constant-radius run. Skia expands the polyline into the swept
         // capsule, caches the tessellation, and resolves the path's self-overlap in a single
         // coverage pass — so a scribbled erase does not double-darken its own crossings.
@@ -196,8 +232,40 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
         canvas.restoreToCount(layer)
     }
 
+    /** Reused every frame — `onDraw` must not allocate (CLAUDE.md rule 7). */
+    private val objectMatrix = Matrix()
+    private val objectToCanvas = Matrix()
+    private val matrixValues = FloatArray(MATRIX_VALUES)
+
+    /**
+     * [Matrix3] (two rows, the third implied) into an `android.graphics.Matrix` (all nine).
+     *
+     * Row-major in both, in the same order, so this is a copy and not a transpose — which is
+     * worth stating because getting it wrong produces a transform that is *plausible*: a pure
+     * scale survives a transpose unchanged, so the mistake only shows up once something is
+     * rotated, by which point the change that caused it is long merged.
+     */
+    // The nine indices ARE the matrix layout, exactly as the byte offsets are the format in
+    // `StrokeGeometryCodec` (which suppresses this for the same reason). A constant per slot would
+    // say "row one, column two" less clearly than `[5]` does, and would make the block harder to
+    // check against the six fields above it.
+    @Suppress("MagicNumber")
+    private fun Matrix3.into(out: Matrix) {
+        matrixValues[0] = m00
+        matrixValues[1] = m01
+        matrixValues[2] = m02
+        matrixValues[3] = m10
+        matrixValues[4] = m11
+        matrixValues[5] = m12
+        matrixValues[6] = 0f
+        matrixValues[7] = 0f
+        matrixValues[8] = 1f
+        out.setValues(matrixValues)
+    }
+
     private companion object {
         const val PAGE_BORDER_COLOR = 0x22000000
         const val LAYER_PADDING_PT = 2f
+        const val MATRIX_VALUES = 9
     }
 }

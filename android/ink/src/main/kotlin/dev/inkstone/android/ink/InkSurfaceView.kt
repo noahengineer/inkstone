@@ -99,6 +99,10 @@ public class InkSurfaceView @JvmOverloads constructor(
     private val strokes = StrokeStore()
 
     private val dryView = DryStrokesView(context, strokes, textureStore)
+
+    /** M8a's chrome, between the ink and the wet layer. See [SelectionOverlayView]. */
+    private val overlay = SelectionOverlayView(context)
+
     private val wetView = InProgressStrokesView(context)
 
     /** How many finished strokes are on the page. */
@@ -115,6 +119,21 @@ public class InkSurfaceView @JvmOverloads constructor(
         dryView.onStoreChanged()
         onStrokeCountChanged?.invoke(strokes.size)
     }
+
+    /**
+     * ⭐ M8a — the selection tool. Built to [EraserController]'s shape; see its own KDoc for
+     * why the ops it writes are stamped here rather than in `NoteEditor`.
+     */
+    // The explicit type is required: the callback reads `selection` back, and without it the
+    // compiler cannot infer the property's type from an initialiser that mentions the property.
+    private val selectionController: SelectionController =
+        SelectionController(strokes, brushFactory, displayMetrics.density, pixelsPerPoint) {
+            dryView.onStoreChanged()
+            overlay.onSelectionChanged()
+            onStrokeCountChanged?.invoke(strokes.size)
+            onSelectionChanged?.invoke(selectionController.size)
+            onHistoryChanged?.invoke()
+        }
 
     private val gestures = CameraGestureTracker(zoomLimits)
     private val palmGuard = PalmGuard()
@@ -150,8 +169,16 @@ public class InkSurfaceView @JvmOverloads constructor(
 
     public var pen: PenConfig = PenConfig.Default
 
-    /** The toolbar eraser. The flipped pen tip and barrel button are per-event. */
-    public var eraserSelected: Boolean = false
+    /**
+     * Which tool the toolbar has selected. The flipped pen tip and barrel button are per-event
+     * and override this (SPEC §3.3).
+     *
+     * ⭐ M8a replaced a `eraserSelected: Boolean` with this. Adding selection as a second
+     * boolean would have made "the eraser and the lasso are both active" a representable state
+     * that nothing could resolve, which is the same shape as the `undoable` flag M6 deleted —
+     * a wrong call that is expressible is eventually made.
+     */
+    public var tool: InkTool = InkTool.PEN
 
     /**
      * SPEC §3.4 — "steal this from Goodnotes: after erasing, auto-return to the
@@ -210,6 +237,7 @@ public class InkSurfaceView @JvmOverloads constructor(
         set(value) {
             field = value
             dryView.pageSize = value
+            overlay.pageSize = value
         }
 
     /** The paper under the ink. Changed through [loadPage] or [setPageMeta], never on its own. */
@@ -219,11 +247,23 @@ public class InkSurfaceView @JvmOverloads constructor(
         private set(value) {
             field = value
             dryView.camera = value
+            overlay.camera = value
             onCameraChanged?.invoke(value)
         }
 
     public var onCameraChanged: ((Camera) -> Unit)? = null
     public var onStrokeCountChanged: ((Int) -> Unit)? = null
+
+    /**
+     * ⭐ M8a — how many objects are selected, so the toolbar can offer the actions that need
+     * one and hide them when there is nothing to act on.
+     *
+     * A nullable callback rather than a method on `NoteEditor.NoteSurface`, for the reason
+     * `onStrokeCaptured` is: a method there acquires a `= Unit` default and a recording fake in
+     * front of it, which is M6's `setPageMeta` — every assertion true of the editor and false
+     * of the app. This has one implementation, it is this class, and there is nothing to stub.
+     */
+    public var onSelectionChanged: ((Int) -> Unit)? = null
 
     /**
      * ⭐ M12 — a stroke the user just drew, and the monotonic time its **down event** arrived
@@ -312,6 +352,10 @@ public class InkSurfaceView @JvmOverloads constructor(
      */
     public fun loadPage(page: FoldedPage) {
         wetView.cancelUnfinishedStrokes()
+        // Before `reset`, so the overlay is not briefly drawing a box round ids that no longer
+        // exist. A selection belongs to a page: carrying it across would leave the toolbar
+        // offering "delete" for objects on a page the user has left.
+        selectionController.clear()
         strokes.reset()
         pageSize = page.size
         // Explicit, because the setter above no longer does it. A page *switch* should fit the new
@@ -429,11 +473,25 @@ public class InkSurfaceView @JvmOverloads constructor(
     }
 
     /**
-     * Fired when [autoReturnToPenAfterErase] has just cleared [eraserSelected],
+     * Fired when [autoReturnToPenAfterErase] has just put [tool] back to [InkTool.PEN],
      * so the toolbar's own copy of the tool state can follow. Nothing else in
      * this view changes the tool behind the caller's back.
      */
     public var onEraserAutoReleased: (() -> Unit)? = null
+
+    // -----------------------------------------------------------------------
+    // Selection (ROADMAP M8a)
+    // -----------------------------------------------------------------------
+
+    /**
+     * ⭐ What the toolbar does to a selection — see [InkSelection].
+     *
+     * One handle rather than seven methods on this class. `InkSurfaceView` already owns ink
+     * capture, a camera, a page, an undo bridge and a recording hook; the commands read better as
+     * `surface.selection.bringToFront()` than as a seventh group of top-level members, and the
+     * interface is what `:app` holds so the controller itself stays internal to this module.
+     */
+    public val selection: InkSelection get() = selectionController
 
     /** Applies SPEC §4.5's leash: pan freely, but never lose the page. */
     private fun Camera.leashed(): Camera =
@@ -448,7 +506,9 @@ public class InkSurfaceView @JvmOverloads constructor(
             ViewGroup.LayoutParams.MATCH_PARENT,
         )
         addView(dryView, fill)
+        addView(overlay, fill)
         addView(wetView, fill)
+        overlay.selection = selectionController
 
         // Warm the native ink stack and the texture atlas now, so the first
         // ACTION_DOWN of the session is not the one that pays for them.
@@ -599,7 +659,8 @@ public class InkSurfaceView @JvmOverloads constructor(
             return true
         }
 
-        if (activeStrokeId != null || eraser.isActive || !palmGuard.allowsFinger(event)) return true
+        val gestureInFlight = activeStrokeId != null || eraser.isActive || selectionController.isActive
+        if (gestureInFlight || !palmGuard.allowsFinger(event)) return true
 
         taps.onPointerDown(event)
 
@@ -627,10 +688,14 @@ public class InkSurfaceView @JvmOverloads constructor(
         val hardwareEraser = hardwareEraserAllowed &&
             (event.getToolType(index) == MotionEvent.TOOL_TYPE_ERASER || (event.buttonState and barrel) != 0)
 
-        if (hardwareEraser || eraserSelected) {
+        if (hardwareEraser || tool == InkTool.ERASER) {
             // Only a hardware eraser is "temporary": it restores itself when the
             // pen is flipped back, so it must not trigger SPEC §3.4's auto-return.
+            // A flipped tip beats the selection tool too — the eraser end of the pen
+            // erases, whatever the toolbar says, which is the whole point of SPEC §3.3.
             eraser.begin(event, index, pointerId, temporary = hardwareEraser, camera = camera)
+        } else if (tool == InkTool.SELECT) {
+            selectionController.begin(event, index, pointerId, camera, pageSize)
         } else {
             beginStroke(event, pointerId)
         }
@@ -682,6 +747,11 @@ public class InkSurfaceView @JvmOverloads constructor(
             eraser.extend(event, camera)
             return true
         }
+        if (selectionController.isActive) {
+            palmGuard.noteStylusEvent(event)
+            selectionController.extend(event, camera)
+            return true
+        }
         if (!gestures.isActive || !palmGuard.allowsFinger(event)) return false
         taps.onMove(event)
         camera = gestures.onMove(event, camera).leashed()
@@ -710,6 +780,15 @@ public class InkSurfaceView @JvmOverloads constructor(
             eraser.pointerId -> {
                 if (!cancelled) eraser.extend(event, camera)
                 releaseEraser()
+            }
+
+            selectionController.pointerId -> {
+                if (cancelled) {
+                    selectionController.cancel()
+                } else {
+                    selectionController.extend(event, camera)
+                    selectionController.end(camera)
+                }
             }
 
             else -> {
@@ -744,6 +823,9 @@ public class InkSurfaceView @JvmOverloads constructor(
         activeStrokeId = null
         strokePointerId = MotionEvent.INVALID_POINTER_ID
         releaseEraser()
+        // Puts the previewed transforms back and writes nothing — a cancelled drag must not
+        // leave the objects where the finger last was, because no op describes that position.
+        selectionController.cancel()
         gestures.abandon()
         taps.cancel()
     }
@@ -757,8 +839,8 @@ public class InkSurfaceView @JvmOverloads constructor(
      */
     private fun releaseEraser() {
         val wasToolbarEraser = eraser.end()
-        if (wasToolbarEraser && autoReturnToPenAfterErase && eraserSelected) {
-            eraserSelected = false
+        if (wasToolbarEraser && autoReturnToPenAfterErase && tool == InkTool.ERASER) {
+            tool = InkTool.PEN
             onEraserAutoReleased?.invoke()
         }
     }

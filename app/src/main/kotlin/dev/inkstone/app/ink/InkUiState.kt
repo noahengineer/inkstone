@@ -11,6 +11,7 @@ import androidx.compose.runtime.setValue
 import dev.inkstone.android.ink.EraseMode
 import dev.inkstone.android.ink.InkBrushKind
 import dev.inkstone.android.ink.InkInputModel
+import dev.inkstone.android.ink.InkTool
 import dev.inkstone.android.ink.LatencyStats
 import dev.inkstone.android.ink.PenConfig
 import dev.inkstone.android.ink.StylusStats
@@ -42,7 +43,17 @@ class InkUiState {
     var kind by mutableStateOf(InkBrushKind.FOUNTAIN)
         private set
 
-    var eraserSelected by mutableStateOf(false)
+    /**
+     * ⭐ M8a — pen, eraser or lasso, as one value.
+     *
+     * Was `eraserSelected: Boolean`. Selection made a second boolean the obvious move and a
+     * wrong one: two flags make "eraser and lasso both on" representable and nothing would have
+     * resolved it. See [InkTool].
+     */
+    var tool by mutableStateOf(InkTool.PEN)
+
+    /** How many objects the lasso currently holds — what the selection actions are enabled by. */
+    var selectionSize by mutableIntStateOf(0)
 
     /** SPEC §3.5, revised in M1: partial erase is the default. */
     var eraseMode by mutableStateOf(EraseMode.PARTIAL)
@@ -75,7 +86,7 @@ class InkUiState {
 
     fun selectBrush(next: InkBrushKind) {
         kind = next
-        eraserSelected = false
+        tool = InkTool.PEN
     }
 
     fun setColor(argb: Int) {

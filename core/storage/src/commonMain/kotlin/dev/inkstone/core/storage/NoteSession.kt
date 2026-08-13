@@ -483,18 +483,16 @@ public class NoteSession(
      * a grow-only union, and the fold's first-write-wins payload rule would then make one
      * copy's geometry silently win on both pages — SPEC §5.6 names the same failure for
      * recovered imports.
+     *
+     * ⚠️ And new ids mean anything that *names* an id has to be re-targeted, which since M8b is a
+     * real case: a connector's binding lives in the `SetTextContent` register (`ShapeRecord`).
+     * [copiedObjectOps] is the one implementation of both halves — see its KDoc for what a bare
+     * `AddObject` loop lost.
      */
     public suspend fun duplicatePage(pageId: PageId, index: Int = pageCount): PageId? {
         val source = page(pageId)
         val copyId = addPage(index, source.size, source.background)
-        val ops = source.objects.map { obj ->
-            PageOp.AddObject(
-                opId = nextOpId(),
-                clock = nextClock(),
-                obj = obj.withRegisters().withNewId(ids.newObjectId()),
-            )
-        }
-        replay(copyId, ops)
+        replay(copyId, copiedObjectOps(source, ids::newObjectId, ::nextOpId, ::nextClock))
         return copyId
     }
 
@@ -762,17 +760,7 @@ public class NoteSession(
     }
 }
 
-/**
- * A copy of this object under a new identity.
- *
- * Lives here rather than on [dev.inkstone.core.model.InkObject] because re-identifying an
- * object is a storage-layer operation with exactly one legitimate caller — duplicating a
- * page. Offering it on the model type would make it look like something an editor may do,
- * and an object that changes id mid-life is unmergeable.
- */
-private fun InkObject.withNewId(id: ObjectId): InkObject = when (this) {
-    is StrokeObject -> copy(id = id)
-    is ImageObject -> copy(id = id)
-    is TextBoxObject -> copy(id = id)
-    is ShapeObject -> copy(id = id)
-}
+// The private `withNewId` that used to live here was a third hand-written `when` over the four
+// object kinds, beside `NoteDuplicate.withCopiedId`'s two. M8b folded all three copiers into
+// `copiedObjectOps`, which is the only caller now — and one implementation is what stops the
+// *next* register being carried by two of them and forgotten by the third.

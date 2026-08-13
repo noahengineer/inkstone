@@ -397,8 +397,23 @@ public class NoteStore(private val fs: FileSystem, private val clock: Clock, pri
      */
     public suspend fun writeSnapshot(id: DocumentId, page: FoldedPage, deviceId: String) {
         val clockValue = page.throughClock ?: return
-        val ops = page.objects.map { obj ->
+        val ops = ArrayList<PageOp>(page.objects.size)
+        page.objects.mapTo(ops) { obj ->
             PageOp.AddObject(opId = ids.newOpId(), clock = clockValue, obj = obj)
+        }
+        // ⚠️ **`AddObject` alone is not the whole fold, and has not been since M8b.** Every other
+        // register is baked onto the payload by `PageFolder.materialise`; the `SetTextContent` one
+        // is baked on only for a text box, and it is where a shape's fill and a connector's
+        // attachment live (`ShapeRecord`).
+        //
+        // The bundle keeps the raw log either way (SPEC §4.7 — *"the snapshot is a cache, not the
+        // truth"*), so a snapshot that dropped this would not lose data: `PageLog` re-absorbs the
+        // real `SetTextContent` from the log and the record comes back. Writing it anyway makes
+        // the snapshot a faithful picture rather than one that happens to be repaired downstream,
+        // which is the difference between a cache and a cache with a hole in it.
+        for (obj in page.objects) {
+            val text = page.textOf(obj.id) ?: continue
+            ops += PageOp.SetTextContent(opId = ids.newOpId(), clock = clockValue, target = obj.id, text = text)
         }
         val document = Document(
             id = id,

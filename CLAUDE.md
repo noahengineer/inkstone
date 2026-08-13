@@ -181,6 +181,13 @@ A milestone is done when:
 2. New logic has tests
 3. `./gradlew build` is green, including guardrail 1 (`checkCoreIsPlatformFree`) and the iOS **klib compile**. It does **not** include guardrail 2's framework link off macOS — `linkIosCore` and every `link*IosSimulatorArm64` task log `SKIPPED` on Windows, and the macOS CI job is what proves them. "Green including both guardrails" is not a claim a Windows build supports; say which half ran.
 
+   ⚠️ **`--rerun` is a *per-task* option and silently ignores the tasks before it** (M8a).
+   `gradlew :a:testDebugUnitTest :b:testDebugUnitTest --rerun` reruns **neither** — both log
+   `UP-TO-DATE`, which is the green-build-that-ran-nothing this section is about, met while trying
+   to avoid it. It has to follow each task: `:a:testDebugUnitTest --rerun :b:testDebugUnitTest
+   --rerun`. (`--rerun-tasks` is global but reruns the whole graph, which on a OneDrive-synced
+   checkout hits `classes.jar` file locks.) Always read the `> Task …` lines back.
+
    ⚠️ **A green `build` routinely executes zero tests, and then it is evidence about nothing.** Found in M6's closing audit, three times in a row: `BUILD SUCCESSFUL in 18s` with every `test*UnitTest`, `detekt`, `spotlessCheck` and `checkCoreIsPlatformFree` logging `UP-TO-DATE`. Deleting `build/test-results` does **not** force them — the second attempt returned `:app:testDebugUnitTest FROM-CACHE`, restored from the Gradle build cache without running a method. **Before quoting a build line as evidence, check that its test tasks are neither `UP-TO-DATE` nor `FROM-CACHE`**; force with `--no-build-cache` plus `--rerun` per test task. This bites hardest on tests that reach outside the build — the live merge matrix talks to a real Nextcloud, and an up-to-date check will skip it without a word.
 4. It has been used on the actual Galaxy Tab, not just an emulator — `tools/send-to-tablet.ps1` builds and copies the APK over MTP, which works when `adb install` can't because USB debugging is unauthorized. Measuring still needs adb; see the README.
 
@@ -224,6 +231,7 @@ A milestone is done when:
 | Ink input requirements | SPEC §3.3 |
 | Erase model (area-based since M1) | SPEC §3.5 |
 | Op vocabulary + absolute transforms | SPEC §4.2 |
+| **Shapes + where a connector's attachment lives** | SPEC §4.8 |
 | **Undo — per page, and why** | SPEC §4.6 |
 | Convergence / re-folding | SPEC §4.3 |
 | **Coordinate spaces** | SPEC §4.4 |
@@ -247,6 +255,8 @@ A milestone is done when:
 | **M5 Nextcloud decisions + spike #4 status** | `docs/M5-NEXTCLOUD.md` |
 | **M6 pull/merge/conflict decisions + the 21-row status table** | `docs/M6-SYNC.md` |
 | **M7 recognition/search decisions + the segmented-vs-blob numbers** | `docs/M7-RECOGNITION.md` |
+| **M8a selection/transform decisions + the per-feature check table** | `docs/M8-SELECTION.md` |
+| **M8b connector format decided + what is still not built** | `docs/M8-CONNECTORS.md` (§6 is the remainder) |
 | **M12 lecture recording — capture built, alignment still designed** | `docs/M12-AUDIO.md` (§15 is what exists) |
 
 ---
@@ -330,6 +340,49 @@ Collected during research so they don't get reintroduced from stale training dat
   affine; assuming one of them flipped 40% of the sample and cost the segmented arm more than half
   its accuracy, reported as nothing at all. Found by rendering a page to a PNG and *looking at it*.
   When a measurement is worse than it should be and nothing is failing, draw the input.
+- ⚠️ **A milestone's own prompt can be superseded by the section it tells you to read** (M8a).
+  ROADMAP M8a asks for partial erase as `DeleteObject + AddObject(fragment) + AddObject(fragment)`;
+  SPEC §3.5, revised twice in M1 **on the tablet**, says *"M8a's 'partial erase splits a stroke into
+  fragments' is superseded. Nothing splits."* — and the prompt opens with *"Read SPEC.md §3.5"*.
+  Implementing the prompt fails SPEC §13.2 row 7, whose `assertEquals(1, folded.objects.size)` is
+  the automated guard against exactly it. The habit that catches this is reading the referenced
+  section **before** the instruction that references it, not after.
+- ⚠️ **When a coordinate space is only ever the identity, two different spaces have the same
+  numbers — and the code says the wrong one for free** (M8a). Erase capsules were "in page space"
+  for four milestones and were really in the *object's* space; nothing could tell, because nothing
+  could move. The moment M8a's selection tool could, both readings failed silently: a page-space
+  region leaves the hole behind when the stroke is dragged away, and a page-space coverage test
+  passes straight through the moved stroke. **Before adding the thing that makes two spaces differ,
+  grep for every place that names either one.** Nothing migrated here — every existing capsule
+  belongs to an object at the identity, where the two agree — but only by luck of ordering.
+- ⚠️ **An undo entry with no inverse used to go on the stack, and pressing undo consumed it doing
+  nothing** (M8a). `UndoStack.commit` skipped entries empty in *both* directions; `Undo.inverseOf`
+  returns null for a `PageOp.Unknown`, for a delete of an object that has not arrived, and — the
+  one that made it a real bug — for the **first `SetStyle` on any stroke**, because the style
+  register starts unset and SPEC §4.2's `SetStyle` cannot carry "unset". So *"change the colour,
+  press undo"* did nothing while eating the press. `commit` tests `isUndoable` now, and
+  `:android:ink` writes the capture-time style into the register first (it is the only module that
+  can read it off the brush) so the recolour has something to invert to. **Neither fix touches the
+  op format** — making `style` nullable would break every older build, since `OpCodec` reads it
+  with `getValue`.
+- ⚠️ **A private counter that hands out fractional keys goes stale the moment another op can write
+  one** (M8a). `PageOpRecorder` advanced its own `lastZ` per stroke, which was right until
+  `SetZOrder` existed: bring a stroke to the front and the recorder's counter is now *below* the
+  top of the page, so **the next stroke the user draws lands underneath it** — on screen, in the
+  PDF's `/Annots` order, and on every peer, with nothing connecting the two actions. The maximum
+  belongs to whatever sees *every* writer, which is `StrokeStore`.
+- ⚠️ **A register that only one object kind can carry is a register three copy paths will drop**
+  (M8b). `SetTextContent` was a text box's field for six milestones: `PageFolder.materialise`
+  applied it only to a `TextBoxObject`, `Undo.inverseOf` cast the target to one, and
+  `duplicateNote` / `duplicatePage` / `conflictedCopyOf` each relied on the documented invariant
+  that *"a fold collapses **every** register onto the payload, so `AddObject` is the only op
+  carrying an `ObjectId` a re-identification pass could miss"*. The moment a shape's fill and a
+  connector's attachment moved into that register (SPEC §4.8) all four were wrong at once, and
+  every one of them failed **silently**: a duplicated diagram came back as unfilled boxes joined by
+  straight lines, its connectors naming the *original's* ids and so resolving as detached — defined,
+  non-crashing and visibly wrong — while "change a fill, press undo" ate the press and did nothing.
+  Copying is one shared `copiedObjectOps` now. The habit that catches this is grepping for
+  everything that *copies an object*, not everything that reads the new field.
 - **`EncryptedSharedPreferences` was deprecated in 2025.** Keystore AES-GCM directly.
 - Nextcloud's `loginName` is **not** the WebDAV path segment. Fetch the UID from `/ocs/v2.php/cloud/user`.
 - Nextcloud forbids only `\` and `/` by default — **not** the Windows character set. Read the real rules from capabilities.

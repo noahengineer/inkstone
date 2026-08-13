@@ -97,6 +97,27 @@ public data class Matrix3(
         return abs(m00 * m01 + m10 * m11) / (lengthX * lengthY) > tolerance
     }
 
+    /**
+     * True when the two axes have become parallel, or one of them has vanished — the
+     * transform has collapsed the object onto a line or a point.
+     *
+     * Added in M8a, and here rather than in the selection code for the same reason
+     * [isSkewed] is: it is a property of the matrix, and the one caller that must refuse to
+     * *write* such a matrix ([SelectionEdit.transform]) is not the only one that cares —
+     * [inverse] answers null for one, and the inverse is what maps an eraser's page-space
+     * sweep into a transformed object's own space.
+     *
+     * Normalised by the axis lengths, so it asks about *shape* and not about size: a 0.01×
+     * uniform scale is a legible thumbnail and must not be refused, while a 1000×-wide
+     * zero-height scale must.
+     */
+    public fun isDegenerate(tolerance: Float = DEGENERATE_TOLERANCE): Boolean {
+        val lengthX = hypot(m00, m10)
+        val lengthY = hypot(m01, m11)
+        if (lengthX < DEGENERATE_AXIS || lengthY < DEGENERATE_AXIS) return true
+        return abs(determinant) / (lengthX * lengthY) < tolerance
+    }
+
     public companion object {
         public val Identity: Matrix3 = Matrix3(1f, 0f, 0f, 0f, 1f, 0f)
 
@@ -113,5 +134,9 @@ public data class Matrix3(
 
         private const val EPSILON = 1e-9f
         private const val SKEW_TOLERANCE = 1e-4f
+
+        /** An axis shorter than this is gone, whatever the determinant says about the pair. */
+        private const val DEGENERATE_AXIS = 1e-6f
+        private const val DEGENERATE_TOLERANCE = 1e-4f
     }
 }

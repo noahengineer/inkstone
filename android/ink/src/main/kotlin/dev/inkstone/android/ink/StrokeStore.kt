@@ -6,28 +6,121 @@ import androidx.ink.geometry.ImmutableBox
 import androidx.ink.geometry.ImmutableParallelogram
 import androidx.ink.geometry.ImmutableSegment
 import androidx.ink.geometry.ImmutableVec
+import androidx.ink.geometry.MutableVec
 import androidx.ink.geometry.Parallelogram
 import androidx.ink.strokes.Stroke
+import dev.inkstone.core.model.FractionalKey
+import dev.inkstone.core.model.Lasso
+import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PagePoint
+import dev.inkstone.core.model.PageRect
+import dev.inkstone.core.model.SelectedObject
+import dev.inkstone.core.model.SelectionEdit
 import dev.inkstone.core.model.StrokeObject
+import kotlin.math.abs
+import kotlin.math.sqrt
 
 /**
- * A finished stroke, in **page space** (SPEC §4.4 rule 1).
+ * A finished stroke, in **page space** (SPEC §4.4 rule 1) — or, since M8a, in its own space
+ * with [transform] placing it on the page.
  *
  * @property id the object's [ObjectId] — a UUIDv7, minted when the stroke finished. M1 used a
  *   process-local counter here because there was nothing to persist; ops target objects by id,
  *   so M2 replaces it (CLAUDE.md, "Identity": never derive identity from array position).
- * @property bounds cached at insertion. Recomputing it per hit-test would make erasing
- *   O(strokes) native calls instead of O(strokes) float compares. Null for a stroke whose mesh
- *   came out empty, which then simply cannot be culled.
+ * @property bounds cached at insertion, in the stroke's **own** space. Recomputing it per
+ *   hit-test would make erasing O(strokes) native calls instead of O(strokes) float compares.
+ *   Null for a stroke whose mesh came out empty, which then simply cannot be culled.
  */
-internal class DryStroke(val id: ObjectId, val stroke: Stroke, val kind: InkBrushKind, val bounds: PageBounds?) {
+internal class DryStroke(
+    val id: ObjectId,
+    stroke: Stroke,
+    val kind: InkBrushKind,
+    /**
+     * The smoothing model this stroke was **captured** with, not the toolbar's current one.
+     *
+     * Carried because [restyle] re-tessellates, and re-tessellating with today's setting would
+     * silently re-shape a stroke drawn months ago the moment its colour was changed — the same
+     * mistake `InkBrushFactory.brushFor(kind, …)` exists to avoid on the load path, arriving by
+     * a different door.
+     */
+    val inputModel: InkInputModel = InkInputModel.SPRING,
+    transform: Matrix3 = Matrix3.Identity,
+    style: ObjectStyle? = null,
+    z: FractionalKey = FractionalKey.Initial,
+) {
 
     /**
-     * What an eraser has taken out of this stroke, in page space. Null until something is
-     * erased, so an untouched stroke costs nothing. See [ErasedRegion] for why erasing is an
-     * area rather than a point list.
+     * The stroke as it is currently drawn.
+     *
+     * ⚠️ **`var`, and that is not a mutation of user data.** A `SetStyle` changes the brush,
+     * and `Brush.size` is in stroke units — so restyling re-tessellates and produces a
+     * genuinely different mesh. The *inputs* are untouched and the geometry blob on disk is
+     * untouched; what changes is the rendering of them, which is what a style register is
+     * (see [ObjectStyle] on why a stroke's captured colour and its style override are two
+     * different things and only one is the truth).
+     *
+     * Everything downstream — erasing, the PDF outline, `isFullyErased` — reads this rather
+     * than the captured stroke, because what the user erases is what the user can see.
+     */
+    var stroke: Stroke = stroke
+        private set
+
+    var bounds: PageBounds? = PageBounds.of(stroke.shape.computeBoundingBox())
+        private set
+
+    /**
+     * ⭐ M8a — the object's **absolute** transform (SPEC §4.2, CLAUDE.md rule 8).
+     *
+     * Identity for every stroke drawn before M8a and for every stroke the user has not moved:
+     * ink is authored directly in page space, so there is nothing to transform until a
+     * selection tool touches it.
+     */
+    var transform: Matrix3 = transform
+        private set
+
+    /** Null means "as captured" — see [ObjectStyle]. */
+    var style: ObjectStyle? = style
+        private set
+
+    /** Render order within this stroke's band, resolved by `(z, id)`. */
+    var z: FractionalKey = z
+        private set
+
+    /**
+     * The bounding box **in page space** — [bounds] under [transform].
+     *
+     * Kept beside [bounds] rather than derived per use because the two answer different
+     * questions and confusing them is silent: culling and the lasso are page-space questions,
+     * the erased region and the eraser's own coverage test are object-space ones.
+     */
+    var pageBounds: PageBounds? = bounds?.under(transform)
+        private set
+
+    /**
+     * Page space → this object's space, and the linear scale that goes with it.
+     *
+     * The eraser arrives in page space and [ErasedRegion]'s capsules are in object space, so
+     * every erase sample crosses this. Cached because a scribble-erase crosses it a few
+     * hundred times a second, and null only for a transform that has collapsed —
+     * `SelectionEdit.transform` refuses to write one, but a peer running a future build might
+     * still send one and a null here means "this object cannot be erased" rather than a crash.
+     */
+    private var inverse: Matrix3? = transform.inverse()
+    private var inverseScale: Float = transform.linearScale()
+
+    /**
+     * What an eraser has taken out of this stroke, in the stroke's **own** space. Null until
+     * something is erased, so an untouched stroke costs nothing.
+     *
+     * ⭐ **Object space, not page space, and M8a is what forced the distinction.** Before it
+     * every transform was the identity and the two were the same words for the same numbers.
+     * Once a stroke can move, an erasure recorded in page space stays behind when the stroke
+     * is dragged away — a hole in the paper rather than a bite out of the line. The region
+     * belongs to the object, so it is stored in the object's coordinates and travels with it
+     * for free.
      */
     var erased: ErasedRegion? = null
         private set
@@ -46,6 +139,45 @@ internal class DryStroke(val id: ObjectId, val stroke: Stroke, val kind: InkBrus
         erased = region
     }
 
+    /** The render side of `SetTransform`. Absolute: the whole matrix, never a composition. */
+    fun setTransform(absolute: Matrix3) {
+        transform = absolute
+        pageBounds = bounds?.under(absolute)
+        inverse = absolute.inverse()
+        inverseScale = absolute.linearScale()
+    }
+
+    /**
+     * The render side of `SetStyle`.
+     *
+     * Rebuilds the brush and therefore the mesh, off the ink path — a restyle is a toolbar
+     * action, never something that happens between `ACTION_DOWN` and the front buffer.
+     *
+     * ⚠️ The erased region is **kept**. It is in this stroke's own space and a restyle does
+     * not move the stroke, so the bite stays where the user put it — even though the line may
+     * now be a different width through it, which is the honest rendering of "this part is
+     * gone" and what the screen and the published PDF will agree on.
+     */
+    fun restyle(style: ObjectStyle?, brushes: InkBrushFactory) {
+        this.style = style
+        if (style == null) return
+        val brush = brushes.brushFor(
+            kind = kind,
+            colorArgb = style.colorArgb.withOpacity(style.opacity),
+            sizePt = if (style.widthPt > 0f) style.widthPt else stroke.brush.size,
+            epsilonPt = stroke.brush.epsilon,
+            inputModel = inputModel,
+        )
+        stroke = Stroke(brush, stroke.inputs)
+        bounds = PageBounds.of(stroke.shape.computeBoundingBox())
+        pageBounds = bounds?.under(transform)
+        spatialIndexReady = false
+    }
+
+    fun setZ(key: FractionalKey) {
+        z = key
+    }
+
     /**
      * `PartitionedMesh` builds a spatial index lazily and it is not cheap, so it is built on
      * the first hit-test that actually reaches this stroke — never when the stroke finishes,
@@ -60,11 +192,57 @@ internal class DryStroke(val id: ObjectId, val stroke: Stroke, val kind: InkBrus
         }
     }
 
-    /** True when [sweptTip] covers any painted part of this stroke. */
+    /**
+     * True when [sweptTip] covers any painted part of this stroke.
+     *
+     * [sweptTip] is in **this stroke's own space** — the caller maps it there with [toLocal],
+     * rather than handing ink a `meshToQuery` transform. Two reasons: the query stays a
+     * genuine [Parallelogram] (an affine image of one is, but ink's constructors build them
+     * from a segment and a padding, so re-expressing a sheared one is not free), and the
+     * erased region this test decides to extend is in that space anyway.
+     */
     fun hitBy(sweptTip: Parallelogram): Boolean {
         ensureSpatialIndex()
         return stroke.shape.computeCoverageIsGreaterThan(sweptTip, 0f, AffineTransform.IDENTITY)
     }
+
+    /**
+     * A page-space point in this object's own space, or null if [transform] cannot be
+     * inverted.
+     */
+    fun toLocal(x: Float, y: Float, into: PagePointF): Boolean {
+        val matrix = inverse ?: return false
+        val mapped = matrix.map(PagePoint(x, y))
+        into.set(mapped.x, mapped.y)
+        return true
+    }
+
+    /** A page-space length in this object's own space. See [Matrix3.linearScale] on the fudge. */
+    fun toLocalLength(pageLength: Float): Float = pageLength / inverseScale
+
+    /**
+     * Every silhouette vertex, in **page space** — what a lasso is tested against.
+     *
+     * The outline rather than the input path, because a lasso drawn inside a thick loop must
+     * select the loop: the input path of a 16 pt highlighter stroke is a line through the
+     * middle of a band four millimetres wide, and testing only that would make selection
+     * disagree with what is on the screen by half the brush width in every direction.
+     */
+    fun forEachPagePoint(scratch: MutableVec, action: (Float, Float) -> Unit) {
+        val shape = stroke.shape
+        for (group in 0 until shape.getRenderGroupCount()) {
+            for (outline in 0 until shape.getOutlineCount(group)) {
+                for (vertex in 0 until shape.getOutlineVertexCount(group, outline)) {
+                    shape.populateOutlinePosition(group, outline, vertex, scratch)
+                    val mapped = transform.map(PagePoint(scratch.x, scratch.y))
+                    action(mapped.x, mapped.y)
+                }
+            }
+        }
+    }
+
+    /** The registers a selection edit reads. */
+    fun asSelected(): SelectedObject = SelectedObject(id, transform, z)
 }
 
 /**
@@ -85,6 +263,15 @@ internal class DryStroke(val id: ObjectId, val stroke: Stroke, val kind: InkBrus
  * - Restoring a removed stroke no longer needs its old list index: z-order lives on the object
  *   as a fractional key, so a re-added stroke sorts back where it was by construction.
  *
+ * ## ⭐ What M8a changed
+ *
+ * `SetTransform`, `SetStyle` and `SetZOrder` used to fall through [applyOps]'s `else` branch
+ * with the comment *"M8's ops … nothing on this layer draws them"*. They are drawn now, and
+ * that sentence was the whole feature: an op the fold resolved correctly, journaled, uploaded
+ * and merged, and that the screen ignored. This layer therefore carries the three registers
+ * per object, and — the part that is easy to miss — every **page-space** question in the file
+ * now asks [DryStroke.pageBounds] while every **object-space** one asks [DryStroke.bounds].
+ *
  * [eraseAlong] still supports both modes of [EraseMode] and still **never mutates a stroke's
  * point list** (SPEC §3.5, CLAUDE.md rule 8).
  *
@@ -97,13 +284,50 @@ internal class StrokeStore {
      * records why that reversed after M4). Two lists rather than one sorted list, so render
      * order is free rather than a per-frame sort of 5,000 elements.
      *
-     * This is a *band*, not a z-order: within each band, order is insertion order, which
-     * matches the fractional keys the recorder hands out in the same sequence.
+     * This is a *band*, not a z-order. Within a band the order is `(z, id)` — the same
+     * comparator `FoldedPage` sorts by — which since M8a is a real sort rather than insertion
+     * order, because `SetZOrder` can now move something. It is done lazily and only when a key
+     * has actually changed: a page load inserts in fold order, which is already sorted.
      */
     private val ink = ArrayList<DryStroke>()
     private val highlight = ArrayList<DryStroke>()
 
     private val byId = HashMap<ObjectId, DryStroke>()
+
+    /** Set when a z key changed or a stroke was inserted out of order. See [ink]. */
+    private var orderDirty = false
+
+    /**
+     * ⭐ The highest z key on the page — where the **next** stroke goes.
+     *
+     * ## Why this moved here in M8a
+     *
+     * `PageOpRecorder` used to keep its own `lastZ` and advance it per stroke. That was correct
+     * for as long as nothing else could write a z key, and `SetZOrder` is exactly the thing that
+     * can: bring one stroke to the front and the recorder's private counter is now *below* the
+     * top of the page, so **the next stroke the user draws lands underneath it** — on screen, in
+     * the published PDF's `/Annots` order, and on every peer. No error, and no reason for anyone
+     * to connect the two actions.
+     *
+     * The store is the one object that sees every source of a key — a capture, a load, a peer's
+     * op, an undo — so it is the only place the maximum can be maintained without a scan. Kept
+     * incrementally, compare-and-raise, because scanning the page per finished stroke would be
+     * O(strokes) on the ink path (CLAUDE.md rule 7) and this is O(1).
+     */
+    private var topZ: FractionalKey? = null
+
+    private fun raiseTop(key: FractionalKey) {
+        if (!key.isWellFormed) return
+        val current = topZ
+        if (current == null || key > current) topZ = key
+    }
+
+    /** The next key above everything on the page, and it becomes the new top. */
+    private fun allocateTopZ(): FractionalKey = SelectionEdit.keyAbove(topZ).also { topZ = it }
+
+    /** [count] keys above everything, ascending — for a duplicate, which lands on top. */
+    fun allocateTopZ(count: Int): List<FractionalKey> =
+        SelectionEdit.keysAbove(topZ, count).also { keys -> keys.lastOrNull()?.let { topZ = it } }
 
     /**
      * Where edits are reported. Null only before a page is bound — a store with no recorder is
@@ -173,9 +397,10 @@ internal class StrokeStore {
      *   tolerate.)
      */
     fun add(stroke: Stroke, kind: InkBrushKind): ObjectId? {
-        val recorded = recorder?.strokeFinished(stroke, kind, inputModel)
+        val z = allocateTopZ()
+        val recorded = recorder?.strokeFinished(stroke, kind, inputModel, z)
         val id = recorded ?: ObjectId(UNBOUND_ID_PREFIX + size)
-        insert(DryStroke(id, stroke, kind, PageBounds.of(stroke.shape.computeBoundingBox())))
+        insert(DryStroke(id, stroke, kind, inputModel, z = z))
         revision++
         return recorded
     }
@@ -194,6 +419,8 @@ internal class StrokeStore {
     private fun insert(dry: DryStroke) {
         (if (dry.kind.drawsOverInk) highlight else ink).add(dry)
         byId[dry.id] = dry
+        raiseTop(dry.z)
+        orderDirty = true
     }
 
     private fun remove(dry: DryStroke) {
@@ -202,12 +429,10 @@ internal class StrokeStore {
     }
 
     /**
-     * Apply ops to the render state — the load path, and the undo/redo path.
+     * Apply ops to the render state — the load path, the undo/redo path, and a peer's edits.
      *
      * This is the only way anything other than a live gesture changes what is drawn, which is
-     * what keeps the folded log and the screen in agreement. Ops this layer cannot draw
-     * (transforms, styles, text) are ignored rather than rejected: they are M8's, and an op
-     * arriving before the code that draws it must not be an error.
+     * what keeps the folded log and the screen in agreement.
      *
      * @param record true when these ops originated here and still need journaling. A page
      *   being loaded is already on disk and must not be written back.
@@ -229,17 +454,54 @@ internal class StrokeStore {
                 true
             } ?: false
 
-            // Absolute: the whole region is replaced, never merged.
-            is PageOp.SetErasedRegion -> byId[op.target]?.let {
-                it.setErased(op.absolute.toRegion())
-                true
-            } ?: false
-
-            // M8's ops. Journaled if they came from here, but nothing on this layer draws them.
-            else -> false
+            else -> applyRegister(op, brushes)
         }
         if (record) recorder?.record(op)
         return changed
+    }
+
+    /**
+     * The absolute LWW registers (SPEC §4.2) — the value on the op is what the object ends up
+     * with, never something composed with what is already here (CLAUDE.md rule 8).
+     *
+     * Split out of [applyOp] because it is the half that grew: `SetErasedRegion` was the only
+     * register this layer drew until M8a added three more, and the `when` became long enough that
+     * the thing worth reading — *every branch writes a whole value* — stopped being visible in one
+     * screen.
+     *
+     * A register op for an object that is not here is **not an error**: SPEC §4.2 allows one to
+     * arrive before the `AddObject` it targets, and the fold keeps it either way. Same for text and
+     * page metadata, which this layer does not draw at all.
+     */
+    private fun applyRegister(op: PageOp, brushes: InkBrushFactory): Boolean {
+        val target = op.target ?: return false
+        val dry = byId[target] ?: return false
+        return when (op) {
+            // Absolute: the whole region is replaced, never merged.
+            is PageOp.SetErasedRegion -> {
+                dry.setErased(op.absolute.toRegion())
+                true
+            }
+
+            is PageOp.SetTransform -> {
+                dry.setTransform(op.absolute)
+                true
+            }
+
+            is PageOp.SetStyle -> {
+                dry.restyle(op.style, brushes)
+                true
+            }
+
+            is PageOp.SetZOrder -> {
+                dry.setZ(op.z)
+                raiseTop(op.z)
+                orderDirty = true
+                true
+            }
+
+            else -> false
+        }
     }
 
     private fun addObject(op: PageOp.AddObject, brushes: InkBrushFactory): Boolean {
@@ -252,8 +514,12 @@ internal class StrokeStore {
             id = obj.id,
             stroke = decoded.stroke,
             kind = decoded.kind,
-            bounds = PageBounds.of(decoded.stroke.shape.computeBoundingBox()),
+            inputModel = decoded.inputModel,
+            transform = obj.transform,
+            z = obj.z,
         )
+        // After the constructor, so the rebuilt mesh and its bounds are the ones cached.
+        obj.style?.let { dry.restyle(it, brushes) }
         dry.setErased(obj.erased.toRegion())
         insert(dry)
         return true
@@ -267,6 +533,10 @@ internal class StrokeStore {
         removedThisGesture.clear()
         erasedThisGesture.clear()
         inGesture = false
+        orderDirty = false
+        // A different page's keys say nothing about this one's. Leaving it would put the first
+        // stroke on the new page above or below everything for no reason the user could see.
+        topZ = null
         revision++
     }
 
@@ -287,17 +557,82 @@ internal class StrokeStore {
         revision++
     }
 
+    // --- Selection (M8a) ----------------------------------------------------
+
+    /**
+     * ⚠️ **A live drag's preview, which emits nothing.**
+     *
+     * A move or a resize has to be visible while the finger is down, and it must produce
+     * exactly one op per object when the finger lifts — not one per frame. So the drag writes
+     * here and the *commit* goes through `SelectionEdit.transform` and the recorder, composed
+     * against the transforms the objects had when the gesture started.
+     *
+     * That split is the reason this method exists at all, and the reason it is named for what
+     * it is: anything that changes the page without telling the recorder is one forgotten call
+     * away from an edit that never reaches disk, so it should be impossible to reach by
+     * accident.
+     */
+    fun previewTransform(id: ObjectId, absolute: Matrix3) {
+        val dry = byId[id] ?: return
+        dry.setTransform(absolute)
+        revision++
+    }
+
+    /**
+     * Insert a copy of [source] under a new id — the duplicate gesture's render half.
+     *
+     * The `androidx.ink` `Stroke` is **shared, not copied**, which is safe because it is
+     * immutable: its inputs and its mesh are fixed once the stroke is finished. The op that
+     * carries this copy to disk encodes that same immutable stroke on a worker
+     * (`PageOpRecorder.strokeDuplicated`), so nothing here touches the geometry blob and
+     * nothing runs the encoder on the UI thread (CLAUDE.md rule 7).
+     */
+    fun duplicate(source: ObjectId, into: ObjectId, transform: Matrix3, z: FractionalKey): DryStroke? {
+        val original = byId[source] ?: return null
+        val copy = DryStroke(
+            id = into,
+            stroke = original.stroke,
+            kind = original.kind,
+            inputModel = original.inputModel,
+            transform = transform,
+            style = original.style,
+            z = z,
+        )
+        // The bite travels with the copy: it is in the object's own space and the copy has the
+        // same geometry, so a duplicate of a half-erased stroke is half-erased. Anything else
+        // would make "duplicate" a way to recover erased ink, which is a surprise either way.
+        original.erased?.let { region ->
+            val restored = ErasedRegion()
+            for (capsule in region.capsules) restored.add(capsule)
+            copy.setErased(restored)
+        }
+        insert(copy)
+        revision++
+        return copy
+    }
+
+    /** For the commit path: the decoded stroke behind an id, so its geometry can be encoded. */
+    fun strokeOf(id: ObjectId): DryStroke? = byId[id]
+
     // --- Rendering ----------------------------------------------------------
 
     /**
      * Visit every stroke in render order — ink first, highlighters last, so a highlight
-     * multiplies over the writing it was drawn across.
+     * multiplies over the writing it was drawn across, and `(z, id)` within each band.
      *
      * [visibleBounds] culls in page space. It does nothing when the whole page is on screen; it
      * earns its keep when zoomed in, which is where the frame budget is tightest because each
      * visible stroke covers more pixels.
      */
     fun forEachInRenderOrder(visibleBounds: Box?, action: (DryStroke) -> Unit) {
+        if (orderDirty) {
+            // `(z, id)`, and not z alone: two devices can pick the same key, and a tie broken
+            // by insertion order is a tie broken differently on each device — the same
+            // comparator `PageFolder.build` uses, for the same reason.
+            ink.sortWith(RENDER_ORDER)
+            highlight.sortWith(RENDER_ORDER)
+            orderDirty = false
+        }
         emit(ink, visibleBounds, action)
         emit(highlight, visibleBounds, action)
     }
@@ -305,7 +640,7 @@ internal class StrokeStore {
     private fun emit(strokes: List<DryStroke>, visibleBounds: Box?, action: (DryStroke) -> Unit) {
         for (index in strokes.indices) {
             val dry = strokes[index]
-            if (visibleBounds == null || overlaps(dry.bounds, visibleBounds)) action(dry)
+            if (visibleBounds == null || overlaps(dry.pageBounds, visibleBounds)) action(dry)
         }
     }
 
@@ -322,6 +657,12 @@ internal class StrokeStore {
      * work: with a hand moving 30 cm/s, endpoints alone leave un-erased gaps between samples —
      * the same failure mode as skipping historical points when drawing.
      *
+     * ⭐ **The sweep arrives in page space and is recorded in each stroke's own space** (M8a).
+     * For an untransformed stroke — which is every stroke until a selection tool moves one —
+     * those are the same numbers and the shared page-space query is reused. For a moved one
+     * the segment is mapped through the inverse; see [DryStroke.erased] for why the region
+     * cannot simply stay in page space.
+     *
      * @return the number of strokes the eraser changed.
      */
     fun eraseAlong(from: PagePointF, to: PagePointF, radiusPageUnits: Float, mode: EraseMode): Int {
@@ -336,28 +677,95 @@ internal class StrokeStore {
             ImmutableVec(minOf(from.x, to.x) - radiusPageUnits, minOf(from.y, to.y) - radiusPageUnits),
             ImmutableVec(maxOf(from.x, to.x) + radiusPageUnits, maxOf(from.y, to.y) + radiusPageUnits),
         )
-        val capsule = ErasedRegion.Capsule(from.x, from.y, to.x, to.y, radiusPageUnits)
+        val sweep = EraserSweep(
+            from,
+            to,
+            radiusPageUnits,
+            sweptTip,
+            ErasedRegion.Capsule(
+                from.x,
+                from.y,
+                to.x,
+                to.y,
+                radiusPageUnits,
+            ),
+        )
 
-        val touched = applyErase(ink, coarse, sweptTip, capsule, mode) +
-            applyErase(highlight, coarse, sweptTip, capsule, mode)
+        val touched = applyErase(ink, coarse, sweep, mode) + applyErase(highlight, coarse, sweep, mode)
         if (touched > 0) revision++
         return touched
+    }
+
+    /** One eraser sample, in page space, with the query objects an identity transform can reuse. */
+    private class EraserSweep(
+        val from: PagePointF,
+        val to: PagePointF,
+        val radius: Float,
+        val pageTip: Parallelogram,
+        val pageCapsule: ErasedRegion.Capsule,
+    )
+
+    /** Reusable endpoints for mapping a sweep into one object's space — no allocation per sample. */
+    private class LocalSweep(val from: PagePointF = PagePointF(), val to: PagePointF = PagePointF())
+
+    /**
+     * The capsule this sweep takes out of [dry], **in [dry]'s own space**, or null when it takes
+     * none.
+     *
+     * ⭐ Where M8a's coordinate change actually happens. For an untransformed stroke — which is
+     * every stroke until a selection tool moves one — the page-space query objects are reused
+     * unchanged, so the common path allocates nothing and is exactly what M1 shipped. For a moved
+     * one the segment is mapped through the inverse and the tip radius divided by the transform's
+     * linear scale (see [Matrix3.linearScale] on the approximation that costs).
+     */
+    private fun sweptCapsuleFor(
+        dry: DryStroke,
+        coarse: ImmutableBox,
+        sweep: EraserSweep,
+        scratch: LocalSweep,
+    ): ErasedRegion.Capsule? {
+        // Cheap float compares first, in page space. Only strokes whose bounds the eraser actually
+        // swept get a native coverage test, which keeps erasing usable with 5,000 strokes.
+        if (!overlaps(dry.pageBounds, coarse)) return null
+
+        if (dry.transform == Matrix3.Identity) {
+            return if (dry.hitBy(sweep.pageTip)) sweep.pageCapsule else null
+        }
+
+        // Both ends or neither: a half-mapped segment is not a shorter erase, it is a wrong one.
+        val mapped = dry.toLocal(sweep.from.x, sweep.from.y, scratch.from) &&
+            dry.toLocal(sweep.to.x, sweep.to.y, scratch.to)
+        if (!mapped) return null
+        val radius = dry.toLocalLength(sweep.radius)
+        val tip = ImmutableParallelogram.fromSegmentAndPadding(
+            ImmutableSegment(
+                ImmutableVec(scratch.from.x, scratch.from.y),
+                ImmutableVec(scratch.to.x, scratch.to.y),
+            ),
+            radius,
+        )
+        return if (dry.hitBy(tip)) {
+            ErasedRegion.Capsule(scratch.from.x, scratch.from.y, scratch.to.x, scratch.to.y, radius)
+        } else {
+            null
+        }
     }
 
     private fun applyErase(
         strokes: MutableList<DryStroke>,
         coarse: ImmutableBox,
-        sweptTip: Parallelogram,
-        capsule: ErasedRegion.Capsule,
+        sweep: EraserSweep,
         mode: EraseMode,
     ): Int {
         var touched = 0
+        val scratch = LocalSweep()
         val iterator = strokes.iterator()
         while (iterator.hasNext()) {
             val dry = iterator.next()
-            // Cheap float compares first. Only strokes whose bounds the eraser actually swept
-            // get a native coverage test, which keeps erasing usable with 5,000 strokes.
-            if (!overlaps(dry.bounds, coarse) || !dry.hitBy(sweptTip)) continue
+            // One rejection, one `continue`. The three reasons a stroke is not hit — its bounds
+            // are elsewhere, its transform cannot be inverted, the tip does not cover it — are
+            // the same answer to the caller, and collapsing them keeps this loop readable.
+            val capsule = sweptCapsuleFor(dry, coarse, sweep, scratch) ?: continue
 
             touched++
             if (mode == EraseMode.WHOLE_STROKE) {
@@ -399,6 +807,8 @@ internal class StrokeStore {
                 val dry = iterator.next()
                 val region = dry.erased ?: continue
                 budget -= region.capsules.size
+                // Both in the stroke's own space — which is what makes this comparison correct
+                // for a moved stroke without any mapping at all.
                 if (isFullyErased(dry.stroke, dry.bounds, region)) {
                     iterator.remove()
                     byId.remove(dry.id)
@@ -423,6 +833,8 @@ internal class StrokeStore {
          * would be obvious rather than plausible.
          */
         const val UNBOUND_ID_PREFIX = "unbound-"
+
+        val RENDER_ORDER = compareBy<DryStroke>({ it.z.value }, { it.id.value })
     }
 }
 
@@ -441,6 +853,16 @@ internal class StrokeStore {
  * sample-based erasing can only ever remove the full width of a line, at whatever granularity
  * the stylus happened to sample, so it cuts rather than erases. Neither mode mutates a stroke's
  * point list.
+ *
+ * ⭐ **M8a inherits this rather than replacing it.** ROADMAP M8a's prompt says partial erase
+ * *"splits a stroke"* into `DeleteObject + AddObject(fragment) + AddObject(fragment)`. SPEC
+ * §3.5 supersedes that in as many words — *"M8a's 'partial erase splits a stroke into
+ * fragments' is superseded. Nothing splits."* — and the reason is worth keeping in front of
+ * whoever reads the prompt next: splitting is strictly *worse* on the two counts M8a cares
+ * about. It destroys the original stroke where the area model keeps it (CLAUDE.md rule 1), and
+ * it makes the fragments new objects, so a peer's concurrent `SetTransform` on the original
+ * lands on a tombstone and the two devices end up with different object counts — which is
+ * SPEC §13.2 row 7, failing.
  */
 public enum class EraseMode {
     /** Erase exactly the area the eraser tip passed over, keeping the rest of the stroke. */
@@ -451,7 +873,9 @@ public enum class EraseMode {
 }
 
 /**
- * A stroke's bounding box in page space, as four plain floats.
+ * A stroke's bounding box, as four plain floats. In the stroke's own space, or in page space —
+ * the two are different fields on [DryStroke] and this type is deliberately silent about which
+ * it holds, because it is the same four numbers either way.
  *
  * `androidx.ink` has a perfectly good [ImmutableBox], but the only way to get one from a [Box]
  * is `Box.toImmutable()`, which is `@RestrictTo(LIBRARY_GROUP)` in 1.0.0 — see the note on
@@ -459,9 +883,54 @@ public enum class EraseMode {
  * stroke per erase sample, and a float compare beats a native call by a wide margin.
  */
 internal class PageBounds(val xMin: Float, val yMin: Float, val xMax: Float, val yMax: Float) {
+
+    /**
+     * This box under [transform], as an axis-aligned box in the target space.
+     *
+     * All four corners, not two: a rotation maps the top-left corner to somewhere that is
+     * neither the top nor the left, and mapping only the diagonal gives a box that is wrong
+     * for every rotation that is not a multiple of 90°.
+     */
+    fun under(transform: Matrix3): PageBounds {
+        if (transform == Matrix3.Identity) return this
+        val corners = listOf(
+            transform.map(PagePoint(xMin, yMin)),
+            transform.map(PagePoint(xMax, yMin)),
+            transform.map(PagePoint(xMax, yMax)),
+            transform.map(PagePoint(xMin, yMax)),
+        )
+        return PageBounds(
+            xMin = corners.minOf { it.x },
+            yMin = corners.minOf { it.y },
+            xMax = corners.maxOf { it.x },
+            yMax = corners.maxOf { it.y },
+        )
+    }
+
+    fun containsWithin(x: Float, y: Float, slop: Float): Boolean =
+        x >= xMin - slop && x <= xMax + slop && y >= yMin - slop && y <= yMax + slop
+
+    fun asRect(): PageRect = PageRect(xMin, yMin, xMax, yMax)
+
     companion object {
         fun of(box: Box?): PageBounds? = box?.let { PageBounds(it.xMin, it.yMin, it.xMax, it.yMax) }
     }
+}
+
+/**
+ * The transform's average linear scale — how much longer a length gets under it.
+ *
+ * `sqrt(|det|)` is the geometric mean of the two axis scales: exact for a uniform scale and for
+ * any rotation, and an approximation for a non-uniform one. That approximation has exactly one
+ * consumer — the eraser tip's radius, mapped into a squashed object's space, where the tip
+ * becomes an ellipse and a single radius cannot describe it. The alternative is an elliptical
+ * eraser query, which `androidx.ink`'s coverage API cannot take; the error is bounded by the
+ * aspect ratio the user squashed the object to, and a squashed object erased with a slightly
+ * round tip is not a correctness problem — nothing is destroyed either way (SPEC §3.5).
+ */
+internal fun Matrix3.linearScale(): Float {
+    val scale = sqrt(abs(determinant))
+    return if (scale > 0f) scale else 1f
 }
 
 /**
@@ -481,3 +950,20 @@ internal class PagePointF(var x: Float = 0f, var y: Float = 0f) {
         set(other.x, other.y)
     }
 }
+
+/**
+ * An ARGB colour at [opacity] of its own alpha — how [ObjectStyle.opacity] reaches a brush.
+ *
+ * Multiplied into the existing alpha rather than replacing it, so restyling a highlighter to
+ * 50% gives half of *its* translucency and not half of opaque. `androidx.ink`'s brush has no
+ * separate opacity, so this is the only place it can go.
+ */
+private fun Int.withOpacity(opacity: Float): Int {
+    if (opacity >= 1f) return this
+    val alpha = ((this ushr ALPHA_SHIFT and BYTE_MAX) * opacity).toInt().coerceIn(0, BYTE_MAX)
+    return (alpha shl ALPHA_SHIFT) or (this and RGB_MASK)
+}
+
+private const val ALPHA_SHIFT = 24
+private const val BYTE_MAX = 0xFF
+private const val RGB_MASK = 0x00FFFFFF

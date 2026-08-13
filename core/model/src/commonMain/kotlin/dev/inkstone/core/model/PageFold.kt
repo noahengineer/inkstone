@@ -51,6 +51,7 @@ public fun foldPage(
  *   it to decide whether an incoming op can be appended or forces a re-fold.
  * @property unknownOps ops this build could not interpret, kept so a save writes
  *   them back verbatim (SPEC §5.8).
+ * @property texts the winning `SetTextContent` register per object — see [textOf].
  */
 public class FoldedPage(
     public val pageId: PageId,
@@ -61,11 +62,27 @@ public class FoldedPage(
     public val throughClock: LamportClock?,
     public val opCount: Int,
     public val unknownOps: List<PageOp.Unknown> = emptyList(),
+    public val texts: Map<ObjectId, String> = emptyMap(),
 ) {
 
     public val isEmpty: Boolean get() = objects.isEmpty()
 
     public fun find(id: ObjectId): InkObject? = objects.firstOrNull { it.id == id }
+
+    /**
+     * ⭐ The `SetTextContent` register's winning value for [id], whatever kind of object it is.
+     *
+     * ⚠️ **Exposed in M8b, and until then this register was reachable for exactly one kind.**
+     * `materialise` copies the winning text onto a [TextBoxObject]'s payload and drops it for
+     * everything else — so a `SetTextContent` aimed at a shape folded correctly, converged
+     * correctly, round-tripped through the file correctly, and was then discarded at the last
+     * step with nothing to see. That register is where a connector's attachment lives
+     * ([ShapeRecord]), so M8b needs the fold to answer for it rather than only for text boxes.
+     *
+     * Kept as a side table rather than pushed onto the payload, because the payload is
+     * first-write-wins and this value is one the user can change (see [ShapeRecord]).
+     */
+    public fun textOf(id: ObjectId): String? = texts[id]
 
     public companion object {
         public fun empty(
@@ -138,6 +155,12 @@ internal class PageFolder(
             presence[obj.id] = Register(Presence.PRESENT, clock)
         }
         for (id in base.deleted) presence[id] = Register(Presence.DELETED, clock)
+        // ⚠️ The text register is seeded too, and it is the one register here that is *not*
+        // already baked into the payload. `withRegisters` carries the transform, style, z key and
+        // erased region onto the object, so re-seeding those would be redundant — but a shape's
+        // record ([ShapeRecord]) lives only in this table, and a snapshot that dropped it would
+        // hand back a fold in which every connector had quietly become a plain line.
+        for ((id, text) in base.texts) texts[id] = Register(text, clock)
         unknown += base.unknownOps
         highest = clock
         count = base.opCount
@@ -243,6 +266,10 @@ internal class PageFolder(
             throughClock = highest,
             opCount = count,
             unknownOps = unknown.toList(),
+            // Every winning value, including ones whose object has not arrived — a register op
+            // may legitimately be folded before its `AddObject` (see the class KDoc), and a
+            // connector's record is exactly the kind that can.
+            texts = texts.mapValues { (_, register) -> register.value },
         )
     }
 

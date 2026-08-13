@@ -8,6 +8,7 @@ import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.IdFactory
+import dev.inkstone.core.model.InkObject
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.MaterializedFile
 import dev.inkstone.core.model.NoteSyncState
@@ -879,16 +880,24 @@ class NoteEditor(
 
         val removed = beforeIds - afterIds
         val added = after.objects.filter { it.id !in beforeIds }
-        // An object present in both may still have changed — an undone erase is the same
-        // object with a different absolute region.
-        val reErased = after.objects.filter { obj ->
-            obj.id in beforeIds && before.find(obj.id)?.erased != obj.erased
-        }
 
-        val ops = ArrayList<PageOp>(removed.size + added.size + reErased.size)
+        val ops = ArrayList<PageOp>(removed.size + added.size)
         removed.forEach { ops += PageOp.DeleteObject("", REPLAY_CLOCK, it) }
         added.forEach { ops += PageOp.AddObject("", REPLAY_CLOCK, it) }
-        reErased.forEach { ops += PageOp.SetErasedRegion("", REPLAY_CLOCK, it.id, it.erased) }
+        // ⭐ An object present in both may still have changed, and every absolute register it
+        // carries has to be compared — an undone erase is the same object with a different
+        // region, and since **M8a** the same is true of its transform, its style and its z key.
+        //
+        // ⚠️ The three M8a registers were the whole of this milestone's inert-feature risk, and
+        // in the most convincing form: `SetTransform` folds correctly, journals, uploads and
+        // merges, and produces an **empty diff** here. So the undo of your own lasso-move would
+        // have changed nothing on screen, and a peer's move would have arrived invisibly and
+        // stayed invisible until the next page switch — with every test green, because the log
+        // is right and only the screen is wrong. That is M6's `setPageMeta` exactly, and this
+        // method is where it was fixed then too.
+        for (obj in after.objects) {
+            before.find(obj.id)?.let { ops += changedRegisters(it, obj) }
+        }
         // An empty diff is the *common* case on the pull side, not an edge one: a poll re-delivers a
         // peer's whole page log, `NoteSession.merge` subtracts nearly all of it by opId, and the
         // folds come out identical. Reaching the surface with nothing to say would cost a call per
@@ -898,6 +907,30 @@ class NoteEditor(
         // record = false: these ops are already in the log. Journaling them again would append
         // a duplicate of every undo.
         surface.applyOps(ops, record = false)
+    }
+
+    /**
+     * ⭐ The absolute registers that differ between one object's two folds.
+     *
+     * ⚠️ **All four, and M8a is why that sentence is here.** This method compared presence and the
+     * erased region only, which was complete for as long as nothing else could change — and
+     * `SetTransform`, `SetStyle` and `SetZOrder` then produced an **empty diff**. So the undo of
+     * your own lasso-move would have changed nothing on screen, and a peer's move would have
+     * arrived invisibly and stayed invisible until the next page switch, with every test green
+     * because the log was right and only the screen was wrong. That is M6's `setPageMeta` bug, in
+     * the method that was extended to fix it then.
+     *
+     * A null style is skipped rather than pushed: "as captured" is what a register that has never
+     * been written means, no op can say it (SPEC §4.2), and it cannot be the *result* of a change
+     * either — a register never goes back to unset — so there is nothing here to miss.
+     */
+    private fun changedRegisters(was: InkObject, now: InkObject): List<PageOp> {
+        val ops = ArrayList<PageOp>(REGISTER_COUNT)
+        if (was.erased != now.erased) ops += PageOp.SetErasedRegion("", REPLAY_CLOCK, now.id, now.erased)
+        if (was.transform != now.transform) ops += PageOp.SetTransform("", REPLAY_CLOCK, now.id, now.transform)
+        now.style?.takeIf { it != was.style }?.let { ops += PageOp.SetStyle("", REPLAY_CLOCK, now.id, it) }
+        if (was.z != now.z) ops += PageOp.SetZOrder("", REPLAY_CLOCK, now.id, now.z)
+        return ops
     }
 
     // -----------------------------------------------------------------------
@@ -1111,6 +1144,9 @@ class NoteEditor(
 
         /** Ops built only to update the screen; never journaled. See `reconcile`. */
         val REPLAY_CLOCK = LamportClock(0, "replay")
+
+        /** Transform, style, z-order, erased region — see [NoteEditor.changedRegisters]. */
+        const val REGISTER_COUNT = 4
     }
 }
 

@@ -65,12 +65,11 @@ public class InkStrokeSampler(
             record = false,
         )
 
-        // `DryStroke` does not carry the object's transform — the store is a render cache and
-        // the renderer bakes it in elsewhere — so it is looked up from the fold. Building a
-        // second decoder to get at it would be a second place for the erase model to drift,
-        // which is the trade `InkStrokeOutliner` already refused.
-        val transforms = page.objects.associate { it.id to it.transform }
-
+        // ⭐ M8a — the transform comes off the `DryStroke` now. It used to be looked up from
+        // the fold in a side map here, because the store was a pure render cache that did not
+        // carry one; the store applies `SetTransform` itself since M8a, so the side map became
+        // a *second* answer to the same question, differing from the store's exactly when one
+        // of them was wrong. There is one now, and it is the one the screen draws.
         val result = ArrayList<SampledStroke>(store.size)
         // One scratch for the whole page. `populate` is a JNI call per sample and a dense
         // page is thousands of strokes at ~200 Hz; allocating per sample is the difference
@@ -79,7 +78,7 @@ public class InkStrokeSampler(
         var clock = 0L
         store.forEachInRenderOrder(visibleBounds = null) { dry ->
             if (dry.kind.drawsOverInk) return@forEachInRenderOrder
-            val samples = samplesOf(dry, transforms[dry.id] ?: Matrix3.Identity, scratch, clock)
+            val samples = samplesOf(dry, dry.transform, scratch, clock)
             if (samples.isEmpty()) return@forEachInRenderOrder
             clock = samples.last().tMillis + PEN_LIFT_MILLIS
             val bounds = PageRect.around(samples.map { PagePoint(it.x, it.y) })

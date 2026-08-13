@@ -981,12 +981,34 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 
 **Bigger than it looks.** Connectors that stay attached and reroute when a shape moves is a small diagramming engine.
 
+> ⚠️ **Partially delivered. The format half is done; the renderer and the UI are not.**
+> What exists: the connector data structure decided, specified (SPEC §4.8) and implemented in
+> `:core:model`; routing, anchoring and detachment derived and tested; the record carried safely
+> through every storage path that rebuilds a page from something other than its raw log — bundle,
+> compaction snapshot, page duplicate, note duplicate and conflicted copy. 47 new JVM tests, all
+> green, plus the iOS klib.
+> What does **not** exist: shapes and connectors are not drawn, no tool creates one, and nothing is
+> reachable from the app. `docs/M8-CONNECTORS.md` §6 is the remaining work, in order, with the
+> traps each step inherits. **No acceptance criterion below is met yet** — each needs the renderer.
+
 ### Scope
 
-- Draw-and-hold shape snapping: line, rectangle, ellipse, triangle, polygon, arrow
+- Draw-and-hold shape snapping: line, rectangle, ellipse, triangle, ~~polygon~~, arrow
 - Fill colour with opacity; rounded corners
 - **Connectors that attach to shapes, stay attached, and reroute on move or resize** — elbow and curved
 - Snap-to-other-shapes for endpoints
+
+⚠️ **~~polygon~~ is struck out, and SPEC won** (M8b). `ShapeKind` was frozen in M2 as
+`{LINE, ARROW, RECTANGLE, ELLIPSE, TRIANGLE}`, and `OpCodec.decodeObject` reads it with
+`ShapeKind.valueOf` while `BundleReader` decodes a page's ops unguarded — so a sixth constant does
+not make an older build *degrade*, it makes an older build **fail to open a note it has already
+synced**. A closed run of straight segments is still expressible as an ordinary ink stroke with no
+format change; it simply cannot carry a fill. SPEC §4.8.8.
+
+⚠️ **"Arrow" is a tool, not a recognised shape** (M8b). An arrowhead is a few samples at the end of
+a gesture and is indistinguishable from a hooked pen-lift, so draw-and-hold classifies
+`{LINE, RECTANGLE, ELLIPSE, TRIANGLE}` and picking the arrow tool turns the line result into an
+arrow. SPEC §4.8.7.
 
 ### Acceptance
 
@@ -994,6 +1016,13 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 - [ ] Connectors stay attached and reroute when a connected shape is moved or resized
 - [ ] Deleting a shape leaves its connectors in a defined state (detached, not dangling or crashing)
 - [ ] Connector attachment survives a sync round-trip
+
+⚠️ **The third criterion must not be read as "persist a detachment"** (M8b). SPEC §4.2 already
+says a delete of an object that has not arrived records its tombstone anyway, and that an op
+targeting a tombstone is a no-op; storing detachment would contradict both, and would make the
+*not-yet-arrived* case permanent — a connector whose target was merely still in flight written off
+by whichever device noticed first, and still written off after it arrived. Detachment is derived
+every fold. SPEC §4.8.4.
 
 ### Prompt
 

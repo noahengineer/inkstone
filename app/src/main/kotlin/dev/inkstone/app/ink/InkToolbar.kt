@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.dp
 import dev.inkstone.android.ink.EraseMode
 import dev.inkstone.android.ink.InkBrushKind
 import dev.inkstone.android.ink.InkInputModel
+import dev.inkstone.android.ink.InkTool
 import dev.inkstone.core.model.FitMode
 import kotlin.math.roundToInt
 
@@ -52,7 +53,7 @@ fun InkToolbar(state: InkUiState, actions: InkToolbarActions, modifier: Modifier
 
     Card(modifier = modifier) {
         Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            ToolRow(state) { colorPanelOpen = !colorPanelOpen }
+            ToolRow(state, actions) { colorPanelOpen = !colorPanelOpen }
 
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 // Also two-finger tap / three-finger tap on the page. The
@@ -69,11 +70,24 @@ fun InkToolbar(state: InkUiState, actions: InkToolbarActions, modifier: Modifier
                 TextButton(onClick = { measurePanelOpen = !measurePanelOpen }) { Text("Measure") }
             }
 
+            // ⭐ ROADMAP M8a. Shown only when something is selected: an action row that is
+            // always there but usually disabled says the tool is broken rather than idle.
+            AnimatedVisibility(visible = state.selectionSize > 0) {
+                SelectionRow(state, actions)
+            }
+
             AnimatedVisibility(visible = colorPanelOpen) {
                 ColorPicker(
                     argb = state.pen.colorArgb,
                     slots = state.slots,
-                    onColorChange = state::setColor,
+                    // ⚠️ The picker drives **two** things now, and which one depends on whether
+                    // anything is selected. Wiring it only to the pen was the obvious thing and
+                    // would have made "select some writing, pick a colour" change the colour of
+                    // the *next* stroke instead of the selected one — visibly doing something,
+                    // and the wrong something.
+                    onColorChange = { argb ->
+                        if (state.selectionSize > 0) actions.onRecolourSelection(argb) else state.setColor(argb)
+                    },
                     onSaveToSlot = state::saveToSlot,
                 )
             }
@@ -149,21 +163,62 @@ private const val MIN_WIDTH_DP = 0.5f
 private const val MAX_WIDTH_DP = 32f
 private const val GATE_STROKE_COUNT = 5000
 
+/**
+ * ⭐ ROADMAP M8a — what a selection can have done to it.
+ *
+ * Every button here calls straight through to `InkSurfaceView`, which emits one gesture's worth
+ * of ops through the recorder. That is the whole path: no view model, no session, no file. The
+ * ops reach disk on the next autosave drain exactly as a stroke does, and each button is one
+ * undo entry.
+ *
+ * The width slider is deliberately the same control as the pen's, reading the *pen's* current
+ * width — a selection has no single width to show (the strokes in it may differ, and SPEC §4.2's
+ * `SetStyle` is per object), so the slider is an instruction rather than a readout. Dragging it
+ * says "make them this wide"; it does not claim they already are.
+ */
+@Composable
+private fun SelectionRow(state: InkUiState, actions: InkToolbarActions) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(
+            "${state.selectionSize} selected",
+            style = MaterialTheme.typography.labelSmall,
+        )
+        TextButton(onClick = actions.onDeleteSelection) { Text("Delete") }
+        TextButton(onClick = actions.onDuplicateSelection) { Text("Duplicate") }
+        TextButton(onClick = actions.onBringSelectionToFront) { Text("Front") }
+        TextButton(onClick = actions.onSendSelectionToBack) { Text("Back") }
+        TextButton(onClick = { actions.onResizeSelectionStroke(state.pen.widthDp) }) {
+            Text("${state.pen.widthDp.roundToInt()} dp")
+        }
+        TextButton(onClick = actions.onClearSelection) { Text("Deselect") }
+    }
+}
+
 /** Brushes, eraser, erase mode, colour swatch and width. */
 @Composable
-private fun ToolRow(state: InkUiState, onToggleColorPanel: () -> Unit) {
+private fun ToolRow(state: InkUiState, actions: InkToolbarActions, onToggleColorPanel: () -> Unit) {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         InkBrushKind.entries.forEach { kind ->
             FilterChip(
-                selected = !state.eraserSelected && state.kind == kind,
+                selected = state.tool == InkTool.PEN && state.kind == kind,
                 onClick = { state.selectBrush(kind) },
                 label = { Text(kind.label) },
             )
         }
         FilterChip(
-            selected = state.eraserSelected,
-            onClick = { state.eraserSelected = !state.eraserSelected },
+            selected = state.tool == InkTool.ERASER,
+            onClick = { state.tool = if (state.tool == InkTool.ERASER) InkTool.PEN else InkTool.ERASER },
             label = { Text("Eraser") },
+        )
+        // ⭐ ROADMAP M8a. Leaving the tool clears the selection, because a box round objects
+        // the toolbar no longer offers actions for is chrome that lies.
+        FilterChip(
+            selected = state.tool == InkTool.SELECT,
+            onClick = {
+                state.tool = if (state.tool == InkTool.SELECT) InkTool.PEN else InkTool.SELECT
+                if (state.tool != InkTool.SELECT) actions.onClearSelection()
+            },
+            label = { Text("Select") },
         )
         // SPEC §3.5, revised in M1. Partial is the default; whole-stroke is kept
         // because it never rebuilds geometry, so it stays fast on a dense page,

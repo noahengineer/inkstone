@@ -7,6 +7,27 @@ import androidx.ink.brush.BrushFamily
 import androidx.ink.brush.ExperimentalInkCustomBrushApi
 
 /**
+ * ⭐ ROADMAP M8a — which tool the toolbar has selected.
+ *
+ * One value rather than a boolean per tool. Until M8a there was one tool that was not the pen
+ * and `eraserSelected: Boolean` was an honest way to say so; adding a second would have made
+ * "eraser and lasso both on" representable, and this codebase has twice paid for a wrong state
+ * being expressible (`apply(…, undoable)` and `NoteSession.close`'s defaulted argument, both
+ * deleted in M6 for the same reason).
+ *
+ * A flipped pen tip and a held barrel button are **not** here: they are decided per
+ * `MotionEvent` and override whatever this says, because that is what SPEC §3.3 requires of
+ * hardware.
+ */
+public enum class InkTool {
+    PEN,
+    ERASER,
+
+    /** Lasso, move, resize, rotate — see `SelectionController`. */
+    SELECT,
+}
+
+/**
  * SPEC §3.4 — the four v1 brushes.
  *
  * The families themselves live in `InkstoneBrushFamilies.kt` and are ours, not

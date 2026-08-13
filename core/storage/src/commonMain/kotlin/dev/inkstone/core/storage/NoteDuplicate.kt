@@ -3,13 +3,16 @@ package dev.inkstone.core.storage
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.Document
 import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.InkObject
+import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.ShapeObject
+import dev.inkstone.core.model.ShapeRecord
 import dev.inkstone.core.model.StrokeObject
 import dev.inkstone.core.model.TextBoxObject
 import dev.inkstone.core.model.foldPage
@@ -65,15 +68,9 @@ public suspend fun NoteStore.duplicateNote(
             size = folded.size,
             background = folded.background,
         )
-        for (obj in folded.objects) {
-            ops += PageOp.AddObject(
-                opId = session.nextOpId(),
-                clock = session.nextClock(),
-                // `withRegisters()` with no arguments materialises the winning register
-                // values onto the payload, so the copy needs no register ops to look right.
-                obj = obj.withRegisters().withCopiedId(ids.newObjectId()),
-            )
-        }
+        // ⚠️ Not a bare `AddObject` loop since M8b — the text register is not collapsed onto the
+        // payload and a connector's bindings have to be re-targeted. See [copiedObjectOps].
+        ops += copiedObjectOps(folded, ids::newObjectId, session::nextOpId, session::nextClock)
         // `replay`, not `apply`: the copy has no history to undo *into*, and an undo stack
         // seeded with "everything on every page" is a stack whose first undo empties the note.
         session.replay(target, ops)
@@ -102,4 +99,72 @@ internal fun InkObject.withCopiedId(id: ObjectId): InkObject = when (this) {
     is ImageObject -> copy(id = id)
     is TextBoxObject -> copy(id = id)
     is ShapeObject -> copy(id = id)
+}
+
+/**
+ * ⭐ A folded page re-expressed as the shortest log that reproduces it, **under fresh
+ * [ObjectId]s** — the one implementation shared by all three copiers (a note duplicate, a page
+ * duplicate, and SPEC §7.7 layer 3's conflicted copy).
+ *
+ * ## Why this exists at all, and what M8b broke
+ *
+ * Until M8b the three call sites were one line each, and [conflictedCopyOf]'s KDoc justified that
+ * in as many words:
+ *
+ * > A fold collapses every register — transform, style, z-order, erased region, presence — onto
+ * > the object payload (`withRegisters`), so the only op left to write is `AddObject` and there is
+ * > **no second op carrying an [ObjectId] in a `target` field** that a re-identification pass
+ * > could miss.
+ *
+ * Both halves of that stopped being true at once. The `SetTextContent` register is **not**
+ * collapsed onto the payload for anything but a text box (`PageFolder.materialise`), and it is
+ * where a shape's fill, corner radius and — the part that matters — a connector's attachment live
+ * ([ShapeRecord]). So a one-line copy produced two failures, neither of which anything would have
+ * reported:
+ *
+ * 1. **Every record vanished.** A duplicated diagram came back as unfilled boxes joined by
+ *    straight authored lines, because the fill and the bindings were only ever in the register.
+ * 2. **Every binding named the original's ids.** Even carried verbatim, a record points at objects
+ *    the copy does not contain — so every connector in the copy would resolve as detached.
+ *    Defined, non-crashing, and visibly wrong, which is the acceptance criterion passing while the
+ *    feature does not work.
+ *
+ * Hoisting it here rather than fixing three call sites is the same reasoning [withCopiedId] gives
+ * for being shared: a third hand-written copy is where the *next* register is forgotten.
+ *
+ * ## Which ops come out
+ *
+ * One `AddObject` per live object, then one `SetTextContent` per object that has a register value
+ * — emitted whenever there is one, including for a text box whose payload already carries it. The
+ * redundancy is a few dozen bytes per text box and it buys the rule *"if the fold answers for it,
+ * the copy carries it"*, which has no per-kind branch for a future kind to fall through.
+ *
+ * A binding naming an object that is **not** in [folded] — its target was deleted before the copy
+ * — keeps the original id, and therefore resolves in the copy as [ConnectorEndState.DETACHED_ABSENT]
+ * rather than `DETACHED_TOMBSTONED`. The geometry is identical either way (see that type); only
+ * the label the UI could show differs, and the copy genuinely does not contain the tombstone.
+ */
+internal fun copiedObjectOps(
+    folded: FoldedPage,
+    newObjectId: () -> ObjectId,
+    nextOpId: () -> String,
+    nextClock: () -> LamportClock,
+): List<PageOp> {
+    // The whole map first: a connector may be copied before the shape it points at.
+    val remap = folded.objects.associate { it.id to newObjectId() }
+    val ops = ArrayList<PageOp>(folded.objects.size)
+    for (obj in folded.objects) {
+        val id = remap.getValue(obj.id)
+        ops += PageOp.AddObject(nextOpId(), nextClock(), obj.withRegisters().withCopiedId(id))
+    }
+    for (obj in folded.objects) {
+        val text = folded.textOf(obj.id) ?: continue
+        val id = remap.getValue(obj.id)
+        // A record is re-targeted; anything else — a text box's text, or a register this build
+        // cannot parse — is carried verbatim. Guessing at an unparseable one is how a stranger's
+        // data becomes geometry (see `ShapeRecord.decode`).
+        val carried = ShapeRecord.decode(text)?.remapTargets { remap[it] }?.encode() ?: text
+        ops += PageOp.SetTextContent(nextOpId(), nextClock(), id, carried)
+    }
+    return ops
 }

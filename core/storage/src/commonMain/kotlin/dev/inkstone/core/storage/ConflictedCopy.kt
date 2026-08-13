@@ -122,11 +122,15 @@ public suspend fun NoteStore.conflictedCopyOf(
 /**
  * One remote page, folded and re-expressed as the shortest log that produces its picture.
  *
- * Folding first is what makes re-identification *provably* complete rather than merely
- * thorough. A fold collapses every register — transform, style, z-order, erased region,
- * presence — onto the object payload (`withRegisters`), so the only op left to write is
- * `AddObject` and there is no second op carrying an [ObjectId] in a `target` field that a
- * re-identification pass could miss.
+ * Folding first is what makes re-identification tractable: it collapses the transform, style,
+ * z-order, erased region and presence registers onto the object payload (`withRegisters`), so
+ * none of those needs an op of its own.
+ *
+ * ⚠️ **This paragraph used to say "every register", and to conclude that `AddObject` was
+ * therefore the only op carrying an [ObjectId] a re-identification pass could miss. M8b made both
+ * halves false.** The `SetTextContent` register is collapsed for a text box and for nothing else,
+ * and it is where a shape's fill and a connector's attachment live. Copying is [copiedObjectOps]
+ * now, which emits that register too and re-targets the ids inside it.
  *
  * The cost is that an op this build cannot parse is **not** carried into the copy.
  * [PageOp.Unknown] holds its own JSON verbatim (SPEC §5.8) but nothing here can tell whether
@@ -155,13 +159,7 @@ private suspend fun NoteSession.copyPage(remote: BundleReader, source: PageId, t
         size = folded.size,
         background = folded.background,
     )
-    for (obj in folded.objects) {
-        ops += PageOp.AddObject(
-            opId = nextOpId(),
-            clock = nextClock(),
-            obj = obj.withRegisters().withCopiedId(ids.newObjectId()),
-        )
-    }
+    ops += copiedObjectOps(folded, ids::newObjectId, ::nextOpId, ::nextClock)
 
     // `replay`, not `apply`: a copy has no history to undo *into*, and an undo stack seeded
     // with "every object on every page" is a stack whose first undo empties the note. Not

@@ -4,14 +4,18 @@ import dev.inkstone.core.model.Document
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.EraseCapsule
 import dev.inkstone.core.model.ErasedArea
+import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.SelectedObject
+import dev.inkstone.core.model.SelectionEdit
 import dev.inkstone.core.model.StrokeGeometry
 import dev.inkstone.core.model.StrokeObject
+import dev.inkstone.core.model.selected
 import dev.inkstone.core.storage.NoteLayout
 import dev.inkstone.core.storage.renameNote
 import kotlin.random.Random
@@ -42,15 +46,31 @@ internal suspend fun Device.drawStrokeOn(noteId: DocumentId, pageId: PageId): Ob
     id
 }
 
-/** CLAUDE.md rule 8 — an **absolute** transform, as an LWW register. */
-internal suspend fun Device.transform(noteId: DocumentId, target: ObjectId, scale: Float): Matrix3 =
+/**
+ * CLAUDE.md rule 8 — an **absolute** transform, as an LWW register.
+ *
+ * ⭐ **Through `SelectionEdit.transform`, which is what the app writes** (M8a). This used to
+ * build its own `SetTransform` from a matrix the helper chose, and CLAUDE.md is blunt about what
+ * that is worth: *"distrust a fixture that is more generous than production"*. A row that builds
+ * its own op tests the row. `SelectionEdit` is the one production decision-maker for a selection
+ * edit — `SelectionController` calls exactly this function with exactly these arguments — so
+ * routing through it means rows 3 and 7 fail if the app's composition order, its absoluteness or
+ * its degenerate-gesture refusal ever changes.
+ *
+ * What is still *not* production here is the gesture-to-matrix step and the ink surface around
+ * it: there is no `MotionEvent` in a JVM test. That half is `SelectionHandleTest` and the
+ * emulator walk in `docs/M8-SELECTION.md` §5.
+ */
+internal suspend fun Device.transform(noteId: DocumentId, target: ObjectId, gesture: Matrix3): Matrix3 =
     edit(noteId) { session, page ->
-        val absolute = Matrix3.scale(scale, scale)
-        session.apply(
-            page,
-            listOf(PageOp.SetTransform(session.nextOpId(), session.nextClock(), target, absolute)),
+        val ops = SelectionEdit.transform(
+            objects = selectedIn(session.page(page), target),
+            gesture = gesture,
+            nextOpId = session::nextOpId,
+            nextClock = session::nextClock,
         )
-        absolute
+        session.apply(page, ops)
+        (ops.single() as PageOp.SetTransform).absolute
     }
 
 /**
@@ -59,20 +79,32 @@ internal suspend fun Device.transform(noteId: DocumentId, target: ObjectId, scal
  * Row 3's premise is *equal* Lamport counters, which is the case `Register.write`'s tiebreak
  * exists for. Letting both devices call `nextClock()` usually produces equal counters anyway
  * (they are folding the same log), but "usually" is not a test — this makes it certain.
+ *
+ * The clock generator is a lambda for exactly this reason: `SelectionEdit` never mints one
+ * itself, so a test can pin it without a second code path.
  */
 internal suspend fun Device.transformAtCounter(
     noteId: DocumentId,
     target: ObjectId,
     counter: Long,
-    scale: Float,
+    gesture: Matrix3,
 ): Matrix3 = edit(noteId) { session, page ->
-    val absolute = Matrix3.scale(scale, scale)
-    session.apply(
-        page,
-        listOf(PageOp.SetTransform(session.nextOpId(), LamportClock(counter, deviceId()), target, absolute)),
+    // Read before the lambda: `deviceId()` suspends, and `SelectionEdit`'s generator is a plain
+    // `() -> LamportClock` — deliberately, since it is called from the UI thread in production.
+    val device = deviceId()
+    val ops = SelectionEdit.transform(
+        objects = selectedIn(session.page(page), target),
+        gesture = gesture,
+        nextOpId = session::nextOpId,
+        nextClock = { LamportClock(counter, device) },
     )
-    absolute
+    session.apply(page, ops)
+    (ops.single() as PageOp.SetTransform).absolute
 }
+
+/** The object as a selection edit sees it, read out of the fold the way the app reads it. */
+private fun selectedIn(page: FoldedPage, target: ObjectId): List<SelectedObject> =
+    listOf(assertNotNull(page.find(target), "no object $target on ${page.pageId}").selected)
 
 /** A tombstone. The `AddObject` stays in the log (SPEC §4.2), which is why row 2 can be asked. */
 internal suspend fun Device.deleteObjectAt(noteId: DocumentId, target: ObjectId, counter: Long) {
@@ -81,11 +113,25 @@ internal suspend fun Device.deleteObjectAt(noteId: DocumentId, target: ObjectId,
     }
 }
 
-/** An independent register from the transform — row 4's whole point. */
+/**
+ * An independent register from the transform — row 4's whole point.
+ *
+ * Through `SelectionEdit.restyle`, for the reason [transform] gives. Note the per-object
+ * `styleOf` lambda: the production caller composes each object's *own* style with the one field
+ * the user changed, and a helper that passed one shared style would not exercise that.
+ */
 internal suspend fun Device.setStyle(noteId: DocumentId, target: ObjectId, colorArgb: Int): ObjectStyle =
     edit(noteId) { session, page ->
         val style = ObjectStyle(colorArgb = colorArgb, widthPt = STYLE_WIDTH_PT)
-        session.apply(page, listOf(PageOp.SetStyle(session.nextOpId(), session.nextClock(), target, style)))
+        session.apply(
+            page,
+            SelectionEdit.restyle(
+                objects = selectedIn(session.page(page), target),
+                styleOf = { style },
+                nextOpId = session::nextOpId,
+                nextClock = session::nextClock,
+            ),
+        )
         style
     }
 
@@ -94,6 +140,19 @@ internal suspend fun Device.setStyle(noteId: DocumentId, target: ObjectId, color
  *
  * The stroke is not touched and no fragment is created. Row 7 is the assertion that a concurrent
  * transform of the same stroke therefore cannot duplicate it.
+ *
+ * ⚠️ **This one op is still hand-built, and it is the one place in this file where the fixture
+ * is more generous than production** — say so rather than let a green row imply otherwise. The
+ * real capsules come from `StrokeStore.eraseAlong`, which needs `androidx.ink`'s native coverage
+ * test to decide *which* strokes an eraser touched and where, and there is no ink in a JVM test.
+ * So what row 7 proves is that an absolute region and a concurrent transform **converge** — the
+ * merge question — and what it does not prove is that an eraser produces the right region, or
+ * that erasing a *moved* stroke maps the sweep into the object's own space. Both of those are
+ * `SelectionEraseTest` in `:android:ink`'s instrumented suite, on a device, with real ink.
+ *
+ * The capsule's coordinates are in the object's own space (M8a). For this fixture's stroke that
+ * is the same as page space, because its transform starts as the identity — which is the whole
+ * reason the distinction went unnoticed until something could move.
  */
 internal suspend fun Device.erase(noteId: DocumentId, target: ObjectId): ErasedArea = edit(noteId) { session, page ->
     val area = ErasedArea(listOf(EraseCapsule(ERASE_FROM, ERASE_FROM, ERASE_TO, ERASE_FROM, ERASE_RADIUS)))

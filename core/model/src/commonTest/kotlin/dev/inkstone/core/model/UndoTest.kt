@@ -146,10 +146,40 @@ class UndoTest {
         stack.undo(pageId, ::opId, ::clock)
         assertTrue(stack.canRedo(pageId))
 
-        stack.commit(UndoEntry(pageId, listOf(add), emptyList()))
+        val next = PageOp.AddObject(opId(), clock(), stroke("obj-2"))
+        stack.commit(UndoEntry(pageId, listOf(next), listOf(PageOp.DeleteObject(opId(), clock(), ObjectId("obj-2")))))
 
         assertFalse(stack.canRedo(pageId))
         assertTrue(stack.canUndo(pageId))
+    }
+
+    /**
+     * ⭐ M8a — **an entry with no inverse is not an undoable gesture, and must not pretend to be.**
+     *
+     * `Undo.inverseOf` answers null for a `PageOp.Unknown`, for a delete of an object whose
+     * `AddObject` has not arrived, and — the case that made this a real bug — for the **first
+     * `SetStyle` on any stroke**, whose style register is unset and which SPEC §4.2 cannot express.
+     * Committing such an entry put it on the stack, and pressing undo then popped it, applied
+     * nothing, and left the user's actual last edit one press further away.
+     *
+     * The redo branch still dies, because the page changed: a redo stored against the old state
+     * would be re-applied on top of something else. Both halves are asserted here, because getting
+     * only the first right is what a naive `if (inverse.isEmpty()) return` at the top of `commit`
+     * would do.
+     */
+    @Test
+    fun `a gesture with no inverse clears redo without becoming undoable`() {
+        val stack = UndoStack()
+        val add = PageOp.AddObject(opId(), clock(), stroke("obj-1"))
+        stack.commit(UndoEntry(pageId, listOf(add), listOf(PageOp.DeleteObject(opId(), clock(), ObjectId("obj-1")))))
+        stack.undo(pageId, ::opId, ::clock)
+        assertTrue(stack.canRedo(pageId))
+
+        stack.commit(UndoEntry(pageId, listOf(add), emptyList()))
+
+        assertFalse(stack.canRedo(pageId), "a page that has changed must not offer a stale redo")
+        assertFalse(stack.canUndo(pageId), "undo is offered for a gesture that cannot be undone")
+        assertTrue(stack.undo(pageId, ::opId, ::clock).isEmpty(), "undo returned ops for an empty stack")
     }
 
     @Test

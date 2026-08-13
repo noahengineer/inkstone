@@ -301,6 +301,28 @@ data class SetErasedRegion(val target: ObjectId, val absolute: List<EraseCapsule
 
 M8a's "partial erase splits a stroke into fragments" is **superseded**. Nothing splits.
 
+⭐ **The region is in the object's own space, not in page space.** *Added in M8a, which is the
+milestone that made the difference exist.* Every stroke's transform was the identity until a
+selection tool could move one, so "page space" and "the stroke's own space" were two names for the
+same numbers and the paragraphs above could use them interchangeably. They are not the same once
+something moves, and both readings of the old text fail silently:
+
+- Record the sweep in **page space** and the hole stays behind when the stroke is next dragged
+  away — a bite out of the paper rather than out of the line.
+- Test the eraser's coverage in **page space** and it passes straight through a moved stroke
+  without touching it, because the mesh it is testing against is still at the origin.
+
+So the eraser's swept segment is mapped through the object's inverse transform before it becomes
+an `EraseCapsule`, and its tip radius is divided by the transform's linear scale. Nothing
+migrates: every capsule written before M8a belongs to an object whose transform is the identity,
+under which the two spaces agree exactly.
+
+Two consequences worth stating. The radius is an approximation under a **non-uniform** scale — a
+round tip becomes an ellipse in a squashed object's space and a capsule cannot describe one; the
+error is bounded by the aspect ratio and destroys nothing, since erasing never destroys. And a
+transform that cannot be inverted has no such mapping, which is why `SelectionEdit.transform`
+refuses to write a degenerate matrix at all (SPEC §4.2, `Matrix3.isDegenerate`).
+
 ### 3.6 Latency verification (M1 gate)
 
 Do not declare M1 done on vibes:
@@ -447,6 +469,47 @@ moves.
 With absolute matrices: concurrent transforms resolve last-writer-wins, undo writes back the previous absolute matrix, and a transform targeting a tombstoned object is a trivial no-op. Same for `SetStyle` and `SetZOrder`.
 
 **Transform on a deleted object:** no-op. **Delete of a non-existent object:** record the tombstone anyway (the AddObject may arrive later — this is what makes ordering irrelevant).
+
+⚠️ **`SetStyle` cannot say "back to as-captured", and M8a is where that became a bug rather than a
+curiosity.** A stroke's style register starts *unset* — null meaning "the colour and width in the
+geometry blob" — because duplicating capture-time style into a register would give two sources of
+truth that drift (see `ObjectStyle`). But `SetStyle.style` is non-null, so the inverse of the
+**first** recolour of any stroke is a value the vocabulary cannot express: §4.6's
+`SetStyle ↔ SetStyle(previous style)` has no previous style to write. `Undo.inverseOf` returned
+null, the gesture went onto the undo stack with an empty inverse, and *"change the colour, press
+undo"* did nothing — while consuming the press, so the user's actual last edit moved one step
+further away.
+
+Making the field nullable would be an op-format change after sync is live, which is the thing this
+section exists to prevent: `OpCodec` reads `style` with `getValue`, so an older build would fail to
+open a note containing one. **The fix is therefore two things, neither of them a format change:**
+
+1. `:android:ink` writes the **capture-time style** into the register first, as a batch of its own,
+   before the recolour. It is the only module that can — the values are on the decoded brush. The
+   write is invisible: it renders identically because it is the same numbers.
+2. `UndoStack.commit` **drops an entry whose inverse is empty** (§4.6). That makes the baseline
+   batch cost no press, and it fixes the general case: an entry that cannot be undone must not make
+   the button say it can.
+
+The remaining limitation is honest and small: once recoloured, an object's style register is set
+forever, so "as captured" is no longer reachable as a *state* — only as a value someone writes
+back. Nothing is lost; the blob still holds what the stroke was drawn with.
+
+⭐ **`SetTextContent` is not only a text box's register, and since M8b it is load-bearing for
+something else.** It is the vocabulary's one *absolute, object-keyed, arbitrary-length* register —
+every other one is a fixed arity of numbers — which makes it the only place a shape's fill and a
+connector's attachment can live without a format change. §4.8 is the whole argument. Two
+consequences worth carrying back here:
+
+- **The fold must answer for the register on any kind of object.** `PageFolder.materialise`
+  copied the winning value onto a `TextBoxObject`'s payload and dropped it for everything else, so
+  a `SetTextContent` aimed at a shape folded correctly, converged correctly, round-tripped through
+  the file correctly, and was discarded at the last step with nothing to see. `FoldedPage.textOf`
+  exposes it now.
+- **Its inverse is the previous value, not the previous *text box's* text.** `Undo.inverseOf`
+  cast the target to `TextBoxObject`, so *"change a shape's fill, press undo"* produced no inverse
+  — and `UndoStack.commit` drops an entry with no inverse, so the press would have looked as
+  though it worked. That is this section's own first-`SetStyle` trap, in the register next door.
 
 ### 4.3 Convergence — how it actually works
 
@@ -604,6 +667,15 @@ An entry in an `undo.json` written before this **is dropped on load**, since the
 to guess a page and the guess is the bug. That costs the ability to undo gestures made before
 the upgrade, once, and costs no data: every forward op is already in the log.
 
+⚠️ **An entry with no inverse is not an undoable gesture, and used to be committed as one** (M8a).
+`UndoStack.commit` skipped only entries that were empty in *both* directions. A gesture with
+forward ops and no inverse — which `Undo.inverseOf` produces for a `PageOp.Unknown`, for a delete
+of an object whose `AddObject` has not arrived, and, routinely, for the first `SetStyle` on any
+stroke (§4.2) — therefore went on the stack, and pressing undo popped it, applied nothing, and put
+the user's real last edit one press further away. `commit` now tests `UndoEntry.isUndoable`. The
+button and the action ask the same question, which is the same property `canUndo(pageId)` was
+given for.
+
 ### 4.7 Compaction
 
 **The naive rule ("compact when SYNCED") is wrong twice:** it would never compact a `LOCAL_ONLY` note (i.e. most notes, and all notes before M5), and "SYNCED" means "this device uploaded", not "every peer has seen these ops" — compacting while your other tablet holds older ops offline leaves them nowhere to reintegrate.
@@ -651,6 +723,160 @@ only in memory produces a cache holding state the log does not — and discardin
 9 requires the moment an older op arrives, would then lose that work outright. `close()`
 materializes first so it cannot happen today; a caller reaching `compactIfDue` directly is one
 refactor away and the cost of being wrong is silent.
+
+### 4.8 Shapes and connectors ⭐
+
+*Added in M8b. This section did not exist, and ROADMAP M8b's central data structure — a
+connector — appeared nowhere in this document. Deciding it and writing it down here was the
+milestone's first task.*
+
+#### 4.8.1 A connector is not a new kind of object
+
+`ShapeKind` was frozen in M2 as `{LINE, ARROW, RECTANGLE, ELLIPSE, TRIANGLE}` and §4.2's op
+vocabulary was frozen with it. **A connector is a `ShapeObject` of kind `LINE` or `ARROW`.**
+There is no connector object, no connector op, and no new enum constant.
+
+That is not minimalism for its own sake. `OpCodec.decodeObject` ends in
+`error("Unknown object kind")` and reads a shape with `ShapeKind.valueOf`, and `BundleReader`
+decodes a page's ops unguarded — so a new object kind *or a new `ShapeKind`* does not make an
+older build **degrade**, it makes an older build **fail to open a note it has already synced**.
+Unknown-field preservation does not rescue it either: `OpExtras` collects unrecognised members
+at an op's **top level only**, so a field added inside the object payload is read by nobody,
+dropped on the next two-second autosave, and uploaded that way.
+
+#### 4.8.2 Where attachment lives: the `SetTextContent` register
+
+Everything M8b must persist that §4.2 cannot express — a fill colour, a fill opacity, a corner
+radius, and which object each end of a connector is attached to — lives in **one absolute LWW
+register on the shape: `SetTextContent`**, holding a `ShapeRecord` encoded as a short ASCII
+string.
+
+```
+is1;f=-16777216;fo=0.5;r=8;a=o:<objectId>;b=o:<objectId>:0.5:1;rt=e
+```
+
+`SetTextContent` is the vocabulary's only absolute, object-keyed, arbitrary-length register;
+every other register is a fixed arity of numbers. Nothing in the codec looks at what an op's
+target *is*, so an M8a-era build decodes this op, folds it into its register table, and
+re-encodes it **byte for byte** on save.
+
+**The two homes that do not work**, both for reasons only visible from an older build or a
+second device:
+
+- **A field on `ShapeObject`.** §4.8.1 — silently dropped on the next autosave.
+- **The `AddObject` payload.** `PageFolder.absorb` does `payloads.getOrPut(id)` deliberately, so
+  a payload is **first-write-wins** and a re-add cannot overwrite it (§4.2). An endpoint can be
+  dragged to a different shape and a fill can be recoloured, so neither is payload. Re-emitting
+  `AddObject` for the same id looks right on screen, lands in `journal.ops`, passes every test,
+  and is discarded by the next fold from empty.
+
+**The cost, stated rather than hidden.** One register holds four independently-edited
+properties and an LWW register resolves *whole*, so a concurrent fill change and endpoint
+re-attachment lose one of the two. That is a lost edit, not a corrupt state: a record is written
+whole and consumed whole, so whichever wins is internally consistent, and both devices hold the
+same one. The alternative that keeps them separate is a format change, and a format change here
+is a note that will not open.
+
+**Forward compatibility applies inside the record too.** Keys this build does not recognise are
+kept verbatim and written back, exactly as `OpExtras` does one level up (§5.8). Without that, a
+later build adding a key would have it destroyed by every M8b device that opened the note.
+
+#### 4.8.3 A reroute writes no op ⭐
+
+**A connector's path is derived from the fold at draw time and never persisted.** Moving,
+resizing or rotating a shape emits that shape's absolute `SetTransform` and **nothing else**,
+however many connectors touch it.
+
+Persisting a route would put two devices' independent edits into one LWW register, and an
+absolute value wins whole — so a connector would end up attached at one end and visibly detached
+at the other, identically on both devices, with every op present and no error. The derived route
+converges for free instead: every input to it (the targets' transforms, their extents, their
+presence) is a value the merge already agrees on, so the two devices agree on the route without
+exchanging a byte about it.
+
+**An anchor is a point in the target's own box**, either `Auto` (the boundary point facing the
+other end, recomputed every draw) or `Pinned(u, v)` normalised to `[0,1]²`. That single choice is
+what makes a connector track a **resize** and a **rotation** and not merely a translate: the
+anchor is carried by the target's absolute matrix like any other point on it. An anchor stored as
+a page-space offset would need rewriting under every one of those — which is the register this
+section forbids, arrived at from the other direction.
+
+#### 4.8.4 Detachment is derived, never stored
+
+An end whose target cannot be resolved falls back to the connector's **own** `ShapeObject`
+geometry — the segment `(0, h/2) → (w, h/2)` under its transform. Three things then agree for
+free: that is what an M8a-era build draws, it is what a detached end draws, and undoing the
+delete restores the attachment with no op.
+
+There are three ways to fail to resolve and they produce **identical geometry**:
+
+| State | Cause |
+|---|---|
+| `DETACHED_TOMBSTONED` | the target's presence register says DELETED (§4.2) |
+| `DETACHED_ABSENT` | nothing on the page has that id — its `AddObject` has not arrived |
+| `DETACHED_UNANCHORABLE` | the target is here but has no measurable box (a stroke — §5.4) |
+
+They are told apart only so the UI can label the first. **Storing a detachment would make the
+second permanent**: a connector whose target was merely still in flight would be written off by
+whichever device noticed first, and would stay written off after it arrived. Deriving means the
+end re-attaches the moment the object turns up — or the moment a delete is undone — with no op,
+no merge, and nothing for two devices to disagree about.
+
+This is why ROADMAP M8b's acceptance wording *"deleting a shape leaves its connectors detached"*
+must not be read as an instruction to persist a detachment. §4.2 already says a delete of an
+object that has not arrived records its tombstone anyway, and that ops targeting a tombstone are
+no-ops; a stored detachment would contradict both.
+
+#### 4.8.5 What an older build does with such a note
+
+An M8a-era build **opens the note, keeps every byte, and shows no shapes**. `StrokeStore.addObject`
+opens with `as? StrokeObject ?: return false`, so a `ShapeObject` is dropped from the *screen*
+while its `AddObject` and its record sit correctly in the log, survive an autosave, survive a
+compaction snapshot (§4.7 keeps the raw log), and re-materialise the next time an M8b build opens
+the note. The published PDF that older build writes will lack the shapes; the bundle inside it
+will not, and the bundle is the truth (§5.1).
+
+That is a degrade, and it is the strongest one available without a schema bump.
+
+#### 4.8.6 Local geometry, and the one case that decides it
+
+Every kind occupies `[0, widthPt] × [0, heightPt]` in its own space — **except `LINE` and
+`ARROW`, whose segment runs horizontally through the middle of the box** rather than along its
+diagonal, and which are placed by `translate · rotate`.
+
+The diagonal reads more naturally right up until an axis-aligned line: its box then has zero
+height, its placement matrix has zero determinant, and `SelectionEdit.transform` correctly
+refuses to write a singular matrix — so the most common line a person draws would be the one
+thing this could not express. A rotated horizontal segment has determinant 1 at every angle.
+
+**Only a rectangle rounds its corners.** An ellipse has none, and a triangle's corners meet at
+angles a single radius cannot round consistently.
+
+#### 4.8.7 Draw-and-hold snapping is on the ink path
+
+§2.4 and CLAUDE.md rule 7 apply in full, because the user is still touching the screen. The work
+is split so that the per-sample half is two float writes into a buffer the caller already owns
+and one distance compare; classification runs **once**, when the hold fires, as two allocation-free
+passes over that buffer. Its signature takes `FloatArray`s and a count rather than a list for
+exactly that reason.
+
+Classification is a **bounding box and a shoelace area**, not a recogniser: a rectangle fills its
+box, an ellipse `π/4` of it, a triangle half. Those are facts about the shapes rather than tuning.
+What *is* tuned is the confidence bar and the window around each target, and M7's rule applies —
+a synthetic fixture is the worst possible witness for a geometric heuristic, so *"no fighting it
+to draw a freehand curve"* is settled on the tablet and nowhere else. A gesture that matches
+nothing well leaves the ink alone, which is the default.
+
+`ARROW` is never recognised. An arrowhead is a few samples at one end of a gesture,
+indistinguishable from a hooked pen-lift; it is a tool the user picks.
+
+#### 4.8.8 POLYGON is not in this milestone, and ROADMAP has been corrected
+
+ROADMAP M8b's scope list names *polygon* among the snappable shapes. Adding it to `ShapeKind`
+would make `ShapeKind.valueOf` throw in every older build (§4.8.1), which is the one failure this
+whole section is arranged to avoid. **SPEC wins; POLYGON is dropped.** A closed run of straight
+segments remains expressible as an ordinary ink stroke with no format change at all, which is
+where it should go if it is ever wanted — it simply cannot carry a fill.
 
 ---
 

@@ -124,7 +124,7 @@ internal object StrokeGeometryCodec {
         }.getOrNull() ?: return null
 
         val brush = brushes.brushFor(kind, colorArgb, sizePt, epsilonPt, inputModel)
-        return DecodedStroke(Stroke(brush, inputs), kind)
+        return DecodedStroke(Stroke(brush, inputs), kind, inputModel)
     }
 
     private fun ByteArrayOutputStream.writeInt(value: Int) {
@@ -157,8 +157,14 @@ internal object StrokeGeometryCodec {
     private const val ESTIMATED_INPUT_BYTES = 2048
 }
 
-/** A stroke rebuilt from a blob, with the brush kind the dry layer needs for render order. */
-internal class DecodedStroke(val stroke: Stroke, val kind: InkBrushKind)
+/**
+ * A stroke rebuilt from a blob, with the brush kind the dry layer needs for render order.
+ *
+ * [inputModel] is carried since M8a. It was decoded and discarded before, which was harmless
+ * while nothing re-tessellated a loaded stroke — and `SetStyle` does exactly that, so without
+ * it a recolour would quietly re-shape a stroke captured with the other smoothing model.
+ */
+internal class DecodedStroke(val stroke: Stroke, val kind: InkBrushKind, val inputModel: InkInputModel)
 
 /**
  * The two `ink-storage` calls, in one place.

@@ -19,6 +19,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import dev.inkstone.android.ink.InkSurfaceView
+import dev.inkstone.android.ink.InkTool
 import dev.inkstone.android.ink.SyntheticInk
 import dev.inkstone.app.note.NoteEditor
 import dev.inkstone.app.note.NoteEditorState
@@ -135,6 +136,18 @@ private fun inkToolbarActions(
         surface?.latency?.reset()
         surface?.stylus?.reset()
     },
+    // ⭐ ROADMAP M8a. Straight through to the surface, like `onClear` and unlike `onUndo`:
+    // these are gestures on the page, so they belong with the other gestures, and routing them
+    // through the view model would assign their Lamport clocks inside a coroutine (see
+    // `SelectionController`). The surface calls `onSelectionChanged` back, which is what makes
+    // the row disappear after a delete rather than offering actions for nothing.
+    onDeleteSelection = { surface?.selection?.delete() },
+    onDuplicateSelection = { surface?.selection?.duplicate() },
+    onRecolourSelection = { argb -> surface?.selection?.recolour(argb) },
+    onResizeSelectionStroke = { widthDp -> surface?.selection?.setWidth(widthDp) },
+    onBringSelectionToFront = { surface?.selection?.bringToFront() },
+    onSendSelectionToBack = { surface?.selection?.sendToBack() },
+    onClearSelection = { surface?.selection?.clear() },
 )
 
 /**
@@ -262,7 +275,9 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
                 onHistoryChanged = { ui.strokeCount = strokeCount }
                 onUndoRequested = { editor.undo() }
                 onRedoRequested = { editor.redo() }
-                onEraserAutoReleased = { ui.eraserSelected = false }
+                onEraserAutoReleased = { ui.tool = InkTool.PEN }
+                // ⭐ M8a — what the selection action row is shown and enabled by.
+                onSelectionChanged = { count -> ui.selectionSize = count }
                 // ⭐ M12 §3 — the timeline's only input. Fired on the UI thread in the frame the
                 // dry layer redraws, so the view model does one subtraction and one enqueue and
                 // returns (CLAUDE.md rule 7); the file append rides the journal's own rhythm.
@@ -272,7 +287,10 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
         },
         update = { view ->
             view.pen = ui.pen
-            view.eraserSelected = ui.eraserSelected
+            // ⚠️ M8a — the line that makes the Select chip do anything. A tool the toolbar
+            // knows about and this lambda does not push is a chip that highlights and changes
+            // nothing, which is CLAUDE.md's definition-of-done #6 in one missing assignment.
+            view.tool = ui.tool
             view.eraseMode = ui.eraseMode
             view.predictionEnabled = ui.predictionEnabled
             view.inputModel = ui.inputModel

@@ -5,6 +5,7 @@ import dev.inkstone.core.model.EraseCapsule
 import dev.inkstone.core.model.ErasedArea
 import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.StrokeObject
@@ -61,6 +62,7 @@ internal class PageOpRecorder(
             val kind: InkBrushKind,
             val inputModel: InkInputModel,
             val z: FractionalKey,
+            val transform: Matrix3,
         ) : Entry
     }
 
@@ -77,10 +79,23 @@ internal class PageOpRecorder(
     /** The gesture in progress. UI thread only, so it needs no synchronisation. */
     private var current: MutableList<Entry>? = null
 
-    /** Z-order keys, handed out in insertion order so the log's order is the draw order. */
-    private var lastZ: FractionalKey = FractionalKey.Initial
-
     val isEmpty: Boolean get() = queue.isEmpty() && current.isNullOrEmpty()
+
+    /**
+     * The note's own id and clock generators, for ops built by the selection tool.
+     *
+     * ⚠️ **Exposed rather than duplicated.** A selection edit is a local gesture like any
+     * other, and its ops must be stamped **on the UI thread at the moment of the edit** for the
+     * reason this class exists (see the KDoc): the Lamport order is the order the user did
+     * things in, and a clock assigned on a worker lets two edits swap places depending on how
+     * the encoder was scheduled. So the selection controller stamps here and enqueues through
+     * [record], rather than handing the surface a second pair of generators.
+     */
+    fun newOpId(): String = nextOpId()
+
+    fun newClock(): LamportClock = nextClock()
+
+    fun newObjectId(): ObjectId = nextObjectId()
 
     /** Opens a gesture. Nested calls are ignored — see `StrokeStore.beginEdit`. */
     fun beginGesture() {
@@ -109,9 +124,8 @@ internal class PageOpRecorder(
      * @return the [ObjectId] the stroke now has, so the dry layer can carry it and later
      *   ops can target it.
      */
-    fun strokeFinished(stroke: Stroke, kind: InkBrushKind, inputModel: InkInputModel): ObjectId {
+    fun strokeFinished(stroke: Stroke, kind: InkBrushKind, inputModel: InkInputModel, z: FractionalKey): ObjectId {
         val id = nextObjectId()
-        lastZ = FractionalKey.between(lastZ, null)
         enqueue(
             Entry.UnencodedStroke(
                 opId = nextOpId(),
@@ -120,10 +134,46 @@ internal class PageOpRecorder(
                 stroke = stroke,
                 kind = kind,
                 inputModel = inputModel,
-                z = lastZ,
+                z = z,
+                transform = Matrix3.Identity,
             ),
         )
         return id
+    }
+
+    /**
+     * ⭐ M8a — a copy of a stroke already on the page, at [id], offset by [transform].
+     *
+     * The `androidx.ink` [Stroke] is **shared with the original**, not copied: it is immutable
+     * once finished, so two objects may point at one mesh, and the encode below reads it on a
+     * worker exactly as it does for a freshly drawn stroke.
+     *
+     * That is the whole reason duplication does not build its op in `:core:model` alongside
+     * every other selection edit: an `AddObject` carries a geometry blob, producing one means
+     * running `androidx.ink`'s encoder, and CLAUDE.md rule 7 forbids that between the tap and
+     * the next frame. The *decision* — the new z key and the offset — is `SelectionEdit`'s;
+     * this is the mechanics.
+     */
+    fun strokeDuplicated(
+        source: Stroke,
+        id: ObjectId,
+        kind: InkBrushKind,
+        inputModel: InkInputModel,
+        transform: Matrix3,
+        z: FractionalKey,
+    ) {
+        enqueue(
+            Entry.UnencodedStroke(
+                opId = nextOpId(),
+                clock = nextClock(),
+                objectId = id,
+                stroke = source,
+                kind = kind,
+                inputModel = inputModel,
+                z = z,
+                transform = transform,
+            ),
+        )
     }
 
     /** Whole-stroke erase, or a delete from any other tool. A tombstone, never a removal. */
@@ -170,6 +220,7 @@ internal class PageOpRecorder(
                         obj = StrokeObject(
                             id = entry.objectId,
                             geometry = StrokeGeometryCodec.encode(entry.stroke, entry.kind, entry.inputModel),
+                            transform = entry.transform,
                             z = entry.z,
                         ),
                     )

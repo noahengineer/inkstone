@@ -7,6 +7,7 @@ import androidx.ink.geometry.MutableVec
 import androidx.ink.strokes.StrokeInput
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.StrokeOutline
@@ -77,6 +78,15 @@ public class InkStrokeOutliner(
         result
     }
 
+    /**
+     * ⭐ M8a — the brush is read *after* any `SetStyle` has been applied.
+     *
+     * `StrokeStore.applyOps` rebuilds a restyled stroke's brush, so `brush.colorIntArgb` and
+     * `brush.size` here are the object's current colour and width and not its captured ones.
+     * That is the whole of "a recoloured stroke publishes recoloured", and it works because
+     * this outliner drives the same store the editor does — a second decoder would have had to
+     * reimplement the override, which is the drift this class already refuses elsewhere.
+     */
     private fun outlineOf(dry: DryStroke): StrokeOutline {
         val brush = dry.stroke.brush
         return StrokeOutline(
@@ -94,10 +104,20 @@ public class InkStrokeOutliner(
      * The untouched case reads the mesh's own outline vertices — exact, and already
      * polylines, because a tessellated stroke has no curves left. Only an erased
      * stroke pays for the round trip through [Path] and [PathMeasure].
+     *
+     * ⚠️ **The object's transform is applied last, after the erasure has been subtracted.**
+     * Both the mesh and the eraser's capsules are in the object's own space (SPEC §3.5 as
+     * revised in M8a), so subtracting there is exact and needs no mapping; mapping first would
+     * mean transforming the capsules too, and a rotation turns a round eraser tip into an
+     * ellipse that `Path` stroking cannot express. What crosses into `:android:pdf` is page
+     * space, because that is what SPEC §4.4 says a persisted coordinate is.
      */
     private fun contoursOf(dry: DryStroke): List<List<PagePoint>> {
         val erased = dry.erased
-        return if (erased == null) meshContours(dry) else erasedContours(dry, erased)
+        val local = if (erased == null) meshContours(dry) else erasedContours(dry, erased)
+        val transform = dry.transform
+        if (transform == Matrix3.Identity) return local
+        return local.map { contour -> contour.map { transform.map(it) } }
     }
 
     private fun meshContours(dry: DryStroke): List<List<PagePoint>> {
@@ -150,7 +170,11 @@ public class InkStrokeOutliner(
             eraser.op(expanded, Path.Op.UNION)
         }
         stroke.op(eraser, Path.Op.DIFFERENCE)
-        return flatten(stroke)
+        // Sampled at a step that will be [FLATTEN_STEP_PT] once the object's transform has
+        // scaled it. A stroke enlarged 4× and flattened at the plain step publishes visibly
+        // faceted curves — correct geometry, wrong resolution, and only on the objects the user
+        // has bothered to make big.
+        return flatten(stroke, FLATTEN_STEP_PT / dry.transform.linearScale())
     }
 
     /**
@@ -163,14 +187,14 @@ public class InkStrokeOutliner(
      * a hole in it — which is exactly what erasing produces — comes back with the
      * hole's edge joined to the outside by a stray segment.
      */
-    private fun flatten(path: Path): List<List<PagePoint>> {
+    private fun flatten(path: Path, stepPt: Float): List<List<PagePoint>> {
         val measure = PathMeasure(path, false)
         val contours = ArrayList<List<PagePoint>>()
         val position = FloatArray(2)
         do {
             val length = measure.length
             if (length <= 0f) continue
-            val steps = (length / FLATTEN_STEP_PT).toInt().coerceIn(MIN_POLYGON_POINTS, MAX_CONTOUR_POINTS)
+            val steps = (length / stepPt).toInt().coerceIn(MIN_POLYGON_POINTS, MAX_CONTOUR_POINTS)
             val points = ArrayList<PagePoint>(steps + 1)
             for (step in 0..steps) {
                 if (!measure.getPosTan(length * step / steps, position, null)) continue
@@ -197,6 +221,7 @@ public class InkStrokeOutliner(
         val inputs = dry.stroke.inputs
         if (inputs.size == 0) return emptyList()
         val scratch = StrokeInput()
+        val transform = dry.transform
         val points = ArrayList<PagePoint>(inputs.size)
         var lastX = Float.NaN
         var lastY = Float.NaN
@@ -204,7 +229,13 @@ public class InkStrokeOutliner(
             inputs.populate(index, scratch)
             val isLast = index == inputs.size - 1
             if (!isLast && !lastX.isNaN() && hypot(scratch.x - lastX, scratch.y - lastY) < THIN_THRESHOLD_PT) continue
-            points += PagePoint(scratch.x, scratch.y)
+            // ⚠️ Mapped, like [contoursOf]. Missing it here and not there is worse than missing
+            // it in both: the appearance stream would move and the `/InkList` interop polyline
+            // would stay behind, so another editor's idea of where the stroke is would differ
+            // from the picture in the same file — and Recovered mode reads `/InkList`
+            // ([InkStrokeRebuilder]), so a recovered note would put the ink back where it was
+            // before the user moved it.
+            points += transform.map(PagePoint(scratch.x, scratch.y))
             lastX = scratch.x
             lastY = scratch.y
         }

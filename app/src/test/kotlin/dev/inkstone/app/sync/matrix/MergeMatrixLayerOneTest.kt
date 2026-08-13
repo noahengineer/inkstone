@@ -1,8 +1,10 @@
 package dev.inkstone.app.sync.matrix
 
+import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.PageOp
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -86,7 +88,7 @@ class MergeMatrixLayerOneTest {
         devices.a.pull()
 
         // Concurrent, and deliberately ordered: the delete is later, so it must win everywhere.
-        devices.a.transformAtCounter(id, target, counter = COLLISION_COUNTER, scale = 2f)
+        devices.a.transformAtCounter(id, target, COLLISION_COUNTER, Matrix3.scale(2f, 2f))
         devices.b.deleteObjectAt(id, target, counter = COLLISION_COUNTER + 5L)
 
         devices.syncBothWays()
@@ -116,11 +118,18 @@ class MergeMatrixLayerOneTest {
      * Two assertions, and the second is the one that would have caught the original bug: the
      * resolved matrix is identical on both devices, and no two ops in the merged log share a
      * `LamportClock`.
+     *
+     * ⭐ **Two things changed in M8a.** The ops now come from `SelectionEdit.transform` — the
+     * function the selection tool itself calls — rather than being built by the helper, because
+     * a row that builds its own op tests the row. And the gestures are **non-uniform**: a
+     * `scale(s, s)` is a scalar multiple of the identity and therefore *commutes* with rotation,
+     * so the composed-instead-of-resolved failure this row exists to catch would come out
+     * identical to the correct answer. The row could not have failed for its own reason.
      */
     @Test
     fun `row 3 - two concurrent transforms at one counter resolve identically and never to a product`() = matrixRow(
         row = "row 3 (Lamport tiebreak)",
-        proven = "an equal-counter collision resolving to one input on both devices",
+        proven = "an equal-counter collision resolving to one input on both devices, through the app's own op builder",
         notProven = "nothing extra — the tiebreak is local, and this is the row a shared deviceId broke",
     ) { devices ->
         val id = devices.share("Row3")
@@ -131,8 +140,11 @@ class MergeMatrixLayerOneTest {
         devices.b.drain()
         devices.a.pull()
 
-        val fromA = devices.a.transformAtCounter(id, target, counter = COLLISION_COUNTER, scale = 2f)
-        val fromB = devices.b.transformAtCounter(id, target, counter = COLLISION_COUNTER, scale = 3f)
+        // Non-uniform, and not commuting with each other: a squash and a quarter-turn. Their
+        // product is skewed, so "composed rather than resolved" is a state this row can now
+        // actually reach and therefore actually rule out.
+        val fromA = devices.a.transformAtCounter(id, target, COLLISION_COUNTER, Matrix3.scale(2f, 1f))
+        val fromB = devices.b.transformAtCounter(id, target, COLLISION_COUNTER, Matrix3.rotate(QUARTER_TURN))
 
         devices.syncBothWays()
 
@@ -142,6 +154,10 @@ class MergeMatrixLayerOneTest {
         assertTrue(
             onA == fromA || onA == fromB,
             "the resolved matrix is neither input — the ops were composed rather than resolved (CLAUDE.md rule 8)",
+        )
+        assertFalse(
+            onA.isSkewed(),
+            "the resolved matrix is skewed, which is what SPEC §4.2's worked example produces from a delta log",
         )
 
         for (device in listOf(devices.a, devices.b)) {
@@ -170,7 +186,7 @@ class MergeMatrixLayerOneTest {
         devices.a.pull()
 
         val style = devices.a.setStyle(id, target, colorArgb = RED)
-        val transform = devices.b.transform(id, target, scale = 2f)
+        val transform = devices.b.transform(id, target, Matrix3.scale(2f, 2f))
 
         devices.syncBothWays()
 
@@ -249,12 +265,28 @@ class MergeMatrixLayerOneTest {
      * fragments are new objects, so a peer's transform of the original lands on nothing and the
      * object count differs between the two devices. With `SetErasedRegion` as an absolute
      * register, there is still exactly one object and it carries both.
+     *
+     * ⚠️ **ROADMAP M8a's prompt asks for the fragment model in as many words** — *"partial erase
+     * splits a stroke and must be expressed as `DeleteObject(original) + AddObject(fragment1) +
+     * AddObject(fragment2)`"* — and SPEC §3.5 supersedes it: *"Nothing splits."* The
+     * `assertEquals(1, folded.objects.size)` below is the automated guard on that, and it is the
+     * assertion that would fail if anyone implemented the prompt. Do not weaken it.
+     *
+     * ⭐ **What M8a added: the erase and the transform must commute.** They are different
+     * registers on one object, so a device that erases before a peer's move arrives and one that
+     * erases after must finish identically — which is true only because the region is stored in
+     * the object's **own** space. Had the capsules been page-space, the erase would have had to
+     * be re-expressed when the transform arrived, nothing does that, and the two devices would
+     * hold the same numbers meaning different places. The second half of this row runs the two
+     * orders on the two devices and asserts they agree.
      */
     @Test
     fun `row 7 - a partial erase and a concurrent transform converge without duplicating the stroke`() = matrixRow(
         row = "row 7 (area-based erase)",
-        proven = "one object carrying both an erased region and a transform on both devices",
-        notProven = "nothing extra",
+        proven = "one object carrying both an erased region and a transform, identical whichever order they arrived",
+        notProven = "that an eraser produces the right region, or that erasing a *moved* stroke maps the " +
+            "sweep into its own space — there is no ink in a JVM test; both are :android:ink's " +
+            "SelectionEraseTest, on a device",
     ) { devices ->
         val id = devices.share("Row7")
         val page = devices.a.firstPage(id)
@@ -264,8 +296,10 @@ class MergeMatrixLayerOneTest {
         devices.b.drain()
         devices.a.pull()
 
+        // Concurrent and in opposite orders locally: A erases and only then hears about the
+        // move; B moves and only then hears about the erase.
         val erased = devices.a.erase(id, target)
-        val transform = devices.b.transform(id, target, scale = 2f)
+        val transform = devices.b.transform(id, target, Matrix3.scale(2f, 2f))
 
         devices.syncBothWays()
 
@@ -276,6 +310,18 @@ class MergeMatrixLayerOneTest {
             assertEquals(erased, obj.erased, "${device.name} dropped the erased region")
             assertEquals(transform, obj.transform, "${device.name} dropped the concurrent transform")
         }
+
+        // The capsules are byte-identical on both devices — neither re-expressed them when the
+        // transform arrived, which is what "the region is in the object's own space" means for
+        // the merge. A page-space region would have had to move and does not.
+        val onA = assertNotNull(devices.a.page(id, page).find(target))
+        val onB = assertNotNull(devices.b.page(id, page).find(target))
+        assertEquals(
+            onA.erased.capsules,
+            onB.erased.capsules,
+            "the two devices hold different capsules — the region was re-expressed by one of them",
+        )
+        assertEquals(onA.transform, onB.transform, "the two devices disagree about the transform")
     }
 
     private companion object {
@@ -285,5 +331,8 @@ class MergeMatrixLayerOneTest {
          */
         const val COLLISION_COUNTER = 10_000L
         const val RED = 0xFFCC0000.toInt()
+
+        /** π/2, as a literal so the test has no arithmetic of its own to be wrong about. */
+        const val QUARTER_TURN = 1.5707964f
     }
 }
