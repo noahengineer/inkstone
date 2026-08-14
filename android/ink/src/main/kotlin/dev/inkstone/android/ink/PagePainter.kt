@@ -281,21 +281,22 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
      */
     private fun paintShape(canvas: Canvas, dry: DryShape) {
         val record = dry.record
-        val style = dry.style ?: dry.obj.style
         if (dry.fillable) {
             val fill = record.fillArgb ?: 0
             fillPaint.color = fill.withOpacity(record.fillOpacity)
             canvas.drawPath(dry.path, fillPaint)
         }
-        val width = style?.widthPt ?: DEFAULT_SHAPE_WIDTH_PT
-        if (width <= 0f) return
-        shapePaint.color = (style?.colorArgb ?: DEFAULT_SHAPE_COLOR).withOpacity(style?.opacity ?: 1f)
-        shapePaint.strokeWidth = width
+        // The one fallback chain — live register, payload, defaults — lives on [DryShape], so
+        // what a first restyle's baseline writes down is exactly what was painted.
+        val style = dry.effectiveStyle()
+        if (style.widthPt <= 0f) return
+        shapePaint.color = style.colorArgb.withOpacity(style.opacity)
+        shapePaint.strokeWidth = style.widthPt
         canvas.drawPath(dry.path, shapePaint)
         // The head is rebuilt rather than cached because it is two lines and it depends on the
         // stroke width the *style register* currently says — which a peer can change without the
         // outline changing at all.
-        dry.arrowHead(width * ARROW_HEAD_WIDTHS)?.let { canvas.drawPath(it, shapePaint) }
+        dry.arrowHead(style.widthPt * ARROW_HEAD_WIDTHS)?.let { canvas.drawPath(it, shapePaint) }
     }
 
     /** Filled interior. Antialiased, no blend mode — see [paintShape]. */
@@ -358,10 +359,6 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
 
     private companion object {
         const val PAGE_BORDER_COLOR = 0x22000000
-
-        /** What a shape drawn before anything restyled it looks like — the pen's default weight. */
-        const val DEFAULT_SHAPE_WIDTH_PT = 2f
-        const val DEFAULT_SHAPE_COLOR = 0xFF1A1A1A.toInt()
 
         /** Barb length as a multiple of the line width — proportional, so it survives a resize. */
         const val ARROW_HEAD_WIDTHS = 5f

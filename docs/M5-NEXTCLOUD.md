@@ -141,7 +141,9 @@ NEEDS_REAUTH }`. `NoteSyncState` (added in M2 for `Compaction`) had six of the s
 and a non-retryable 4xx land in. It has to be distinct from `CONFLICTED` because the two
 need different things from the user (merge vs change something on the server) and from
 `NEEDS_REAUTH` because the credential is fine. SPEC §7.6 has been left as it is and the
-enum now matches it, `CONFLICT`/`CONFLICTED` spelling aside.
+enum now matches it, `CONFLICT`/`CONFLICTED` spelling aside. *(⚠️ An eighth state, `PAUSED`,
+was added in M6 for a signed-out account's notes — non-compactable, its own badge — so "matches
+the seven-state set" is stale by one.)*
 
 ### 3.3 §7.5's `OC-Checksum` needs a digest `:core:*` does not have
 
@@ -185,7 +187,9 @@ thing SPEC §7.2 exists to prevent.
 **A 412 parks; it does not retry and it does not drop.** SPEC §7.5 says never blind-retry
 and §7.7 rule 3 says a conflicted note is flagged and skipped while everything else keeps
 syncing. So the row stays (M6 will resolve it) with `next_attempt_at` pushed a day out, and
-the note is flagged `CONFLICTED`.
+the note is flagged `CONFLICTED`. *(As forecast: M6 added the resolvers — the drainer reports
+412'd note ids and `OutboxDrainWorker` enqueues a per-note reconcile, and the completing merge
+un-parks — and M12 added `syncNowRequested`, which lifts parks on an explicit user press.)*
 
 **A 401 costs exactly one extra request, ever.** SPEC §7.2's *"confirm once with
 `GET /ocs/v2.php/cloud/user`"*. If that also 401s the account halts; if it succeeds the 401
@@ -215,10 +219,13 @@ install the CA in the system trust store — the user's decision, not the app's 
 
 - **No pull, no reconciler, no merge.** That is M6 (SPEC §7.4, §7.7, §13.2's 21 rows).
   `capabilities.core.pollinterval` is parsed and cached but nothing paces against it yet,
-  because nothing polls.
+  because nothing polls. *(Superseded as forecast: `PollTicker` paces the foreground poll at
+  `pollIntervalSeconds + bruteforceDelaySeconds`, and `ReconcileWorker` polls in the
+  background.)*
 - **`capabilities.bruteforce.delay` is parsed and surfaced but not yet acted on.** SPEC §7.2
   says a non-zero value means the client is already throttled; using it to widen backoff
-  belongs with M6's polling loop.
+  belongs with M6's polling loop. *(Superseded with the bullet above — the delay is in
+  `PollTicker`'s pacing sum.)*
 - **Folder mirroring is one-directional and partial.** Renaming a note renames the remote
   file (a MOVE, which drains before that note's UPLOAD). Moving a note between *library*
   folders does **not** move the remote file: the remote folder is the one the user picked
@@ -315,7 +322,10 @@ session" counted as `skipped`, and `skipped` does not set `shouldRunAgain`. A us
 signed out with work queued got a permanent, silent stall.
 
 Two changes: `signOut` now unbinds every note on that account first (back to
-`LOCAL_ONLY` — nothing local destroyed, nothing remote touched), and the drainer
+`LOCAL_ONLY` — nothing local destroyed, nothing remote touched) *(⚠️ superseded in M6:
+`signOut` **pauses** instead — `remote_binding` rows survive, outbox rows drop, notes go
+`PAUSED` — which is what makes signing back in one tap rather than a migration; the
+unbind-to-`LOCAL_ONLY` behaviour lives only in `forgetAccount` now)*, and the drainer
 distinguishes the two cases. An account that is **gone** is permanent, so the row is
 dropped and the note goes to `LOCAL_ONLY`; an account that **exists but is unusable**
 (`NEEDS_REAUTH`, no uid) is a wait, so the work is kept and the note is flagged

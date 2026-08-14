@@ -215,6 +215,7 @@ Per CLAUDE.md's definition of done #6, each feature says **which** check reached
 | `text/` is a known bundle entry, not carried | `PageTextMergeTest` + the bundle pulled off the device | automated + device |
 | Two devices converge on one page's text | `PageTextMergeTest` — including the symmetry test the old rule fails | automated |
 | Invisible text layer is written and extractable | `InvisibleTextLayerTest` + Xpdf + pypdf on the app's own PDF | **run on a device** |
+| ⚠️ …ASCII words only, since M8c | a recognised word containing any character above printable ASCII is **skipped** from the PDF layer (`PdfContent.invisibleText`'s filter, M8 follow-up audit) rather than truncated (pre-M8c) or failing the whole publish (M8c before the filter). In-app search still finds it; carrying it in the PDF needs `PdfCidFont`, which has no caller yet | automated (`InvisibleTextLayerTest`) |
 | Recognition is reachable from the app | drawn with `adb shell input stylus`, read out of `pageWord` with `run-as` | **driven over adb** |
 | Search finds handwriting and jumps to it | typed `III` in the app, tapped the hit, screenshotted the highlight | **driven over adb** |
 | Model-absent degradation | fresh install, searched, read the offer off the screen | **driven over adb** |

@@ -271,6 +271,16 @@ and a row here would be the "green tick for a file existing" this section exists
 
 ### ⛔ An open regression: nine SPEC §13.2 merge-matrix rows fail
 
+> ✅ **Resolved — not reproducible at HEAD `aa2b474`, verified 2026-08-13.** The full
+> `:app:testDebugUnitTest` suite was forced fresh twice (`--rerun --no-build-cache`, the task
+> executed, neither `UP-TO-DATE` nor `FROM-CACHE`, result-XML timestamps checked per this
+> section's own warning): **95 tests, 0 failures**, including all seven `MergeMatrix*` classes
+> (35 tests; `MergeMatrixLayerOneTest` tests=7 failures=0). `git diff 12063a6..HEAD` shows
+> `:core:storage` and `app/src/test` untouched and `BundleWriter.write` byte-identical, so the
+> root-cause hypothesis below was never confirmed — the failure was most likely environmental
+> (this very section records a OneDrive file lock and a stale daemon during that session). The
+> text below is kept as written, as the record of what was observed.
+
 **This is not shippable as it stands, and it is the first thing the next session must fix.**
 
 At baseline — before any of this session's work — `:app` was **95 tests, 0 failures**. After it,
@@ -354,9 +364,11 @@ arriving by a different route.
    is reachable and a green suite establishes nothing.
 2. **`PagePainter` draws a text box and an image**, over `DryObject`. `DryPlaceholder` currently
    orders and converges correctly and paints nothing.
-3. **`NoteEditor.reconcile` must diff the `SetFormat` register.** It diffs presence and the four
-   original registers; a fifth exists now. A peer's font change would otherwise arrive invisibly —
-   M8a's recorded regression, one register along.
+3. ~~**`NoteEditor.reconcile` must diff the `SetFormat` register.**~~ **Already done — in this
+   milestone's own commit.** `NoteEditor.changedRecords` (`NoteEditor.kt:965-972`) diffs both
+   `textOf` and `formatOf` and is called from `reconcile`; `InkSurfaceView.loadOps` pushes
+   `SetFormat` on page load too. This item listed as remaining something `12063a6` itself
+   shipped (found by the M8 follow-up audit).
 4. **The PDF text box.** `PdfCidFont` is written and compiles; nothing calls it. It needs: the font
    merged into the **page's** `/Resources` via `PdfResources.addToPage` (never the stream), the
    whole new-object chain passed through `markUpdated`, and a real text matrix — `placeWord` writes

@@ -143,7 +143,10 @@ public enum class PageAnnotationMode {
     PER_STROKE,
 
     /**
-     * A single annotation holding the whole page's ink.
+     * The whole page's ink written as a page **content** overlay — no annotation at all,
+     * which is what SPEC §6.4 asks for and what `PdfContent.flattenedOverlay` and
+     * `PdfBoxWriter`'s FLATTENED branch implement. (This KDoc said "a single annotation"
+     * for four milestones; the audit that caught it is why it now matches the code.)
      *
      * Recovered mode can only get a flat image back from this, and **must say so**
      * (SPEC §6.4, SPEC §5.6 point 4).

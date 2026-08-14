@@ -16,6 +16,7 @@ import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.SelectedObject
 import dev.inkstone.core.model.SelectionEdit
 import dev.inkstone.core.model.SelectionGesture
+import dev.inkstone.core.model.ShapeEdit
 import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.max
@@ -125,6 +126,16 @@ internal class SelectionController(
 
     val isEmpty: Boolean get() = selection.isEmpty()
 
+    /**
+     * ROADMAP M8a — *"freehand AND rectangular"*: when true, the select tool drags a box.
+     * The containment rule is unchanged ([Lasso.rectangle] builds the same polygon), so the
+     * marquee cannot select differently from a lasso traced round the same rectangle.
+     */
+    var marquee: Boolean = false
+
+    /** [marquee] as it was when the gesture began — see [begin]. */
+    private var lassoIsRectangle = false
+
     private var mode = Mode.LASSO
     private var pageSize: PageSize = PageSize.Letter
 
@@ -170,7 +181,12 @@ internal class SelectionController(
         }
 
         when (mode) {
-            Mode.LASSO -> lasso = mutableListOf(PagePoint(start.x, start.y))
+            Mode.LASSO -> {
+                // Read once, at gesture start: toggling the chip mid-drag must not turn a
+                // half-drawn lasso into a rectangle it never was.
+                lassoIsRectangle = marquee
+                lasso = mutableListOf(PagePoint(start.x, start.y))
+            }
 
             else -> {
                 startHandle = handle
@@ -193,7 +209,7 @@ internal class SelectionController(
     fun extend(event: MotionEvent, camera: Camera) {
         val index = event.findPointerIndex(pointerId)
         if (index < 0) return
-        if (mode == Mode.LASSO) {
+        if (mode == Mode.LASSO && !lassoIsRectangle) {
             for (h in 0 until event.historySize) {
                 toPageSpace(event.getHistoricalX(index, h), event.getHistoricalY(index, h), camera, current)
                 appendToLasso()
@@ -201,7 +217,14 @@ internal class SelectionController(
         }
         toPageSpace(event.getX(index), event.getY(index), camera, current)
         if (mode == Mode.LASSO) {
-            appendToLasso()
+            // A marquee is where the finger *is* — its corners are derived from two points, so
+            // historical samples add nothing and the outline is rebuilt whole, not appended to.
+            // [Lasso.rectangle]'s own corners, so chrome and containment share one rule.
+            if (lassoIsRectangle) {
+                lasso = Lasso.rectangle(PagePoint(start.x, start.y), PagePoint(current.x, current.y)).points
+            } else {
+                appendToLasso()
+            }
         } else {
             // The guides are recomputed here rather than inside `moveGesture`, because `commit`
             // calls that too and a snap must be decided once, while the finger is still down.
@@ -209,7 +232,11 @@ internal class SelectionController(
                 val box = startBounds
                 if (box != null) {
                     val moved = box.translated(current.x - start.x, current.y - start.y)
-                    alignment = AlignmentGuides.forMove(moved, guideTargets, pageSize)
+                    // Divided by the camera scale so the snap radius is constant on the glass —
+                    // the conversion [AlignmentGuides.forMove]'s own KDoc asks the caller for,
+                    // and which was missing here: 6 pt of page was 2 mm at 100% and 8 mm of
+                    // reach at 25%, snapping things nowhere near each other.
+                    alignment = AlignmentGuides.forMove(moved, guideTargets, pageSize, snapTolerance(camera))
                 }
             }
             preview(currentGesture())
@@ -235,6 +262,7 @@ internal class SelectionController(
     private fun finishGesture() {
         pointerId = MotionEvent.INVALID_POINTER_ID
         lasso = null
+        lassoIsRectangle = false
         alignment = Alignment.None
         startSelected = emptyList()
         startBounds = null
@@ -268,10 +296,18 @@ internal class SelectionController(
     private fun settleLasso(camera: Camera) {
         val points = lasso.orEmpty()
         val travelled = hypot(current.x - start.x, current.y - start.y)
-        val hits = if (points.size < TAP_MAX_POINTS && travelled < tapSlop(camera)) {
-            listOfNotNull(store.objectAt(start.x, start.y, tapSlop(camera)))
-        } else {
-            store.objectsIn(Lasso.freehand(points))
+        // A marquee's outline is always four derived corners, so its tap test is travel alone.
+        val isTap = travelled < tapSlop(camera) && (lassoIsRectangle || points.size < TAP_MAX_POINTS)
+        val hits = when {
+            isTap -> listOfNotNull(store.objectAt(start.x, start.y, tapSlop(camera)))
+
+            // The same two corners the chrome drew, through the same [Lasso.rectangle], so what
+            // was on screen and what is selected cannot come from two pieces of arithmetic.
+            lassoIsRectangle -> store.objectsIn(
+                Lasso.rectangle(PagePoint(start.x, start.y), PagePoint(current.x, current.y)),
+            )
+
+            else -> store.objectsIn(Lasso.freehand(points))
         }
         select(hits)
     }
@@ -445,23 +481,28 @@ internal class SelectionController(
         val recorder = store.recorder ?: return
         if (selection.isEmpty()) return
         val baseline = selection
-            .mapNotNull { store.strokeOf(it) }
+            .mapNotNull { store.objectOf(it) }
             .filter { it.style == null }
-            .map { dry ->
-                PageOp.SetStyle(recorder.newOpId(), recorder.newClock(), dry.id, dry.capturedStyle())
+            .mapNotNull { dry ->
+                dry.baselineStyle()?.let { style ->
+                    PageOp.SetStyle(recorder.newOpId(), recorder.newClock(), dry.id, style)
+                }
             }
         applyAsGesture(baseline)
         applyAsGesture(
             SelectionEdit.restyle(
                 objects = store.selected(selection),
                 // Each object's own style, with the one field the user changed. After the
-                // baseline above, `style` is non-null for every stroke in the selection, so the
-                // fallback is unreachable in practice — and it is `capturedStyle` rather than
-                // an invented default so that if it ever *is* reached, the stroke keeps the
-                // colour it was drawn with instead of turning black.
+                // baseline above, `style` is non-null for every object in the selection, so the
+                // fallback is unreachable in practice — and it is [baselineStyle] rather than
+                // an invented default so that if it ever *is* reached, the object keeps what it
+                // is painted with instead of turning black. ⚠️ `objectOf`, never `strokeOf`:
+                // reading through `strokeOf` answered null for a shape, the DEFAULT_STYLE
+                // fallback fired, and recolouring a shape reset its width to 3 pt while
+                // set-width recoloured it black — the M8a/M8b seam bug.
                 styleOf = { obj ->
-                    val dry = store.strokeOf(obj.id)
-                    change(dry?.style ?: dry?.capturedStyle() ?: DEFAULT_STYLE)
+                    val dry = store.objectOf(obj.id)
+                    change(dry?.style ?: dry?.baselineStyle() ?: DEFAULT_STYLE)
                 },
                 nextOpId = recorder::newOpId,
                 nextClock = recorder::newClock,
@@ -472,30 +513,60 @@ internal class SelectionController(
     /**
      * Copy the selection, offset so the copy is visibly a copy, and select it.
      *
-     * The `AddObject` is built by [PageOpRecorder.strokeDuplicated] rather than by
-     * `SelectionEdit`, because it carries a geometry blob and encoding one must not happen on
-     * this thread (CLAUDE.md rule 7). The *decisions* are still core's:
-     * [SelectionEdit.keysAbove] for where the copy sits in the stack and
-     * [SelectionGesture.move] for the offset.
+     * Two construction paths by necessity, one gesture by design. A stroke's `AddObject` is
+     * built by [PageOpRecorder.strokeDuplicated] because it carries a geometry blob and
+     * encoding one must not happen on this thread (CLAUDE.md rule 7); a shape's whole gesture
+     * is [ShapeEdit.duplicate] in `:core:model`, applied through the store's one door with
+     * `record = true`. The *decisions* are core's either way: [SelectionEdit.keysAbove] for
+     * where the copies sit in the stack and [SelectionGesture.move] for the offset.
+     *
+     * A connector's record is re-targeted at the copies for ends attached *inside* the
+     * selection — a duplicated diagram keeps its own wiring — and left alone for ends attached
+     * outside it, so that copy attaches to the same shape the original does. Ids are minted
+     * up front for exactly this: a record may name a shape that comes later in the selection.
      */
     override fun duplicate() {
         val recorder = store.recorder ?: return
         if (selection.isEmpty()) return
-        val sources = selection.mapNotNull { store.strokeOf(it) }
+        val sources = selection.mapNotNull { store.objectOf(it) }.filter { it !is DryPlaceholder }
+        if (sources.isEmpty()) return
         val keys = store.allocateTopZ(sources.size)
         val offset = SelectionGesture.move(DUPLICATE_OFFSET_PT, DUPLICATE_OFFSET_PT)
-        val copies = ArrayList<ObjectId>(sources.size)
+        val ids = HashMap<ObjectId, ObjectId>(sources.size)
+        for (source in sources) ids[source.id] = recorder.newObjectId()
 
         store.beginEdit()
         for ((index, source) in sources.withIndex()) {
-            val id = recorder.newObjectId()
+            val id = ids.getValue(source.id)
             val transform = offset * source.transform
-            recorder.strokeDuplicated(source.stroke, id, source.kind, source.inputModel, transform, keys[index])
-            store.duplicate(source.id, id, transform, keys[index])
-            copies += id
+            when (source) {
+                is DryStroke -> {
+                    recorder.strokeDuplicated(source.stroke, id, source.kind, source.inputModel, transform, keys[index])
+                    store.duplicate(source.id, id, transform, keys[index])
+                }
+
+                is DryShape -> store.applyOps(
+                    ShapeEdit.duplicate(
+                        source = source.obj,
+                        id = id,
+                        transform = transform,
+                        style = source.style,
+                        erased = source.erased.toAbsolute(),
+                        z = keys[index],
+                        record = source.record.remapTargets { ids[it] },
+                        nextOpId = recorder::newOpId,
+                        nextClock = recorder::newClock,
+                    ),
+                    brushes,
+                    record = true,
+                )
+
+                // Filtered above, and unselectable regardless — see [DryPlaceholder]'s KDoc.
+                is DryPlaceholder -> Unit
+            }
         }
         store.endEdit()
-        select(copies)
+        select(sources.map { ids.getValue(it.id) })
     }
 
     // -----------------------------------------------------------------------
@@ -504,6 +575,9 @@ internal class SelectionController(
 
     /** A constant size on the glass, so a handle is grabbable at every zoom. */
     private fun handleReach(camera: Camera): Float = HANDLE_TOUCH_DP * displayDensity / camera.scale
+
+    /** A constant snap distance on the glass, like [handleReach] — see the note in [extend]. */
+    private fun snapTolerance(camera: Camera): Float = SNAP_TOLERANCE_DP * displayDensity / camera.scale
 
     private fun tapSlop(camera: Camera): Float = TAP_SLOP_DP * displayDensity / camera.scale
 
@@ -529,7 +603,15 @@ internal class SelectionController(
         const val MIN_SIZE_PT = 8f
         const val MIN_SIZE_FRACTION = 0.05f
 
-        /** Only reachable for an object with no decoded stroke, which is not a stroke. */
+        /** About 2 mm on the glass at any zoom — what [AlignmentGuides]' page-space default only was at 100%. */
+        const val SNAP_TOLERANCE_DP = 12f
+
+        /**
+         * Unreachable in practice: every selectable kind answers [baselineStyle]. Kept so a
+         * future kind that slips through keeps *a* style rather than crashing — this was the
+         * live fallback for shapes for one milestone, which made recolouring a shape reset its
+         * width to 3 pt and set-width recolour it black.
+         */
         val DEFAULT_STYLE = ObjectStyle(colorArgb = 0xFF1A1A1A.toInt(), widthPt = 3f)
     }
 }
@@ -537,6 +619,20 @@ internal class SelectionController(
 /** The style a stroke was drawn with, read off its brush — see [SelectionController.restyle]. */
 internal fun DryStroke.capturedStyle(): ObjectStyle =
     ObjectStyle(colorArgb = stroke.brush.colorIntArgb, widthPt = stroke.brush.size)
+
+/**
+ * The style an object shows on screen right now — what a first restyle's baseline writes, so
+ * that undoing the restyle puts back what was actually painted. A stroke's is its capture-time
+ * style, readable only in this module (off the decoded brush); a shape's is the painter's own
+ * fallback chain ([DryShape.effectiveStyle]). Null only for a kind that cannot be selected at
+ * all ([DryPlaceholder] answers false to every geometric predicate), so a null never reaches
+ * an op.
+ */
+internal fun DryObject.baselineStyle(): ObjectStyle? = when (this) {
+    is DryStroke -> capturedStyle()
+    is DryShape -> effectiveStyle()
+    is DryPlaceholder -> null
+}
 
 /** Move a box without changing its size. */
 internal fun PageRect.translated(dx: Float, dy: Float): PageRect =

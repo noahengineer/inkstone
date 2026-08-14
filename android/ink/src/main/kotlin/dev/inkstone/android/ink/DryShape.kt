@@ -182,6 +182,17 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
     }
 
     /**
+     * The style this shape is painted with right now — the live register, then the payload's,
+     * then the defaults [PagePainter.paintShape] falls back to.
+     *
+     * ⭐ This is what a first restyle's **baseline** must write (`SelectionController.restyle`):
+     * the register starts null for a shape a peer created without one, and the inverse of the
+     * first `SetStyle` has to put back what was on screen — which is this, not an invented
+     * default. Kept beside the painter's own fallback chain so the two cannot drift.
+     */
+    fun effectiveStyle(): ObjectStyle = style ?: obj.style ?: ObjectStyle(DEFAULT_COLOR, DEFAULT_WIDTH_PT)
+
+    /**
      * ⭐ Arithmetic rather than a native coverage test — see [ShapeHit].
      *
      * [sweptTip] is ignored: it is the query `androidx.ink` wants for a tessellated mesh, and a
@@ -211,5 +222,9 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
         const val COS_BARB = 0.8660254f
         const val SIN_BARB = 0.5f
         const val MIN_DIRECTION = 1e-4f
+
+        /** What a shape with no style register and no payload style is drawn with — the pen's default weight. */
+        const val DEFAULT_WIDTH_PT = 2f
+        const val DEFAULT_COLOR = 0xFF1A1A1A.toInt()
     }
 }

@@ -102,7 +102,18 @@ internal object PdfContent {
      */
     fun invisibleText(words: List<InvisibleWord>, geometry: PdfPageGeometry, font: String): ByteArray {
         // A word with no text, or no height to sit in, has no position to be searched at.
-        val placeable = words.filter { it.text.isNotEmpty() && abs(it.bottomPt - it.topPt) > 0f }
+        // ⚠️ A word containing anything outside printable ASCII is *skipped*, not written: a
+        // literal string's bytes are glyph codes and [ContentBuilder.toByteArray] refuses
+        // non-ASCII loudly (M8c), so one accented word must degrade to "not searchable in this
+        // PDF" — never fail the whole publish, which is what it did between M8c and this filter.
+        // It is not transliterated either: a lookalike puts the wrong word into search. In-app
+        // search is unaffected (the word table never comes through here). Carrying such a word
+        // in the PDF needs the CID font path ([PdfCidFont]), which has no production caller yet.
+        val placeable = words.filter { word ->
+            word.text.isNotEmpty() &&
+                abs(word.bottomPt - word.topPt) > 0f &&
+                word.text.all { it.code in PRINTABLE_ASCII }
+        }
         if (placeable.isEmpty()) return ByteArray(0)
         return buildContent {
             line("q")
@@ -301,6 +312,11 @@ internal object PdfContent {
 
     /** Helvetica's rough average advance, in ems. Only used to scale a word to its own box. */
     private const val NOMINAL_ADVANCE_EM = 0.5f
+
+    /** What a literal string may carry — see the filter in [invisibleText]. */
+    private const val PRINTABLE_MIN = 0x20
+    private const val PRINTABLE_MAX = 0x7E
+    private val PRINTABLE_ASCII: IntRange = PRINTABLE_MIN..PRINTABLE_MAX
 }
 
 /** A content stream under construction. `\n` separated, ASCII, no trailing state. */
@@ -332,7 +348,7 @@ internal class ContentBuilder {
     fun toByteArray(): ByteArray = ByteArray(out.length) { index ->
         val code = out[index].code
         require(code <= MAX_ASCII) {
-            "content streams are ASCII; U+${code.toString(HEX).uppercase().padStart(4, '0')} " +
+            "content streams are ASCII; U+${code.toString(HEX).uppercase().padStart(CODEPOINT_DIGITS, '0')} " +
                 "reached the buffer. Text must go through PdfCidFont.hex, not a literal string."
         }
         code.toByte()
@@ -342,5 +358,8 @@ internal class ContentBuilder {
         const val INITIAL_CAPACITY = 4096
         const val MAX_ASCII = 0x7F
         const val HEX = 16
+
+        /** `U+0041`, not `U+41` — the conventional four-digit form of a BMP code point. */
+        const val CODEPOINT_DIGITS = 4
     }
 }

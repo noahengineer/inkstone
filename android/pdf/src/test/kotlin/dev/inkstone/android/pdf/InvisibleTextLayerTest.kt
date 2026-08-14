@@ -123,6 +123,36 @@ class InvisibleTextLayerTest {
     }
 
     /**
+     * ⚠️ The M8c seam. `ContentBuilder.toByteArray` refuses non-ASCII loudly (correctly), and
+     * this layer still writes literal strings — so between M8c and the filter in
+     * `PdfContent.invisibleText`, ONE accented recognised word threw at publish time and the
+     * whole note became unpublishable (`PUBLISH_FAILED`, with nothing on screen to say why).
+     * The degrade is per word: the publish succeeds, ASCII words stay extractable, and the
+     * non-ASCII word is absent — not transliterated, not truncated into different letters.
+     * In-app search still finds it; the word table never comes through this path.
+     */
+    @Test
+    fun `a non-ASCII recognised word is skipped rather than failing the publish`() {
+        val published = publish(
+            words = listOf(
+                InvisibleWord("cafe", leftPt = 72f, topPt = 90f, rightPt = 210f, bottomPt = 114f),
+                InvisibleWord("café", leftPt = 220f, topPt = 90f, rightPt = 340f, bottomPt = 114f),
+            ),
+        )
+
+        val stream = pageContent(published, 0)
+        assertTrue("(cafe) Tj" in stream, "the ASCII word must still be written")
+        // The old truncation turned U+00E9 into the 0xE9 byte, which ISO-8859-1 reads back as
+        // 'é' — so this assertion distinguishes "skipped" from "silently mangled" too.
+        assertTrue("é" !in stream, "the non-ASCII word must be absent, not carried as other bytes")
+        assertEquals(
+            1,
+            Regex("""1 0 0 1 [-\d.]+ [-\d.]+ Tm""").findAll(stream).count(),
+            "exactly one word should have been placed",
+        )
+    }
+
+    /**
      * ROADMAP M7's hard criterion, for a human and for the external readers.
      *
      * Silent unless `INKSTONE_PDF_DUMP` names a directory — the same convention

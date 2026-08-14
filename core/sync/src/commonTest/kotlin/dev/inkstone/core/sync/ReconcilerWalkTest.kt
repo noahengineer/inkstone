@@ -19,6 +19,15 @@ class ReconcilerWalkTest {
 
     private val lecture = DocumentId("note-lecture")
 
+    private companion object {
+        /**
+         * `Reconciler.FULL_WALK_INTERVAL_MILLIS`, repeated rather than referenced — the
+         * companion is private, and if the two diverge the stale-stamp test fails, which is
+         * the right failure (the same argument `InvisibleTextLayerTest` makes for the font name).
+         */
+        const val DAY_MILLIS = 24L * 60 * 60 * 1000
+    }
+
     // -----------------------------------------------------------------------
     // SPEC §7.6 step 1 — the one-request common case
     // -----------------------------------------------------------------------
@@ -116,6 +125,84 @@ class ReconcilerWalkTest {
         )
         assertEquals(0, report.trashed)
         assertTrue(h.gate.trashed.isEmpty(), "a pruned subtree is not a deletion")
+    }
+
+    // -----------------------------------------------------------------------
+    // SPEC §7.6 step 4's backstop — the periodic unpruned walk
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `a stale full-walk stamp forces an unpruned walk past a matching root ETag`() = runTest {
+        // The fingerprint is unretrievable in production (SPEC §7.6), so this is the only path
+        // that ever catches a restored backup — and a restore can leave the root ETag exactly
+        // as it was, so the check must beat the unchanged short-circuit. This stamp was
+        // write-only for two milestones; this test is what makes that unrepeatable.
+        val server = FakeServer()
+            .directory("Inkstone", etag = "r1", ocId = "oc-root")
+            .directory("Inkstone/Physics", etag = "p1", ocId = "oc-phys")
+        val h = ReconcileHarness(server)
+        h.cache("Inkstone/Physics", etag = "p1", ocId = "oc-phys")
+        h.cursors.upsert(
+            SyncCursor(testAccount.id, rootEtag = ETag("r1", weak = false), lastFullAtEpochMillis = 1L),
+        )
+        h.clock.now = 1L + DAY_MILLIS
+
+        val report = h.reconciler.reconcile()
+
+        assertEquals(0, report.unchanged, "a due full walk must not be short-circuited by the root ETag")
+        assertEquals(0, report.pruned, "a full walk prunes nothing")
+        assertEquals(2, report.walked)
+        assertEquals(
+            1L + DAY_MILLIS,
+            h.cursors.rows[testAccount.id]?.lastFullAtEpochMillis,
+            "a completed full walk must advance the stamp",
+        )
+    }
+
+    @Test
+    fun `a fresh full-walk stamp leaves pruning intact and does not advance`() = runTest {
+        // The other half of the compromise: the backstop must not become "prune nothing" —
+        // request amplification against the user's own server is the failure SPEC §7.2 forbids.
+        val server = FakeServer()
+            .directory("Inkstone", etag = "r2", ocId = "oc-root")
+            .directory("Inkstone/Physics", etag = "p1", ocId = "oc-phys")
+            .file("Inkstone/Physics/Lecture.pdf", etag = "f1", ocId = "oc-42")
+        val h = ReconcileHarness(server)
+        h.bind(lecture, "Inkstone/Physics/Lecture.pdf", "oc-42", ETag("f1", weak = false))
+        h.cache("Inkstone/Physics", etag = "p1", ocId = "oc-phys")
+        val stamped = h.clock.now
+        h.cursors.upsert(SyncCursor(testAccount.id, lastFullAtEpochMillis = stamped))
+
+        val report = h.reconciler.reconcile()
+
+        assertEquals(1, report.pruned, "a fresh stamp must not defeat pruning")
+        assertEquals(
+            stamped,
+            h.cursors.rows[testAccount.id]?.lastFullAtEpochMillis,
+            "an ordinary pruned pass must not claim to have been a full walk",
+        )
+    }
+
+    @Test
+    fun `an interrupted full walk leaves the stamp owed`() = runTest {
+        // The stamp is a claim — "everything was read at this instant" — and a bounded or
+        // refused pass has not earned it. Advancing it anyway would postpone the re-walk a day.
+        val server = FakeServer()
+            .directory("Inkstone", etag = "r1", ocId = "oc-root")
+            .directory("Inkstone/Physics", etag = "p1", ocId = "oc-phys")
+            .refusing("Inkstone/Physics", HttpStatusCode.ServiceUnavailable)
+        val h = ReconcileHarness(server)
+        h.cursors.upsert(SyncCursor(testAccount.id, lastFullAtEpochMillis = 1L))
+        h.clock.now = 1L + DAY_MILLIS
+
+        val report = h.reconciler.reconcile()
+
+        assertTrue(report.shouldRunAgain)
+        assertEquals(
+            1L,
+            h.cursors.rows[testAccount.id]?.lastFullAtEpochMillis,
+            "an interrupted full walk must stay due",
+        )
     }
 
     @Test

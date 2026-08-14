@@ -92,6 +92,12 @@ class InkUiState {
     /** What the last gesture snapped to, for the toolbar's one-line acknowledgement. Null once seen. */
     var lastSnapped by mutableStateOf<String?>(null)
 
+    /**
+     * ⭐ ROADMAP M8a — the rectangular marquee. A mode on the select tool rather than a second
+     * tool, so leaving Select still clears the selection exactly as before.
+     */
+    var marqueeSelection by mutableStateOf(false)
+
     var latency by mutableStateOf(LatencyStats.Snapshot(0, 0f, 0f))
 
     /** SPEC §3.3 — what the digitiser reports. See [StylusStats]; polled with [latency]. */

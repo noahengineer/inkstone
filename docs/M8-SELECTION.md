@@ -226,6 +226,18 @@ gets the same independence from inside this module.
 
 ## 7. Not done
 
+> ⚠️ **Amended by the M8 follow-up audit (2026-08-13), which found this section incomplete in
+> both directions.** Missing from it: the **rectangular marquee** — ROADMAP says "freehand AND
+> rectangular", `Lasso.rectangle` existed with only test callers, and nothing here said so. It
+> is wired now: a **Box** chip beside Select, read at gesture start, settled through the same
+> `Lasso.rectangle` the chrome draws (`SelectionControllerShapeTest` covers it). Also fixed in
+> the same pass: the second bullet below aged badly when M8b made **shapes** selectable —
+> `restyle` read `strokeOf` and fell to `DEFAULT_STYLE` (recolouring a shape reset its width to
+> 3 pt; set-width recoloured it black), and `duplicate` silently dropped shapes. Restyle now
+> baselines off `DryShape.effectiveStyle()` via `objectOf`, duplicate routes shapes through
+> `ShapeEdit.duplicate` ops, and the alignment snap tolerance is now divided by the camera
+> scale as `Alignment.kt`'s KDoc always claimed the caller did.
+
 - **Cut / copy / paste across pages or notes.** ROADMAP lists "cut/copy/duplicate/delete";
   duplicate and delete are done and are what the acceptance criteria name. A clipboard that
   survives a page switch needs somewhere to put geometry that is not the page's log, which is a
@@ -234,7 +246,8 @@ gets the same independence from inside this module.
   works on `SelectedObject` and never asks what an object is — but nothing creates a non-stroke
   object until M8c, so there is nothing to select and no way to test that there is. `StrokeStore`
   is a stroke store; hit-testing an image is M8c's, and it is a few lines of rectangle containment
-  when the objects exist.
+  when the objects exist. *(⚠️ Overtaken by M8b: shapes exist and are selectable — see the
+  amendment above for the two action paths that had to catch up.)*
 - **The rotate grip is on an axis-aligned box.** After a rotation the box is the bounding box of
   the rotated content, not a rotated box. Rotating 45° and back does not restore the box's size;
   the ink returns exactly, because the transform is absolute and composed.

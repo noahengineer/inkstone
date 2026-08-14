@@ -64,6 +64,46 @@ public object ShapeEdit {
     }
 
     /**
+     * A copy of a shape already on the page, at [id] — the selection tool's duplicate.
+     *
+     * The stroke half of that gesture is built beside the encoder
+     * (`PageOpRecorder.strokeDuplicated`), because a stroke's payload is a geometry blob only
+     * `:android:ink` can produce; a shape's payload is a kind and two extents, so its whole
+     * gesture is built here, where a JVM test can reach it — the same contrast [create]'s KDoc
+     * draws.
+     *
+     * [transform], [style], [z] and [erased] are the **live** register values, collapsed onto the
+     * copy's payload, so the copy looks exactly like the original at the moment it was duplicated —
+     * including its erased bites, which are in the object's own space and therefore travel with it
+     * unchanged.
+     *
+     * @param record the source's record, with any end the caller wants re-targeted already passed
+     *   through [ShapeRecord.remapTargets] — a duplicated diagram keeps its own wiring, while an
+     *   end attached to something outside the copy keeps its target and the copy attaches to the
+     *   same shape the original does.
+     */
+    @Suppress("LongParameterList") // The live registers, spelled out; a holder would hide which are collapsed.
+    public fun duplicate(
+        source: ShapeObject,
+        id: ObjectId,
+        transform: Matrix3,
+        style: ObjectStyle?,
+        erased: ErasedArea,
+        z: FractionalKey,
+        record: ShapeRecord,
+        nextOpId: () -> String,
+        nextClock: () -> LamportClock,
+    ): List<PageOp> {
+        val add = PageOp.AddObject(
+            nextOpId(),
+            nextClock(),
+            source.copy(id = id, transform = transform, style = style, z = z, erased = erased),
+        )
+        if (record.isDefault) return listOf(add)
+        return listOf(add, writeRecord(id, record, nextOpId, nextClock))
+    }
+
+    /**
      * The one op that changes a shape's fill, corner radius, route or attachment.
      *
      * ⭐ **This is the only op M8b ever writes about a connector**, and re-attaching an endpoint is

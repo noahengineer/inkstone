@@ -309,6 +309,12 @@ not so `:app` can choose a backend.
 - **A non-ASCII word would be truncated** by `ContentBuilder`'s Latin-1 encoding. Fine for
   scaffolding, and M7 owes a font decision (WinAnsi covers Latin-1; anything else needs a
   CID font).
+  *(⚠️ Twice superseded. M8c made `toByteArray` **throw** on non-ASCII instead of truncating —
+  correct, but with the invisible layer still writing literal strings, one accented recognised
+  word then failed the whole publish. The M8 follow-up audit fix filters at the word level in
+  `PdfContent.invisibleText`: the publish succeeds, ASCII words stay extractable, and a
+  non-ASCII word is absent from the PDF layer — not transliterated — until `PdfCidFont` gains
+  a caller. In-app search is unaffected. `InvisibleTextLayerTest` covers the degrade.)*
 - **Idle-while-charging materialization** (SPEC §5.1) is still unscheduled.
   `WorkManagerScheduler.enqueueMaterialization` is M5's, together with the outbox it
   belongs beside. Close and before-upload both work today.

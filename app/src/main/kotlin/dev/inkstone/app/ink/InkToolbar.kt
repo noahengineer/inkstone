@@ -241,6 +241,14 @@ private fun ToolRow(state: InkUiState, actions: InkToolbarActions, onToggleColor
             },
             label = { Text("Select") },
         )
+        // The rectangular half of M8a's "freehand AND rectangular" lasso. A mode, not a tool:
+        // enabled only while Select is, the way Arrow is enabled only with Hold-to-snap.
+        FilterChip(
+            selected = state.tool == InkTool.SELECT && state.marqueeSelection,
+            onClick = { state.marqueeSelection = !state.marqueeSelection },
+            enabled = state.tool == InkTool.SELECT,
+            label = { Text("Box") },
+        )
         // SPEC §3.5, revised in M1. Partial is the default; whole-stroke is kept
         // because it never rebuilds geometry, so it stays fast on a dense page,
         // and some people simply prefer it.

@@ -151,8 +151,10 @@ class CidFontSpikeTest {
          * One character from each block SPEC §4.9.5 claims coverage of, plus plain ASCII.
          *
          * Every character here is above U+00FF except the ASCII and the `é`, which is the point:
-         * `PdfContent`'s `toByteArray` is `ByteArray(out.length) { out[it].code.toByte() }`, so
-         * each of these silently becomes a *different* byte today.
+         * `PdfContent`'s `toByteArray` used to truncate each of these into a *different* byte
+         * silently; since M8c it refuses them loudly, and the invisible-text path skips such
+         * words per word (`PdfContent.invisibleText`). Carrying them is what needs the CID font
+         * this spike is about.
          */
         const val SAMPLE = "Hello — café Łódź Ωμέγα Живёт €5"
     }

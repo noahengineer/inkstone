@@ -250,6 +250,11 @@ Three details that matter:
 - **Capsules are the durable form**, not the flattened path. Five floats each —
   segment plus tip radius, in page space — resolution-independent and replayable
   anywhere. The `Path` is a render cache.
+  *(⚠️ "In page space" superseded in M8a: capsules are recorded in each **object's own**
+  space, so a bite travels with a moved stroke — the page-space sweep is mapped through the
+  inverse transform before it is recorded. Identical numbers at the identity, which is why
+  this read as true for four milestones. The op also shipped carrying `ErasedArea`, not a
+  bare capsule list — same semantics, different type.)*
 
 ⚠️ **This adds an op to SPEC §4.2, and M2 owes it:**
 `SetErasedRegion(target, absolute: List<EraseCapsule>)` — **absolute**, LWW, like
@@ -304,6 +309,9 @@ still centre — that is what they are for. `Camera.leashedTo` is the rule;
 §4.6 puts undo in the op-log, which is M2, but M1 accumulated enough destructive
 actions to need it. `EditHistory` is a plain stack — the honest form of §4.6's
 model when there is no log to append to — with one entry per gesture.
+*(⚠️ Superseded as designed: `EditHistory` is gone. Undo/redo route through the op log —
+`onUndoRequested`/`onRedoRequested` into `NoteEditorViewModel` — since M2, and per page since
+the M6 follow-up. The two- and three-finger tap bindings survive.)*
 
 Two things fell out rather than being designed:
 
@@ -343,10 +351,14 @@ is the 404. The View-based path is what M1 uses, as SPEC §3.2 requires.
   DryStrokesView      finished strokes, page space, camera as a canvas transform
   StrokeStore         the dry layer's contents; both erase modes (SPEC §3.5)
   StrokeSplitter      partial erase, as delete + add(fragments) — never mutation
+                      ⚠️ gone since SPEC §3.5's second revision: nothing splits, the
+                      eraser records the area it swept (§2.5), and the file no longer exists
   EraserController    the erase gesture, historical points included
   CameraGestureTracker pan + pinch, fingers only
   PalmGuard           hover-based palm rejection + FLAG_CANCELED
   InkBrushes          the four brushes of SPEC §3.4
+                      ⚠️ the families moved to InkstoneBrushFamilies.kt (§2.1 already
+                      names it); InkBrushes.kt holds the kind, config and factory
   CameraMatrix        Camera -> android.graphics.Matrix
   LatencyStats        SPEC §3.6's instrument
   SyntheticInk        the 5,000-stroke page the frame-rate gate needs
@@ -393,7 +405,11 @@ additionally ignored while a stroke is live.
 - **No in-place point-list mutation.** The whole-stroke-only limit was reversed
   during device testing (§2.4), but the rule underneath it was kept: splitting
   is delete + add, so M8a inherits the model rather than replacing it.
-- **No persistence.** Close the app, the drawing is gone.
+  *(⚠️ Stale in its second half: SPEC §3.5's later revision removed splitting entirely —
+  nothing splits, the eraser records the swept area — and M8a inherited* that *model.
+  The mutation prohibition itself is untouched.)*
+- **No persistence.** Close the app, the drawing is gone. *(True of M1; superseded by M2 —
+  the surface records ops and pages load from the fold.)*
 
 ---
 

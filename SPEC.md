@@ -1800,6 +1800,14 @@ protection against a restored backup.
 *unpruned* walk, which is the backstop for every way ETag pruning can lie, restores included.
 That is the mechanism to strengthen if this matters, not the fingerprint.
 
+⚠️ **The column was write-only for two milestones** — `finish` maintained the stamp and nothing
+read it, so the backstop this section describes could not fire (found by the M8 follow-up audit).
+It is wired now: `Reconciler.probeRoot` forces an unpruned walk whenever the stamp is more than
+**24 hours** old, checked *before* the root-ETag short-circuit because a restore can leave the
+root ETag looking exactly as it did. The stamp advances only when a forced walk completes, so an
+interrupted one stays owed, and a never-recorded stamp reads as maximally stale — an install's or
+an upgrade's first pass is its full walk.
+
 **And absent must never mean changed.** The comparison requires *both* the cached and the
 reported value to be non-null. Reading "no property" as "it changed" would force an unpruned
 walk on **every poll against every real Nextcloud** — permanent request amplification, which is

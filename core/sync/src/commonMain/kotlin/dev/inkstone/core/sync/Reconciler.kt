@@ -295,10 +295,25 @@ public class Reconciler(
             return RootProbe.Walk(resource.etag, resource.dataFingerprint, force = true)
         }
 
+        // ⭐ SPEC §7.6 step 4's *actual* protection, wired. `nc:data-fingerprint` is not
+        // retrievable from a real Nextcloud (a 404 propstat on 32.0.13 — SPEC §7.6), so the
+        // branch above never fires in production, and the periodic unpruned walk is the only
+        // thing that covers a restored backup — or any other way ETag pruning can lie. It was
+        // write-only for two milestones: [finish] maintained the stamp and nothing read it.
+        // A due walk beats the unchanged short-circuit below, because a restore can leave the
+        // root ETag looking exactly as it did. Nothing is cleared here — an unpruned walk
+        // re-reads every directory anyway and concludes deletions under the same rules as any
+        // other walk — and the stamp advances only when a forced walk *completes* ([finish]),
+        // so an interrupted one stays owed. A cursor that has never recorded one (0) reads as
+        // maximally stale, which on a real clock makes an install's — or an upgrade's — first
+        // pass the full walk, at the cost of nothing on a fresh install (there is no cache to
+        // decline to prune).
+        val fullWalkDue = passStartedAt - cursor.lastFullAtEpochMillis >= FULL_WALK_INTERVAL_MILLIS
+
         // ⚠️ `RemoteWalk.unchanged`, not `==`. A weak validator says "semantically equivalent",
         // which is exactly not what is being asked, and treating one as a match ends the pass
         // before it starts — losing the pull with no error anywhere (SPEC §7.3).
-        if (RemoteWalk.unchanged(cursor.rootEtag, resource.etag)) {
+        if (!fullWalkDue && RemoteWalk.unchanged(cursor.rootEtag, resource.etag)) {
             pull.cursors.upsert(
                 cursor.copy(
                     dataFingerprint = resource.dataFingerprint ?: cursor.dataFingerprint,
@@ -307,7 +322,7 @@ public class Reconciler(
             )
             return RootProbe.Unchanged
         }
-        return RootProbe.Walk(resource.etag, resource.dataFingerprint, force = false)
+        return RootProbe.Walk(resource.etag, resource.dataFingerprint, force = fullWalkDue)
     }
 
     /**
@@ -1462,6 +1477,17 @@ public class Reconciler(
          * ACTIVE — the probe said the credential is alive, or the probe could not be reached.
          */
         const val REFUSAL_COOLDOWN_MILLIS = 60L * 60 * 1000
+
+        /**
+         * How often the unpruned walk runs — SPEC §7.6 step 4's backstop cadence, recorded in
+         * SPEC in the same change that wired it. A day, and both directions of the compromise
+         * are real, the same shape as [REFUSAL_COOLDOWN_MILLIS]'s: shorter approaches "prune
+         * nothing", which is request amplification against the user's own server (§7.2);
+         * longer leaves a restored backup — or any other way ETag pruning can lie — undetected
+         * for that much longer. The cost when it fires is one `Depth:1` PROPFIND per known
+         * directory, once a day, which is what a single ordinary edit already costs.
+         */
+        const val FULL_WALK_INTERVAL_MILLIS = 24L * 60 * 60 * 1000
     }
 }
 

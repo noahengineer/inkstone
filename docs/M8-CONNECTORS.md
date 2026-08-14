@@ -278,6 +278,13 @@ under a hand. SPEC §4.8.7 says so explicitly, and M7's rotated-text detector �
 
 ### Gates
 
+> ✅ **Resolved — not reproducible at HEAD `aa2b474`, verified 2026-08-13.** Both halves of the
+> split below pass now: the full `:app` suite was forced fresh twice (`--rerun --no-build-cache`,
+> task executed, fresh result XML) and is **95 tests, 0 failures**, all seven `MergeMatrix*`
+> classes included. Nothing on the implicated path changed between `12063a6` and the green runs,
+> so the failure was most likely environmental — see the matching note in `docs/M8-TEXT.md` §5.
+> The record below is kept as written.
+
 ⛔ **`:app:testDebugUnitTest` is NOT green, and the failures split two ways.** 21 of 95 fail. The
 attribution was measured, not assumed:
 
@@ -321,11 +328,12 @@ remains:
    record, the routing, the re-attachment, the derived detachment. Until a gesture writes a
    `ShapeRecord` with an end in it, `ConnectorRouting` has no production caller and a green suite
    establishes nothing (CLAUDE.md definition-of-done #6). This is the single largest gap.
-2. **`NoteEditor.reconcile` must diff the record.** It compares presence and the four object
-   registers; a record is a fifth and it lives outside `InkObject`, so a peer's *re-attachment*
-   arrives invisibly. ⚠️ A peer's *move* already re-routes for free — that is a `SetTransform` the
-   diff carries, and `StrokeStore.applyRegister` sets `routesDirty` — which is the payoff of §1.2
-   and also exactly why this gap is easy to miss: the obvious test passes.
+2. ~~**`NoteEditor.reconcile` must diff the record.**~~ **Done — M8c closed it in `12063a6`.**
+   `NoteEditor.changedRecords` diffs `textOf` (and `formatOf`) between folds and is called from
+   `reconcile`; `StrokeStore.applyContent` carries a record to `DryShape.setRecord` and sets
+   `routesDirty`, so a peer's re-attachment renders. (⚠️ A peer's *move* already re-routed for
+   free — a `SetTransform` the diff carries — which is why this gap was easy to miss when it was
+   open: the obvious test passed.)
 3. **Fill, corner radius and route pickers.** The record carries all three and nothing sets them,
    so `DryShape.fillable` is false for every shape the app can currently make. The painter's fill
    path has therefore **never drawn a pixel in the app** — only in `ShapeHitTest`'s arithmetic.
@@ -337,5 +345,12 @@ remains:
    apply — different registers).
 6. **Selecting a shape.** `SelectionQueries.objectAt` now hit-tests one through the shared
    predicate, but the lasso and the transform handles have not been tried against a shape on a
-   device, and `StrokeStore.duplicate` is still strokes-only.
+   device. ~~and `StrokeStore.duplicate` is still strokes-only~~ — **closed by the M8 follow-up
+   audit fixes**, along with two seam bugs this item did not know about: `SelectionController`'s
+   restyle read `strokeOf` and fell to `DEFAULT_STYLE` for a shape (recolour reset its width to
+   3 pt; set-width recoloured it black), and Duplicate silently dropped shapes. Restyle now reads
+   `objectOf` with `DryShape.effectiveStyle()` as the baseline, and a duplicated shape travels as
+   `ShapeEdit.duplicate` ops through the store's one door — a connector's record re-targeted at
+   copies for ends inside the selection. `SelectionControllerShapeTest` (instrumented) covers all
+   three, plus the newly wired rectangular marquee.
 7. **The tablet**, including SPEC §3.6's two measurements, which §4 records as owed.

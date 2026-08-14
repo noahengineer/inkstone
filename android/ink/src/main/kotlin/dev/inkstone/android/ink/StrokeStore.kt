@@ -728,10 +728,13 @@ internal class StrokeStore {
      * nothing runs the encoder on the UI thread (CLAUDE.md rule 7).
      */
     fun duplicate(source: ObjectId, into: ObjectId, transform: Matrix3, z: FractionalKey): DryStroke? {
-        // Strokes only, and that is a gap rather than a rule: the op that carries a copy to disk
-        // is `PageOpRecorder.strokeDuplicated`, which encodes a geometry blob, and there is no
-        // equivalent for an image's asset bytes yet (SPEC §4.9.4's third consequence). Selection
-        // cannot reach a [DryPlaceholder] in this build, so nothing can call it for one.
+        // Strokes only, and since the M8a/M8b seam fix that is a rule with one door per kind
+        // rather than a gap: a shape's copy travels as ops (`ShapeEdit.duplicate` applied
+        // through `applyOps`), because its payload needs no encoder; a stroke's cannot, because
+        // its blob does — so `SelectionController.duplicate` routes each kind accordingly. What
+        // is still a gap is an image's asset bytes (SPEC §4.9.4's third consequence), and
+        // selection cannot reach a [DryPlaceholder] in this build, so nothing can call this
+        // for one.
         val original = strokeOf(source) ?: return null
         val copy = DryStroke(
             id = into,

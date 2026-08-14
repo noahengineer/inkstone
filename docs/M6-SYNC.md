@@ -346,7 +346,10 @@ to pull again; local was novel → advance the ETag *first*, then one UPLOAD car
 loser 412s, the 412 reconciles that one note, and that pass finds nothing novel locally and
 stops. Bounded at two round trips, with a test of its own.
 
-**A 412 parks the upload for a day, and only a completed merge may un-park it.** Coalescing
+**A 412 parks the upload for a day, and only a completed merge may un-park it.** *(⚠️ The
+"only" is stale since M12: `SyncEngine.syncNowRequested` also lifts parks — across op types —
+on an explicit user press, with its own safety argument: a person pressing a button is the one
+signal in the system that is not a loop. Coalescing's inheritance below is unchanged.)* Coalescing
 deliberately *inherits* `next_attempt_at` — resetting it per save is a hot retry loop against
 the user's own server — so without an explicit un-park, the `noteChanged` that follows a merge
 inherits the day-long park and the union never uploads. A backoff is about the transport; a park

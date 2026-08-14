@@ -236,6 +236,84 @@ class ShapesTest {
     // Fixture
     // -----------------------------------------------------------------------
 
+    // -----------------------------------------------------------------------
+    // Duplication — the selection tool's shape copy (ShapeEdit.duplicate)
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `duplicate collapses the live registers onto the copy and emits one AddObject`() {
+        val source = ShapeObject(
+            id = ObjectId("shape-1"),
+            shape = ShapeKind.RECTANGLE,
+            widthPt = 100f,
+            heightPt = 60f,
+            // Stale on purpose: the payload's values are what the shape was *created* with, and
+            // the copy must carry the live registers instead.
+            transform = Matrix3.translate(10f, 10f),
+            style = ObjectStyle(colorArgb = 0xFF112233.toInt(), widthPt = 5f),
+        )
+        val liveTransform = Matrix3.translate(28f, 28f)
+        val liveStyle = ObjectStyle(colorArgb = 0xFF445566.toInt(), widthPt = 7f)
+        val bite = ErasedArea(listOf(EraseCapsule(0f, 0f, 10f, 0f, 3f)))
+        val z = FractionalKey.between(null, null)
+
+        val ops = ShapeEdit.duplicate(
+            source = source,
+            id = ObjectId("copy-1"),
+            transform = liveTransform,
+            style = liveStyle,
+            erased = bite,
+            z = z,
+            record = ShapeRecord.None,
+            nextOpId = ::nextId,
+            nextClock = ::nextClock,
+        )
+
+        assertEquals(1, ops.size, "a default record must not put a string in the file")
+        val copy = (ops.single() as PageOp.AddObject).obj as ShapeObject
+        assertEquals(ObjectId("copy-1"), copy.id)
+        assertEquals(ShapeKind.RECTANGLE, copy.shape)
+        assertEquals(100f, copy.widthPt)
+        assertEquals(60f, copy.heightPt)
+        assertEquals(liveTransform, copy.transform)
+        assertEquals(liveStyle, copy.style)
+        assertEquals(z, copy.z)
+        // The bite travels with the copy: it is in the object's own space.
+        assertEquals(bite, copy.erased)
+    }
+
+    @Test
+    fun `duplicating a connector re-targets ends inside the copy and keeps ends outside it`() {
+        val record = ShapeRecord(
+            endA = ConnectorEnd.Attached(ObjectId("box-in"), ConnectorAnchor.Auto),
+            endB = ConnectorEnd.Attached(ObjectId("box-out"), ConnectorAnchor.Auto),
+        )
+        // What SelectionController hands in: only ids duplicated alongside the connector remap.
+        val remap = mapOf(ObjectId("box-in") to ObjectId("box-in-copy"))
+
+        val ops = ShapeEdit.duplicate(
+            source = ShapeObject(ObjectId("conn-1"), ShapeKind.LINE, widthPt = 200f, heightPt = 2f),
+            id = ObjectId("copy-2"),
+            transform = Matrix3.Identity,
+            style = null,
+            erased = ErasedArea.None,
+            z = FractionalKey.between(null, null),
+            record = record.remapTargets { remap[it] },
+            nextOpId = ::nextId,
+            nextClock = ::nextClock,
+        )
+
+        assertEquals(2, ops.size)
+        val write = ops[1] as PageOp.SetTextContent
+        assertEquals(ObjectId("copy-2"), write.target)
+        val decoded = ShapeRecord.decode(write.text)
+        assertNotNull(decoded)
+        assertEquals(ConnectorEnd.Attached(ObjectId("box-in-copy"), ConnectorAnchor.Auto), decoded.endA)
+        assertEquals(ConnectorEnd.Attached(ObjectId("box-out"), ConnectorAnchor.Auto), decoded.endB)
+    }
+
+    // -----------------------------------------------------------------------
+
     private var counter = 0
 
     private fun nextId(): String = "op-${counter++}"

@@ -548,6 +548,18 @@ public class InkSurfaceView @JvmOverloads constructor(
      */
     public val selection: InkSelection get() = selectionController
 
+    /**
+     * ⭐ ROADMAP M8a — the rectangular half of *"freehand AND rectangular"*. When on, the select
+     * tool drags a box instead of drawing a lasso; the containment rule is unchanged
+     * (`Lasso.rectangle` builds the same polygon), and the toggle is read at gesture start so
+     * flipping it mid-drag changes nothing.
+     */
+    public var marqueeSelection: Boolean
+        get() = selectionController.marquee
+        set(value) {
+            selectionController.marquee = value
+        }
+
     /** Applies SPEC §4.5's leash: pan freely, but never lose the page. */
     private fun Camera.leashed(): Camera =
         leashedTo(pageSize, Viewport(width.toFloat(), height.toFloat()), minVisiblePx)

@@ -302,6 +302,7 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
             // that highlight and change nothing is exactly what definition-of-done #6 is about.
             view.shapeSnapEnabled = ui.shapeSnapEnabled
             view.arrowHeads = ui.arrowHeads
+            view.marqueeSelection = ui.marqueeSelection
         },
     )
 }

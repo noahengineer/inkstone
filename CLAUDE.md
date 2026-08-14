@@ -19,7 +19,7 @@ These exist because violating them causes damage that's expensive or impossible 
 - **No hard deletes.** Everything goes to a trash with 30-day retention — local trash for local deletes, Nextcloud trash for remote.
 - **Never resolve a sync conflict by discarding bytes.** If two versions can't merge, keep both as a conflicted copy.
 - **Never overwrite a remote file without `If-Match`.** A 412 means someone else changed it; that is a conflict, not a retry.
-- `assets/source.pdf` inside a bundle is **immutable**. An imported PDF's original bytes are preserved forever.
+- An imported PDF's **original bytes are preserved forever** — as the verbatim prefix of `document.pdf`, guarded by `originalLength` truncate-rebase and `originalSha256` verification (docs/M4-PDF.md §7.3). There is no `assets/source.pdf` and never was (`Bundle.kt` says so); this bullet named a mechanism that was designed out in M4, and the invariant is what matters.
 - Before any destructive local operation, the previous version goes to trash first.
 
 ### 2. `:core:*` must stay platform-free — and the iOS target is what proves it
