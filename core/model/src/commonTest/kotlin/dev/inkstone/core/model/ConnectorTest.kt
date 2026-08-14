@@ -267,6 +267,19 @@ class ConnectorTest {
     }
 
     // -----------------------------------------------------------------------
+    // The default record's wire form — what editRecords' undo baseline stands on
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `the default record round-trips through its wire form`() {
+        // `SelectionController.editRecords` writes `ShapeRecord.None` as the baseline that makes
+        // a first fill undoable. That only works if the default's encoding is a *record* — if
+        // `decode` ever answered null for it (fail-closed, as it does for prose), the baseline
+        // would read back as no record and the undo would restore nothing.
+        assertEquals(ShapeRecord.None, ShapeRecord.decode(ShapeRecord.None.encode()))
+    }
+
+    // -----------------------------------------------------------------------
     // Id remapping — what a note or page duplicate needs
     // -----------------------------------------------------------------------
 

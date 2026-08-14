@@ -145,10 +145,10 @@ internal fun StrokeStore.allSelected(): List<SelectedObject> {
  * wrong centre. `strokeOf` returns null for every non-stroke kind, which is the same silent skip
  * `filterIsInstance<StrokeObject>()` was in [InkSurfaceView], one screen further on.
  *
- * Unreachable in this build, because a [DryPlaceholder] cannot be selected at all (it answers false
- * to every geometric predicate — see its KDoc). Written this way anyway: the first kind that paints
- * itself is selectable the moment it exists, and a `strokeOf` here would then be a wrong frame
- * rather than a compile error.
+ * ⭐ **M8c: no longer merely defensive.** It was written this way while the only non-stroke kinds
+ * were unselectable, on the grounds that *"the first kind that paints itself is selectable the
+ * moment it exists"*. Both of them do now, so `strokeOf` here would be a selection frame that does
+ * not contain the picture it is drawn round and a resize about the wrong centre.
  */
 internal fun StrokeStore.pageBoundsOf(ids: Collection<ObjectId>): PageRect? {
     var union: PageRect? = null
@@ -163,17 +163,8 @@ internal fun StrokeStore.pageBoundsOf(ids: Collection<ObjectId>): PageRect? {
 /**
  * Everything *not* selected, as page-space boxes — what alignment guides line up with.
  *
- * ⭐ **M8c: a [DryPlaceholder] is included, and that is the deliberate half of the trade.** Every
- * other geometric query in this file refuses one, because *nothing the user cannot see may be
- * selected or erased* — both of those write to the log. A guide writes nothing: the cost of
- * including an unpainted object is a snap line the user cannot see the cause of, and the cost of
- * excluding one is that dragging a stroke against a picture stops snapping to it the moment there
- * is a painter for pictures.
- *
- * The alternative — an `isPainted` flag on [DryObject] — is refused for the reason
- * [DryPlaceholder]'s own KDoc gives: a kind that paints itself replaces that type rather than
- * configuring it, so the flag would be born already answering for nobody. Both costs are confined
- * to a note written by a *later* build, since no tool in this one can create either kind.
+ * Every kind, which since M8c is every kind the user can see: dragging a stroke against a photo
+ * snaps to the photo's edges and its centre, exactly as it does against another stroke.
  */
 internal fun StrokeStore.pageBoundsExcluding(ids: Collection<ObjectId>): List<PageRect> {
     val excluded = ids.toHashSet()

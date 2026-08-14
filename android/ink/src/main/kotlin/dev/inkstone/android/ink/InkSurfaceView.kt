@@ -113,6 +113,9 @@ public class InkSurfaceView @JvmOverloads constructor(
     /** M8a's chrome, between the ink and the wet layer. See [SelectionOverlayView]. */
     private val overlay = SelectionOverlayView(context)
 
+    /** ⭐ M8c's chrome — the straight edge and the laser. Its own view; see [ToolOverlayView]. */
+    private val toolOverlay = ToolOverlayView(context)
+
     private val wetView = InProgressStrokesView(context)
 
     /** How many finished strokes are on the page. */
@@ -144,6 +147,30 @@ public class InkSurfaceView @JvmOverloads constructor(
             onSelectionChanged?.invoke(selectionController.size)
             onHistoryChanged?.invoke()
         }
+
+    /**
+     * ⭐ ROADMAP M8c — the straight edge. See [RulerController] for how the snap is applied.
+     *
+     * Placed at the middle of what is on screen the first time it is switched on; a null viewport
+     * centre means the surface has not been laid out yet, and the next enable places it.
+     */
+    private val rulerController = RulerController(
+        displayDensity = displayMetrics.density,
+        viewportCentre = {
+            if (width <= 0 || height <= 0) {
+                null
+            } else {
+                PagePointF().also { toPageSpace(width / 2f, height / 2f, it) }
+            }
+        },
+        onChanged = {
+            toolOverlay.onToolsChanged()
+            onRulerChanged?.invoke()
+        },
+    )
+
+    /** ⭐ ROADMAP M8c — the laser pointer. It reaches no store and writes no op; see [LaserController]. */
+    private val laser = LaserController { toolOverlay.onToolsChanged() }
 
     private val gestures = CameraGestureTracker(zoomLimits)
     private val palmGuard = PalmGuard()
@@ -279,11 +306,33 @@ public class InkSurfaceView @JvmOverloads constructor(
             field = value
             dryView.camera = value
             overlay.camera = value
+            toolOverlay.camera = value
             onCameraChanged?.invoke(value)
         }
 
     public var onCameraChanged: ((Camera) -> Unit)? = null
     public var onStrokeCountChanged: ((Int) -> Unit)? = null
+
+    /**
+     * ⭐ ROADMAP M8c — the straight edge, for a toolbar that wants to switch it on and type an
+     * angle at it. See [InkRuler].
+     */
+    public val ruler: InkRuler get() = rulerController
+
+    /**
+     * Fired whenever the edge moved, turned or was switched on or off — so a numeric angle field
+     * follows a finger drag instead of going stale the moment anyone touches the ruler itself.
+     */
+    public var onRulerChanged: (() -> Unit)? = null
+
+    /**
+     * ⭐ M8c — where an inserted image's pixels come from (SPEC §4.9.4). Null until `:app` supplies
+     * a cache, and a picture whose asset is not there draws a visible placeholder rather than
+     * nothing. See [PageAssets].
+     */
+    public fun setPageAssets(assets: PageAssets?) {
+        dryView.pageAssets = assets
+    }
 
     /**
      * ⭐ M8a — how many objects are selected, so the toolbar can offer the actions that need
@@ -388,6 +437,9 @@ public class InkSurfaceView @JvmOverloads constructor(
      */
     public fun loadPage(page: FoldedPage) {
         wetView.cancelUnfinishedStrokes()
+        // Immediately, not left to fade: a mark made on the previous page would spend the next
+        // second pointing at whatever now happens to be underneath it.
+        laser.clear()
         // Before `reset`, so the overlay is not briefly drawing a box round ids that no longer
         // exist. A selection belongs to a page: carrying it across would leave the toolbar
         // offering "delete" for objects on a page the user has left.
@@ -574,8 +626,11 @@ public class InkSurfaceView @JvmOverloads constructor(
         )
         addView(dryView, fill)
         addView(overlay, fill)
+        addView(toolOverlay, fill)
         addView(wetView, fill)
         overlay.selection = selectionController
+        toolOverlay.ruler = rulerController
+        toolOverlay.laser = laser
 
         // Warm the native ink stack and the texture atlas now, so the first
         // ACTION_DOWN of the session is not the one that pays for them.
@@ -595,6 +650,9 @@ public class InkSurfaceView @JvmOverloads constructor(
 
     override fun onDetachedFromWindow() {
         wetView.cancelUnfinishedStrokes()
+        // ⭐ M8c — the fade schedules its own next frame from `onDraw` (see [ToolOverlayView]), so a
+        // live trail is the one thing here that would keep asking a detached view to draw.
+        laser.clear()
         predictor = null
         super.onDetachedFromWindow()
     }
@@ -726,8 +784,19 @@ public class InkSurfaceView @JvmOverloads constructor(
             return true
         }
 
-        val gestureInFlight = activeStrokeId != null || eraser.isActive || selectionController.isActive
+        val gestureInFlight = activeStrokeId != null || eraser.isActive ||
+            selectionController.isActive || rulerController.isActive || laser.isActive
         if (gestureInFlight || !palmGuard.allowsFinger(event)) return true
+
+        // ⭐ M8c — before the camera and before finger drawing. A finger that lands on the straight
+        // edge moves the edge; a finger anywhere else pans the page, exactly as before. Checked
+        // here and not in `beginDrawOrErase` because that is the *stylus* path: the pen draws along
+        // the ruler, so a pen that also moved it would make drawing and adjusting one gesture.
+        if (rulerController.begin(event, index, pointerId, camera)) {
+            taps.cancel()
+            parent?.requestDisallowInterceptTouchEvent(true)
+            return true
+        }
 
         taps.onPointerDown(event)
 
@@ -763,15 +832,32 @@ public class InkSurfaceView @JvmOverloads constructor(
             eraser.begin(event, index, pointerId, temporary = hardwareEraser, camera = camera)
         } else if (tool == InkTool.SELECT) {
             selectionController.begin(event, index, pointerId, camera, pageSize)
+        } else if (tool == InkTool.LASER) {
+            // ⭐ M8c — stylus only, which is the PalmGuard rule the rest of this class follows.
+            // ⚠️ A finger does **nothing** rather than falling through to `beginStroke`: on a
+            // surface with `fingerDrawingEnabled` on — which is how this gets driven over adb —
+            // falling through would draw permanent ink from a tool whose whole promise is that it
+            // writes nothing.
+            if (event.isStylusPointer(index)) laser.begin(event, index, pointerId, camera)
         } else {
-            beginStroke(event, pointerId)
+            beginStroke(event, index, pointerId)
         }
         // Reject anything else while the gesture is live: no second stroke, no
         // camera gesture, no palm.
         parent?.requestDisallowInterceptTouchEvent(true)
     }
 
-    private fun beginStroke(event: MotionEvent, pointerId: Int) {
+    /**
+     * ⚠️ **The ruler is applied here, as a transform, and that is the whole of the snap.**
+     *
+     * `motionEventToWorldTransform` is captured once per stroke and every sample — historical,
+     * live and predicted — is mapped through it by ink's own code. Composing the straight edge's
+     * orthogonal projection onto it therefore rules the stroke straight at no per-sample cost and
+     * without hand-building a single `StrokeInput`, which CLAUDE.md is explicit would silently drop
+     * pressure, tilt, orientation and tool type. [RulerController] has the full argument, including
+     * why a singular matrix is safe here and what would make it stop being safe.
+     */
+    private fun beginStroke(event: MotionEvent, pointerIndex: Int, pointerId: Int) {
         if (activeStrokeId != null) return
         // M12 — latched here, used when the stroke finishes. `elapsedRealtime` rather than
         // `event.eventTime`, which is `uptimeMillis` and stops during deep sleep: a recording holds
@@ -783,16 +869,26 @@ public class InkSurfaceView @JvmOverloads constructor(
         strokes.beginEdit()
         activeStrokeKind = pen.kind
         strokePointerId = pointerId
+        val ruled = rulerController.appliesTo(event, pointerIndex)
         // ⭐ M8b — armed here, fed in `onMove`, and it allocates nothing on either path.
-        toPageSpace(event.getX(event.actionIndex), event.getY(event.actionIndex), snapPoint)
-        snap.begin(snapPoint.x, snapPoint.y, event.eventTime)
+        // ⚠️ Not armed while the ruler is out. Draw-and-hold measures dwell against the *raw*
+        // samples while the ink lands on the projected ones, so a hold that fired would replace a
+        // ruled line with a shape fitted to a hand's wobble — and a straight edge is already the
+        // deliberate way to draw a straight line.
+        if (!ruled) {
+            toPageSpace(event.getX(pointerIndex), event.getY(pointerIndex), snapPoint)
+            snap.begin(snapPoint.x, snapPoint.y, event.eventTime)
+        }
+        val viewToPage = cameraMatrix.viewToPage(camera)
         activeStrokeId = wetView.startStroke(
             event = event,
             pointerId = pointerId,
             brush = brushFactory.brushFor(pen),
-            // The camera in effect at stroke start, and only that camera.
-            motionEventToWorldTransform = cameraMatrix.viewToPage(camera),
-            // Stroke space *is* page space, so nothing needs converting later.
+            // The camera in effect at stroke start, and only that camera — with the straight edge
+            // composed onto it when one is out.
+            motionEventToWorldTransform = if (ruled) rulerController.strokeTransform(viewToPage) else viewToPage,
+            // Stroke space *is* page space, so nothing needs converting later — and it is what
+            // makes the ruler's singular projection safe: nothing ever inverts it.
             strokeToWorldTransform = IDENTITY,
         )
     }
@@ -903,6 +999,30 @@ public class InkSurfaceView @JvmOverloads constructor(
     public var onShapeSnapped: ((ShapeKind, Boolean) -> Unit)? = null
 
     private fun onMove(event: MotionEvent): Boolean {
+        if (stylusGestureMove(event)) return true
+        // ⭐ M8c — no `noteStylusEvent`: the ruler is dragged by a **finger**, and telling the palm
+        // guard a stylus had been near would then block the very pointer that is doing the moving.
+        if (rulerController.isActive) {
+            rulerController.extend(event, camera)
+            return true
+        }
+        if (!gestures.isActive || !palmGuard.allowsFinger(event)) return false
+        taps.onMove(event)
+        camera = gestures.onMove(event, camera).leashed()
+        return true
+    }
+
+    /**
+     * The four gestures a pen can be in the middle of, in the order they can be live.
+     *
+     * Split out of [onMove] when M8c added the laser: they share a property the ruler does not,
+     * which is that every one of them feeds [PalmGuard] — a palm that lands while any of these is
+     * running must not start panning the page. Keeping the ruler on the other side of that line is
+     * the point of the split, not the line count.
+     *
+     * @return true when one of them consumed the event.
+     */
+    private fun stylusGestureMove(event: MotionEvent): Boolean {
         val strokeId = activeStrokeId
         if (strokeId != null) {
             palmGuard.noteStylusEvent(event)
@@ -931,10 +1051,12 @@ public class InkSurfaceView @JvmOverloads constructor(
             selectionController.extend(event, camera)
             return true
         }
-        if (!gestures.isActive || !palmGuard.allowsFinger(event)) return false
-        taps.onMove(event)
-        camera = gestures.onMove(event, camera).leashed()
-        return true
+        if (laser.isActive) {
+            palmGuard.noteStylusEvent(event)
+            laser.extend(event, camera)
+            return true
+        }
+        return false
     }
 
     private fun onPointerUp(event: MotionEvent): Boolean {
@@ -942,24 +1064,7 @@ public class InkSurfaceView @JvmOverloads constructor(
         val cancelled = event.isCancelledPointer()
 
         when (pointerId) {
-            strokePointerId -> {
-                val strokeId = activeStrokeId
-                if (strokeId != null) {
-                    if (cancelled) {
-                        wetView.cancelStroke(strokeId, event)
-                    } else {
-                        wetView.finishStroke(event, pointerId, strokeId)
-                    }
-                }
-                if (cancelled) strokes.endEdit()
-                // ⭐ M8b — disarmed whichever way the gesture ended. A detector left armed would
-                // measure the *next* stroke's dwell against this one's anchor and travel, and a
-                // timer left posted would snap a gesture the user had already finished.
-                snap.cancel()
-                removeCallbacks(snapTimer)
-                activeStrokeId = null
-                strokePointerId = MotionEvent.INVALID_POINTER_ID
-            }
+            strokePointerId -> endStroke(event, pointerId, cancelled)
 
             eraser.pointerId -> {
                 if (!cancelled) eraser.extend(event, camera)
@@ -975,6 +1080,16 @@ public class InkSurfaceView @JvmOverloads constructor(
                 }
             }
 
+            // ⭐ M8c — the trail is **not** cleared on the lift. A laser mark fading out after the
+            // pen leaves the glass is the feature; clearing it here would make pointing at
+            // something require holding the pen there.
+            laser.pointerId -> {
+                if (!cancelled) laser.extend(event, camera)
+                laser.end()
+            }
+
+            rulerController.pointerId -> if (cancelled) rulerController.cancel() else rulerController.end()
+
             else -> {
                 gestures.removePointer(event, pointerId)
                 onFingersLifted(event)
@@ -982,6 +1097,28 @@ public class InkSurfaceView @JvmOverloads constructor(
         }
         if (event.actionMasked == MotionEvent.ACTION_UP) gestures.abandon()
         return true
+    }
+
+    /**
+     * The pen left the glass — finish the stroke, or throw it away if the pointer was cancelled.
+     *
+     * ⭐ M8b — the detector is disarmed whichever way the gesture ended. One left armed would
+     * measure the *next* stroke's dwell against this one's anchor and travel, and a timer left
+     * posted would snap a gesture the user had already finished.
+     */
+    private fun endStroke(event: MotionEvent, pointerId: Int, cancelled: Boolean) {
+        val strokeId = activeStrokeId
+        if (strokeId != null) {
+            if (cancelled) wetView.cancelStroke(strokeId, event) else wetView.finishStroke(event, pointerId, strokeId)
+        }
+        // A finished stroke closes its own bracket in `onStrokesFinished`; a cancelled one never
+        // reaches that listener, so it has to be closed here or the next stroke joins this one's
+        // undo entry.
+        if (cancelled) strokes.endEdit()
+        snap.cancel()
+        removeCallbacks(snapTimer)
+        activeStrokeId = null
+        strokePointerId = MotionEvent.INVALID_POINTER_ID
     }
 
     /**
@@ -1010,6 +1147,11 @@ public class InkSurfaceView @JvmOverloads constructor(
         // Puts the previewed transforms back and writes nothing — a cancelled drag must not
         // leave the objects where the finger last was, because no op describes that position.
         selectionController.cancel()
+        // ⭐ M8c. The ruler keeps where it has been dragged to — there is nothing to put back,
+        // because nothing was written and a straight edge left where the user's hand last had it is
+        // not a lost edit. The laser's trail is left to fade for the same reason a lift leaves it.
+        rulerController.cancel()
+        laser.end()
         gestures.abandon()
         taps.cancel()
     }

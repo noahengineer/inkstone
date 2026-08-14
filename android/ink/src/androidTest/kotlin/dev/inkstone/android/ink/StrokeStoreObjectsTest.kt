@@ -18,6 +18,7 @@ import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.TextBoxObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -25,7 +26,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * ⭐ ROADMAP M8c — the store holds **objects**, not only strokes.
+ * ⭐ ROADMAP M8c — the store holds **objects**, not only strokes, and every kind now paints itself.
  *
  * ## What this file is the guard against
  *
@@ -42,6 +43,18 @@ import org.junit.runner.RunWith
  * is M8a's recorded regression (`docs/M8-SELECTION.md` §6, first bullet) arriving from a new
  * direction, and [aStrokeDrawnAfterAnImageIsInsertedLandsOnTopOfIt] is the assertion that closes it.
  *
+ * ## ⚠️ Two assertions in here were reversed, deliberately
+ *
+ * The previous version of this file asserted that a lasso could not take an image and that an
+ * eraser passed straight through one. Both were correct **while nothing could draw one**: the rule
+ * was *"nothing the user cannot see may be selected or erased"*, since a selection frame round an
+ * invisible object resizes something nobody can see and a bite out of one is stored in a register
+ * SPEC §4.9.2 keeps deliberately separate from an image's crop.
+ *
+ * There is nothing the user cannot see any more. The rule is unchanged and its answer flipped, so
+ * [aLassoRoundAnImageTakesIt] and [anEraserBitesAPictureAndTheStrokeUnderIt] are the same rule
+ * asserted from the other side.
+ *
  * ## Geometry is hand-built, and deliberately without orientation
  *
  * Same reasoning as [StrokeStoreSelectionTest], repeated because it is the reason these tests are
@@ -49,14 +62,6 @@ import org.junit.runner.RunWith
  * never clamps to `[0, 2π)` and x86_64 rounding puts it a thousandth outside, which `androidx.ink`
  * rejects. The strokes here carry **no orientation and no tilt**, so there is nothing to be out of
  * range. Every expected coordinate is arithmetic a reader can check.
- *
- * ## Why the non-stroke objects here are unpainted
- *
- * [DryPlaceholder] is what an [ImageObject] or a [TextBoxObject] becomes in this build: ordered,
- * carried and converged, and drawing nothing. That is not a stub these tests work around — it is
- * the behaviour under test. *Nothing the user cannot see may be selected or erased*, so
- * [aLassoRoundAnImageTakesNothing] and [anEraserPassesThroughAPictureAndTakesTheStrokeUnderIt] are
- * assertions about the degrade being safe, not about it being temporary.
  */
 @RunWith(AndroidJUnit4::class)
 class StrokeStoreObjectsTest {
@@ -133,8 +138,10 @@ class StrokeStoreObjectsTest {
         z = z,
     )
 
-    private fun placeholderFor(id: ObjectId): DryPlaceholder =
-        required(store.objectOf(id) as? DryPlaceholder, "the placeholder for $id")
+    private fun imageFor(id: ObjectId): DryImage = required(store.objectOf(id) as? DryImage, "the image for $id")
+
+    private fun textBoxFor(id: ObjectId): DryTextBox =
+        required(store.objectOf(id) as? DryTextBox, "the text box for $id")
 
     // -----------------------------------------------------------------------
     // The z key — the acceptance argument
@@ -158,7 +165,7 @@ class StrokeStoreObjectsTest {
 
         val drawn = addLine(LINE_X, LINE_Y + FAR_PT)
 
-        val picture = placeholderFor(ObjectId("photo")).z
+        val picture = imageFor(ObjectId("photo")).z
         val stroke = required(store.strokeOf(drawn), "the new stroke").z
         assertTrue("the new stroke ($stroke) landed under the picture ($picture)", stroke > picture)
     }
@@ -246,7 +253,7 @@ class StrokeStoreObjectsTest {
             factory,
         )
 
-        val dry = placeholderFor(id)
+        val dry = imageFor(id)
         val own = required(dry.bounds, "the own-space box")
         val page = required(dry.pageBounds, "the page-space box")
         assertEquals("the own-space box moved with the object", 0f, own.xMin, TOLERANCE)
@@ -291,7 +298,7 @@ class StrokeStoreObjectsTest {
      * were lost for a milestone.
      *
      * The seeded value is asserted first because a text box created with words and never edited has
-     * **no** `SetTextContent` op at all — its text is on the payload, and reading only the register
+     * **no** `SetTextContent` op at all: its text is on the payload, and reading only the register
      * would show an empty box for every text box nobody has retyped.
      */
     @Test
@@ -306,7 +313,7 @@ class StrokeStoreObjectsTest {
                 z = HIGH_KEY,
             ),
         )
-        assertEquals("the payload's own words were dropped", SEEDED_TEXT, placeholderFor(id).content)
+        assertEquals("the payload's own words were dropped", SEEDED_TEXT, textBoxFor(id).content)
 
         store.applyOps(
             listOf(
@@ -316,9 +323,10 @@ class StrokeStoreObjectsTest {
             factory,
         )
 
-        val dry = placeholderFor(id)
+        val dry = textBoxFor(id)
         assertEquals("SetTextContent did not reach the object", RETYPED_TEXT, dry.content)
         assertEquals("SetFormat did not reach the object", FORMAT_RECORD, dry.format)
+        assertEquals("the record was not decoded", SERIF_SIZE_PT, dry.decodedFormat.sizePt, TOLERANCE)
     }
 
     /**
@@ -335,27 +343,46 @@ class StrokeStoreObjectsTest {
 
         store.applyOps(listOf(PageOp.SetFormat("op-format", clock(), id, FUTURE_RECORD)), factory)
 
-        assertEquals(FUTURE_RECORD, placeholderFor(id).format)
+        assertEquals(FUTURE_RECORD, textBoxFor(id).format)
+    }
+
+    /**
+     * A `SetFormat` aimed at an **image** lands on the image, and not merely on text.
+     *
+     * The two kinds share one register and one op, and the branch that routes it is a single
+     * `is DryBox`. That is exactly the shape of thing that gets narrowed to `is DryTextBox` by
+     * somebody reading the op's name — after which cropping a picture would converge, journal,
+     * upload and change nothing on the glass.
+     */
+    @Test
+    fun aFormatRecordAimedAtAnImageReachesTheImage() {
+        val id = ObjectId("photo")
+        addObject(image("photo", IMAGE_X, IMAGE_Y, HIGH_KEY))
+
+        store.applyOps(listOf(PageOp.SetFormat("op-crop", clock(), id, CROP_RECORD)), factory)
+
+        assertEquals(CROP_RECORD, imageFor(id).format)
+        assertNotNull("the crop was not decoded", imageFor(id).decodedFormat.crop)
     }
 
     // -----------------------------------------------------------------------
-    // Nothing the user cannot see may be selected or erased
+    // Selecting and erasing — the same rule, answered from the other side
     // -----------------------------------------------------------------------
 
     /**
-     * ⚠️ The eraser passes through a picture and takes the writing under it.
+     * ⚠️ **Reversed in M8c, and the rule behind it did not change.**
      *
-     * A bite out of an object this build cannot draw would be *stored* — in a register SPEC §4.9.2
-     * keeps deliberately separate from an image's crop — so a later build that can draw the picture
-     * would open it with a hole nobody remembers making. The rule lives in the object's own
-     * coverage test rather than as a kind check in the erase loop, which is why it holds for the
-     * lasso and the tap as well.
+     * This test used to assert that the eraser passed *through* a picture, because a bite out of an
+     * object nothing could draw would be stored in a register the user could not see the effect of.
+     * A picture is drawn now, so an eraser dragged across it takes a bite out of it — and the
+     * stroke underneath as well, because both are under the tip.
      *
      * The picture is placed over the line so that a coverage test which merely used the bounding
-     * box would report two.
+     * box would not be distinguishable from one that did the work; the assertion is on *both*
+     * objects having a region, which only a real per-object test produces.
      */
     @Test
-    fun anEraserPassesThroughAPictureAndTakesTheStrokeUnderIt() {
+    fun anEraserBitesAPictureAndTheStrokeUnderIt() {
         val stroke = addLine(LINE_X, LINE_Y)
         val id = ObjectId("photo")
         addObject(image("photo", LINE_X, LINE_Y - IMAGE_HEIGHT_PT / 2f, HIGH_KEY))
@@ -365,8 +392,11 @@ class StrokeStoreObjectsTest {
         val touched = store.eraseAlong(middle, middle, ERASER_RADIUS_PT, EraseMode.PARTIAL)
         store.endEdit()
 
-        assertEquals("the eraser bit something it cannot draw", 1, touched)
-        assertNull("a picture was given an erased region", placeholderFor(id).erased)
+        assertEquals("the eraser did not reach both objects", 2, touched)
+        assertTrue(
+            "the picture was not bitten",
+            imageFor(id).erased?.capsules?.isNotEmpty() == true,
+        )
         assertTrue(
             "the stroke under the picture was not erased",
             required(store.strokeOf(stroke), "the stroke").erased?.capsules?.isNotEmpty() == true,
@@ -374,13 +404,17 @@ class StrokeStoreObjectsTest {
     }
 
     /**
-     * A lasso round a picture takes nothing, and a tap on one selects nothing.
+     * ⚠️ **Also reversed.** A lasso round a picture takes it, and a tap on one selects it.
      *
-     * A selection frame drawn round an invisible object is worse than a blank rectangle: the
-     * handles would resize something the user cannot see, and the resize would be journaled.
+     * `docs/M8-SELECTION.md` §7 said hit-testing an image would be *"a few lines of rectangle
+     * containment when the objects exist"*. They exist. The tap is in the **middle** of the
+     * rectangle rather than on its edge, which is the assertion that the predicate is a filled
+     * containment test and not an outline one — the difference between selecting a photo by
+     * touching it and having to find its border.
      */
     @Test
-    fun aLassoRoundAnImageTakesNothing() {
+    fun aLassoRoundAnImageTakesIt() {
+        val id = ObjectId("photo")
         addObject(image("photo", IMAGE_X, IMAGE_Y, HIGH_KEY))
 
         val hits = store.objectsIn(
@@ -390,10 +424,39 @@ class StrokeStoreObjectsTest {
             ),
         )
 
-        assertTrue("a lasso selected an object nothing can draw: $hits", hits.isEmpty())
-        assertNull(
-            "a tap selected an object nothing can draw",
+        assertEquals("a lasso round a picture did not take it", listOf(id), hits)
+        assertEquals(
+            "a tap in the middle of a picture selected nothing",
+            id,
             store.objectAt(IMAGE_X + IMAGE_WIDTH_PT / 2f, IMAGE_Y + IMAGE_HEIGHT_PT / 2f, TAP_SLOP_PT),
+        )
+    }
+
+    /**
+     * A tap in the white space **between** a text box's words still selects the text box.
+     *
+     * The alternative — hit-testing the glyphs — would make a caption something you have to aim at
+     * a letter of, and would make the tap disagree with the lasso, which tests the four corners.
+     * One predicate for both is what `DryBox` exists to keep.
+     */
+    @Test
+    fun aTapInABlankPartOfATextBoxSelectsIt() {
+        val id = ObjectId("caption")
+        addObject(
+            TextBoxObject(
+                id = id,
+                text = SHORT_TEXT,
+                widthPt = IMAGE_WIDTH_PT,
+                heightPt = IMAGE_HEIGHT_PT,
+                transform = Matrix3.translate(IMAGE_X, IMAGE_Y),
+                z = HIGH_KEY,
+            ),
+        )
+
+        assertEquals(
+            "a tap below the one line of text selected nothing",
+            id,
+            store.objectAt(IMAGE_X + IMAGE_WIDTH_PT / 2f, IMAGE_Y + IMAGE_HEIGHT_PT - 1f, TAP_SLOP_PT),
         )
     }
 
@@ -446,6 +509,7 @@ class StrokeStoreObjectsTest {
 
         const val SEEDED_TEXT = "as created"
         const val RETYPED_TEXT = "as retyped by a peer"
+        const val SHORT_TEXT = "one line"
 
         /**
          * A real `ObjectFormatCodec` record — serif, 18 pt, centred.
@@ -456,6 +520,10 @@ class StrokeStoreObjectsTest {
          * the next reader: someone extending this file would copy the shape of what is here.
          */
         const val FORMAT_RECORD = "if1;f=se;sz=18;a=c"
+        const val SERIF_SIZE_PT = 18f
+
+        /** A rectangular crop, the middle four fifths — what an image's format record carries. */
+        const val CROP_RECORD = "if1;c=0.1:0.1:0.9:0.9"
 
         /** A key from a build that knows a format field this one does not — see SPEC §4.9.2. */
         const val FUTURE_RECORD = "if1;f=se;sz=18;vertical=rl"

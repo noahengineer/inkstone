@@ -3,10 +3,12 @@ package dev.inkstone.android.ink
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
+import android.graphics.Rect
 import android.graphics.RectF
 import androidx.ink.brush.TextureBitmapStore
 import androidx.ink.geometry.Box
@@ -250,15 +252,80 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
     private fun paintContent(canvas: Canvas, dry: DryObject, strokeToCanvas: Matrix) {
         when (dry) {
             is DryStroke -> renderer.draw(canvas, dry.stroke, strokeToCanvas)
-
             is DryShape -> paintShape(canvas, dry)
-
-            // Nothing, on purpose — see [DryPlaceholder]. It holds its place in the z-order and
-            // carries its registers; a painter for images and text boxes is the next step owed,
-            // and it arrives as a new [DryObject] kind with a branch here, not as a flag on this
-            // one.
-            is DryPlaceholder -> Unit
+            is DryTextBox -> paintText(canvas, dry)
+            is DryImage -> paintImage(canvas, dry)
         }
+    }
+
+    /**
+     * ⭐ M8c — a text box, in its own space.
+     *
+     * Everything expensive already happened: [DryTextBox] rebuilds its `StaticLayout` when its
+     * words, its format or its style change, and this method scales, draws and restores. That split
+     * is CLAUDE.md rule 7 — a text box on a page being written on is redrawn on every dry-layer
+     * invalidation, and measuring glyphs there would put line breaking on the pen-to-pixel path.
+     *
+     * ⚠️ **The layout is [DryTextBox.LAYOUT_SCALE]× oversized and the canvas is scaled down**, for
+     * the reason that class records: `StaticLayout`'s wrap width and line height are integers, and
+     * at page-point magnitudes a 14 pt line rounds to a 16 pt one — a 4 % error compounded once per
+     * line.
+     */
+    private fun paintText(canvas: Canvas, dry: DryTextBox) {
+        val saved = canvas.save()
+        canvas.scale(1f / DryTextBox.LAYOUT_SCALE, 1f / DryTextBox.LAYOUT_SCALE)
+        dry.layout.draw(canvas)
+        canvas.restoreToCount(saved)
+    }
+
+    /**
+     * ⭐ M8c — an image, cropped, in its own space.
+     *
+     * The crop is a source-rectangle draw and, for a freehand crop, a clip on top of it — both
+     * decided by [DryImage], which holds the reframing rule so that the pixels and the shaped edge
+     * cannot disagree. Everything else about placing an image is the object matrix, which
+     * [paintObject] has already concatenated: a rotation and a flip are `SetTransform` (SPEC
+     * §4.9.2), so this draws into `[0, w] × [0, h]` and never looks at either.
+     *
+     * ⚠️ **A missing bitmap draws a placeholder rather than nothing.** [PageAssets] returns null for
+     * an asset that has not loaded yet and for one that is not there, and both are ordinary — an
+     * image merged from a peer arrives one poll before its bytes do. Drawing nothing would make a
+     * picture indistinguishable from blank paper, which is the *silent* half of SPEC §4.9.4's
+     * "blank rectangle" failure and the half a user cannot report.
+     */
+    private fun paintImage(canvas: Canvas, dry: DryImage) {
+        val bitmap = assets?.bitmap(dry.asset)
+        if (bitmap == null || bitmap.isRecycled) {
+            paintMissingImage(canvas, dry)
+            return
+        }
+        val saved = canvas.save()
+        dry.clipPath?.let { canvas.clipPath(it) }
+        dry.sourceRect(bitmap.width, bitmap.height, sourceRect)
+        destRect.set(0f, 0f, dry.widthPt, dry.heightPt)
+        // Opacity only. `ObjectStyle.colorArgb` means nothing for a photograph — it has its own
+        // colours — so a recolour applied to a mixed selection leaves pictures alone, exactly as
+        // `setFill` leaves pen strokes alone (`InkSelection.setFill`).
+        objectImagePaint.alpha = (dry.effectiveStyle().opacity.coerceIn(0f, 1f) * OPAQUE).toInt()
+        canvas.drawBitmap(bitmap, sourceRect, destRect, objectImagePaint)
+        canvas.restoreToCount(saved)
+    }
+
+    /**
+     * The "this picture is not here" box: a flat wash, a dashed edge and a cross.
+     *
+     * Deliberately unmistakable rather than tasteful. A neutral grey rectangle alone reads as a
+     * design choice; a crossed one reads as a fault, which is what it is, and is the difference
+     * between a user reporting a missing image and never noticing one.
+     */
+    private fun paintMissingImage(canvas: Canvas, dry: DryImage) {
+        val width = dry.widthPt
+        val height = dry.heightPt
+        destRect.set(0f, 0f, width, height)
+        canvas.drawRect(destRect, missingFill)
+        canvas.drawRect(destRect, missingEdge)
+        canvas.drawLine(0f, 0f, width, height, missingEdge)
+        canvas.drawLine(width, 0f, 0f, height, missingEdge)
     }
 
     /**
@@ -314,10 +381,43 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
         isAntiAlias = true
     }
 
+    /**
+     * ⭐ M8c — where an [DryImage]'s pixels come from, or null when nobody has supplied a lookup.
+     *
+     * Null is not a misconfiguration to be defended against: [InkPageThumbnailRenderer] renders on
+     * a background dispatcher and a caller that has no asset cache is entitled to say so. It draws
+     * the same placeholder a missing asset does, which is the honest picture either way.
+     */
+    var assets: PageAssets? = null
+
+    /** The image's own pixels. Separate from [imagePaint] so the two alphas cannot interfere. */
+    private val objectImagePaint = Paint().apply {
+        isFilterBitmap = true
+        isAntiAlias = false
+    }
+
+    /** A flat wash under a missing picture — light enough to read as paper, dark enough to see. */
+    private val missingFill = Paint().apply {
+        style = Paint.Style.FILL
+        color = MISSING_FILL_COLOR
+        isAntiAlias = true
+    }
+
+    /** The dashed edge and the cross. See [paintMissingImage] on why it is a cross. */
+    private val missingEdge = Paint().apply {
+        style = Paint.Style.STROKE
+        color = MISSING_EDGE_COLOR
+        strokeWidth = 1f
+        isAntiAlias = true
+        pathEffect = DashPathEffect(floatArrayOf(MISSING_DASH_PT, MISSING_DASH_PT), 0f)
+    }
+
     /** Reused every frame — `onDraw` must not allocate (CLAUDE.md rule 7). */
     private val objectMatrix = Matrix()
     private val objectToCanvas = Matrix()
     private val matrixValues = FloatArray(MATRIX_VALUES)
+    private val sourceRect = Rect()
+    private val destRect = RectF()
 
     /**
      * [Matrix3] (two rows, the third implied) into an `android.graphics.Matrix` (all nine).
@@ -362,5 +462,12 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
 
         const val LAYER_PADDING_PT = 2f
         const val MATRIX_VALUES = 9
+
+        /** Full alpha on a `Paint`, and the multiplier `ObjectStyle.opacity` scales. */
+        const val OPAQUE = 255
+
+        const val MISSING_FILL_COLOR = 0x14000000
+        const val MISSING_EDGE_COLOR = 0x59000000
+        const val MISSING_DASH_PT = 4f
     }
 }

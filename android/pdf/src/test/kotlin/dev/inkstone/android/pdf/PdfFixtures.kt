@@ -9,15 +9,21 @@ import com.tom_roush.pdfbox.pdmodel.PDPage
 import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
 import com.tom_roush.pdfbox.pdmodel.common.PDStream
 import dev.inkstone.core.model.FractionalKey
+import dev.inkstone.core.model.ImageCrop
+import dev.inkstone.core.model.Matrix3
+import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageAnnotationMode
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.StrokeGeometry
 import dev.inkstone.core.model.StrokeOutline
 import dev.inkstone.core.model.StrokeRebuilder
+import dev.inkstone.core.model.TextFont
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 
 /**
  * The source PDFs M4's acceptance criteria are about, built rather than committed.
@@ -197,12 +203,14 @@ internal object PdfFixtures {
     fun highlight(id: String, left: Float, top: Float, side: Float): StrokeOutline =
         square(id, left, top, side, TRANSLUCENT_YELLOW)
 
+    @Suppress("LongParameterList")
     fun plan(
         sourceIndex: Int,
         outlines: List<StrokeOutline>,
         pageId: String = "page-$sourceIndex",
         mode: PageAnnotationMode = PageAnnotationMode.PER_STROKE,
         words: List<InvisibleWord> = emptyList(),
+        objects: List<PdfPageObject> = emptyList(),
     ) = PdfPagePlan(
         source = PageSource.Existing(sourceIndex),
         pageId = PageId(pageId),
@@ -210,7 +218,92 @@ internal object PdfFixtures {
         mode = mode,
         outlines = outlines,
         words = words,
+        objects = objects,
     )
+
+    // -----------------------------------------------------------------------
+    // M8c — text boxes and images
+    // -----------------------------------------------------------------------
+
+    /**
+     * A text box at ([leftPt], [topPt]) in page space, sized [widthPt] × [heightPt].
+     *
+     * Placed through the object's **transform**, not by baking the position into the payload,
+     * because that is where a text box's position actually lives (`SetTransform`, absolute, SPEC
+     * §4.2) and because a fixture that used the identity everywhere could not tell a correct
+     * matrix from a dropped one — CLAUDE.md's M8a lesson about two spaces with the same numbers.
+     */
+    @Suppress("LongParameterList")
+    fun textBox(
+        id: String,
+        text: String,
+        leftPt: Float = 72f,
+        topPt: Float = 100f,
+        widthPt: Float = 300f,
+        heightPt: Float = 120f,
+        format: ObjectFormat = ObjectFormat.Default,
+        transform: Matrix3 = Matrix3.translate(leftPt, topPt),
+        style: ObjectStyle = ObjectStyle(colorArgb = OPAQUE_BLACK, widthPt = 0f),
+    ) = PdfTextBox(
+        objectId = ObjectId(id),
+        text = text,
+        widthPt = widthPt,
+        heightPt = heightPt,
+        transform = transform,
+        format = format,
+        style = style,
+    )
+
+    @Suppress("LongParameterList")
+    fun image(
+        id: String,
+        bytes: ByteArray,
+        leftPt: Float = 72f,
+        topPt: Float = 300f,
+        widthPt: Float = 200f,
+        heightPt: Float = 150f,
+        crop: ImageCrop? = null,
+        opacity: Float = 1f,
+        transform: Matrix3 = Matrix3.translate(leftPt, topPt),
+    ) = PdfImage(
+        objectId = ObjectId(id),
+        bytes = bytes,
+        widthPt = widthPt,
+        heightPt = heightPt,
+        transform = transform,
+        crop = crop,
+        opacity = opacity,
+    )
+
+    /** Bytes that only [FakeImageDecoder] understands — a stand-in for a WebP asset. */
+    val FAKE_IMAGE_BYTES: ByteArray = "INKSTONE-FAKE-IMAGE".toByteArray(Charsets.US_ASCII)
+
+    /**
+     * A JPEG **header**, structurally valid as far as [JpegHeader] reads and no further.
+     *
+     * ⚠️ **This cannot prove a viewer decodes the image**, and it is not asked to. What the
+     * `/DCTDecode` path has to get right is the dictionary — `/Width`, `/Height`, `/ColorSpace`
+     * — and that the bytes reach the file *unaltered*, because a PDF reader takes those numbers
+     * from the dictionary and not from the stream. Building a genuinely decodable JPEG would need
+     * an encoder; the Flate path is where a real, renderable picture is produced, and that is what
+     * the dumped file carries.
+     */
+    fun headerOnlyJpeg(widthPx: Int, heightPx: Int, components: Int = 3): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.write(byteArrayOf(0xFF.toByte(), 0xD8.toByte()))
+        // APP0, length 4, so the scan has a segment to step over before the frame.
+        out.write(byteArrayOf(0xFF.toByte(), 0xE0.toByte(), 0x00, 0x04, 0x00, 0x00))
+        // SOF0: length 8 + 3*components, precision 8, height, width, component count.
+        out.write(byteArrayOf(0xFF.toByte(), 0xC0.toByte()))
+        out.write(byteArrayOf(0x00, (8 + 3 * components).toByte(), 0x08))
+        out.write(byteArrayOf((heightPx shr 8).toByte(), heightPx.toByte()))
+        out.write(byteArrayOf((widthPx shr 8).toByte(), widthPx.toByte()))
+        out.write(byteArrayOf(components.toByte()))
+        repeat(components) { out.write(byteArrayOf((it + 1).toByte(), 0x11, 0x00)) }
+        out.write(byteArrayOf(0xFF.toByte(), 0xDA.toByte(), 0x00, 0x02))
+        out.write(byteArrayOf(0xFF.toByte(), 0xD9.toByte()))
+        return out.toByteArray()
+    }
 
     const val OPAQUE_BLACK: Int = 0xFF101010.toInt()
 
@@ -224,6 +317,75 @@ internal object PdfFixtures {
     const val INHERITED_WIDTH_PT: Float = 595f
 
     const val INHERITED_HEIGHT_PT: Float = 842f
+}
+
+/**
+ * [PdfFontFaces] over the committed `TestSubset-Regular.ttf`.
+ *
+ * ⚠️ **Not the production face**, and `CidFontSpikeTest` says why: pdfbox-android's
+ * `LiberationSans-Regular.ttf` lives in the AAR's *assets*, which are not on a JVM test's
+ * classpath. This is a real 28 KB subset of that very face, cut to one character from each block
+ * SPEC §4.9.5 claims coverage of, so the encoding path under test is the production one — but it
+ * is a **narrower** face than production, not a wider one, which is the direction CLAUDE.md's
+ * "distrust a fixture more generous than production" asks for.
+ *
+ * It answers for all three families, so the multi-family subsetting path is exercised. Production
+ * may well answer null for serif and mono, and [PdfFontFaces.None] is what covers that.
+ */
+internal object TestFontFaces : PdfFontFaces {
+
+    private val bytes: ByteArray by lazy {
+        val url = requireNotNull(TestFontFaces::class.java.classLoader?.getResource(FACE)) {
+            "$FACE missing from android/pdf/src/test/resources"
+        }
+        File(url.toURI()).readBytes()
+    }
+
+    override fun face(font: TextFont): ByteArray? = bytes
+
+    private const val FACE = "TestSubset-Regular.ttf"
+}
+
+/**
+ * A [PdfImageDecoder] that answers for one fixture byte string and nothing else.
+ *
+ * ⚠️ Deliberately **not** a decoder that accepts anything. `AndroidImageDecoder` answers null for
+ * bytes it cannot decode, and a fake that always succeeded would hide every place the writer fails
+ * to handle that — which is the ordinary case for a peer's asset this build has no codec for.
+ *
+ * The picture is **asymmetric on both axes**: red across the top row, blue across the bottom, and
+ * a bright first column. A symmetric fixture cannot tell a correctly oriented image from one
+ * flipped by [PdfPlacement.unitImageToObject] getting the unit square's `v` direction backwards,
+ * which is the one mistake in this area that produces a *plausible* picture.
+ */
+internal class FakeImageDecoder(
+    private val widthPx: Int = 8,
+    private val heightPx: Int = 6,
+    private val withAlpha: Boolean = false,
+) : PdfImageDecoder {
+
+    var decoded: Int = 0
+        private set
+
+    override fun decode(bytes: ByteArray): RasterImage? {
+        if (!bytes.contentEquals(PdfFixtures.FAKE_IMAGE_BYTES)) return null
+        decoded++
+        val rgb = ByteArray(widthPx * heightPx * 3)
+        for (row in 0 until heightPx) {
+            for (column in 0 until widthPx) {
+                val at = (row * widthPx + column) * 3
+                val top = row < heightPx / 2
+                rgb[at] = if (top) LIT else 0
+                rgb[at + 1] = if (column == 0) LIT else 0
+                rgb[at + 2] = if (top) 0 else LIT
+            }
+        }
+        return RasterImage(widthPx, heightPx, rgb, if (withAlpha) ByteArray(widthPx * heightPx) { LIT } else null)
+    }
+
+    private companion object {
+        const val LIT: Byte = 0xFF.toByte()
+    }
 }
 
 /**

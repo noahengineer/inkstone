@@ -1,9 +1,7 @@
 package dev.inkstone.android.pdf
 
-import dev.inkstone.core.model.Background
+import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.PagePoint
-import dev.inkstone.core.model.PageSize
-import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.model.PdfPageGeometry
 import dev.inkstone.core.model.StrokeOutline
 import kotlin.math.abs
@@ -125,8 +123,21 @@ internal object PdfContent {
         }
     }
 
+    /**
+     * ⚠️ **The `Tm` is the page's whole geometry, not a converted origin** (M8c).
+     *
+     * This wrote `1 0 0 1 x y Tm` from M4 to M8b: the right *place*, and the identity *rotation*.
+     * On a `/Rotate 90` scan — SPEC §4.4's headline case, and the ordinary shape of a lecture PDF
+     * — every recognised word was laid across the handwriting at ninety degrees. Nothing caught
+     * it from either side: the layer is invisible, so no visual check could, and `pdftotext`
+     * reports the characters whatever the matrix says, so no extraction check could either.
+     * [PdfPlacement] is the fix and the KDoc there is the reasoning.
+     *
+     * On an unrotated page the composition still reduces to `1 0 0 1 x y`, which is why the M4-era
+     * assertions in `InvisibleTextLayerTest` are unchanged: the bug was only ever visible on the
+     * fixture pages nothing was asserting against.
+     */
     private fun ContentBuilder.placeWord(word: InvisibleWord, geometry: PdfPageGeometry, font: String) {
-        val baseline = geometry.toPdfUser(PagePoint(word.leftPt, word.bottomPt))
         val height = abs(word.bottomPt - word.topPt)
         // Helvetica's average advance is ~0.5 em; scaling horizontally to the measured
         // box is what makes a text selection follow the handwriting instead of drifting
@@ -135,99 +146,13 @@ internal object PdfContent {
         val width = abs(word.rightPt - word.leftPt)
         val nominal = word.text.length * height * NOMINAL_ADVANCE_EM
         val horizontal = if (nominal > 0f) (width / nominal) * PERCENT else PERCENT
+        // A recognised word is in page space at the identity: the strokes that produced it were
+        // authored there (SPEC §4.4 rule 1) and nothing has moved them.
+        val matrix = PdfPlacement.textLine(geometry, Matrix3.Identity, word.leftPt, word.bottomPt)
         line("/$font ${number(height)} Tf")
         line("${number(horizontal)} Tz")
-        line("1 0 0 1 ${number(baseline.x)} ${number(baseline.y)} Tm")
-        line("(${escapeText(word.text)}) Tj")
-    }
-
-    /**
-     * A page template as vector content (SPEC §4.1's five built-ins).
-     *
-     * Drawn into the generated base page, not into the update section: the rules
-     * are part of the paper, and a note exported to someone else should show the
-     * lines the writer saw. The metrics come from [PageTemplate] in `:core:model`
-     * for exactly that reason — one set of numbers, so the screen, the thumbnail
-     * and the PDF cannot rule a page three different ways.
-     */
-    fun template(background: Background, size: PageSize): ByteArray {
-        val template = (background as? Background.Template)?.template ?: return ByteArray(0)
-        if (template == PageTemplate.BLANK) return ByteArray(0)
-        return buildContent {
-            line("q")
-            line("${number(RULE_GRAY)} ${number(RULE_GRAY)} ${number(RULE_GRAY)} RG")
-            line("${number(RULE_WIDTH_PT)} w")
-            when (template) {
-                PageTemplate.RULED -> horizontalRules(size, template.spacingPt, PageTemplate.RULED_MARGIN_PT)
-
-                PageTemplate.GRID -> {
-                    horizontalRules(size, template.spacingPt, 0f)
-                    verticalRules(size, template.spacingPt)
-                }
-
-                PageTemplate.DOT_GRID -> dots(size, template.spacingPt)
-
-                PageTemplate.CORNELL -> cornell(size, template.spacingPt)
-
-                PageTemplate.BLANK -> Unit
-            }
-            line("Q")
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Template shapes. Page space is y-down; a generated base page's CropBox is
-    // [0 0 w h] with no rotation, so the flip is the only conversion needed.
-    // -----------------------------------------------------------------------
-
-    private fun ContentBuilder.horizontalRules(size: PageSize, spacing: Float, margin: Float) {
-        var y = margin
-        while (y <= size.heightPt - margin) {
-            rule(0f, size.heightPt - y, size.widthPt, size.heightPt - y)
-            y += spacing
-        }
-    }
-
-    private fun ContentBuilder.rule(x0: Float, y0: Float, x1: Float, y1: Float) {
-        line("${number(x0)} ${number(y0)} m ${number(x1)} ${number(y1)} l S")
-    }
-
-    private fun ContentBuilder.verticalRules(size: PageSize, spacing: Float) {
-        var x = spacing
-        while (x < size.widthPt) {
-            rule(x, 0f, x, size.heightPt)
-            x += spacing
-        }
-    }
-
-    private fun ContentBuilder.dots(size: PageSize, spacing: Float) {
-        line("${number(RULE_GRAY)} ${number(RULE_GRAY)} ${number(RULE_GRAY)} rg")
-        // A dot is a tiny square: a circle would be four Béziers each, and at this
-        // radius nothing on earth can tell the difference.
-        val side = number(DOT_RADIUS_PT * 2)
-        var y = spacing
-        while (y < size.heightPt) {
-            var x = spacing
-            while (x < size.widthPt) {
-                val left = number(x - DOT_RADIUS_PT)
-                val bottom = number(size.heightPt - y - DOT_RADIUS_PT)
-                line("$left $bottom $side $side re f")
-                x += spacing
-            }
-            y += spacing
-        }
-    }
-
-    private fun ContentBuilder.cornell(size: PageSize, spacing: Float) {
-        val cue = size.widthPt * PageTemplate.CORNELL_CUE_FRACTION
-        val summary = size.heightPt * PageTemplate.CORNELL_SUMMARY_FRACTION
-        var y = PageTemplate.RULED_MARGIN_PT
-        while (y <= size.heightPt - summary) {
-            rule(cue, size.heightPt - y, size.widthPt, size.heightPt - y)
-            y += spacing
-        }
-        rule(cue, 0f, cue, size.heightPt)
-        rule(0f, summary, size.widthPt, summary)
+        line("${PdfPlacement.args(matrix)} Tm")
+        line("${literalString(word.text)} Tj")
     }
 
     // -----------------------------------------------------------------------
@@ -250,13 +175,20 @@ internal object PdfContent {
     fun alpha(colorArgb: Int): Int = (colorArgb ushr ALPHA_SHIFT) and BYTE_MASK
 
     /**
-     * The `/ExtGState` name for an outline's compositing.
+     * The `/ExtGState` name for one composited alpha, 0..255.
      *
-     * Derived rather than passed as a map so the content stream and the resource
-     * dictionary that has to satisfy it cannot name different things: `PdfBoxWriter`
-     * calls this too.
+     * Derived rather than passed as a map so the content stream and the resource dictionary that
+     * has to satisfy it cannot name different things: `PdfBoxWriter` calls this too, and M4's
+     * defect was exactly a name defined in one place and used in another.
+     *
+     * Keyed on the **alpha alone**, so a translucent stroke, a translucent text box and a
+     * translucent image at the same alpha share one entry — which they should, because a graphics
+     * state is a graphics state.
      */
-    fun stateNameFor(outline: StrokeOutline): String = "GS${alpha(outline.colorArgb)}"
+    fun stateName(alpha: Int): String = "GS$alpha"
+
+    /** [stateName] for an outline's own alpha. */
+    fun stateNameFor(outline: StrokeOutline): String = stateName(alpha(outline.colorArgb))
 
     /** The `/ca` value for an ARGB colour, as a PDF real. */
     fun alphaValue(colorArgb: Int): Float = alpha(colorArgb) / BYTE_MASK.toFloat()
@@ -282,8 +214,40 @@ internal object PdfContent {
         return if (negative) "-$digits" else digits
     }
 
-    /** PDF literal strings escape `(`, `)` and `\`. */
-    private fun escapeText(text: String): String = buildString {
+    /**
+     * ⭐ A PDF **hex string**, `<00480065…>` — how a text box's words reach the content stream.
+     *
+     * ⚠️ **Never a `(…)` literal, and the reason is structural rather than stylistic.** With
+     * `Identity-H` a character is a two-byte CID, and those bytes are freely `0x00`, `0x28` and
+     * `0x29` — an unbalanced `(` or a premature `)` inside a literal ends the string early and
+     * corrupts every operator after it. Hex has no delimiters to escape, so the class of bug does
+     * not exist. It is also the only form `ContentBuilder`'s ASCII invariant can carry: a CID is
+     * not a character, and writing it as one is precisely the mod-256 truncation M8c removed.
+     *
+     * The digits are **checked**. Passing user text here instead of `PdfCidFont.hex`'s output
+     * would otherwise produce a syntactically valid string of the wrong glyphs, which renders,
+     * extracts, and says something else.
+     */
+    fun hexString(digits: String): String {
+        require(digits.length % HEX_PAIR == 0) {
+            "a hex string is whole bytes; '$digits' is ${digits.length} digits"
+        }
+        require(digits.all { it in HEX_DIGITS }) {
+            "'$digits' is not hex — text must come through PdfCidFont.hex, not straight from a user"
+        }
+        return "<$digits>"
+    }
+
+    /**
+     * A PDF **literal string**, `(hello)`, escaping `(`, `)` and `\`.
+     *
+     * The two callers left are the invisible layer (SPEC §5.5, recognised words) and a text box
+     * falling back to a standard-14 base font (`PdfPageFont.Standard`). Both are ASCII-only by
+     * construction — `ContentBuilder.toByteArray` refuses anything else — so the escaping here is
+     * complete for what can actually reach it. Anything wider goes through [hexString].
+     */
+    fun literalString(text: String): String = buildString(text.length + LITERAL_OVERHEAD) {
+        append('(')
         for (char in text) {
             when (char) {
                 '(', ')', '\\' -> append('\\').append(char)
@@ -292,6 +256,7 @@ internal object PdfContent {
                 else -> append(char)
             }
         }
+        append(')')
     }
 
     private fun buildContent(block: ContentBuilder.() -> Unit): ByteArray = ContentBuilder().apply(block).toByteArray()
@@ -305,9 +270,6 @@ internal object PdfContent {
     private const val DECIMALS = 3
     private const val SCALE = 1000.0
     private const val MIN_POLYGON_POINTS = 3
-    private const val RULE_GRAY = 0.78f
-    private const val RULE_WIDTH_PT = 0.5f
-    private const val DOT_RADIUS_PT = 0.6f
     private const val PERCENT = 100f
 
     /** Helvetica's rough average advance, in ems. Only used to scale a word to its own box. */
@@ -317,6 +279,14 @@ internal object PdfContent {
     private const val PRINTABLE_MIN = 0x20
     private const val PRINTABLE_MAX = 0x7E
     private val PRINTABLE_ASCII: IntRange = PRINTABLE_MIN..PRINTABLE_MAX
+
+    /** Two hex digits to a byte. See [hexString]. */
+    private const val HEX_PAIR = 2
+
+    /** `(`, `)`, and a little room for escapes. */
+    private const val LITERAL_OVERHEAD = 8
+
+    private val HEX_DIGITS: Set<Char> = ('0'..'9').toSet() + ('a'..'f') + ('A'..'F')
 }
 
 /** A content stream under construction. `\n` separated, ASCII, no trailing state. */

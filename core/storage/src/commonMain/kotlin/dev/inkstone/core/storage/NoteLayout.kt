@@ -1,6 +1,8 @@
 package dev.inkstone.core.storage
 
+import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.ElementId
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.PageId
@@ -35,6 +37,16 @@ import dev.inkstone.core.model.PageId
  * other. It is also the largest thing a bundle could gain for no remote benefit: an
  * undone scribble-erase carries a whole absolute region.
  */
+// ⚠️ Suppressed here rather than by raising the shared threshold, on `OpCodec`'s precedent and for
+// the same reason. This object is a **table of paths** — one two-line function per file this app
+// writes, by construction — so the count grows with the number of kinds of file and never with
+// complexity. Collapsing them into fewer, larger functions (a `pathOf(kind, id)` with a `when`)
+// would make the layout harder to check against SPEC §5.1, which is the only thing that matters
+// about this file, and would put a string-building `when` between every caller and its path.
+// Raising `thresholdInObjects` instead would re-tune a limit calibrated for `OpCodec` to
+// accommodate this file, which leaves nothing checking the next object. M8c's Element library took
+// it to exactly one past.
+@Suppress("TooManyFunctions")
 public object NoteLayout {
 
     public const val NOTES_DIR: String = "notes"
@@ -203,6 +215,62 @@ public object NoteLayout {
      * so nothing downstream has to sniff a file the user picked.
      */
     public fun folderCoverImage(id: FolderId): String = "${folderDir(id)}/cover$THUMBNAIL_EXTENSION"
+
+    // -----------------------------------------------------------------------
+    // M8c — the Element library (SPEC §4.9.4)
+    // -----------------------------------------------------------------------
+
+    /**
+     * ⭐ Saved Elements — reusable stamps.
+     *
+     * ```
+     * elements/<elementId>.element        one stamp: payloads, both registers, its own image bytes
+     * elements/trash/<elementId>.element  deleted, kept (CLAUDE.md rule 1)
+     * ```
+     *
+     * A **sibling** of `notes/`, for [FOLDERS_DIR]'s reason and [RECORDINGS_DIR]'s: an Element is
+     * not part of any note. It is saved *from* one and stamped *into* others, so filing it under
+     * the note it happened to come from would take it to the trash with that note, copy it with a
+     * duplicate, and upload it inside a PDF nobody asked to contain it.
+     *
+     * It is also not a cache. The user drew it and named it, and it cannot be regenerated from
+     * anything else — which is what puts it here rather than under [THUMBNAIL_CACHE_DIR], where a
+     * storage sweep is a feature.
+     */
+    public const val ELEMENTS_DIR: String = "elements"
+
+    /** One saved Element. A single file, so a save is one atomic write (CLAUDE.md rule 10). */
+    public fun element(id: ElementId): String = "$ELEMENTS_DIR/${id.value}$ELEMENT_EXTENSION"
+
+    /**
+     * Deleted Elements. **Not** [TRASH_DIR], and that is the interesting half.
+     *
+     * ⚠️ `trash/<millis>-<id>` is parsed by [NoteTrash.entries], which reads everything after the
+     * first `-` as a [DocumentId] — so an Element dropped in there would appear in the note trash
+     * as a restorable note, and a restore would move a stamp file to `notes/<elementId>/`. That is
+     * the trap [orphanedStub] solves with a suffix no [DocumentId] can contain; an Element cannot
+     * borrow that trick, because its own id is an ordinary UUIDv7 and would collide with a note's
+     * exactly.
+     *
+     * ⚠️ **There is therefore no thirty-day sweep here, on purpose.** [NoteTrash.purgeExpired]
+     * only deletes what [NoteTrash.entries] lists, and nothing else in this app deletes anything.
+     * Retention exists to *bound* trash, and CLAUDE.md rule 1 is about not losing data: an Element
+     * is a handful of objects and at most a few small pictures, so keeping it forever costs less
+     * than the alternative reading of the rule. The day a sweeper is wanted it needs a [Clock],
+     * which [ElementLibrary] deliberately does not take (see its KDoc).
+     */
+    public const val ELEMENTS_TRASH_DIR: String = "$ELEMENTS_DIR/trash"
+
+    public fun trashedElement(id: ElementId): String = "$ELEMENTS_TRASH_DIR/${id.value}$ELEMENT_EXTENSION"
+
+    /**
+     * The suffix that makes an Element file recognisable in a directory listing.
+     *
+     * [ElementLibrary.list] filters on it rather than taking every child, so the `trash`
+     * subdirectory beside them is skipped without a special case — and a stray file some other
+     * tool leaves in the directory does not become an unreadable entry in the user's stamp picker.
+     */
+    public const val ELEMENT_EXTENSION: String = ".element"
 
     // -----------------------------------------------------------------------
     // M12 — recorded lectures (docs/M12-AUDIO.md)

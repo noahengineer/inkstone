@@ -52,7 +52,19 @@ import java.io.ByteArrayOutputStream
  * the ink path (CLAUDE.md rule 7). [PdfDocumentMaterializer] moves it off the main
  * thread; nothing here does its own dispatching.
  */
-internal class PdfBoxWriter : PdfWriter {
+internal class PdfBoxWriter(faces: PdfFontFaces = PdfFontFaces.None, decoder: PdfImageDecoder = PdfImageDecoder.None) :
+    PdfWriter {
+
+    /**
+     * M8c's text boxes and images, and the resources they name — see [PdfPageObjects].
+     *
+     * ⚠️ **The defaults are the *narrow* ones on purpose.** A writer built with no arguments
+     * publishes text boxes in a standard-14 base font and skips any image that is not already a
+     * JPEG, which is what a JVM test can reach. Production passes both in through
+     * [InkstonePdfMaterializer], so a test can never be more generous than the app — the
+     * direction CLAUDE.md warns about is the other one, and this makes it structurally unavailable.
+     */
+    private val pageObjects = PdfPageObjects(faces, decoder)
 
     override fun createBase(pages: List<BasePage>): ByteArray {
         require(pages.isNotEmpty()) { "a base PDF needs at least one page" }
@@ -60,7 +72,7 @@ internal class PdfBoxWriter : PdfWriter {
             for (spec in pages) {
                 val page = PDPage(PDRectangle(spec.size.widthPt, spec.size.heightPt))
                 doc.addPage(page)
-                val template = PdfContent.template(spec.background, spec.size)
+                val template = PdfTemplateContent.forPage(spec.background, spec.size)
                 if (template.isNotEmpty()) {
                     val stream = PDStream(doc, ByteArrayInputStream(template), COSName.FLATE_DECODE)
                     page.cosObject.setItem(COSName.CONTENTS, stream)
@@ -103,7 +115,7 @@ internal class PdfBoxWriter : PdfWriter {
             }
 
             is PageSource.Generated -> PDPage(PDRectangle(source.size.widthPt, source.size.heightPt)).also { page ->
-                val template = PdfContent.template(source.background, source.size)
+                val template = PdfTemplateContent.forPage(source.background, source.size)
                 if (template.isNotEmpty()) {
                     val stream = PDStream(doc, ByteArrayInputStream(template), COSName.FLATE_DECODE).cosObject
                     markUpdated(stream)
@@ -162,6 +174,16 @@ internal class PdfBoxWriter : PdfWriter {
     // One page
     // -----------------------------------------------------------------------
 
+    /**
+     * ⭐ **One appended content stream per page, not one per feature** (M8c).
+     *
+     * M4 called [appendContent] once for the flattened overlay and again for the invisible text
+     * layer, and each call re-wraps everything already there in a fresh `q`/`Q`. Two features
+     * therefore nested two levels deep; M8c's text boxes and images would have made it four. The
+     * pieces are each balanced on their own, so concatenating them and appending once is the same
+     * output with one level of nesting — and it is the only arrangement in which the page's
+     * objects come out in the order this method wrote them.
+     */
     private fun writePage(doc: PDDocument, page: PDPage, plan: PdfPagePlan) {
         val dict = page.cosObject
         // Read from the page rather than taken from the caller. SPEC §4.4's whole
@@ -174,6 +196,10 @@ internal class PdfBoxWriter : PdfWriter {
         dict.setString(COSName.getPDFName(PdfPageKeys.SORT_KEY), plan.sortKey.value)
 
         val drawable = plan.outlines.filterNot { it.isEmpty }
+        val content = mutableListOf<ByteArray>()
+        val states = COSDictionary()
+        val fonts = COSDictionary()
+
         when (plan.mode) {
             PageAnnotationMode.PER_STROKE -> {
                 dict.removeItem(COSName.getPDFName(PdfPageKeys.FLATTENED))
@@ -183,21 +209,48 @@ internal class PdfBoxWriter : PdfWriter {
             PageAnnotationMode.FLATTENED -> {
                 dict.setBoolean(COSName.getPDFName(PdfPageKeys.FLATTENED), true)
                 if (drawable.isNotEmpty()) {
-                    // ⚠️ The **page's** resources, not the stream's — see PdfResources.
-                    PdfResources.addToPage(dict, COSName.EXT_G_STATE, extGStates(drawable))
-                    appendContent(doc, page, flateStream(doc, PdfContent.flattenedOverlay(drawable, geometry)))
+                    mergeInto(states, extGStates(drawable))
+                    content += PdfContent.flattenedOverlay(drawable, geometry)
                 }
             }
         }
 
+        // ⭐ SPEC §4.9 — text boxes and images, as page content and never as annotations. That is
+        // what keeps `PdfPagePlan.annotatedObjects` honest: SPEC §6.4's threshold is a cap on
+        // `/Annots` length, and nothing below adds to it.
+        val objects = pageObjects.write(doc, plan, geometry)
+        content += objects.content
+        mergeInto(states, objects.states)
+        mergeInto(fonts, objects.fonts)
+        PdfResources.addToPage(dict, COSName.XOBJECT, objects.xObjects)
+
         val text = PdfContent.invisibleText(plan.words, geometry, TEXT_FONT_NAME)
         if (text.isNotEmpty()) {
-            PdfResources.addToPage(dict, COSName.FONT, invisibleFont())
-            appendContent(doc, page, flateStream(doc, text))
+            fonts.setItem(COSName.getPDFName(TEXT_FONT_NAME), baseFontDictionary(INVISIBLE_BASE_FONT))
+            content += text
         }
+
+        // ⚠️ The **page's** resources, not the stream's — see PdfResources. Both calls are no-ops
+        // for an empty category, so a page with no objects writes no dictionaries.
+        PdfResources.addToPage(dict, COSName.EXT_G_STATE, states)
+        PdfResources.addToPage(dict, COSName.FONT, fonts)
+        if (content.isNotEmpty()) appendContent(doc, page, flateStream(doc, join(content)))
 
         markUpdated(dict)
         markParentChain(dict)
+    }
+
+    /** Copy [source]'s entries into [target]. One category, built from several contributors. */
+    private fun mergeInto(target: COSDictionary, source: COSDictionary) {
+        if (source.keySet().isEmpty()) return
+        for (name in source.keySet()) target.setItem(name, source.getItem(name))
+        markUpdated(target)
+    }
+
+    private fun join(parts: List<ByteArray>): ByteArray {
+        val out = ByteArrayOutputStream(parts.sumOf { it.size })
+        for (part in parts) out.write(part)
+        return out.toByteArray()
     }
 
     /**
@@ -345,27 +398,6 @@ internal class PdfBoxWriter : PdfWriter {
         val stream = PDStream(doc, ByteArrayInputStream(content), COSName.FLATE_DECODE).cosObject
         markUpdated(stream)
         return stream
-    }
-
-    /**
-     * The standard-14 font the invisible text layer names (SPEC §5.5), as a `/Font` entry.
-     *
-     * Written by hand rather than through PDFBox's font stack, which would pull in
-     * `PDFBoxResourceLoader` and a `Context` for an AFM file describing metrics nothing
-     * here measures — the text is invisible.
-     */
-    private fun invisibleFont(): COSDictionary {
-        val font = COSDictionary().apply {
-            setItem(COSName.TYPE, COSName.FONT)
-            setItem(COSName.SUBTYPE, COSName.getPDFName("Type1"))
-            setItem(COSName.getPDFName("BaseFont"), COSName.getPDFName("Helvetica"))
-            setItem(COSName.getPDFName("Encoding"), COSName.getPDFName("WinAnsiEncoding"))
-            markUpdated(this)
-        }
-        return COSDictionary().apply {
-            setItem(COSName.getPDFName(TEXT_FONT_NAME), font)
-            markUpdated(this)
-        }
     }
 
     /**
@@ -539,6 +571,17 @@ internal class PdfBoxWriter : PdfWriter {
         const val INK_SUBTYPE = "Ink"
         const val INK_LIST = "InkList"
         const val TEXT_FONT_NAME = "InkstoneF0"
+
+        /**
+         * The invisible layer's font (SPEC §5.5), named and not embedded.
+         *
+         * A base font rather than a CID subset, deliberately: the layer is `3 Tr`, so nothing is
+         * ever *drawn* with it and its metrics are irrelevant. Embedding a face for text nobody
+         * sees would add a subset to every published page that has been over the recogniser.
+         * Recognised words outside printable ASCII are skipped per word — `PdfContent.invisibleText`
+         * has the reasoning, and carrying them is what M8c's [PdfPageObjects] path is for.
+         */
+        const val INVISIBLE_BASE_FONT = "Helvetica"
         const val BUNDLE_MIME = "application/vnd.inkstone.note"
         const val ANNOTATION_FLAG_PRINT = 4
         const val BYTE_MASK = 0xFF

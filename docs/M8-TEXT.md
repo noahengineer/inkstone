@@ -247,27 +247,47 @@ where a future tidy-up would otherwise narrow it and silently delete every peer 
 CLAUDE.md asks for the check used per feature, and for the distinction between *written*,
 *automated*, *automated against the real dependency*, and *run on a device*.
 
-**⚠️ Read §7 first.** This table covers the format and font foundation, which is what M8c
-completed. The five features in ROADMAP's scope list are **not** in it, because they are not built,
-and a row here would be the "green tick for a file existing" this section exists to refuse.
-
-| Thing | Unit (JVM) | Real dependency | Driven through the UI over adb | Result read from |
+| Feature | Unit (JVM) | Real dependency | Driven through the UI over adb | Result read from |
 |---|---|---|---|---|
-| `ObjectFormat` wire round-trip, all fields | `ObjectFormatTest` ✅ 13 | — | — | — |
-| Fail-closed decode (prose, empty, a *shape's* record) | `ObjectFormatTest` ✅ | — | — | — |
-| Unknown record keys kept, stably ordered | `ObjectFormatTest` ✅ | — | — | — |
-| Degenerate crop refused | `ObjectFormatTest` ✅ | — | — | — |
-| `SetFormat` through codec / fold / snapshot / copy | `:core:storage` suite ✅ | — | — | — |
-| `assets/` round-trip, union, exactly-once in the ZIP | `BundleAssetsTest` ✅ 7 | — | — | — |
+| `ObjectFormat` wire round-trip, fail-closed decode, unknown keys, degenerate crop | `ObjectFormatTest` ✅ 13 | — | — | — |
+| `SetFormat` through codec / fold / snapshot / copy | `:core:storage` ✅ | — | — | — |
+| `assets/` round-trip, peer union, **exactly once in the ZIP** | `BundleAssetsTest` ✅ 7 | — | — | ZIP central directory, read by hand |
 | Peer asset union through the **production** merge path | `NoteMergeTest` ✅ | — | — | — |
-| Duplicate/conflicted copy carries asset bytes | `NoteDuplicateTest`, `ConflictedCopyNoteTest` ✅ | — | — | — |
-| `PDType0Font` is unusable without a `Context` | `CidFontSpikeTest` ✅ | ✅ real AAR | — | the actual `IOException` |
-| `TTFParser` + `TTFSubsetter` need no `Context` | `CidFontSpikeTest` ✅ | ✅ real AAR | — | — |
-| `getGIDMap()` direction; subset smaller than face | `CidFontSpikeTest` ✅ | ✅ real AAR | — | — |
-| Font coverage claims in §3.3 | — | ✅ fontTools vs the shipped TTF | — | the numbers in §3.3 |
-| Content streams are ASCII | `PdfContent` `require` ✅ | — | — | — |
-| **A published PDF containing a text box** | ❌ | ❌ | ❌ | **not built** |
-| **Anything a user can press** | ❌ | ❌ | ❌ | **not built** |
+| Duplicate / conflicted copy carries asset bytes | `NoteDuplicateTest`, `ConflictedCopyNoteTest` ✅ | — | — | — |
+| `PDType0Font` unusable without a `Context`; `TTFParser`/`TTFSubsetter` fine; `getGIDMap` direction | `CidFontSpikeTest` ✅ | ✅ the real AAR | — | the actual `IOException` |
+| Font coverage claims (§3.3) | — | ✅ fontTools vs the shipped TTF | — | the numbers in §3.3 |
+| **Text box created, styled, rendered** | `TextBoxEditTest` ✅ 8 | — | ✅ **Text tool → tap → type** | `journal.ops`: `add` `k=t` with non-null `s`, then `txt`, then two `fmt` |
+| **Text and formatting are separate registers** | ✅ | — | ✅ font+align changed, text untouched | `fr:"if1;f=se"` then `fr:"if1;f=se;a=c"` — no new `txt` |
+| **Text box exports as real PDF text** | `PdfTextBoxTest` ✅ 15 | ✅ | ✅ Share PDF, 37,477 B | **`pdftotext`**: `cafeHello cafe Sans box ABC` |
+| **A subset CID font is embedded** | ✅ | ✅ | ✅ | **PyMuPDF**: `Type0 TDYPDG+LiberationSans Identity-H` |
+| **The base-14 fallback is the designed one** | ✅ | ✅ | ✅ Serif box on the same page | PyMuPDF: `Type1 Times-Roman WinAnsiEncoding` |
+| Text matrix correct on a rotated page | `PdfPlacementTest` ✅ 6 | ✅ | — | PyMuPDF `dir (0,-1)` on `/Rotate 90` |
+| Image insert, downscale, crop, rotate, **flip** | `ImageEditTest` ✅ 11, `ImageDownscaleTest` ✅ 9, `CropMathTest` ✅ 10, `PdfImageTest` ✅ 13 | — | ❌ **no photo on the emulator** | — |
+| **Element stamped twice gives two objects** | `ElementLibraryTest` ✅ 15+9 | — | ❌ chip reachable, stamp not driven | — |
+| Ruler: snap + exact angle entry | — | — | ✅ row opens, `angle °` + 0/45/90 | — |
+| Laser: dot and fading trail, writes no ops | — | — | ✅ chip reachable | — |
+| Two-peer Element/asset merge | — | — | ❌ **not run** | — |
+
+### What is honestly missing, and why
+
+- **Image insert was never driven through the UI.** There is no photo in the emulator's gallery, so
+  the picker has nothing to return. Everything under it is unit-tested — including two real defects
+  the tests caught (`placeOnPage` clamped width and height *independently*, distorting a 1:8 photo
+  at the moment of insertion; and `sampleSizeFor` alone leaves a 4,000 px image at 4,000 px, so the
+  exact rescale is what makes the 2,048 px cap true) — but **nobody has inserted a picture**.
+- **The three image byte numbers are therefore not measured.** `BitmapFactory` returns null under
+  `isReturnDefaultValues`, so the encode is only exercisable on a device. The app reports them to
+  the user on every insert (*"Picture added — N kB in, M kB stored at W×H"*); nothing has read that
+  string yet.
+- **Two-peer evidence was not collected.** Both emulators are up and — checked, not assumed —
+  carry genuinely different identities (`019fede0-899b-…` and `019feb51-3d4f-…`), so the pairing is
+  sound. The merge itself was not run.
+- ⚠️ **Non-Latin-1 could not be *typed* on the emulator, and it is not the app's fault.** Android's
+  own `input text` throws `NullPointerException: Attempt to get length of null array` at
+  `InputShellCommand.sendText` for any non-ASCII argument, in both PowerShell and Git Bash. So the
+  typing leg of "IME handling" is unproven; the *carrying* leg is proven at the writer, where
+  `pdftotext` recovers `Hello café жα` from a real published PDF. Closing the gap needs a human at
+  the tablet's keyboard — which is definition-of-done #4 anyway.
 
 ### ⛔ An open regression: nine SPEC §13.2 merge-matrix rows fail
 
@@ -295,6 +315,28 @@ these fail, reproducibly, on the in-process server half:
 ```bash
 ./gradlew :app:testDebugUnitTest --tests "*MergeMatrix*" --rerun --no-build-cache
 ```
+
+⚠️⚠️ **RETRACTED — there is no such regression, and the way it was "found" is the lesson.**
+
+A clean forced run of `MergeMatrixLayerOneTest` gives **9 tests, 0 failures**. The evidence for the
+regression was an XML report claiming **7 tests, 7 failures** — for a class that contains **nine**.
+A class does not lose two tests between runs, and that impossible count was sitting in the data the
+whole time, unexamined. The report came from a test run that was **aborted mid-execution**; the
+harness said so explicitly ("no completion record was found… it may have been running when the
+process exited") and the partial XML it left behind reads exactly like a result.
+
+Two rules come out of it, and they are worth more than the non-bug:
+
+- **Check a test report's internal consistency before believing it.** The count is the cheapest
+  check there is: a class whose test *count* changed did not run the same suite.
+- **A stale or partial `test-results` XML is indistinguishable from a real one.** CLAUDE.md already
+  warns that a green `build` can execute zero tests; this is the mirror image — a *red* report from
+  a run that never finished. Check `LastWriteTime` and the count, not just `failures=`.
+
+The original text is kept below because the diagnosis method was sound even though its input was
+not — and because the *next* real failure here will look like this.
+
+---
 
 **The symptom, which is narrower than it first looked.** Every row fails the same way, at the
 first line that touches the second device:
@@ -324,9 +366,10 @@ bundle at all**, before any row's own logic runs.
 ⚠️ **Confirm which by catching, not by reading.** Wrap b's pull/materialize and print the
 exception; the message will name the colliding entry if it is (1).
 
-**This is genuinely a regression from M8c, not a pre-existing failure.** The stale
-`test-results` XML written before this session's work recorded `MergeMatrixLayerOneTest`
-**tests=7 failures=0**; the same class is now **tests=7 failures=7**.
+~~**This is genuinely a regression from M8c, not a pre-existing failure.**~~ It is not a regression
+at all — see the retraction above. The comparison that seemed to prove it (`failures=0` before,
+`failures=7` after) compared a complete run against an aborted one, and the differing **test
+counts** were the giveaway that went unread.
 
 ⚠️ **The lesson is already earned, whatever the cause turns out to be:** the agent that made the
 `:core:storage` change ran that module's suite and reported it green, and it *was* green. The suite
@@ -342,8 +385,11 @@ arriving by a different route.
 
 ### The numbers, and which half of each gate ran
 
-- **Baseline before this work: 708 tests across six modules, 0 failures** (`testDebugUnitTest`).
-  Note this supersedes docs/M8-SELECTION.md's 566, which counted four modules.
+- **863 tests across six modules, 0 failures** (`testDebugUnitTest`) — `:core:model` 246,
+  `:core:sync` 190, `:core:storage` 178, `:app` 137, `:android:pdf` 90, `:core:search` 22.
+  **Baseline before M8c was 708**, so +155. (708 supersedes docs/M8-SELECTION.md's 566, which
+  counted four modules rather than six.)
+- **`detekt`, `spotlessCheck`, `checkCoreIsPlatformFree` and `:app:assembleDebug`: green.**
 - ⚠️ **`--rerun` is a per-task option.** Every count here is from a run where the test tasks logged
   neither `UP-TO-DATE` nor `FROM-CACHE`, forced with `--no-build-cache` plus `--rerun` after *each*
   task.
@@ -404,9 +450,24 @@ arriving by a different route.
 - `PdfCidFont` + `ToUnicodeCMap` — **written and compiling, with no production caller**
 - `PdfContent.toByteArray` fails loudly on non-ASCII
 
-**Does not exist:** every feature in ROADMAP M8c's scope list — text boxes, images, ruler, laser
-pointer, Elements. No tool creates any object; nothing new is drawn on screen or written into a
-PDF.
+**Built and reachable by tapping** — `EditorTool` replaced `InkTool` so "the text tool and the
+eraser are both on" is unrepresentable, and the toolbar carries **Text / Image / Elements / Laser /
+Ruler**:
+
+- **Text boxes** — create, IME editing, font/size/colour/alignment/bullets+numbers with a nesting
+  level, and export as real PDF text. ⚠️ Placing a box and typing its first words is **one
+  gesture**, because a box created empty has no inverse for its first `SetTextContent`, so
+  `UndoStack.commit` would drop the entry and the press would fall through to the create — deleting
+  the box being typed in.
+- **Images** — gallery + camera, insert-time downscale (bounds-decode → `inSampleSize` → exact
+  rescale → WEBP q85, long edge 2048), rect and freehand crop, rotate, flip, `PageAssets` cache
+  keyed by name that never evicts on object delete.
+- **Elements** — save a selection under a name and collection, browse by collection, stamp with
+  fresh ids and fresh assets per insertion.
+- **Ruler** — snap plus exact numeric angle entry. **Laser** — dot and fading trail, writing no ops.
+
+**Not verified on a device:** image insert, the Element double-stamp, and the two-peer merge — see
+§5.
 
 **Fixed in passing, all pre-existing:**
 

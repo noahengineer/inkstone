@@ -14,6 +14,7 @@ import dev.inkstone.core.model.AnchorTarget
 import dev.inkstone.core.model.ConnectorEndState
 import dev.inkstone.core.model.ConnectorTargets
 import dev.inkstone.core.model.FractionalKey
+import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.InkObject
 import dev.inkstone.core.model.Lasso
 import dev.inkstone.core.model.Matrix3
@@ -26,6 +27,7 @@ import dev.inkstone.core.model.SelectionEdit
 import dev.inkstone.core.model.ShapeObject
 import dev.inkstone.core.model.ShapeRecord
 import dev.inkstone.core.model.StrokeObject
+import dev.inkstone.core.model.TextBoxObject
 import dev.inkstone.core.model.asAnchorTarget
 import kotlin.math.abs
 import kotlin.math.sqrt
@@ -528,7 +530,10 @@ internal class StrokeStore {
             true
         }
 
-        is DryPlaceholder -> {
+        // ⭐ M8c — a text box's **words**. An image's content register is free (SPEC §4.9.2's
+        // table) and is still applied rather than refused, so a peer writing one cannot lose it
+        // here; nothing draws it.
+        is DryBox -> {
             dry.setContent(text)
             true
         }
@@ -538,11 +543,13 @@ internal class StrokeStore {
     private fun applyFormat(dry: DryObject, record: String): Boolean = when (dry) {
         is DryStroke -> false
 
-        // Nothing yet: a format record is a text box's font and an image's crop, and a shape has
-        // neither. Carried in the log by the fold either way.
+        // Nothing: a format record is a text box's font and an image's crop, and a shape has
+        // neither — its own record is `SetTextContent` (SPEC §4.8.2). Carried in the log by the
+        // fold either way, so a build that gives a shape a format later loses nothing.
         is DryShape -> false
 
-        is DryPlaceholder -> {
+        // ⭐ M8c — the font, size, alignment and list for a text box; the crop for an image.
+        is DryBox -> {
             dry.setFormat(record)
             true
         }
@@ -566,11 +573,16 @@ internal class StrokeStore {
      * from the screen. Worse than gone — absent from [topZ], so the next stroke the user drew
      * landed underneath it.
      *
-     * A stroke is the one kind whose geometry only this module can decode; every other kind goes
-     * to [DryPlaceholder.of], whose `when` is exhaustive over [InkObject] so that a kind added to
-     * `:core:model` is a compile error rather than a silent drop. (Adding one is separately a note
-     * older builds cannot open — SPEC §4.9.1's first row — so this is not the only thing standing
-     * in the way of one.)
+     * A stroke is the one kind whose geometry only this module can decode; every other kind is
+     * built straight from its payload. The `when` is exhaustive over [InkObject] on purpose, so
+     * that a kind added to `:core:model` is a compile error here rather than a silent drop.
+     * (Adding one is separately a note older builds cannot open — SPEC §4.9.1's first row — so
+     * this is not the only thing standing in the way of one.)
+     *
+     * ⭐ **M8c: every kind paints itself now.** `DryPlaceholder` — which held its place in the
+     * z-order, converged, and drew nothing — has no members left and is gone. Its own KDoc always
+     * said this was how it would end: *"a kind that paints itself replaces this type rather than
+     * configuring it"*.
      *
      * @return null only when the object has geometry that could not be decoded, which is a stroke
      *   whose blob this build cannot read. Everything else is held.
@@ -585,7 +597,12 @@ internal class StrokeStore {
         // routes on the next op — which is exactly what it does for a detached end anyway.
         is ShapeObject -> DryShape(obj).also { routesDirty = true }
 
-        else -> DryPlaceholder.of(obj)
+        // ⭐ M8c. Both arrive without their `SetFormat`, for the same reason a shape arrives
+        // without its record — it is a separate op that may sort either side of this one — so both
+        // are drawn in the default presentation until it turns up.
+        is TextBoxObject -> DryTextBox(obj)
+
+        is ImageObject -> DryImage(obj)
     }
 
     private fun dryStrokeFor(obj: StrokeObject, brushes: InkBrushFactory): DryStroke? {
@@ -732,10 +749,12 @@ internal class StrokeStore {
         // Strokes only, and since the M8a/M8b seam fix that is a rule with one door per kind
         // rather than a gap: a shape's copy travels as ops (`ShapeEdit.duplicate` applied
         // through `applyOps`), because its payload needs no encoder; a stroke's cannot, because
-        // its blob does — so `SelectionController.duplicate` routes each kind accordingly. What
-        // is still a gap is an image's asset bytes (SPEC §4.9.4's third consequence), and
-        // selection cannot reach a [DryPlaceholder] in this build, so nothing can call this
-        // for one.
+        // its blob does — so `SelectionController.duplicate` routes each kind accordingly.
+        // ⭐ M8c: a text box and an image travel as ops too, and an image's copy **names the same
+        // asset** rather than copying bytes. That is SPEC §4.9.4's own rule — an asset name is a
+        // UUID, its lifetime is refcount-free, and *"a duplicated note and its original can name
+        // one entry"* — so within one note there is nothing to copy. Copying bytes is
+        // `:core:storage`'s job and only when a copy leaves this note.
         val original = strokeOf(source) ?: return null
         val copy = DryStroke(
             id = into,
@@ -899,9 +918,10 @@ internal class StrokeStore {
      * one the segment is mapped through the inverse and the tip radius divided by the transform's
      * linear scale (see [Matrix3.linearScale] on the approximation that costs).
      *
-     * ⭐ M8c: a [DryPlaceholder] answers false to [DryObject.hitBy] and so never yields a capsule.
-     * That is the *"nothing the user cannot see may be erased"* rule, and it lives in one place —
-     * the object's own coverage test — rather than as a kind check in this loop.
+     * ⭐ M8c: every kind answers [DryObject.hitBy] for itself, so a picture and a text box are
+     * erasable exactly as a stroke is — the rule was *"nothing the user cannot see may be erased"*
+     * and there is now nothing the user cannot see. It stays in one place, the object's own
+     * coverage test, rather than as a kind check in this loop.
      */
     private fun sweptCapsuleFor(
         dry: DryObject,
@@ -991,8 +1011,8 @@ internal class StrokeStore {
                 budget -= region.capsules.size
                 // ⭐ M8c: the kind check is [DryObject.isErasedAway]'s default rather than a cast
                 // here — one rejection, one `continue`, and the same shape [sweptCapsuleFor] uses.
-                // A [DryPlaceholder] answers false, so an object this build cannot draw is never
-                // pruned on the strength of a coverage test it cannot run.
+                // Only a stroke answers true; the others refuse for the reason [DryTextBox] gives,
+                // which is that dropping one costs the user their object until the page reloads.
                 if (dry.isErasedAway(region)) {
                     iterator.remove()
                     byId.remove(dry.id)

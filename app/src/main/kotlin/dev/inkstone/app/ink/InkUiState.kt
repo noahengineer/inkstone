@@ -11,10 +11,10 @@ import androidx.compose.runtime.setValue
 import dev.inkstone.android.ink.EraseMode
 import dev.inkstone.android.ink.InkBrushKind
 import dev.inkstone.android.ink.InkInputModel
-import dev.inkstone.android.ink.InkTool
 import dev.inkstone.android.ink.LatencyStats
 import dev.inkstone.android.ink.PenConfig
 import dev.inkstone.android.ink.StylusStats
+import dev.inkstone.core.model.Camera
 
 /**
  * Everything the M1 toolbar can change, and nothing else.
@@ -44,13 +44,48 @@ class InkUiState {
         private set
 
     /**
-     * ⭐ M8a — pen, eraser or lasso, as one value.
+     * ⭐ M8a — pen, eraser or lasso, as one value. ⭐ M8c — and the five tools it added.
      *
      * Was `eraserSelected: Boolean`. Selection made a second boolean the obvious move and a
      * wrong one: two flags make "eraser and lasso both on" representable and nothing would have
-     * resolved it. See [InkTool].
+     * resolved it. M8c faced the identical choice for its overlay tools and took the identical
+     * answer — see [EditorTool], which is now the single value and derives what the ink surface
+     * is told.
      */
-    var tool by mutableStateOf(InkTool.PEN)
+    var tool by mutableStateOf(EditorTool.PEN)
+
+    /**
+     * ⭐ M8c — the ink surface's camera, mirrored so Compose can lay out over the page.
+     *
+     * The overlay places a text field at a page-space box and turns a tap back into page space, so
+     * it needs the same transform the ink surface is drawing with. Pushed from
+     * `InkSurfaceView.onCameraChanged` — the callback that already existed for the zoom readout —
+     * rather than read on recomposition, because a `View`'s field is not Compose state and nothing
+     * would invalidate on a pan.
+     */
+    var camera by mutableStateOf(Camera.Identity)
+
+    /**
+     * ⭐ ROADMAP M8c — whether the straight edge is out.
+     *
+     * ⚠️ **A mirror of `InkSurfaceView.ruler.enabled`, not the truth.** The edge, its position, its
+     * angle and the snap all live in `:android:ink`'s `RulerController`, because the snap is
+     * applied by handing ink a projection matrix at `ACTION_DOWN` — free on the ink path, and
+     * impossible to do from Compose. A `View`'s field is not Compose state, so the surface pushes
+     * changes here through `onRulerChanged` and the toolbar writes back through the actions. Two
+     * rulers, one drawn here and one there, was the first version of this and is exactly the
+     * *"two mechanisms for one change"* trap `setTemplate` records.
+     */
+    var rulerEnabled by mutableStateOf(false)
+
+    /**
+     * The ruler's angle in degrees, clockwise from the page's x axis — the same mirror.
+     *
+     * Degrees rather than radians because the numeric entry field is the reason it is settable at
+     * all: ROADMAP M8c asks for *"an exact numeric angle"*, and a user typing `30` means thirty
+     * degrees. Dragging a straight edge to exactly 30° is not something a finger can do.
+     */
+    var rulerAngleDegrees by mutableFloatStateOf(0f)
 
     /** How many objects the lasso currently holds — what the selection actions are enabled by. */
     var selectionSize by mutableIntStateOf(0)
@@ -122,7 +157,7 @@ class InkUiState {
 
     fun selectBrush(next: InkBrushKind) {
         kind = next
-        tool = InkTool.PEN
+        tool = EditorTool.PEN
     }
 
     fun setColor(argb: Int) {

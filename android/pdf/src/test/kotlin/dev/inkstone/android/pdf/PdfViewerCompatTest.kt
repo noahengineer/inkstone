@@ -51,6 +51,9 @@ import kotlin.test.assertTrue
 class PdfViewerCompatTest {
 
     private val writer = PdfBoxWriter()
+
+    /** M8c's two injected platform capabilities, supplied — see `PdfFontFaces` and `PdfImageDecoder`. */
+    private val objectWriter = PdfBoxWriter(TestFontFaces, FakeImageDecoder())
     private val bundle = "PK pretend this is note.inkstone".toByteArray(Charsets.US_ASCII)
 
     // -----------------------------------------------------------------------
@@ -344,6 +347,91 @@ class PdfViewerCompatTest {
     }
 
     // -----------------------------------------------------------------------
+    // ⭐ M8c — text boxes and images, which are page content and not annotations
+    // -----------------------------------------------------------------------
+
+    /**
+     * ⭐ **The M8c font, asked the M4 question**, on all four fixture pages at once.
+     *
+     * A text box names `/InkstoneT0 Tf` in the **page's** content stream, which has no
+     * `/Resources` of its own. If the font goes on the stream — the mistake this file was written
+     * to find, and the one [PdfResources] exists to prevent — a lenient reader draws nothing where
+     * the text should be and a strict one abandons the rest of the stream, which is the ink.
+     *
+     * ⚠️ Note what this does **not** prove: `/ToUnicode` could be absent and every assertion here
+     * would still pass, because extraction and rendering fail independently (docs/M8-TEXT.md §3.5).
+     * `PdfTextBoxTest` is the other half.
+     */
+    @Test
+    fun `a page with a text box and an image defines every name they use`() {
+        val published = publishObjectsOnEveryPage()
+
+        for (index in 0 until FIXTURE_PAGES) {
+            assertPageNamesDefined(published, index)
+        }
+        PDDocument.load(published).use { document ->
+            val resources = ContentScan.effectiveResources(document.getPage(0))
+            assertTrue(
+                "InkstoneT0" in ContentScan.namesDefined(resources, COSName.FONT),
+                "the text box's font is not in the page's /Resources",
+            )
+            assertTrue(
+                "InkstoneIm0" in ContentScan.namesDefined(resources, COSName.XOBJECT),
+                "the image is not in the page's /Resources",
+            )
+        }
+    }
+
+    /**
+     * ⭐ SPEC §6.4's threshold is a cap on **`/Annots` length**, and M8c is the milestone that made
+     * *"objects on the page"* and *"annotations on the page"* different numbers.
+     *
+     * `PdfPagePlan.annotatedObjects` is the number the density rule is applied to. This asserts it
+     * **is** the number of annotations the writer produced, per page, on a page carrying two text
+     * boxes and an image. The day a text box becomes a `/FreeText`, this fails — which is the point:
+     * without it a page could carry six hundred annotations while the rule believed it carried two,
+     * and *"5,000 annotations will hang Preview and PDFium"* would be enforced against a fiction.
+     */
+    @Test
+    fun `the annotation count the density rule uses is the number of annotations written`() {
+        val plans = objectPlans()
+        val original = PdfFixtures.sourcePdf()
+        val published = objectWriter.publish(original, publishPlan(original, plans))
+
+        PDDocument.load(published).use { document ->
+            for ((index, plan) in plans.withIndex()) {
+                val annots = document.getPage(index).cosObject.getDictionaryObject(COSName.ANNOTS) as? COSArray
+                assertEquals(
+                    plan.annotatedObjects,
+                    annots?.size() ?: 0,
+                    "page $index reported ${plan.annotatedObjects} annotations and wrote ${annots?.size() ?: 0}",
+                )
+            }
+        }
+    }
+
+    /**
+     * Every `/Ink` annotation is still one a viewer recognises when the page also carries objects.
+     *
+     * The two paths share the page dictionary, the `/Resources` merge and the appended content, and
+     * an object writer that replaced a dictionary rather than merging into it would take the ink's
+     * graphics states with it — the same failure as `flattening keeps a source page's own resources`
+     * arriving from a new direction.
+     */
+    @Test
+    fun `adding objects to a page leaves its ink annotations intact`() {
+        val checked = forEachAnnotation(publishObjectsOnEveryPage()) { annotation ->
+            assertEquals("Ink", annotation.getCOSName(COSName.SUBTYPE)?.name, "an annotation stopped being ink")
+            assertTrue(
+                (annotation.getDictionaryObject(COSName.AP) as? COSDictionary)?.getDictionaryObject(COSName.N)
+                    is COSStream,
+                "an annotation lost its appearance stream",
+            )
+        }
+        assertEquals(EXPECTED_ANNOTATIONS, checked, "the fixture stopped producing annotations")
+    }
+
+    // -----------------------------------------------------------------------
     // The manual gate's other half
     // -----------------------------------------------------------------------
 
@@ -386,6 +474,46 @@ class PdfViewerCompatTest {
 
     /** Enough strokes to trip SPEC §6.4's density rule, so FLATTENED is not a fiction. */
     private fun dense() = List(FLATTEN_THRESHOLD + 1) { PdfFixtures.square("d-$it", 10f + (it % 40) * 12f, 20f, 6f) }
+
+    /**
+     * Ink **and** M8c objects on all four fixture pages — plain, rotated, cropped, and both.
+     *
+     * The rotated and cropped pages are in here deliberately: a text matrix or a placement `cm`
+     * that ignored the page's geometry would still define its names and would still pass every
+     * structural assertion in this file, and the fixture that could catch it existed unused from
+     * M4 to M8c.
+     */
+    private fun objectPlans(): List<PdfPagePlan> = (0 until FIXTURE_PAGES).map { index ->
+        PdfFixtures.plan(
+            index,
+            listOf(
+                PdfFixtures.square("ink-$index", 30f, 40f, 25f),
+                PdfFixtures.highlight("hl-$index", 28f, 38f, 29f),
+            ),
+            objects = listOf(
+                PdfFixtures.image("im-$index", PdfFixtures.FAKE_IMAGE_BYTES, topPt = 320f),
+                PdfFixtures.textBox("tb-$index", "a caption with spaces in it", topPt = 200f),
+                PdfFixtures.textBox("tb2-$index", "and a second one", topPt = 260f),
+            ),
+        )
+    }
+
+    private fun publishObjectsOnEveryPage(): ByteArray {
+        val original = PdfFixtures.sourcePdf()
+        return objectWriter.publish(original, publishPlan(original, objectPlans()))
+    }
+
+    private fun publishPlan(original: ByteArray, plans: List<PdfPagePlan>) = PublishPlan(
+        marker = InkstoneMarker(
+            documentId = DocumentId("0192f3c4-5555-7abc-8def-0123456789ab"),
+            schemaVersion = 1,
+            bundleSha256 = bundle.sha256Hex(),
+            originalLength = original.size.toLong(),
+            originalSha256 = original.sha256Hex(),
+        ),
+        pages = plans,
+        bundle = bundle,
+    )
 
     private fun planWith(
         pageIndex: Int,

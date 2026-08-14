@@ -89,6 +89,20 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
             invalidate()
         }
 
+    /**
+     * ⭐ M8c — where an image object's pixels come from. Null draws the missing-asset placeholder.
+     *
+     * A pass-through to [PagePainter] rather than state of its own, so there is one answer to
+     * *"what draws a picture"* and the invalidate that follows a cache being populated is here
+     * rather than at whichever call site happened to remember it.
+     */
+    var pageAssets: PageAssets?
+        get() = painter.assets
+        set(value) {
+            painter.assets = value
+            invalidate()
+        }
+
     private var drawnRevision = -1L
 
     /** Called by the owner when [store] has changed under it. */

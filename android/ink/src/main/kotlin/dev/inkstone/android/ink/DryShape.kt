@@ -23,10 +23,11 @@ import dev.inkstone.core.model.asAnchorTarget
 /**
  * ⭐ M8b — a [ShapeObject] the dry layer actually **draws**.
  *
- * Replaces [DryPlaceholder] for shapes, which is exactly the move that type's KDoc describes: *"a
+ * Replaced `DryPlaceholder` for shapes, which is exactly the move that type's KDoc described: *"a
  * kind that paints itself replaces this type rather than configuring it"* — a new [DryObject]
  * subclass with its own silhouette, its own coverage test and its own branch in [PagePainter],
- * with the sealed hierarchy making a forgotten painter a compile error.
+ * with the sealed hierarchy making a forgotten painter a compile error. M8c finished the job for
+ * text boxes and images, and the placeholder type is gone.
  *
  * ## ⭐ A connector's geometry is derived, and it is kept in the object's own space anyway
  *

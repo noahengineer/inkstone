@@ -32,7 +32,6 @@ import androidx.compose.ui.unit.dp
 import dev.inkstone.android.ink.EraseMode
 import dev.inkstone.android.ink.InkBrushKind
 import dev.inkstone.android.ink.InkInputModel
-import dev.inkstone.android.ink.InkTool
 import dev.inkstone.core.model.ConnectorRoute
 import dev.inkstone.core.model.FitMode
 import kotlin.math.roundToInt
@@ -48,13 +47,27 @@ import kotlin.math.roundToInt
  * synthetic page for the frame-rate gate, and the latency readout.
  */
 @Composable
-fun InkToolbar(state: InkUiState, actions: InkToolbarActions, modifier: Modifier = Modifier) {
+fun InkToolbar(
+    state: InkUiState,
+    objects: ObjectToolState,
+    actions: InkToolbarActions,
+    objectActions: ObjectActions,
+    modifier: Modifier = Modifier,
+) {
     var colorPanelOpen by remember { mutableStateOf(false) }
     var measurePanelOpen by remember { mutableStateOf(false) }
 
     Card(modifier = modifier) {
         Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             ToolRow(state, actions) { colorPanelOpen = !colorPanelOpen }
+
+            // ⭐ ROADMAP M8c — the five new tools, in the row under the brushes. Every one of them
+            // is a chip a finger can reach: CLAUDE.md's definition-of-done #6 is the whole point of
+            // this milestone, and a feature that is correct in every test and unreachable in the
+            // app has shipped broken six times in this repo already.
+            ObjectToolRow(state, objects, objectActions.onRulerEnabled)
+
+            ObjectRows(state, objects, objectActions)
 
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 // Also two-finger tap / three-finger tap on the page. The
@@ -120,6 +133,65 @@ fun InkToolbar(state: InkUiState, actions: InkToolbarActions, modifier: Modifier
         }
     }
 }
+
+/**
+ * ⭐ ROADMAP M8c — the row that belongs to whichever object tool is selected.
+ *
+ * Each appears only when it has something to act on. A format bar with no text box, or a crop
+ * button with no picture, is a row of controls that do nothing when pressed — the dishonest-button
+ * problem `UndoStack.commit` fixes one layer down and `ShapeRow` follows on this one.
+ */
+@Composable
+private fun ObjectRows(state: InkUiState, objects: ObjectToolState, actions: ObjectActions) {
+    AnimatedVisibility(visible = state.tool == EditorTool.IMAGE) { ImageRow(objects, actions) }
+    AnimatedVisibility(visible = state.tool == EditorTool.ELEMENT) { ElementRow(objects, actions) }
+    AnimatedVisibility(visible = objects.editing != null) { TextFormatRow(objects, state.slots, actions) }
+    AnimatedVisibility(visible = state.rulerEnabled) { RulerRow(state, actions) }
+}
+
+/**
+ * ⭐ ROADMAP M8c — Text, Image, Elements, Laser, and the ruler.
+ *
+ * Four tools and one mode, which is why the ruler is a separate chip and not a fifth entry in the
+ * same exclusive group: it is used *with* the pen. `EditorTool` carries the same reasoning — one
+ * value for the tool so that "the text tool and the eraser are both on" is unrepresentable, and a
+ * boolean for the ruler because it genuinely coexists.
+ *
+ * ⚠️ Leaving a tool clears what it was working on, for the reason M8a's Select chip clears the
+ * selection: a text field floating over a page whose tool is now the eraser, or crop handles round
+ * a picture nothing can crop, is chrome that lies about what a press will do.
+ */
+@Composable
+private fun ObjectToolRow(state: InkUiState, objects: ObjectToolState, onRuler: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        OBJECT_TOOLS.forEach { (tool, label) ->
+            FilterChip(
+                selected = state.tool == tool,
+                onClick = {
+                    state.tool = if (state.tool == tool) EditorTool.PEN else tool
+                    if (state.tool != tool) objects.reset()
+                },
+                label = { Text(label) },
+            )
+        }
+        // ⚠️ The ruler is a **mode**, not a member of the group above: the pen keeps drawing while
+        // it is out, which is the whole point of a straight edge. It also does not write through
+        // the UI state — `InkSurfaceView.ruler` owns the edge and the snap, and this state is a
+        // mirror it pushes back (see `InkUiState.rulerEnabled`).
+        FilterChip(
+            selected = state.rulerEnabled,
+            onClick = { onRuler(!state.rulerEnabled) },
+            label = { Text("Ruler") },
+        )
+    }
+}
+
+private val OBJECT_TOOLS = listOf(
+    EditorTool.TEXT to "Text",
+    EditorTool.IMAGE to "Image",
+    EditorTool.ELEMENT to "Elements",
+    EditorTool.LASER to "Laser",
+)
 
 /** SPEC §3.6's controls: the spike A/B switch, the load generator, the readout. */
 @Composable
@@ -272,32 +344,32 @@ private fun ToolRow(state: InkUiState, actions: InkToolbarActions, onToggleColor
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         InkBrushKind.entries.forEach { kind ->
             FilterChip(
-                selected = state.tool == InkTool.PEN && state.kind == kind,
+                selected = state.tool == EditorTool.PEN && state.kind == kind,
                 onClick = { state.selectBrush(kind) },
                 label = { Text(kind.label) },
             )
         }
         FilterChip(
-            selected = state.tool == InkTool.ERASER,
-            onClick = { state.tool = if (state.tool == InkTool.ERASER) InkTool.PEN else InkTool.ERASER },
+            selected = state.tool == EditorTool.ERASER,
+            onClick = { state.tool = if (state.tool == EditorTool.ERASER) EditorTool.PEN else EditorTool.ERASER },
             label = { Text("Eraser") },
         )
         // ⭐ ROADMAP M8a. Leaving the tool clears the selection, because a box round objects
         // the toolbar no longer offers actions for is chrome that lies.
         FilterChip(
-            selected = state.tool == InkTool.SELECT,
+            selected = state.tool == EditorTool.SELECT,
             onClick = {
-                state.tool = if (state.tool == InkTool.SELECT) InkTool.PEN else InkTool.SELECT
-                if (state.tool != InkTool.SELECT) actions.onClearSelection()
+                state.tool = if (state.tool == EditorTool.SELECT) EditorTool.PEN else EditorTool.SELECT
+                if (state.tool != EditorTool.SELECT) actions.onClearSelection()
             },
             label = { Text("Select") },
         )
         // The rectangular half of M8a's "freehand AND rectangular" lasso. A mode, not a tool:
         // enabled only while Select is, the way Arrow is enabled only with Hold-to-snap.
         FilterChip(
-            selected = state.tool == InkTool.SELECT && state.marqueeSelection,
+            selected = state.tool == EditorTool.SELECT && state.marqueeSelection,
             onClick = { state.marqueeSelection = !state.marqueeSelection },
-            enabled = state.tool == InkTool.SELECT,
+            enabled = state.tool == EditorTool.SELECT,
             label = { Text("Box") },
         )
         // SPEC §3.5, revised in M1. Partial is the default; whole-stroke is kept

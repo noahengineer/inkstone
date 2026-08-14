@@ -1,5 +1,7 @@
 package dev.inkstone.app.note
 
+import dev.inkstone.app.elements.Element
+import dev.inkstone.app.elements.ElementLibrary
 import dev.inkstone.app.search.NoteRecogniser
 import dev.inkstone.app.search.RecognitionReport
 import dev.inkstone.core.model.Background
@@ -7,18 +9,32 @@ import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
+import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.IdFactory
+import dev.inkstone.core.model.ImageCrop
+import dev.inkstone.core.model.ImageEdit
+import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.InkObject
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.MaterializedFile
+import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.NoteSyncState
+import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.model.PdfPublisher
+import dev.inkstone.core.model.SelectionEdit
+import dev.inkstone.core.model.ShapeObject
+import dev.inkstone.core.model.TextBoxEdit
+import dev.inkstone.core.model.TextBoxObject
+import dev.inkstone.core.model.selected
+import dev.inkstone.core.storage.Bundle
 import dev.inkstone.core.storage.BundleReader
 import dev.inkstone.core.storage.DeviceIdentity
 import dev.inkstone.core.storage.FileByteSource
@@ -44,6 +60,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.JsonElement
 
 /**
  * Owns the editing session for the note on screen: autosave, page navigation, undo.
@@ -629,7 +646,7 @@ class NoteEditor(
         // to take that default — so the first and most important refusal never fired.
         val id = session.document.id
         val syncState = library?.syncStateOf(id) ?: NoteSyncState.LOCAL_ONLY
-        session.materialize()
+        materializeWithAssets(session)
         store.assertNotStale(id)
         session.compactIfDue(syncState, library?.oldestAckedCounter(id))
         // The bundle has just been rewritten, so this fold is what the note now *is* —
@@ -803,7 +820,7 @@ class NoteEditor(
                 val report = absorbRemote(session) {
                     NoteMerge.mergeBundle(session, FileByteSource(fs, bundlePath)).also { report ->
                         if (report is MergeReport.Merged) {
-                            session.materialize(report.carried, report.carriedManifest)
+                            materializeWithAssets(session, report.carried, report.carriedManifest)
                             // The resolved title, so a peer's rename reaches the library tile and not
                             // only the bundle (SPEC §7.7 layer 2's reader half).
                             library?.onPulled(
@@ -1089,6 +1106,367 @@ class NoteEditor(
         }
     }
 
+    // -----------------------------------------------------------------------
+    // ⭐ M8c — text boxes, images and Elements (SPEC §4.9)
+    // -----------------------------------------------------------------------
+
+    /**
+     * The page on screen, folded — what the overlay hit-tests a tap against.
+     *
+     * Under [serial], like [foldedPage], because folding is not read-only: it re-reads the journal
+     * and populates the session's page cache, which a concurrent [NoteSession.materialize] clears.
+     */
+    suspend fun currentFold(): FoldedPage? = onPage { session, page -> session.page(page) }
+
+    /**
+     * ⭐ A new text box, **with its first words already in it**.
+     *
+     * ⚠️ **Placing the box and typing into it are one gesture, and that is a correctness
+     * requirement rather than a nicety.** `TextBoxEdit.create`'s own KDoc spells it out:
+     * `Undo.inverseOf` reads a `SetTextContent`'s previous value out of the fold and
+     * `SetTextContent.text` cannot say *"unset"*, so the **first** `setText` on a box created
+     * empty has no inverse — `UndoStack.commit` drops the entry and the press falls through to
+     * the create, deleting the box the user was typing in. So the editor overlay holds the tap's
+     * position, opens a field over nothing, and calls this once the first characters exist. A tap
+     * that types nothing creates no object at all, which is also the behaviour a user expects
+     * from tapping in the wrong place.
+     *
+     * [style] is non-null for SPEC §4.9.2's other trap in the register next door: `SetStyle`
+     * cannot express *"unset"* either, so a box created without one has no inverse for its first
+     * recolour and *"change the colour, press undo"* silently eats the press.
+     *
+     * @return the new object's id, so the field can address its later edits to it.
+     */
+    suspend fun insertTextBox(box: PageRect, text: String, style: ObjectStyle, format: ObjectFormat): ObjectId? =
+        onPage { session, page ->
+            saveLocked()
+            val before = session.page(page)
+            val id = ids.newObjectId()
+            session.apply(
+                page,
+                TextBoxEdit.create(
+                    id = id,
+                    text = text,
+                    widthPt = box.width,
+                    heightPt = box.height,
+                    transform = Matrix3.translate(box.left, box.top),
+                    z = SelectionEdit.keyAbove(topZ(before)),
+                    style = style,
+                    format = format,
+                    nextOpId = session::nextOpId,
+                    nextClock = session::nextClock,
+                ),
+            )
+            afterEdit(session, page, before)
+            id
+        }
+
+    /**
+     * ⭐ An inserted image: the bytes onto disk **first**, then the op.
+     *
+     * ⚠️ **The order is the whole safety argument.** An `ImageObject` names its bytes by string
+     * and the bytes are not in the op log (SPEC §4.9.4), so an op that reached the journal without
+     * them is a blank rectangle that nothing can repair — the asset family is refcount-free and
+     * *nothing anywhere is entitled to treat a missing entry as an error*. Staging the bytes
+     * before the op means a crash in the window leaves an unreferenced file, which costs disk and
+     * loses nothing.
+     *
+     * Then [materializeLocked], immediately. That is heavier than an autosave and it is what makes
+     * the two land together: `NoteStore.materialize` is the only thing that writes the `assets/`
+     * family into the bundle, so until it runs the picture exists only in the staging directory.
+     * Inserting a picture is a deliberate act a user performs and then often puts the tablet
+     * down — the same reasoning that made every structural edit report through
+     * [flushAndReport] rather than a bare flush.
+     *
+     * @param bytes already downscaled and re-encoded — see `InsertedImage`. Nothing below this
+     *   point looks at them again.
+     */
+    suspend fun insertImage(bytes: ByteArray, box: PageRect, style: ObjectStyle): ObjectId? = onPage { session, page ->
+        saveLocked()
+        val id = ids.newObjectId()
+        val asset = Bundle.imageAsset(id)
+        stageAsset(session.document.id, asset, bytes)
+        val before = session.page(page)
+        session.apply(
+            page,
+            ImageEdit.create(
+                id = id,
+                asset = asset,
+                widthPt = box.width,
+                heightPt = box.height,
+                transform = Matrix3.translate(box.left, box.top),
+                z = SelectionEdit.keyAbove(topZ(before)),
+                style = style,
+                format = ObjectFormat.Default,
+                nextOpId = session::nextOpId,
+                nextClock = session::nextClock,
+            ),
+        )
+        afterEdit(session, page, before)
+        materializeLocked()
+        id
+    }
+
+    /**
+     * ⭐ One insertion of an Element — fresh ids and fresh asset names, minted by [ElementLibrary].
+     *
+     * The library is a parameter rather than a constructor dependency because the editor is
+     * constructed in unit tests that have no interest in it, and because this is the only method
+     * that needs one. Its bytes are staged exactly as [insertImage]'s are, and for the same
+     * reason.
+     *
+     * @return how many objects landed, so the caller can say *"nothing to stamp"* rather than
+     *   flashing an empty acknowledgement.
+     */
+    suspend fun stampElement(elements: ElementLibrary, element: Element, at: PagePoint): Int = onPage { session, page ->
+        saveLocked()
+        val before = session.page(page)
+        val stamped = elements.stamp(
+            element = element,
+            at = at,
+            topZ = topZ(before),
+            newObjectId = ids::newObjectId,
+            nextOpId = session::nextOpId,
+            nextClock = session::nextClock,
+        )
+        if (stamped.ops.isEmpty()) return@onPage 0
+        for ((name, bytes) in stamped.assets) stageAsset(session.document.id, name, bytes)
+        session.apply(page, stamped.ops)
+        afterEdit(session, page, before)
+        if (stamped.assets.isNotEmpty()) materializeLocked()
+        stamped.ops.count { it is PageOp.AddObject }
+    } ?: 0
+
+    /**
+     * The words — `SetTextContent`, and never `SetFormat` (SPEC §4.9.2).
+     *
+     * Called on a debounce while typing and again when the field loses focus, so it is written to
+     * be idempotent: an unchanged string writes no op at all. Without that, every keystroke's
+     * debounce would land an identical register write in the journal, each one its own undo entry,
+     * and *"press undo"* after typing a word would appear to do nothing several times in a row.
+     */
+    fun updateText(id: ObjectId, text: String) {
+        withPage { session, page ->
+            saveLocked()
+            val before = session.page(page)
+            if (before.textOf(id) == text) return@withPage
+            session.apply(page, listOf(TextBoxEdit.setText(id, text, session::nextOpId, session::nextClock)))
+            afterEdit(session, page, before)
+        }
+    }
+
+    /**
+     * The presentation — `SetFormat`, and never `SetTextContent`.
+     *
+     * ⚠️ **[change] is a function of the current format, not a whole value.** `SetFormat` carries
+     * the object's *entire* record, so a caller that built one from the field the user changed
+     * would silently reset every other field on the same object — the register-resolves-whole
+     * problem one level inside the one the two registers exist to solve. Reading the live value
+     * here rather than in the UI also means the value is read under [serial], so a peer's format
+     * arriving mid-tap cannot be overwritten by a stale copy the toolbar was holding.
+     */
+    fun updateFormat(id: ObjectId, change: (ObjectFormat) -> ObjectFormat) {
+        withPage { session, page ->
+            saveLocked()
+            val before = session.page(page)
+            val next = change(ObjectFormat.decode(before.formatOf(id)))
+            if (next.encode() == before.formatOf(id)) return@withPage
+            session.apply(page, listOf(TextBoxEdit.setFormat(id, next, session::nextOpId, session::nextClock)))
+            afterEdit(session, page, before)
+        }
+    }
+
+    /**
+     * Colour and opacity — `SetStyle`, which SPEC §4.9.2 notes needed nothing new.
+     *
+     * [change] takes the current style for [updateFormat]'s reason, and because `SetStyle` carries
+     * a complete style: one shared value would make *"make this red"* also make it one width, the
+     * flattening `SelectionEdit.restyle`'s per-object `styleOf` exists to prevent.
+     */
+    fun updateStyle(id: ObjectId, change: (ObjectStyle) -> ObjectStyle) {
+        withPage { session, page ->
+            saveLocked()
+            val before = session.page(page)
+            val current = before.find(id)?.style ?: return@withPage
+            val next = change(current)
+            if (next == current) return@withPage
+            val obj = before.find(id) ?: return@withPage
+            session.apply(
+                page,
+                SelectionEdit.restyle(listOf(obj.selected), { next }, session::nextOpId, session::nextClock),
+            )
+            afterEdit(session, page, before)
+        }
+    }
+
+    /**
+     * ⭐ Rotate or flip — `SetTransform`, absolute, composed against the **live** matrix.
+     *
+     * ROADMAP M8c acceptance 2 is the flip, and SPEC §4.9.2 puts both here rather than in the
+     * format record: they are geometry, and geometry has one absolute home.
+     *
+     * ⚠️ The composition reads the object out of the fold *inside* [serial] rather than taking a
+     * matrix from the caller. `SelectionController` makes the same argument for a drag: composing
+     * `gesture × current` against a matrix the UI happened to be holding is how a peer's move,
+     * merged a frame earlier, gets silently undone by the next flip.
+     */
+    fun turnObject(id: ObjectId, degrees: Float = 0f, flipHorizontal: Boolean = false, flipVertical: Boolean = false) {
+        withPage { session, page ->
+            saveLocked()
+            val before = session.page(page)
+            val obj = before.find(id) ?: return@withPage
+            val extents = extentsOf(obj) ?: return@withPage
+            val (width, height) = extents
+            var matrix = obj.transform
+            if (degrees != 0f) matrix = ImageEdit.rotated(matrix, width, height, degrees)
+            if (flipHorizontal) matrix = ImageEdit.flipped(matrix, width, height, horizontal = true)
+            if (flipVertical) matrix = ImageEdit.flipped(matrix, width, height, horizontal = false)
+            if (matrix == obj.transform) return@withPage
+            // The **result**, not the gesture: `ImageEdit.flipped`/`rotated` already composed
+            // against the live matrix, so `SelectionEdit.transform` — which composes a gesture on
+            // the left — would apply the whole thing a second time.
+            session.apply(page, listOf(PageOp.SetTransform(session.nextOpId(), session.nextClock(), id, matrix)))
+            afterEdit(session, page, before)
+        }
+    }
+
+    /**
+     * An image's crop — one `SetFormat` carrying the object's whole format (SPEC §4.9.2).
+     *
+     * Null clears it. That is a *value* of the register rather than an absence, which is why it is
+     * expressible at all where "no style" is not.
+     */
+    fun setCrop(id: ObjectId, crop: ImageCrop?) {
+        updateFormat(id) { it.copy(crop = crop) }
+    }
+
+    /**
+     * ⭐ Every `assets/` entry this note can currently draw — the bundle's, plus anything staged.
+     *
+     * The staged half is not an optimisation: between [insertImage]'s write and the materialize
+     * that folds it into the bundle, the staging directory is the **only** place the bytes are,
+     * and a reader that looked only at the bundle would draw a blank rectangle for the picture the
+     * user just inserted. Staged wins a name clash, which cannot happen — an asset name embeds a
+     * UUIDv7 — but is the right way round if it ever did, because staged bytes are the newer.
+     *
+     * Reads the whole family rather than one entry: `BundleReader` resolves names through a
+     * central directory it has already parsed, and the caller caches by name (`PageAssetCache`),
+     * so this runs about once per note rather than once per image.
+     */
+    suspend fun assets(): Map<String, ByteArray> {
+        val id = session?.document?.id ?: return emptyMap()
+        val fromBundle = runCatching {
+            BundleReader.open(FileByteSource(fs, NoteLayout.bundle(id)))?.assets()
+        }.getOrNull().orEmpty()
+        return fromBundle + stagedAssets(id)
+    }
+
+    /**
+     * Flush, tell the library, bring the screen in line, publish state. The tail of every M8c edit.
+     *
+     * ⚠️ [flushAndReport] and **not** a bare `session.flush()`. That is the M6 lesson this file
+     * already carries in its own KDoc: `library.onSaved` is the only route to
+     * `thumbnails.invalidate` *and* `sync.noteChanged`, and `saveLocked`'s report is gated on
+     * `hasUnflushedWork` — which a bare flush has just cleared. An image inserted through a bare
+     * flush would reach the server only if the user later happened to draw a stroke.
+     *
+     * [reconcile] rather than [display], for SPEC §13.2 row 10's reason: `display` refits the
+     * camera and cancels the in-progress stroke, and inserting a text box is not a page change.
+     */
+    private suspend fun afterEdit(session: NoteSession, page: PageId, before: FoldedPage) {
+        flushAndReport(session)
+        reconcile(before, session.page(page))
+        publish()
+    }
+
+    /**
+     * [withPage] for an operation with an answer.
+     *
+     * `work.async(…).await()` rather than a bare suspend body, so the block runs in the editor's
+     * own scope and is cancelled with it — the contract [materializeInSession] and
+     * [renameInSession] document. Awaiting a cancelled `Deferred` throws into the caller rather
+     * than answering it, which is why the liveness check comes first.
+     */
+    private suspend fun <T> onPage(block: suspend (NoteSession, PageId) -> T): T? {
+        if (!work.isActive) return null
+        return work.async {
+            serial.withLock {
+                val session = this@NoteEditor.session ?: return@withLock null
+                val page = currentPage ?: return@withLock null
+                block(session, page)
+            }
+        }.await()
+    }
+
+    /** The highest z key on the page, so a new object lands above everything. Null for an empty page. */
+    private fun topZ(page: FoldedPage): FractionalKey? = page.objects.maxOfOrNull { it.z }
+
+    private fun extentsOf(obj: InkObject): Pair<Float, Float>? = when (obj) {
+        is ImageObject -> obj.widthPt to obj.heightPt
+        is TextBoxObject -> obj.widthPt to obj.heightPt
+        is ShapeObject -> obj.widthPt to obj.heightPt
+        else -> null
+    }
+
+    // --- The asset staging directory ---------------------------------------
+
+    /**
+     * ⭐ Where an image's bytes wait for the next materialize.
+     *
+     * ⚠️ **`:core:storage` has no "add an asset" door**, and this is `:app`'s stand-in for one.
+     * `NoteStore.materialize` takes the `assets/` family from the bundle's own reader plus
+     * whatever a merge carried in, so the only way for a *new* asset to enter is to be handed to
+     * that call — which happens once per materialize, not once per insert. A directory beside the
+     * journal makes the gap durable: everything in it is unioned into the next materialize and
+     * deleted only once those bytes are in the bundle.
+     *
+     * Inside `notes/<id>/` deliberately, unlike `recordings/`. An asset belongs to its note the
+     * way the journal does: trashing the note should take it, duplicating the note should copy it,
+     * and restoring the note should bring it back. A recording is the opposite case — it is the
+     * one thing in the app that cannot be re-made — and that is why it lives outside.
+     */
+    private fun pendingAssetsDir(id: DocumentId) = "${NoteLayout.noteDir(id)}/$PENDING_ASSETS_DIR"
+
+    private suspend fun stageAsset(id: DocumentId, name: String, bytes: ByteArray) {
+        fs.writeBytesAtomically("${pendingAssetsDir(id)}/${name.removePrefix(Bundle.ASSETS_DIR)}", bytes)
+    }
+
+    private suspend fun stagedAssets(id: DocumentId): Map<String, ByteArray> {
+        val dir = pendingAssetsDir(id)
+        val names = runCatching { fs.list(dir) }.getOrNull().orEmpty()
+        if (names.isEmpty()) return emptyMap()
+        return names.mapNotNull { name ->
+            val path = "$dir/$name"
+            // `exists` first, never a bare `readBytes`: it throws rather than answering empty
+            // (M12), and a throw here would take the whole materialize — and so the note's next
+            // save — with it.
+            if (fs.exists(path)) "${Bundle.ASSETS_DIR}$name" to fs.readBytes(path) else null
+        }.toMap()
+    }
+
+    /**
+     * Materialize with the staged assets folded in, then clear the staging directory.
+     *
+     * ⚠️ **Cleared strictly after**, and only after: `NoteStore.materialize` writes the bundle
+     * atomically and returns having re-opened it, so at that point the bytes are in two places and
+     * deleting one is safe. Clearing first would put a crash between the delete and the write, and
+     * the picture would be gone from a note that still names it.
+     *
+     * Re-supplying a name already in the bundle is harmless — `NoteStore.materialize` unions the
+     * family by name and does not compare bytes (SPEC §4.9.4) — so a failed delete costs a repeat,
+     * never a loss.
+     */
+    private suspend fun materializeWithAssets(
+        session: NoteSession,
+        carried: Map<String, ByteArray> = emptyMap(),
+        carriedManifest: Map<String, JsonElement> = emptyMap(),
+    ) {
+        val id = session.document.id
+        val staged = stagedAssets(id)
+        session.materialize(carried + staged, carriedManifest)
+        if (staged.isNotEmpty()) runCatching { fs.delete(pendingAssetsDir(id)) }
+    }
+
     private fun currentPageIndex(): Int {
         val session = this.session ?: return 0
         return session.document.livePages.indexOfFirst { it.id == currentPage }.coerceAtLeast(0)
@@ -1188,6 +1566,9 @@ class NoteEditor(
 
         /** Text content and format — see [NoteEditor.changedRecords]. */
         const val RECORD_COUNT = 2
+
+        /** ⭐ M8c — image bytes waiting for the next materialize. See [NoteEditor.pendingAssetsDir]. */
+        const val PENDING_ASSETS_DIR = "pending-assets"
     }
 }
 

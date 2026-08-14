@@ -1,5 +1,8 @@
 package dev.inkstone.app.ink
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -19,8 +22,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import dev.inkstone.android.ink.InkSurfaceView
-import dev.inkstone.android.ink.InkTool
 import dev.inkstone.android.ink.SyntheticInk
+import dev.inkstone.app.note.CameraCapture
 import dev.inkstone.app.note.NoteEditor
 import dev.inkstone.app.note.NoteEditorState
 import dev.inkstone.app.note.NoteEditorViewModel
@@ -54,6 +57,7 @@ import kotlinx.coroutines.withContext
 @Composable
 fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltViewModel()) {
     val ui = remember { InkUiState() }
+    val objects = remember { ObjectToolState() }
     val scope = rememberCoroutineScope()
     val note by editor.state.collectAsState()
     val recording by editor.recording.collectAsState()
@@ -61,8 +65,10 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     var pageOverviewOpen by remember { mutableStateOf(false) }
     var exporting by remember { mutableStateOf(false) }
     val context = LocalContext.current
+    val objectActions = rememberObjectActions(ui, objects, editor, surface)
 
     SurfaceEffects(ui = ui, note = note, surface = surface)
+    ObjectEffects(ui, objects, note, surface, editor, objectActions)
 
     DisposableEffect(surface) {
         surface?.let { editor.onSurfaceAttached(it.asNoteSurface(scope, editor)) }
@@ -72,10 +78,17 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     Box(modifier = modifier.fillMaxSize()) {
         InkSurface(ui = ui, editor = editor, onCreated = { surface = it })
 
+        // ⭐ M8c — between the ink surface and the toolbar, deliberately. Above the surface so a
+        // tap with the Text tool reaches it; below the toolbar so the format bar is still pressable
+        // while a field has focus.
+        ObjectLayers(ui = ui, objects = objects, editor = editor, actions = objectActions)
+
         InkToolbar(
             state = ui,
+            objects = objects,
             modifier = Modifier.align(Alignment.TopStart).padding(12.dp),
             actions = inkToolbarActions(surface, editor, ui, scope),
+            objectActions = objectActions,
         )
 
         // ⭐ M12 §10 — top-right, away from the pen tools, because it is not one. Unmistakable
@@ -86,25 +99,14 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
             modifier = Modifier.align(Alignment.TopEnd).padding(12.dp),
         )
 
+        // ⚠️ One `exporting` flag for **both** exports, not one each. They copy into the same share
+        // cache directory and each sweeps it before writing, so two running at once would have the
+        // second delete the first's files out from under a chooser the user already has open.
+        val exports = Exports(exporting, { exporting = it }, scope, context, editor)
         PageBar(
             state = note,
             modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp),
-            actions = pageBarActions(
-                editor = editor,
-                note = note,
-                onShowPages = { pageOverviewOpen = true },
-                // ⚠️ One `exporting` flag for **both** exports, not one each. They copy into the
-                // same share cache directory and each sweeps it before writing, so two running at
-                // once would have the second delete the first's files out from under a chooser the
-                // user already has open.
-                exports = Exports(
-                    busy = exporting,
-                    onBusy = { exporting = it },
-                    scope = scope,
-                    context = context,
-                    editor = editor,
-                ),
-            ),
+            actions = pageBarActions(editor, note, { pageOverviewOpen = true }, exports),
             exporting = exporting,
         )
     }
@@ -119,6 +121,176 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
         )
     }
 }
+
+/**
+ * ⭐ M8c — the effects that keep the object layers in step with the note.
+ *
+ * Beside [SurfaceEffects] and for the same reason, and each is a bug that would otherwise be
+ * silent:
+ *
+ * 1. **The asset cache has to be refreshed and handed over**, or every image on the page draws the
+ *    missing-asset placeholder. A cache that is correct and never reaches the surface is M6's
+ *    inert-feature shape exactly (`PageAssets`).
+ * 2. **Turning a page, or picking another tool, commits and then drops everything transient.** The
+ *    commit is the data-loss half — a user who types and turns the page has left before the
+ *    debounce fired. The drop is the honesty half: crop handles drawn over page 2 for an image on
+ *    page 1 are chrome that lies.
+ */
+@Composable
+private fun ObjectEffects(
+    ui: InkUiState,
+    objects: ObjectToolState,
+    note: NoteEditorState,
+    surface: InkSurfaceView?,
+    editor: NoteEditorViewModel,
+    actions: ObjectActions,
+) {
+    // Keyed on the revision as well as the page: an image merged from a peer arrives as a revision
+    // bump, and without that key its bytes would sit in the bundle undecoded until the next page
+    // turn (SPEC §13.2 row 10 — the peer's edit has to be visible *now*).
+    LaunchedEffect(surface, note.pageIndex, note.localRev) {
+        val view = surface ?: return@LaunchedEffect
+        if (editor.assetCache.refresh()) view.setPageAssets(editor.assetCache)
+    }
+    LaunchedEffect(surface) { surface?.setPageAssets(editor.assetCache) }
+
+    // ⚠️ **Commit, then reset — in that order, and keyed on both.** Turning a page or picking
+    // another tool is a user leaving a text box, and the debounce has not fired yet: without the
+    // commit the tail of what they typed is in no register and no journal, which is the same data
+    // loss the field's focus-loss handler exists to prevent by a different route. `updateText` is
+    // idempotent, so the two firing together costs nothing. And the reset has to happen or crop
+    // handles stay drawn over a page they do not belong to.
+    LaunchedEffect(note.pageIndex, ui.tool) {
+        val editing = objects.editing ?: return@LaunchedEffect
+        actions.onTextChanged(editing.id, objects.draft)
+        objects.reset()
+    }
+}
+
+/**
+ * ⭐ M8c — what the object toolbars and the overlay actually call.
+ *
+ * A `@Composable` because two of the actions are activity results — the photo picker and the
+ * camera — and a launcher can only be remembered inside composition. The rest are one line each
+ * onto [NoteEditorViewModel], which is the point: every M8c edit goes through the editor's lock
+ * rather than through the ink surface, because none of them is on the ink path.
+ */
+@Composable
+private fun rememberObjectActions(
+    ui: InkUiState,
+    objects: ObjectToolState,
+    editor: NoteEditorViewModel,
+    surface: InkSurfaceView?,
+): ObjectActions {
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    var cameraTarget by remember { mutableStateOf<android.net.Uri?>(null) }
+
+    val insert: (android.net.Uri?) -> Unit = { uri ->
+        val view = surface
+        if (uri != null && view != null) {
+            scope.launch { insertPicture(editor, uri, ui.camera, view) }
+        }
+    }
+
+    val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { insert(it) }
+    val takePhoto = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { taken ->
+        if (taken) insert(cameraTarget)
+    }
+
+    return ObjectActions(
+        // ⚠️ A null id means the box has not been created yet — placing and typing are one gesture
+        // (`TextBoxEdit.create`), so the *first* commit with characters in it is what creates the
+        // object, and a tap that types nothing leaves nothing behind.
+        onTextChanged = { id, text -> scope.launch { commitText(editor, objects, id, text) } },
+        // A format change before the box exists is kept on screen only; it rides into
+        // `TextBoxEdit.create` with the first words, as one gesture and one undo entry.
+        onFormatChanged = { id, change -> id?.let { editor.updateFormat(it, change) } },
+        onColourChanged = { id, argb -> id?.let { editor.recolour(it, argb) } },
+        onInsertImage = { source ->
+            when (source) {
+                ImageSource.GALLERY ->
+                    pickImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+
+                ImageSource.CAMERA -> {
+                    val target = CameraCapture.target(context)
+                    cameraTarget = target
+                    if (target == null) editor.report(CAMERA_FAILED) else takePhoto.launch(target)
+                }
+            }
+        },
+        onTurn = { id, degrees, flipH, flipV -> editor.turnObject(id, degrees, flipH, flipV) },
+        onCrop = { id, crop -> editor.setCrop(id, crop) },
+        // ⚠️ Through the surface's own ruler, never through the mirror in `InkUiState`. The edge,
+        // its position and the projection matrix that snaps ink to it all live in
+        // `RulerController`; writing the mirror alone would draw a ruler here that guided nothing.
+        onRulerEnabled = { on -> surface?.ruler?.enabled = on },
+        onRulerAngle = { degrees -> surface?.ruler?.angleDegrees = degrees },
+        onSaveElement = { name, collection ->
+            val area = objects.capturedArea
+            objects.capturedArea = null
+            if (area != null) {
+                scope.launch {
+                    val saved = editor.saveElement(name, collection, area)
+                    editor.report(if (saved == null) NOTHING_TO_SAVE else "Saved “${saved.name}” to Elements")
+                    objects.elementsOpen = true
+                }
+            }
+        },
+    )
+}
+
+/**
+ * Decode, downscale, insert, and say what it cost.
+ *
+ * The byte numbers are said out loud once, on purpose. *"Downscaled at insert time"* is a claim
+ * about **sizes**, and a claim about sizes with no measurement behind it is how a 4 MB photograph
+ * ends up inside a note's bundle, inside the published PDF, uploaded on every sync, forever.
+ */
+private suspend fun insertPicture(
+    editor: NoteEditorViewModel,
+    uri: android.net.Uri,
+    camera: dev.inkstone.core.model.Camera,
+    view: InkSurfaceView,
+) {
+    val page = view.pageSize
+    val report = editor.insertImage(uri, page, visiblePage(camera, view.width, view.height, page))
+    editor.report(
+        report?.let {
+            "Picture added — ${it.sourceBytes / KB} kB in, ${it.storedBytes / KB} kB stored " +
+                "at ${it.widthPx}×${it.heightPx}"
+        } ?: IMAGE_FAILED,
+    )
+}
+
+/**
+ * The words, whether or not the box exists yet.
+ *
+ * ⚠️ A null [id] is a box that has only been *placed* — `TextBoxEdit.create`'s KDoc requires the
+ * placement and the first words to be one gesture, because the first `SetTextContent` on an empty
+ * box has no inverse and *"type a word, press undo"* would delete the box instead. So the first
+ * commit with characters in it creates the object, and a placement that never gets any leaves
+ * nothing behind.
+ */
+private suspend fun commitText(editor: NoteEditorViewModel, objects: ObjectToolState, id: ObjectId?, text: String) {
+    when {
+        id != null -> editor.updateText(id, text)
+
+        text.isBlank() -> Unit
+
+        else -> {
+            val bounds = objects.editing?.bounds ?: return
+            editor.insertTextBox(bounds, text, objects.style, objects.format)?.let(objects::attach)
+        }
+    }
+}
+
+private const val KB = 1024
+
+private const val IMAGE_FAILED = "That file could not be read as a picture."
+private const val CAMERA_FAILED = "There was nowhere to save the photo. Free some space and try again."
+private const val NOTHING_TO_SAVE =
+    "Nothing in that box could be saved yet — Elements hold pictures, text and shapes, not handwriting."
 
 /** The M1 toolbar's wiring — kept beside [pageBarActions] rather than inline, for the same reason. */
 private fun inkToolbarActions(
@@ -273,12 +445,27 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
         modifier = Modifier.fillMaxSize(),
         factory = { context ->
             InkSurfaceView(context).apply {
-                onCameraChanged = { ui.zoomPercent = zoomPercent() }
+                // ⭐ M8c — the camera is mirrored into the UI state as well as the zoom readout,
+                // because the Compose overlay lays a text field out at a page-space box and turns
+                // a tap back into page space. A `View`'s field is not Compose state, so without
+                // this push nothing would invalidate the overlay on a pan and the field would
+                // stay where the page used to be.
+                onCameraChanged = { camera ->
+                    ui.zoomPercent = zoomPercent()
+                    ui.camera = camera
+                }
                 onStrokeCountChanged = { ui.strokeCount = it }
                 onHistoryChanged = { ui.strokeCount = strokeCount }
                 onUndoRequested = { editor.undo() }
                 onRedoRequested = { editor.redo() }
-                onEraserAutoReleased = { ui.tool = InkTool.PEN }
+                onEraserAutoReleased = { ui.tool = EditorTool.PEN }
+                // ⭐ M8c — the ruler's own state, pushed back so the angle field follows a finger
+                // drag instead of going stale the moment anybody touches the edge itself. The
+                // surface owns the edge; `InkUiState` only mirrors it (see `InkUiState.rulerEnabled`).
+                onRulerChanged = {
+                    ui.rulerEnabled = ruler.enabled
+                    ui.rulerAngleDegrees = ruler.angleDegrees
+                }
                 // ⭐ M8a — what the selection action row is shown and enabled by.
                 onSelectionChanged = { count ->
                     ui.selectionSize = count
@@ -310,7 +497,11 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
             // ⚠️ M8a — the line that makes the Select chip do anything. A tool the toolbar
             // knows about and this lambda does not push is a chip that highlights and changes
             // nothing, which is CLAUDE.md's definition-of-done #6 in one missing assignment.
-            view.tool = ui.tool
+            //
+            // ⭐ M8c — `.ink`, because the tool is now `EditorTool` and three of its values are
+            // handled by the Compose overlay rather than by the surface. See that enum on why the
+            // fall-through is SELECT and not PEN.
+            view.tool = ui.tool.ink
             view.eraseMode = ui.eraseMode
             view.predictionEnabled = ui.predictionEnabled
             view.inputModel = ui.inputModel

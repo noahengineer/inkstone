@@ -17,4 +17,18 @@
     <cache-path
         name="shared-pdfs"
         path="share/" />
+    <!--
+      M8c — where the camera app writes the photograph it just took.
+
+      `ActivityResultContracts.TakePicture` hands the *camera* a Uri to write into, so this grant
+      is the only reason "insert an image from the camera" can work at all. A separate sub-path
+      from share/, because NoteSharing sweeps its own directory on every export and a capture in
+      flight must not be deleted out from under the camera app.
+
+      Nothing here is durable: the picture that matters is the downscaled WebP that reached the
+      note's bundle (InsertedImage), and the original is swept on the next capture.
+    -->
+    <cache-path
+        name="camera-capture"
+        path="camera/" />
 </paths>

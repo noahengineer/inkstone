@@ -197,16 +197,47 @@ internal fun copiedObjectOps(
     newObjectId: () -> ObjectId,
     nextOpId: () -> String,
     nextClock: () -> LamportClock,
+): List<PageOp> = copiedObjectOps(
+    objects = folded.objects,
+    texts = folded.texts,
+    formats = folded.formats,
+    newObjectId = newObjectId,
+    nextOpId = nextOpId,
+    nextClock = nextClock,
+)
+
+/**
+ * [copiedObjectOps] over the three things it actually reads, for the one copier whose source is
+ * **not** a page.
+ *
+ * ⚠️ Added in M8c for [ElementLibrary.stamp], and the split is deliberate rather than tidying. An
+ * Element is a *template* — objects and their two registers, with no page, no size, no background
+ * and no clock — so the alternative was fabricating a [FoldedPage] around it with an invented
+ * [dev.inkstone.core.model.PageId]. A page identity that exists only to satisfy a parameter is a
+ * page identity that eventually gets written somewhere, and CLAUDE.md's rule about identity is that
+ * it is never derived and never invented. Taking the three collections instead makes the fabricated
+ * page unnecessary, and — the part that matters — keeps the **one** re-identification pass shared,
+ * so the next register added is added once. A fourth hand-written copier is exactly what this
+ * function's KDoc above is about.
+ */
+@Suppress("LongParameterList") // Three collections and three suppliers; a holder would hide which.
+internal fun copiedObjectOps(
+    objects: List<InkObject>,
+    texts: Map<ObjectId, String>,
+    formats: Map<ObjectId, String>,
+    newObjectId: () -> ObjectId,
+    nextOpId: () -> String,
+    nextClock: () -> LamportClock,
 ): List<PageOp> {
     // The whole map first: a connector may be copied before the shape it points at.
-    val remap = folded.objects.associate { it.id to newObjectId() }
-    val ops = ArrayList<PageOp>(folded.objects.size)
-    for (obj in folded.objects) {
+    val remap = objects.associate { it.id to newObjectId() }
+    val ops = ArrayList<PageOp>(objects.size)
+    for (obj in objects) {
         val id = remap.getValue(obj.id)
         ops += PageOp.AddObject(nextOpId(), nextClock(), obj.withRegisters().withCopiedId(id))
     }
-    for (obj in folded.objects) {
-        val text = folded.textOf(obj.id) ?: continue
+    for (obj in objects) {
+        val text = texts[obj.id] ?: continue
         val id = remap.getValue(obj.id)
         // A record is re-targeted; anything else — a text box's text, or a register this build
         // cannot parse — is carried verbatim. Guessing at an unparseable one is how a stranger's
@@ -222,8 +253,8 @@ internal fun copiedObjectOps(
     // Carried verbatim with no re-targeting: an `ObjectFormat` names no other object. If one ever
     // does, it needs a `remapTargets` of its own here — and the test that would catch forgetting
     // is `duplicate a page, check the copy is independent`, not a codec round-trip.
-    for (obj in folded.objects) {
-        val format = folded.formatOf(obj.id) ?: continue
+    for (obj in objects) {
+        val format = formats[obj.id] ?: continue
         ops += PageOp.SetFormat(nextOpId(), nextClock(), remap.getValue(obj.id), format)
     }
     return ops

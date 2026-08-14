@@ -6,6 +6,8 @@ import dev.inkstone.core.model.Alignment
 import dev.inkstone.core.model.AlignmentGuides
 import dev.inkstone.core.model.Camera
 import dev.inkstone.core.model.ConnectorRoute
+import dev.inkstone.core.model.FractionalKey
+import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.Lasso
 import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectId
@@ -20,6 +22,7 @@ import dev.inkstone.core.model.SelectionGesture
 import dev.inkstone.core.model.ShapeEdit
 import dev.inkstone.core.model.ShapeGeometry
 import dev.inkstone.core.model.ShapeRecord
+import dev.inkstone.core.model.TextBoxObject
 import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.max
@@ -543,13 +546,33 @@ internal class SelectionController(
      */
     private fun editRecords(change: (DryShape, ShapeRecord) -> ShapeRecord?) {
         val recorder = store.recorder ?: return
-        val ops = selection.mapNotNull { id ->
+        val edits = selection.mapNotNull { id ->
             val shape = store.shapeOf(id) ?: return@mapNotNull null
             val next = change(shape, shape.record) ?: return@mapNotNull null
             if (next == shape.record) return@mapNotNull null
-            ShapeEdit.writeRecord(id, next, recorder::newOpId, recorder::newClock)
+            shape to next
         }
-        applyAsGesture(ops)
+        // ⭐ The record register's own first-`SetStyle` trap (SPEC §4.2), and the same cure
+        // [restyle] uses. The inverse of a `SetTextContent` is the register's previous value,
+        // and for a plain shape the register is *unset* — the op cannot say "unset",
+        // `Undo.inverseOf` answers null, and `UndoStack.commit` drops the gesture. So "fill a
+        // fresh box, press undo" popped the gesture BEFORE the fill: the box vanished, filled.
+        // The baseline writes the record the shape already shows (the default), which renders
+        // identically, produces no undo entry of its own (its own inverse is null, so `commit`
+        // drops it), and gives the change an inverse to restore. `isDefault` covers "unset"
+        // and, harmlessly, "explicitly default" — the baseline is then the value already there.
+        applyAsGesture(
+            edits
+                .filter { (shape, _) -> shape.record.isDefault }
+                .map { (shape, _) ->
+                    ShapeEdit.writeRecord(shape.id, shape.record, recorder::newOpId, recorder::newClock)
+                },
+        )
+        applyAsGesture(
+            edits.map { (shape, next) ->
+                ShapeEdit.writeRecord(shape.id, next, recorder::newOpId, recorder::newClock)
+            },
+        )
     }
 
     /**
@@ -623,7 +646,7 @@ internal class SelectionController(
     override fun duplicate() {
         val recorder = store.recorder ?: return
         if (selection.isEmpty()) return
-        val sources = selection.mapNotNull { store.objectOf(it) }.filter { it !is DryPlaceholder }
+        val sources = selection.mapNotNull { store.objectOf(it) }
         if (sources.isEmpty()) return
         val keys = store.allocateTopZ(sources.size)
         val offset = SelectionGesture.move(DUPLICATE_OFFSET_PT, DUPLICATE_OFFSET_PT)
@@ -656,12 +679,80 @@ internal class SelectionController(
                     record = true,
                 )
 
-                // Filtered above, and unselectable regardless — see [DryPlaceholder]'s KDoc.
-                is DryPlaceholder -> Unit
+                is DryBox -> store.applyOps(copyOps(source, id, transform, keys[index]), brushes, record = true)
             }
         }
         store.endEdit()
         select(sources.map { ids.getValue(it.id) })
+    }
+
+    /**
+     * ⭐ M8c — a text box or an image copied, as ops.
+     *
+     * Third construction path, and it is the *cheap* one: neither payload needs an encoder (a
+     * stroke's does) and neither is a shape (whose whole gesture `ShapeEdit.duplicate` builds in
+     * `:core:model`). What has to be right is what travels, and it is three things:
+     *
+     * - **The payload**, at the copy's id, transform and z key. ⚠️ With a **non-null style** — SPEC
+     *   §4.9.2's rule, applied here because this is a place a text box gets *created*: seed it null
+     *   and the copy's first recolour has no inverse and *"change the colour, press undo"* silently
+     *   eats the press. [DryBox.effectiveStyle] is what is on the screen, so the copy looks like the
+     *   original whether or not the original's register was ever written.
+     * - **The format register**, which has no payload home at all — it is the one thing that would
+     *   be silently lost, and losing it means a duplicated caption comes back in the default font.
+     *   Exactly the failure `copiedObjectOps` exists to prevent for a shape's record.
+     * - **The erased region**, absolutely, so a half-erased picture copies half-erased. Anything
+     *   else would make "duplicate" a way to recover erased content, which is a surprise either way.
+     *
+     * ⚠️ **An image's copy names the original's asset and copies no bytes.** SPEC §4.9.4: asset
+     * names are UUIDs, lifetime is refcount-free, and *"a duplicated note and its original can name
+     * one entry"*. Within one note there is nothing to copy and nothing may ever delete an entry on
+     * the grounds that no object in this note names it.
+     */
+    private fun copyOps(source: DryBox, id: ObjectId, transform: Matrix3, z: FractionalKey): List<PageOp> {
+        val recorder = store.recorder ?: return emptyList()
+        val style = source.effectiveStyle()
+        val erased = source.erased.toAbsolute()
+        val ops = ArrayList<PageOp>(COPY_OPS)
+        when (source) {
+            is DryTextBox -> ops += PageOp.AddObject(
+                recorder.newOpId(),
+                recorder.newClock(),
+                TextBoxObject(
+                    id = id,
+                    text = source.content.orEmpty(),
+                    widthPt = source.widthPt,
+                    heightPt = source.heightPt,
+                    transform = transform,
+                    style = style,
+                    z = z,
+                    erased = erased,
+                ),
+            )
+
+            is DryImage -> {
+                ops += PageOp.AddObject(
+                    recorder.newOpId(),
+                    recorder.newClock(),
+                    ImageObject(
+                        id = id,
+                        asset = source.asset,
+                        widthPt = source.widthPt,
+                        heightPt = source.heightPt,
+                        transform = transform,
+                        style = style,
+                        z = z,
+                        erased = erased,
+                    ),
+                )
+                // A text box's words ride on its payload; an image's content register has no home
+                // there (SPEC §4.9.2's table leaves it free), so a peer's write to it travels as
+                // its own op or is dropped.
+                source.content?.let { ops += PageOp.SetTextContent(recorder.newOpId(), recorder.newClock(), id, it) }
+            }
+        }
+        source.format?.let { ops += PageOp.SetFormat(recorder.newOpId(), recorder.newClock(), id, it) }
+        return ops
     }
 
     // -----------------------------------------------------------------------
@@ -695,6 +786,9 @@ internal class SelectionController(
         /** Enough that the copy is obviously not the original, small enough to stay on screen. */
         const val DUPLICATE_OFFSET_PT = 18f
 
+        /** `AddObject`, and at most one op per record register — see [SelectionController.copyOps]. */
+        const val COPY_OPS = 3
+
         const val MIN_SIZE_PT = 8f
         const val MIN_SIZE_FRACTION = 0.05f
 
@@ -719,14 +813,23 @@ internal fun DryStroke.capturedStyle(): ObjectStyle =
  * The style an object shows on screen right now — what a first restyle's baseline writes, so
  * that undoing the restyle puts back what was actually painted. A stroke's is its capture-time
  * style, readable only in this module (off the decoded brush); a shape's is the painter's own
- * fallback chain ([DryShape.effectiveStyle]). Null only for a kind that cannot be selected at
- * all ([DryPlaceholder] answers false to every geometric predicate), so a null never reaches
- * an op.
+ * fallback chain ([DryShape.effectiveStyle]).
+ *
+ * ⭐ **M8c: never null.** It was null for the one kind that could not be selected at all, and there
+ * is no such kind any more — every [DryObject] paints itself and therefore answers the geometric
+ * predicates. The nullable return is kept because a *future* kind might arrive before it can be
+ * styled, and `restyle`'s `mapNotNull` is what would then skip it rather than write a black
+ * baseline over it.
  */
 internal fun DryObject.baselineStyle(): ObjectStyle? = when (this) {
     is DryStroke -> capturedStyle()
+
     is DryShape -> effectiveStyle()
-    is DryPlaceholder -> null
+
+    // ⭐ M8c. SPEC §4.9.2 requires a text box and an image to be *created* with a non-null style
+    // precisely so this is never needed — but this module cannot make a peer obey that, and a
+    // baseline of "what is on the screen" is the same fallback chain the painter uses.
+    is DryBox -> effectiveStyle()
 }
 
 /** Move a box without changing its size. */

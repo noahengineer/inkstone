@@ -60,6 +60,15 @@ public class InkPageThumbnailRenderer(
     private val brushes: InkBrushFactory,
     private val sourcePages: ThumbnailSourcePages = ThumbnailSourcePages { _, _, _ -> null },
     private val dispatcher: CoroutineDispatcher = Dispatchers.Default,
+    /**
+     * ⭐ M8c — an inserted image's pixels (SPEC §4.9.4). The default answers null for everything,
+     * so a caller with no asset cache gets the missing-asset placeholder rather than a picture that
+     * silently is not there.
+     *
+     * ⚠️ **Called on [dispatcher], not on the main thread.** See [PageAssets] on what that requires
+     * of an implementation.
+     */
+    private val assets: PageAssets = PageAssets { null },
 ) : PageThumbnailRenderer {
 
     override suspend fun render(noteId: DocumentId, page: FoldedPage, widthPx: Int): ByteArray? =
@@ -81,6 +90,7 @@ public class InkPageThumbnailRenderer(
                 canvas.concat(pageToThumbnail)
 
                 val painter = PagePainter()
+                painter.assets = assets
                 painter.paintBackground(canvas, size, page.background, sourcePage)
                 // No culling: the whole page is "on screen" in a thumbnail by definition, and a
                 // cull rect would only add a compare per stroke.
@@ -109,14 +119,29 @@ public class InkPageThumbnailRenderer(
      *
      * The ops are synthetic and never leave this function. The store has no recorder, so
      * nothing here can reach the journal.
+     *
+     * ⚠️ **The `AddObject`s alone are not the page**, and this was wrong here for a milestone.
+     * `SetTextContent` and `SetFormat` fold into **side tables**, not onto the payload (SPEC §4.8.2,
+     * §4.9.2), so a store built from `page.objects` holds every shape unfilled, square-cornered and
+     * unattached, and — since M8c — every text box in the default font. `InkStrokeOutliner` already
+     * pushed the content register for exactly this reason and its comment says why; the thumbnail
+     * did not, so the library's picture of a page disagreed with the editor's about precisely the
+     * properties M8b added. Both registers are pushed now, after the adds so each lands on an
+     * object that exists.
      */
     private fun toStrokeStore(page: FoldedPage): StrokeStore {
         val store = StrokeStore()
-        store.applyOps(
-            ops = page.objects.map { PageOp.AddObject(opId = "", clock = THUMBNAIL_CLOCK, obj = it) },
-            brushes = brushes,
-            record = false,
-        )
+        val ops = ArrayList<PageOp>(page.objects.size)
+        page.objects.mapTo(ops) { PageOp.AddObject(opId = "", clock = THUMBNAIL_CLOCK, obj = it) }
+        for (obj in page.objects) {
+            page.textOf(obj.id)?.let {
+                ops += PageOp.SetTextContent(opId = "", clock = THUMBNAIL_CLOCK, target = obj.id, text = it)
+            }
+            page.formatOf(obj.id)?.let {
+                ops += PageOp.SetFormat(opId = "", clock = THUMBNAIL_CLOCK, target = obj.id, record = it)
+            }
+        }
+        store.applyOps(ops = ops, brushes = brushes, record = false)
         return store
     }
 

@@ -414,13 +414,25 @@ what M8b does *not* cover, and what a later milestone inherits.
    the obvious test passed without it.)
 3. ~~Fill, corner radius and route pickers~~ — **done**, as a second selection row shown only when
    the selection holds a shape.
+   ⚠️ **And then fixed once:** the first fill or corner-radius on a *plain* shape had no undo
+   inverse — the record register's own first-`SetStyle` trap. `SetTextContent` cannot say
+   "unset", so `Undo.inverseOf` answered null, `UndoStack.commit` dropped the gesture, and
+   *"fill a box, press undo"* popped the gesture before the fill: **the box vanished, filled.**
+   `editRecords` now writes the same kind of baseline `restyle` writes — the default record,
+   which renders identically and gives the change an inverse. Covered three ways: the default
+   record's wire round-trip (`ConnectorTest` — the property the baseline stands on), the
+   two-gesture emission (`SelectionControllerShapeTest`, on the emulator), and connectors were
+   never affected (their register is set at creation).
 4. ~~The PDF~~ — **done.** Shapes publish as `/Ink` annotations with the fill's alpha in an
    `/ExtGState`; §4's last question has the numbers, read out of a real published file with Python.
-5. ~~A merge-matrix row~~ — **done**, rows 4b and 4c. Still **not** covered: two devices writing a
-   **record** concurrently. SPEC §4.8.2 states the cost — one register holds four properties and
-   LWW resolves whole, so one edit is lost — and that is argued rather than demonstrated. A row
-   asserting both devices land on the same *whole* record is worth having before anyone leans on
-   the argument.
+5. ~~A merge-matrix row~~ — **done**, rows 4b and 4c. ~~Still **not** covered: two devices writing
+   a **record** concurrently.~~ **Covered now — `MergeMatrixRecordTest`, five rows through the
+   real pipe:** 4d (two concurrent record writes resolve to one *whole* input on both devices —
+   SPEC §4.8.2's stated cost, demonstrated, with both losing ops kept in the log per rule 1),
+   4e (record and transform are independent registers, both survive), 2b (a concurrent delete
+   beats a record write, no ghost, tombstone on both), and 4f/4g (the same two claims for
+   `SetFormat` — LWW whole, independent of the record). The `SetFormat` op is hand-built in the
+   fixture and says so in its KDoc: M8c's tools do not exist, so no gesture-level writer does.
 6. **Selecting a shape** is done for tap, move, delete, fill, corners and duplicate. The **lasso**
    and the **resize/rotate handles** have not been driven against a shape on a device. The
    arithmetic is shared with strokes and the hit-test is shared with the eraser, so the risk is

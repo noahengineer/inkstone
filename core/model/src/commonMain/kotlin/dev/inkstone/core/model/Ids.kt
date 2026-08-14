@@ -35,3 +35,19 @@ public value class FolderId(public val value: String)
 /** Strokes, images, text boxes, shapes — anything an op can target. */
 @JvmInline
 public value class ObjectId(public val value: String)
+
+/**
+ * A saved Element — a reusable stamp (SPEC §4.9.4), added in M8c.
+ *
+ * ⚠️ **Not an [ObjectId], and the distance between the two is the whole design.** An Element is a
+ * *template*: it holds payloads and relative geometry, and every insertion mints **fresh**
+ * [ObjectId]s and a fresh asset name for each picture in it. Reusing the saved objects' ids
+ * instead — replaying stored `AddObject` ops — would put two objects with one identity into a
+ * grow-only union, where `PageFolder`'s first-write-wins payload rule gives you **one** object
+ * carrying the first stamp's payload at the second stamp's transform. The first stamp visibly
+ * vanishes; nothing reports anything. That is SPEC §5.6's duplicate-`ObjectId` corruption arriving
+ * from the other direction, and a separate id type is what stops an element id ever being handed
+ * to an op.
+ */
+@JvmInline
+public value class ElementId(public val value: String)

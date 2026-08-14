@@ -93,13 +93,24 @@ public class InkStrokeOutliner(
         // `DryShape` existed. Walking one list is also what keeps a shape's `(z, id)` place in the
         // `/Annots` order, and annotation order is paint order in a PDF exactly as it is on screen.
         //
-        // A `DryPlaceholder` still contributes nothing, and that is unchanged: it paints nothing on
-        // screen either, so a PDF without it agrees with what the user is looking at (SPEC §4.9.3).
+        //
+        // ⚠️ **M8c: a text box and an image contribute nothing here, and that is now a real gap.**
+        // It was not one before — nothing painted them on screen either, so a PDF without them
+        // agreed with what the user was looking at (SPEC §4.9.3). They are painted now, so a
+        // published page is missing something the editor shows. Neither can travel through *this*
+        // boundary: a [StrokeOutline] is filled polygons plus a centreline, and a text box is PDF
+        // **text** — glyph codes in an embedded CID font with a `/ToUnicode` CMap, which is the
+        // whole point of SPEC §4.9.5 and is what makes the words searchable — while an image is an
+        // `/XObject`. Flattening either into polygons would publish a picture of words that
+        // `pdfgrep` cannot read, which is SPEC §5.5's feature failing while every visual check
+        // passes. The boundary they need is `:android:pdf`'s and does not exist yet;
+        // `docs/M8-TEXT.md` §6 items 4 and 6 own it.
         store.forEachInRenderOrder(visibleBounds = null) { dry ->
             when (dry) {
                 is DryStroke -> result += outlineOf(dry)
                 is DryShape -> result += outlinesOf(dry)
-                is DryPlaceholder -> Unit
+                is DryTextBox -> Unit
+                is DryImage -> Unit
             }
         }
         result

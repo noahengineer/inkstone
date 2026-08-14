@@ -18,6 +18,7 @@ import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.ShapeEdit
 import dev.inkstone.core.model.ShapeKind
 import dev.inkstone.core.model.ShapeObject
+import dev.inkstone.core.model.ShapeRecord
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -180,6 +181,36 @@ class SelectionControllerShapeTest {
     }
 
     // -----------------------------------------------------------------------
+    // Record edits — the fill's undo baseline (the first-SetStyle trap, record register)
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun fillingAFreshShapeWritesABaselineSoTheFillCanBeUndone() {
+        val id = addRectangle(SHAPE_LEFT, SHAPE_TOP, SHAPE_RIGHT, SHAPE_BOTTOM)
+        controller.select(listOf(id))
+
+        controller.setFill(FILL_GREEN, FILL_OPACITY)
+
+        // The live register carries the fill.
+        val record = required(store.objectOf(id) as? DryShape, "the shape").record
+        assertEquals(FILL_GREEN, record.fillArgb)
+        // Without the baseline gesture, the fill gesture has no inverse — SetTextContent cannot
+        // say "unset" — so UndoStack.commit drops it and pressing undo pops the gesture BEFORE
+        // the fill: the box vanishes, filled. Two gestures must reach the log: the default
+        // record first, then the fill.
+        val gestures = required(store.recorder, "the recorder").drain()
+            .map { gesture -> gesture.filterIsInstance<PageOp.SetTextContent>().filter { it.target == id } }
+            .filter { it.isNotEmpty() }
+        assertEquals("expected a baseline gesture then the fill gesture", 2, gestures.size)
+        assertEquals(
+            "the baseline must be the record the shape already had",
+            ShapeRecord.None,
+            ShapeRecord.decode(gestures[0].single().text),
+        )
+        assertEquals(FILL_GREEN, required(ShapeRecord.decode(gestures[1].single().text), "the fill record").fillArgb)
+    }
+
+    // -----------------------------------------------------------------------
     // Marquee — the rectangular half of "freehand AND rectangular"
     // -----------------------------------------------------------------------
 
@@ -221,6 +252,8 @@ class SelectionControllerShapeTest {
         const val MARQUEE_BOTTOM = 260f
         const val SHAPE_COLOR = 0xFF2266AA.toInt()
         const val SHAPE_WIDTH_PT = 6f
+        const val FILL_GREEN = 0xFF00AA44.toInt()
+        const val FILL_OPACITY = 0.5f
         const val NEW_WIDTH_DP = 8f
         const val RED = 0xFFCC0000.toInt()
         const val BLACK = 0xFF1A1A1A.toInt()

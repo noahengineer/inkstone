@@ -6,6 +6,10 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.inkstone.app.audio.RecordingController
 import dev.inkstone.app.audio.RecordingUiState
+import dev.inkstone.app.elements.CapturedObject
+import dev.inkstone.app.elements.Element
+import dev.inkstone.app.elements.ElementLibrary
+import dev.inkstone.app.elements.objectsWithin
 import dev.inkstone.app.library.LibraryRepository
 import dev.inkstone.app.library.Thumbnails
 import dev.inkstone.app.search.NoteRecogniser
@@ -22,6 +26,7 @@ import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.model.PdfPublisher
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 
 /**
@@ -45,7 +50,13 @@ import javax.inject.Inject
 // `NoteEditor` or to a lifecycle hook below. Grouping them into a parameter object would make the
 // graph harder to read for a class whose whole job is to be the wiring, which is the same
 // judgement `SyncModule` and `Reconciler` get.
-@Suppress("LongParameterList")
+// ⭐ M8c pushed the member count past thirty. Every one of the additions is a one-line pass-through
+// to `NoteEditor` — insert a text box, write a register, turn an image, crop it, stamp an Element —
+// and the shell exists precisely so those live in a plain class a JVM test can drive. Collapsing
+// them into a `perform(Action)` switch would put the whole M8c surface behind one untyped door and
+// would hide exactly the thing definition-of-done #6 asks to be able to grep for: a production
+// caller per feature. Same judgement `NoteEditor` and `LibraryRepository` already carry.
+@Suppress("LongParameterList", "TooManyFunctions")
 class NoteEditorViewModel @Inject constructor(
     fs: FileSystem,
     clock: Clock,
@@ -57,6 +68,10 @@ class NoteEditorViewModel @Inject constructor(
      * through the session already open here rather than opening a second one.
      */
     private val sessions: NoteSessionHost,
+    /** ⭐ M8c — the Element library (SPEC §4.9.4). Read by the panel, written by a capture. */
+    private val elements: ElementLibrary,
+    /** For reading the bytes behind a picked image Uri. The resolver stops at `:app` (M4). */
+    private val resolver: android.content.ContentResolver,
     /**
      * M12's capture half. A process-wide singleton, deliberately — see [RecordingController]: a
      * lecture has to survive this view model being cleared, and the *stop* has to be able to
@@ -274,6 +289,110 @@ class NoteEditorViewModel @Inject constructor(
 
     fun rename(title: String) = editor.rename(title)
 
+    // -----------------------------------------------------------------------
+    // ⭐ M8c — text boxes, images and Elements (SPEC §4.9)
+    // -----------------------------------------------------------------------
+
+    /** The page on screen, for the overlay's hit-testing. */
+    suspend fun currentFold() = editor.currentFold()
+
+    /** Placing a box and typing its first words is one gesture — see [NoteEditor.insertTextBox]. */
+    suspend fun insertTextBox(
+        box: dev.inkstone.core.model.PageRect,
+        text: String,
+        style: dev.inkstone.core.model.ObjectStyle,
+        format: dev.inkstone.core.model.ObjectFormat,
+    ) = editor.insertTextBox(box, text, style, format)
+
+    fun updateText(id: dev.inkstone.core.model.ObjectId, text: String) = editor.updateText(id, text)
+
+    fun updateFormat(
+        id: dev.inkstone.core.model.ObjectId,
+        change: (dev.inkstone.core.model.ObjectFormat) -> dev.inkstone.core.model.ObjectFormat,
+    ) = editor.updateFormat(id, change)
+
+    fun recolour(id: dev.inkstone.core.model.ObjectId, argb: Int) = editor.updateStyle(id) { it.copy(colorArgb = argb) }
+
+    fun turnObject(id: dev.inkstone.core.model.ObjectId, degrees: Float, flipH: Boolean, flipV: Boolean) =
+        editor.turnObject(id, degrees, flipH, flipV)
+
+    fun setCrop(id: dev.inkstone.core.model.ObjectId, crop: dev.inkstone.core.model.ImageCrop?) =
+        editor.setCrop(id, crop)
+
+    /**
+     * ⭐ M8c — a picked or photographed image, downscaled before it ever reaches the bundle.
+     *
+     * The decode is here rather than in [NoteEditor] because it needs a `ContentResolver` and
+     * `BitmapFactory`, which is the same boundary `MainActivity.importCoverImage` draws: a `Uri` is
+     * only readable while this process holds the grant the picker made, so everything below is
+     * handed bytes.
+     *
+     * @return the byte sizes, for the report a milestone has to be able to make — source, encoded,
+     *   and therefore what the note's `assets/` entry costs. Null when the Uri was not a decodable
+     *   image, which a content Uri can always turn out not to be.
+     */
+    suspend fun insertImage(
+        uri: android.net.Uri,
+        page: PageSize,
+        visible: dev.inkstone.core.model.PageRect,
+    ): ImageInsertReport? {
+        val source = withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching { resolver.openInputStream(uri).use { it?.readBytes() } }.getOrNull()
+        } ?: return null
+        val encoded = withContext(kotlinx.coroutines.Dispatchers.Default) { InsertedImage.reEncode(source) }
+            ?: return null
+        // The box is computed **after** the decode because it needs the picture's aspect ratio, and
+        // the aspect ratio is only known once the bounds pass has run. Placing first and stretching
+        // afterwards would need a second `SetTransform` for every insert.
+        val box = ImageDownscale.placeOnPage(encoded.widthPx, encoded.heightPx, page, visible)
+        val id = editor.insertImage(
+            bytes = encoded.webp,
+            box = box,
+            style = dev.inkstone.app.ink.ObjectToolState.DEFAULT_TEXT_STYLE,
+        ) ?: return null
+        return ImageInsertReport(id, encoded.sourceBytes, encoded.webp.size, encoded.widthPx, encoded.heightPx)
+    }
+
+    /** Put a line in front of the user through the editor's own snackbar — the only channel there is. */
+    fun report(message: String) = editor.showMessage(message)
+
+    /** Every saved Element, for the panel. */
+    suspend fun elements() = elements.list()
+
+    suspend fun deleteElement(id: String) = elements.delete(id)
+
+    suspend fun stampElement(element: Element, at: dev.inkstone.core.model.PagePoint): Int =
+        editor.stampElement(elements, element, at)
+
+    /**
+     * ⭐ Save everything inside [area] as a named Element.
+     *
+     * ⚠️ **Text boxes, images and shapes only.** A stroke's geometry is an opaque blob that only
+     * `:android:ink` can decode (SPEC §5.4), so `:app` cannot measure one to decide it is inside
+     * the area — and `InkSelection` exposes a count rather than its object ids, so the lasso cannot
+     * answer the question either. `ElementLibrary`'s KDoc records the seam; the toolbar's own label
+     * tells the user, because a capture that silently left the handwriting behind would be
+     * discovered by stamping it.
+     *
+     * @return the element, or null when there was nothing capturable in the area.
+     */
+    suspend fun saveElement(name: String, collection: String, area: dev.inkstone.core.model.PageRect): Element? {
+        val fold = editor.currentFold() ?: return null
+        val assets = editor.assets()
+        val captured = objectsWithin(fold.objects, area).map { obj ->
+            CapturedObject(
+                obj = obj,
+                text = fold.textOf(obj.id),
+                format = fold.formatOf(obj.id),
+                assetBytes = (obj as? dev.inkstone.core.model.ImageObject)?.let { assets[it.asset] },
+            )
+        }
+        return elements.save(name, collection, captured)
+    }
+
+    /** The decoded pictures the ink surface draws, cached by asset name. See [PageAssetCache]. */
+    val assetCache: PageAssetCache = PageAssetCache { editor.assets() }
+
     fun dismissMessage() = editor.showMessage(null)
 
     /**
@@ -349,6 +468,21 @@ class NoteEditorViewModel @Inject constructor(
         editor.close()
         super.onCleared()
     }
+
+    /**
+     * What one image insert cost, in bytes — the numbers ROADMAP M8c's downscale rule is judged by.
+     *
+     * Reported rather than logged, because *"insert-time downscale"* is a claim about sizes and a
+     * claim about sizes with no measurement behind it is the kind of thing this repo has shipped
+     * before. `InsertedImage` produces them; the screen shows them once.
+     */
+    class ImageInsertReport(
+        val id: dev.inkstone.core.model.ObjectId,
+        val sourceBytes: Int,
+        val storedBytes: Int,
+        val widthPx: Int,
+        val heightPx: Int,
+    )
 
     companion object {
         /** The note to open, as a [SavedStateHandle] key. */

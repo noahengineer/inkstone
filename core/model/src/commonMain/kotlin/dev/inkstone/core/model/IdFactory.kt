@@ -43,6 +43,9 @@ public class IdFactory(private val clock: Clock, private val random: Random = Ra
 
     public fun newFolderId(): FolderId = FolderId(newUuid7())
 
+    /** M8c — one saved Element (SPEC §4.9.4). See [ElementId] for why it is not an [ObjectId]. */
+    public fun newElementId(): ElementId = ElementId(newUuid7())
+
     /** SPEC §4.2 — every op carries one. A plain [String]; ops are never looked up by id. */
     public fun newOpId(): String = newUuid7()
 

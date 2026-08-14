@@ -25,6 +25,19 @@ public enum class InkTool {
 
     /** Lasso, move, resize, rotate — see `SelectionController`. */
     SELECT,
+
+    /**
+     * ⭐ ROADMAP M8c — a transient dot with a fading trail, for pointing at things while talking.
+     *
+     * A tool rather than a modifier, because while it is selected the pen does not draw at all.
+     * ⚠️ It is here and **the ruler is not**: a ruler does not replace the pen, it guides it, so it
+     * is a switch on the surface (`InkSurfaceView.ruler`) and the tool stays [PEN]. Making it a
+     * tool would have made "the ruler is out" and "I am drawing" mutually exclusive, which is the
+     * opposite of what a ruler is for.
+     *
+     * See [LaserController] for why it can write nothing.
+     */
+    LASER,
 }
 
 /**

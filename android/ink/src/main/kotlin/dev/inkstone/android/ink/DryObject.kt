@@ -3,16 +3,11 @@ package dev.inkstone.android.ink
 import androidx.ink.geometry.MutableVec
 import androidx.ink.geometry.Parallelogram
 import dev.inkstone.core.model.FractionalKey
-import dev.inkstone.core.model.ImageObject
-import dev.inkstone.core.model.InkObject
 import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.SelectedObject
-import dev.inkstone.core.model.ShapeObject
-import dev.inkstone.core.model.StrokeObject
-import dev.inkstone.core.model.TextBoxObject
 
 /**
  * ⭐ M8c — **anything [StrokeStore] holds**, whatever it is made of.
@@ -224,120 +219,11 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
      * else — false costs a little drawing, true costs nothing that cannot come back.
      *
      * ⭐ M8c: on the object rather than as a `when` in the prune loop, which is where the same
-     * decision already lives for erasing ([hitBy]). Default **false**, and the default is the
-     * whole answer for a [DryPlaceholder]: it cannot be erased by anything here, so a region on
-     * one arrived from a build that *can* draw it, and this build must keep it rather than act on
-     * a coverage test it has no geometry to run.
+     * decision already lives for erasing ([hitBy]). Default **false**, which is the whole answer
+     * for every kind but a stroke: pruning is only worth it when the thing dropped is expensive to
+     * keep drawing, and it costs the user their object until the page is reloaded — an undo of the
+     * erase writes `SetErasedRegion` at an id the store no longer holds, and `applyRegister`
+     * answers false for one.
      */
     open fun isErasedAway(region: ErasedRegion): Boolean = false
-}
-
-/**
- * ⭐ M8c — an object the store **orders, carries and converges**, and that this build cannot paint.
- *
- * ## What it is for
- *
- * SPEC §4.9.3 describes what an older build does with a note containing a text box or an image:
- * it *"opens the note, keeps every byte, and shows an unformatted text box and an uncropped
- * image — which in practice means it shows nothing at all"*. This type is that degrade made
- * **local and non-destructive** instead of structural. The object is in the store, so:
- *
- * - it takes a z key from [StrokeStore.allocateTopZ] like everything else, so the next stroke the
- *   user draws lands *above* it rather than under it;
- * - it holds its absolute registers, so a peer's `SetTransform`, `SetStyle`, `SetZOrder`,
- *   `SetErasedRegion`, `SetTextContent` and `SetFormat` reach the render state and are not silently
- *   swallowed by a `when` that had no branch for it;
- * - it is in the one `(z, id)` order, so `SelectionEdit`'s bring-to-front sees the whole page and
- *   cannot put a stroke above something it did not know was there.
- *
- * ## ⚠️ It paints nothing, and that is a decision with a rule attached
- *
- * The rule is **nothing the user cannot see may be selected or erased**, and every geometric
- * predicate below is that one sentence: [hitBy] is false, so a tap and an eraser pass through it;
- * [forEachPagePoint] emits nothing, and `Lasso.selects` answers false for an empty point list, so
- * a lasso cannot take it. A selection box drawn round an invisible object, or an eraser silently
- * biting a photo, would both be worse than a blank rectangle — and a bite would be *stored*, in a
- * register SPEC §4.9.2 deliberately keeps separate from an image's crop.
- *
- * A kind that paints itself replaces this type rather than configuring it: it is a new [DryObject]
- * subclass with its own silhouette, its own coverage test and its own branch in [PagePainter], and
- * the sealed hierarchy is what makes forgetting the painter a compile error rather than an empty
- * rectangle. `docs/M8-CONNECTORS.md` §6 item 2 is the next one owed.
- *
- * @property obj the payload as it was folded. ⚠️ **Read the registers off `this`, never off
- *   [obj]** — the payload is first-write-wins (SPEC §4.2) and carries the values it was folded
- *   with, while the fields above are the live ones. It is kept because it is the only thing that
- *   says *what* the object is: an asset name, a shape kind, an extent.
- * @property content the `SetTextContent` register — a text box's words, or a shape's
- *   `ShapeRecord`. Seeded from [TextBoxObject.text] because a text box created with text and never
- *   edited has **no** `SetTextContent` op at all: its words are in the payload, and the fold's
- *   `texts` table is empty for it. `PageFolder.materialise` mirrors exactly this.
- * @property format the `SetFormat` register (SPEC §4.9.2) — font, size, alignment and list level
- *   for a text box, crop for an image. Kept as the encoded record rather than a decoded
- *   [dev.inkstone.core.model.ObjectFormat], so a key from a later build survives round-trip
- *   through the render state untouched, exactly as it does through the log.
- */
-internal class DryPlaceholder(val obj: InkObject, widthPt: Float, heightPt: Float, content: String? = null) :
-    DryObject(obj.transform, obj.style, obj.z) {
-
-    override val id: ObjectId get() = obj.id
-
-    /** The ink band: a highlighter drawn across a photo must tint the photo. See [drawsOverInk]. */
-    override val drawsOverInk: Boolean get() = false
-
-    var content: String? = content
-        private set
-
-    var format: String? = null
-        private set
-
-    init {
-        // Every non-stroke kind occupies `[0, widthPt] × [0, heightPt]` in its own space and is
-        // placed by its transform (`ShapePaths`' KDoc states it for shapes; `ImageObject` and
-        // `TextBoxObject` carry the same two fields for the same reason).
-        setBounds(PageBounds(0f, 0f, widthPt, heightPt))
-        setErased(obj.erased.toRegion())
-    }
-
-    /** The render side of `SetTextContent`. Absolute, whole-string LWW (SPEC §4.2). */
-    fun setContent(text: String?) {
-        content = text
-    }
-
-    /** The render side of `SetFormat` (SPEC §4.9.2). Absolute, like every register here. */
-    fun setFormat(record: String?) {
-        format = record
-    }
-
-    /** False, always — see the class KDoc. An eraser must not bite what it cannot draw. */
-    override fun hitBy(sweptTip: Parallelogram, capsule: ErasedRegion.Capsule): Boolean = false
-
-    /**
-     * Emits nothing, and the emptiness is the decision rather than an omission — see the class
-     * KDoc. `Lasso.selects` answers false for an empty point list, so this is what "cannot be
-     * lassoed" is spelled as.
-     */
-    override fun forEachPagePoint(scratch: MutableVec, action: (Float, Float) -> Unit) {
-        return
-    }
-
-    companion object {
-        /**
-         * The placeholder for [obj], or null when the object has geometry this build can draw.
-         *
-         * Exhaustive over [InkObject] on purpose: a kind added to `:core:model` without a decision
-         * here fails to compile, rather than being dropped from the screen — which is the whole
-         * bug this file exists to close.
-         */
-        fun of(obj: InkObject): DryPlaceholder? = when (obj) {
-            // Has a geometry blob; `DryStroke` decodes and draws it.
-            is StrokeObject -> null
-
-            is ImageObject -> DryPlaceholder(obj, obj.widthPt, obj.heightPt)
-
-            is TextBoxObject -> DryPlaceholder(obj, obj.widthPt, obj.heightPt, content = obj.text)
-
-            is ShapeObject -> DryPlaceholder(obj, obj.widthPt, obj.heightPt)
-        }
-    }
 }

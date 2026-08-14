@@ -107,7 +107,77 @@ internal object ContentScan {
         return values
     }
 
-    private fun tokens(content: String): List<String> = content.split(' ', '\n', '\r', '\t').filter { it.isNotEmpty() }
+    /**
+     * ⚠️ **Strings are one token each, and before M8c they were not** — which was safe only for as
+     * long as nothing written here contained a space.
+     *
+     * This was `content.split(' ', '\n', '\r', '\t')`. A recognised word has no spaces, so the
+     * invisible layer never noticed; **a text box holds sentences**. `(3 4 m) Tj` then tokenises
+     * as `(3`, `4`, `m)`, `Tj`, and [pointsDrawn] reports a point at (3, 4) that nothing draws —
+     * a scanner that invents geometry out of the user's prose, which would make the `/BBox`
+     * assertions in `PdfViewerCompatTest` fail on the *content of the note*. A hex string has the
+     * same problem in reverse: `<0048 0065>` is legal PDF and splits into two.
+     *
+     * So this is a small lexer rather than a split: literals and hex strings are consumed whole
+     * and reported as one opaque [STRING] token. It is still not a PDF interpreter and does not
+     * need to be — [PdfContent] and [PdfObjectContent] emit one operator per line, no inline
+     * images, no nested dictionaries — but it is now correct for every stream this module writes
+     * rather than for every stream it happened to have written.
+     */
+    private fun tokens(content: String): List<String> =
+        withoutStrings(content).split(' ', '\n', '\r', '\t').filter { it.isNotEmpty() }
+
+    /**
+     * [content] with every string replaced by [STRING], so the whitespace split is safe again.
+     *
+     * Two passes rather than one lexer: the split was already right for operators, operands and
+     * `/Name`s, and the only thing wrong with it was that a string is not made of those.
+     */
+    private fun withoutStrings(content: String): String {
+        val out = StringBuilder(content.length)
+        var index = 0
+        while (index < content.length) {
+            val char = content[index]
+            // `<<` opens a dictionary, not a string. Nothing here writes one, and treating it as a
+            // string would swallow the rest of the stream if a source PDF's content did.
+            val literal = char == '('
+            val hex = char == '<' && content.getOrNull(index + 1) != '<'
+            if (!literal && !hex) {
+                out.append(char)
+                index++
+                continue
+            }
+            out.append(' ').append(STRING).append(' ')
+            index = if (literal) endOfLiteral(content, index) else endOfHex(content, index)
+        }
+        return out.toString()
+    }
+
+    /** The index just past the `>` closing the hex string that starts at [start]. */
+    private fun endOfHex(content: String, start: Int): Int =
+        content.indexOf('>', start).let { if (it < 0) content.length else it + 1 }
+
+    /** The index just past the `)` closing the literal that starts at [start]. */
+    private fun endOfLiteral(content: String, start: Int): Int {
+        var index = start + 1
+        var depth = 1
+        while (index < content.length && depth > 0) {
+            when (content[index]) {
+                // A backslash escapes whatever follows, including a parenthesis — which is exactly
+                // what `PdfContent.literalString` writes for a word containing one.
+                '\\' -> index++
+
+                '(' -> depth++
+
+                ')' -> depth--
+            }
+            index++
+        }
+        return index
+    }
+
+    /** What a string of any kind reduces to: something that is neither a number nor a `/Name`. */
+    private const val STRING = "<string>"
 
     private const val MAX_DEPTH = 64
 }

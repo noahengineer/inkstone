@@ -236,7 +236,19 @@ internal object OpCodec {
         is PageOp.Unknown -> op.type
     }
 
-    private fun encodeObject(obj: InkObject, geometry: GeometryWriter): JsonObject = buildJsonObject {
+    /**
+     * One object's payload, without the op around it.
+     *
+     * ⚠️ **Not private since M8c, and the reason is a rule rather than a convenience.** An Element
+     * ([ElementLibrary]) stores objects and their two registers and **no ops** — deliberately, since
+     * a stored `AddObject` replayed twice is SPEC §4.9.4's vanishing-stamp corruption — so its file
+     * needs an object encoder that is not wrapped in one. Giving it a second encoder of its own is
+     * the mistake M12 recorded about writing a second WebDAV client: *"a mock of a client agrees
+     * with every mistake that client makes"*, and a second object codec would agree with none of
+     * this one's — starting with the geometry blob, which is the only reason [GeometryWriter]
+     * exists.
+     */
+    fun encodeObject(obj: InkObject, geometry: GeometryWriter): JsonObject = buildJsonObject {
         put(O_ID, JsonPrimitive(obj.id.value))
         put(O_KIND, JsonPrimitive(kindOf(obj)))
         when (obj) {
@@ -442,7 +454,8 @@ internal object OpCodec {
 
     private fun target(element: JsonObject) = ObjectId(element.getValue(F_TARGET).jsonPrimitive.content)
 
-    private fun decodeObject(element: JsonObject, geometry: GeometryReader): InkObject {
+    /** [encodeObject] read back. Throws on an object kind this build does not know — see its KDoc. */
+    fun decodeObject(element: JsonObject, geometry: GeometryReader): InkObject {
         val id = ObjectId(element.getValue(O_ID).jsonPrimitive.content)
         val transform = element[F_MATRIX]?.let { decodeMatrix(it.jsonArray) } ?: Matrix3.Identity
         val style = element[F_STYLE]?.let { decodeStyle(it.jsonArray) }

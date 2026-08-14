@@ -16,6 +16,7 @@ import dev.inkstone.android.ink.InkStrokeRebuilder
 import dev.inkstone.android.ink.InkStrokeSampler
 import dev.inkstone.android.ocr.MlKitModels
 import dev.inkstone.android.ocr.MlKitRecogniser
+import dev.inkstone.android.pdf.AssetPdfFontFaces
 import dev.inkstone.android.pdf.InkstonePdfMaterializer
 import dev.inkstone.android.pdf.PdfGateway
 import dev.inkstone.android.pdf.PdfPageRasterizer
@@ -133,15 +134,31 @@ object PlatformProvidersModule {
      * tessellator, and `:android:pdf` can write a PDF because it owns PdfBox. The
      * dependency graph stays one-way (SPEC §2.1) precisely because this wiring is
      * `:app`'s job and not theirs.
+     *
+     * ⭐ **[AssetPdfFontFaces] is the M8c line, and it is the only reason a text box can carry a
+     * character above U+00FF** (SPEC §4.9.5). The face is `LiberationSans-Regular.ttf` out of the
+     * pdfbox-android AAR's own assets — which merge into this APK, so embedding costs no asset of
+     * ours — and it needs an `AssetManager`, which only `:app` has.
+     *
+     * ⚠️ **Forgetting it degrades rather than breaks, deliberately.** `PdfFontFaces.None` is the
+     * default and publishes text boxes in the base-14 fonts carrying printable ASCII, so a missing
+     * injection costs an accented character — not the valid-parseable-and-blank PDF that
+     * docs/M4-PDF.md keeps having to record. That is why the default is a working fallback and not
+     * a throw: the failure this codebase actually suffers from is the silent one.
      */
     @Provides
     @Singleton
-    fun providePdfPublisher(fs: FileSystem, clock: Clock, brushes: InkBrushFactory): PdfPublisher =
-        InkstonePdfMaterializer(
-            fs = fs,
-            store = NoteStore(fs, clock, IdFactory(clock)),
-            outliner = InkStrokeOutliner(brushes),
-        )
+    fun providePdfPublisher(
+        @ApplicationContext context: Context,
+        fs: FileSystem,
+        clock: Clock,
+        brushes: InkBrushFactory,
+    ): PdfPublisher = InkstonePdfMaterializer(
+        fs = fs,
+        store = NoteStore(fs, clock, IdFactory(clock)),
+        outliner = InkStrokeOutliner(brushes),
+        fonts = AssetPdfFontFaces(context.assets),
+    )
 
     @Provides
     @Singleton
