@@ -211,6 +211,65 @@ class PdfViewerCompatTest {
     }
 
     /**
+     * ⭐ M8b — **what a non-PdfBox viewer shows for a translucent filled shape.**
+     *
+     * A shape reaches this module as one or two ordinary [StrokeOutline]s (`InkStrokeOutliner`
+     * expands the outline to its painted width with `Paint.getFillPath`, so the fill and the
+     * stroke are both filled polygons here). Its translucency therefore travels in the colour's
+     * **alpha**, and turns into an `/ExtGState` with `/ca` — which is precisely the mechanism M4
+     * got wrong: the state was named by the content stream and defined nowhere a viewer could
+     * find it, so PDF.js drew the highlighter fully opaque and a stricter reader abandoned the
+     * stream.
+     *
+     * Three separate things, because each fails differently:
+     *
+     * 1. The `/ExtGState` the overlay names is **defined in the resources the page can see**.
+     * 2. It carries a `/ca` **below 1**, so the fill is actually translucent rather than merely
+     *    permitted to be.
+     * 3. The opaque outline gets a *different* state, so the fill's alpha cannot leak onto it —
+     *    a shape drawn with a translucent interior and a solid edge is the whole point.
+     */
+    @Test
+    fun `a translucent shape fill defines the alpha state it names`() {
+        val fill = PdfFixtures.square("fill", 60f, 60f, 80f, colorArgb = TRANSLUCENT_FILL)
+        val edge = PdfFixtures.square("edge", 60f, 60f, 80f, colorArgb = OPAQUE_EDGE)
+        val published = publish(
+            PdfFixtures.sourcePdf(),
+            planWith(
+                0,
+                List(FLATTEN_THRESHOLD + 1) { PdfFixtures.square("s-$it", 10f, 20f, 6f) } + fill + edge,
+                // FLATTENED explicitly: the alpha state then has to be on the **page**, which is
+                // where M4's bug was. In PER_STROKE mode it lives in the annotation's own `/AP /N`
+                // resources instead, and `every name an appearance stream uses is defined in its
+                // own Resources` above is what covers that half.
+                PageAnnotationMode.FLATTENED,
+            ),
+        )
+
+        assertPageNamesDefined(published, 0)
+
+        PDDocument.load(published).use { doc ->
+            val page = doc.getPage(0)
+            val content = page.contents.readBytes().decodeToString()
+            val resources = assertNotNull(ContentScan.effectiveResources(page), "the page has no /Resources")
+            val states = assertNotNull(
+                resources.getDictionaryObject(COSName.EXT_G_STATE) as? COSDictionary,
+                "the page defines no /ExtGState at all",
+            )
+
+            val fillState = PdfContent.stateNameFor(fill)
+            val edgeState = PdfContent.stateNameFor(edge)
+            assertTrue(fillState in content, "the overlay never selects the fill's alpha state")
+            assertTrue(fillState != edgeState, "a translucent fill and an opaque edge share one state")
+
+            val ca = (states.getDictionaryObject(fillState) as? COSDictionary)
+                ?.getDictionaryObject(COSName.CA_NS) as? COSNumber
+            assertNotNull(ca, "/$fillState has no /ca — a viewer would draw the fill opaque")
+            assertTrue(ca.floatValue() < 1f, "the fill's /ca is ${ca.floatValue()}, i.e. not translucent")
+        }
+    }
+
+    /**
      * Adding our names must not cost the source page its own.
      *
      * The other half of the same fix: merging into the page's `/Resources` is only correct if
@@ -424,6 +483,12 @@ class PdfViewerCompatTest {
 
         /** SPEC §6.4's threshold, past which a page is flattened. */
         const val FLATTEN_THRESHOLD = 500
+
+        /** A shape's fill at ~35% — what the toolbar's Fill chip produces (M8b). */
+        const val TRANSLUCENT_FILL = 0x59CC0000.toInt()
+
+        /** Its outline, opaque, so the two must resolve to different graphics states. */
+        const val OPAQUE_EDGE = 0xFF1A1A1A.toInt()
 
         const val RECT_VALUES = 4
         const val TOLERANCE_PT = 0.01f

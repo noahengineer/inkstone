@@ -5,6 +5,8 @@ import android.graphics.Path
 import android.graphics.PathMeasure
 import androidx.ink.geometry.MutableVec
 import androidx.ink.strokes.StrokeInput
+import dev.inkstone.android.ink.InkColor.withOpacity
+import dev.inkstone.android.ink.PagePainter.Companion.ARROW_HEAD_WIDTHS
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.Matrix3
@@ -62,11 +64,22 @@ public class InkStrokeOutliner(
         // would be a second place for render order and absolute erasure to drift —
         // and the published PDF disagreeing with the screen is the one bug in this
         // milestone the user would notice and could not explain.
-        store.applyOps(
-            ops = page.objects.map { PageOp.AddObject(opId = "", clock = OUTLINE_CLOCK, obj = it) },
-            brushes = brushes,
-            record = false,
-        )
+        // ⚠️ **The `AddObject`s alone are not the page** (M8b). A shape's fill, corner radius and
+        // connector attachment live in the `SetTextContent` register, which is a *side table* on
+        // the fold and not on the payload (SPEC §4.8.2) — so a store built from `page.objects`
+        // holds every shape as an unfilled, square-cornered, unattached one. The published file
+        // would then disagree with the screen about exactly the properties this milestone added,
+        // and would do it silently, because every shape would still be there and still be a shape.
+        //
+        // Same shape of bug as `copiedObjectOps`: if the fold answers for it, the consumer has to
+        // ask. Ordered after the adds so each record lands on an object that exists.
+        val ops = ArrayList<PageOp>(page.objects.size * 2)
+        page.objects.mapTo(ops) { PageOp.AddObject(opId = "", clock = OUTLINE_CLOCK, obj = it) }
+        for (obj in page.objects) {
+            val text = page.textOf(obj.id) ?: continue
+            ops += PageOp.SetTextContent(opId = "", clock = OUTLINE_CLOCK, target = obj.id, text = text)
+        }
+        store.applyOps(ops = ops, brushes = brushes, record = false)
 
         val result = ArrayList<StrokeOutline>(store.size)
         // Ink first, then highlighters (SPEC §3.4 — reversed after M4). Annotation order is
@@ -74,9 +87,21 @@ public class InkStrokeOutliner(
         // the editor draws, and the published file disagreeing with the screen is the one
         // bug in this milestone the user would notice and could not explain. The highlight
         // tints rather than hides what it covers because of its alpha, exactly as on screen.
-        // Strokes only: a PDF `/Ink` annotation is ink, and M8c's non-stroke objects reach the
-        // published file by their own route or not at all (SPEC §4.9.5 for text).
-        store.forEachStrokeInRenderOrder(visibleBounds = null) { dry -> result += outlineOf(dry) }
+        // ⭐ **M8b: shapes too, in the one render order.** Not `forEachStrokeInRenderOrder` any
+        // more — that walked ink and skipped everything else, which was right while nothing else
+        // could be painted and became "the published PDF is missing the diagram" the moment
+        // `DryShape` existed. Walking one list is also what keeps a shape's `(z, id)` place in the
+        // `/Annots` order, and annotation order is paint order in a PDF exactly as it is on screen.
+        //
+        // A `DryPlaceholder` still contributes nothing, and that is unchanged: it paints nothing on
+        // screen either, so a PDF without it agrees with what the user is looking at (SPEC §4.9.3).
+        store.forEachInRenderOrder(visibleBounds = null) { dry ->
+            when (dry) {
+                is DryStroke -> result += outlineOf(dry)
+                is DryShape -> result += outlinesOf(dry)
+                is DryPlaceholder -> Unit
+            }
+        }
         result
     }
 
@@ -98,6 +123,91 @@ public class InkStrokeOutliner(
             colorArgb = brush.colorIntArgb,
             widthPt = brush.size,
         )
+    }
+
+    /**
+     * ⭐ M8b — a shape as **filled outlines**, which is the only thing this boundary carries.
+     *
+     * ## Why a shape becomes a `StrokeOutline` rather than gaining a type of its own
+     *
+     * Everything downstream already works on filled polygons: `PdfContent.strokeAppearance` fills
+     * them into an `/AP`, `flattenedOverlay` fills them into the page's content stream, and both
+     * pick an `/ExtGState` from the colour's **alpha** — so a translucent fill needs no new
+     * machinery at all, only an ARGB with alpha in it. A `ShapeOutline` type would have meant a
+     * second writer, a second `/Resources` decision, and a second chance to make M4's mistake
+     * (*"valid, parseable, and blank"*).
+     *
+     * ## Up to two outlines, in paint order
+     *
+     * The fill first, then the outline over it — the order [PagePainter] draws them, so the PDF and
+     * the screen agree by construction rather than by two people implementing the same rule.
+     *
+     * ⚠️ **The stroke is converted to a fill with [Paint.getFillPath], not written as a PDF `S`
+     * operator.** A stroked path would be thinner machinery, and it would be a *second* way for
+     * geometry to reach the file: erasure is subtracted as an area (SPEC §3.5), and subtracting an
+     * area from something that has not been expanded to its painted width yet takes a bite out of
+     * the centreline instead of out of the ink. Expanding first means a shape erases exactly as a
+     * stroke does, through the same [Path.op].
+     */
+    private fun outlinesOf(dry: DryShape): List<StrokeOutline> {
+        val style = dry.effectiveStyle()
+        val outlines = ArrayList<StrokeOutline>(2)
+        val record = dry.record
+
+        val fill = record.fillArgb
+        if (dry.fillable && fill != null) {
+            val interior = pathOf(dry)
+            outlines += StrokeOutline(
+                objectId = dry.id,
+                contours = shapeContours(dry, interior),
+                // Alpha carried in the colour, because that is what `stateNameFor` reads to pick
+                // the `/ca` graphics state. `fillOpacity` multiplies the colour's own alpha for
+                // the reason `Int.withOpacity` gives on screen: 50% of a translucent fill is half
+                // of *its* translucency, not half of opaque.
+                colorArgb = fill.withOpacity(record.fillOpacity),
+                widthPt = 0f,
+                centreline = emptyList(),
+            )
+        }
+
+        if (style.widthPt > 0f) {
+            val stroked = Path()
+            outlinePaint.strokeWidth = style.widthPt
+            outlinePaint.getFillPath(pathOf(dry), stroked)
+            // The arrowhead is part of the painted outline, not a third object: it shares the
+            // stroke's colour and width and is drawn from the same last-segment direction
+            // [PagePainter] uses, so a published arrow points where the drawn one does.
+            dry.arrowHead(style.widthPt * ARROW_HEAD_WIDTHS)?.let { head ->
+                val expanded = Path()
+                outlinePaint.getFillPath(head, expanded)
+                stroked.op(expanded, Path.Op.UNION)
+            }
+            outlines += StrokeOutline(
+                objectId = dry.id,
+                contours = shapeContours(dry, stroked),
+                colorArgb = style.colorArgb.withOpacity(style.opacity),
+                widthPt = style.widthPt,
+                // ⚠️ Empty, deliberately. `/InkList` is where Recovered mode reads a stroke's path
+                // back (SPEC §6.4), and a shape recovered as a *stroke* would come back as ink that
+                // can never again be filled, rounded or attached to. A shape's truth is the bundle;
+                // it is recovered from there or not at all.
+                centreline = emptyList(),
+            )
+        }
+        return outlines
+    }
+
+    /** A shape's own-space outline as a [Path] — the same one [PagePainter] draws. */
+    private fun pathOf(dry: DryShape) = Path(dry.path)
+
+    /** Erasure subtracted in object space, then the transform applied — exactly as ink does. */
+    private fun shapeContours(dry: DryShape, path: Path): List<List<PagePoint>> {
+        val erased = dry.erased
+        if (erased != null) path.op(eraserRegion(erased), Path.Op.DIFFERENCE)
+        val local = flatten(path, FLATTEN_STEP_PT / dry.transform.linearScale())
+        val transform = dry.transform
+        if (transform == Matrix3.Identity) return local
+        return local.map { contour -> contour.map { transform.map(it) } }
     }
 
     /**
@@ -160,23 +270,35 @@ public class InkStrokeOutliner(
             stroke.close()
         }
 
-        val eraser = Path()
-        val expanded = Path()
-        val paint = eraserPaint
-        for (run in erased.runs) {
-            paint.strokeWidth = run.radius * 2f
-            expanded.reset()
-            paint.getFillPath(run.path, expanded)
-            // UNION rather than addPath: overlapping capsules must become one region
-            // before the subtraction, which is the whole point (see the class KDoc).
-            eraser.op(expanded, Path.Op.UNION)
-        }
-        stroke.op(eraser, Path.Op.DIFFERENCE)
+        stroke.op(eraserRegion(erased), Path.Op.DIFFERENCE)
         // Sampled at a step that will be [FLATTEN_STEP_PT] once the object's transform has
         // scaled it. A stroke enlarged 4× and flattened at the plain step publishes visibly
         // faceted curves — correct geometry, wrong resolution, and only on the objects the user
         // has bothered to make big.
         return flatten(stroke, FLATTEN_STEP_PT / dry.transform.linearScale())
+    }
+
+    /**
+     * The eraser's swept capsules as **one** region, in the object's own space.
+     *
+     * ⚠️ `UNION`, not `addPath`: overlapping capsules must become a single region *before* the
+     * subtraction. Adding them and subtracting the result under nonzero winding re-fills wherever
+     * two overlap, which is what a scribbled erase produces on nearly every stroke it touches —
+     * the failure the class KDoc describes, and the reason this is done with Skia at all.
+     *
+     * Shared by ink and shapes since M8b, so an erased rectangle and an erased stroke cannot end
+     * up subtly different subtractions.
+     */
+    private fun eraserRegion(erased: ErasedRegion): Path {
+        val eraser = Path()
+        val expanded = Path()
+        for (run in erased.runs) {
+            eraserPaint.strokeWidth = run.radius * 2f
+            expanded.reset()
+            eraserPaint.getFillPath(run.path, expanded)
+            eraser.op(expanded, Path.Op.UNION)
+        }
+        return eraser
     }
 
     /**
@@ -246,6 +368,21 @@ public class InkStrokeOutliner(
 
     /** Reused across strokes; this class is confined to [dispatcher] for one call. */
     private val eraserPaint = Paint().apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+        strokeJoin = Paint.Join.ROUND
+    }
+
+    /**
+     * ⭐ M8b — expands a shape's outline to its painted width, so the PDF *fills* what the screen
+     * strokes.
+     *
+     * Round cap and join because that is what [PagePainter] draws with. A mitre here would put
+     * spikes on a published rectangle's corners that are not on the screen's — the published file
+     * disagreeing with the glass, which is the one class of bug in this pipeline the user would
+     * notice and could not explain.
+     */
+    private val outlinePaint = Paint().apply {
         style = Paint.Style.STROKE
         strokeCap = Paint.Cap.ROUND
         strokeJoin = Paint.Join.ROUND

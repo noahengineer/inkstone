@@ -2,8 +2,8 @@
 
 **Status: all four acceptance criteria met.** Draw-and-hold snapping, fill with opacity, rounded
 corners, connectors that attach on drawing and reroute on move, derived detachment, and a merge row
-for the round trip. §7 is what is *not* done — chiefly the published PDF, which M8b's scope list
-does not ask for, and the tablet.
+for the round trip. §7 is what is *not* done — chiefly re-attaching a connector after it
+is drawn, and the tablet.
 
 This document is what was decided and why, in the order the milestone's prompt asked for it —
 the three known disagreements first, because they had to be resolved before any code.
@@ -147,14 +147,37 @@ measurement, because there is nothing on a device to measure yet:
 and `dumpsys gfxinfo`, and neither has been run for this feature because the feature is not on a
 screen. It is owed by whoever builds §6.
 
-**What a non-PdfBox viewer shows for a translucent filled shape.** **Unknown, and deliberately not
-guessed at** — nothing writes a shape to a PDF yet. What is already known and must not be
-rediscovered is in CLAUDE.md: a translucent fill needs an `/ExtGState` with `/ca`, a page content
-stream has **no `/Resources` of its own** and resolves names through the page dictionary, and
-`/Resources` is inheritable so a fresh one *shadows* whatever a source PDF kept on a `/Pages` node.
-M4 shipped exactly that bug — a translucent highlighter came out fully opaque in PDF.js and the
-overlay was not drawn at all in a stricter reader — and it was green under PdfBox the whole time.
-`PdfViewerCompatTest` is the test that found it and is where the answer has to come from.
+**What a non-PdfBox viewer shows for a translucent filled shape.** **It shows it translucent**, and
+that is now measured rather than reasoned about.
+
+A shape reaches `:android:pdf` as one or two ordinary `StrokeOutline`s — `InkStrokeOutliner`
+expands the outline to its painted width with `Paint.getFillPath`, so both the fill and the edge
+arrive as filled polygons. Translucency therefore travels in the colour's **alpha**, which the
+existing writer already turns into an `/ExtGState` with `/ca`. No new PDF machinery, and in
+particular no second `/Resources` decision — which is the whole reason it was done this way, since
+that decision is exactly what M4 got wrong.
+
+Checked two ways. `PdfViewerCompatTest` asserts the named state is **defined in the resources the
+page can see**, that its `/ca` is below 1, and that an opaque edge resolves to a *different* state
+so the fill's alpha cannot leak onto it. And a note drawn on the emulator was published and its
+`document.pdf` pulled and parsed **with Python** — not PdfBox, not our own `PdfReader`:
+
+```
+/Subtype /Ink : 11        8 strokes + a filled box's fill and edge + a connector
+/ca values    : 0.34901962, 1.0        89/255 — the toolbar's 0.35 fill opacity
+/ExtGState    : GS89, GS255
+```
+
+⚠️ **The stroke is expanded to a fill rather than written as a PDF `S` operator.** A stroked path
+would be less machinery and would be a *second* way for geometry to reach the file: erasure is
+subtracted as an **area** (SPEC §3.5), and subtracting an area from a path that has not yet been
+expanded to its painted width takes a bite out of the centreline instead of out of the ink.
+Expanding first means a shape erases through the same `Path.op` a stroke does.
+
+⚠️ **A shape's `/InkList` is deliberately empty.** That is where Recovered mode reads a path back
+(SPEC §6.4), and a shape recovered *as a stroke* would come back as ink that can never again be
+filled, rounded, or attached to. A shape's truth is the bundle; it is recovered from there or not
+at all.
 
 **Test counts.** `tests=` summed over `*/build/test-results/testDebugUnitTest/*.xml`:
 
@@ -380,36 +403,38 @@ the box is filled, and it is worth knowing before deciding it is a bug.
 
 ## 7. What is left, in order, and what each step inherits
 
-Items 1, 2 and 5 of the original list are done — `DryShape`, its painter, and draw-and-hold. What
-remains:
+**Everything the milestone's scope list and acceptance criteria ask for is done.** What follows is
+what M8b does *not* cover, and what a later milestone inherits.
 
-1. **A tool that creates a connector.** Everything under it works and none of it is reachable: the
-   record, the routing, the re-attachment, the derived detachment. Until a gesture writes a
-   `ShapeRecord` with an end in it, `ConnectorRouting` has no production caller and a green suite
-   establishes nothing (CLAUDE.md definition-of-done #6). This is the single largest gap.
-2. ~~**`NoteEditor.reconcile` must diff the record.**~~ **Done — M8c closed it in `12063a6`.**
-   `NoteEditor.changedRecords` diffs `textOf` (and `formatOf`) between folds and is called from
-   `reconcile`; `StrokeStore.applyContent` carries a record to `DryShape.setRecord` and sets
-   `routesDirty`, so a peer's re-attachment renders. (⚠️ A peer's *move* already re-routed for
-   free — a `SetTransform` the diff carries — which is why this gap was easy to miss when it was
-   open: the obvious test passed.)
-3. **Fill, corner radius and route pickers.** The record carries all three and nothing sets them,
-   so `DryShape.fillable` is false for every shape the app can currently make. The painter's fill
-   path has therefore **never drawn a pixel in the app** — only in `ShapeHitTest`'s arithmetic.
-4. **The PDF**, with `PdfViewerCompatTest` and not PdfBox as the witness — see §4's last question.
-   Nothing writes a shape to a PDF yet, so a published note loses them.
-5. **A merge-matrix row for a record under concurrency.** Rows 2, 3 and 4 have connector analogues
-   that nothing exercises: a `SetTextContent` on a tombstoned connector, two concurrent record
-   writes, and a record write concurrent with a `SetTransform` on its target (which must *both*
-   apply — different registers).
-6. **Selecting a shape.** `SelectionQueries.objectAt` now hit-tests one through the shared
-   predicate, but the lasso and the transform handles have not been tried against a shape on a
-   device. ~~and `StrokeStore.duplicate` is still strokes-only~~ — **closed by the M8 follow-up
-   audit fixes**, along with two seam bugs this item did not know about: `SelectionController`'s
-   restyle read `strokeOf` and fell to `DEFAULT_STYLE` for a shape (recolour reset its width to
-   3 pt; set-width recoloured it black), and Duplicate silently dropped shapes. Restyle now reads
-   `objectOf` with `DryShape.effectiveStyle()` as the baseline, and a duplicated shape travels as
-   `ShapeEdit.duplicate` ops through the store's one door — a connector's record re-targeted at
-   copies for ends inside the selection. `SelectionControllerShapeTest` (instrumented) covers all
-   three, plus the newly wired rectangular marquee.
-7. **The tablet**, including SPEC §3.6's two measurements, which §4 records as owed.
+1. ~~A tool that creates a connector~~ — **done, and it is not a tool.** Draw a line between two
+   shapes and hold: `ShapeSnapController` binds each end via `StrokeStore.shapeAt`. §6b.
+2. ~~`NoteEditor.reconcile` must diff the record~~ — **done, M8c closed it in `12063a6`.**
+   `changedRecords` diffs `textOf` between folds. (⚠️ A peer's *move* already re-routed for free —
+   a `SetTransform` the diff carries — which is why this gap was easy to miss while it was open:
+   the obvious test passed without it.)
+3. ~~Fill, corner radius and route pickers~~ — **done**, as a second selection row shown only when
+   the selection holds a shape.
+4. ~~The PDF~~ — **done.** Shapes publish as `/Ink` annotations with the fill's alpha in an
+   `/ExtGState`; §4's last question has the numbers, read out of a real published file with Python.
+5. ~~A merge-matrix row~~ — **done**, rows 4b and 4c. Still **not** covered: two devices writing a
+   **record** concurrently. SPEC §4.8.2 states the cost — one register holds four properties and
+   LWW resolves whole, so one edit is lost — and that is argued rather than demonstrated. A row
+   asserting both devices land on the same *whole* record is worth having before anyone leans on
+   the argument.
+6. **Selecting a shape** is done for tap, move, delete, fill, corners and duplicate. The **lasso**
+   and the **resize/rotate handles** have not been driven against a shape on a device. The
+   arithmetic is shared with strokes and the hit-test is shared with the eraser, so the risk is
+   low — and it is still an untried path, which is the same sentence M6's inert features had.
+7. ⚠️ **A connector cannot be re-attached after it is drawn.** The register supports it — that is
+   the whole reason attachment is a register and not payload (SPEC §4.8.2) — and
+   `ShapeEdit.writeRecord` is the single op it needs. What is missing is the *gesture*: dragging an
+   endpoint onto a different shape. Today you delete the connector and draw it again, which works
+   and is not what the format was built for.
+8. ⚠️ **Tapping an unfilled shape's centre selects nothing** — you tap its edge. `ShapeHit`'s rule
+   (*"you can erase through a hollow box without touching it"*) applied to the tap test, with one
+   predicate for both so they cannot drift. It reads as correct once the shape is filled. Whether
+   an unfilled shape should be tappable in its interior is a product question nobody has asked yet.
+9. ⚠️ **The tablet.** `adb devices` lists `emulator-5554` and nothing else, so definition-of-done
+   #4 is unmet and SPEC §3.6's two measurements are owed. The dwell time, the classifier's
+   confidence bar and the endpoint bind radius have never met a hand — and SPEC §4.8.7 is explicit
+   that a fixture cannot settle any of them.

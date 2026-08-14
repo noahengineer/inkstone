@@ -11,6 +11,7 @@ import android.graphics.RectF
 import androidx.ink.brush.TextureBitmapStore
 import androidx.ink.geometry.Box
 import androidx.ink.rendering.android.canvas.CanvasStrokeRenderer
+import dev.inkstone.android.ink.InkColor.withOpacity
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.PageSize
@@ -344,28 +345,21 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
         out.setValues(matrixValues)
     }
 
-    /**
-     * An ARGB colour at [opacity] of its own alpha.
-     *
-     * The same arithmetic `StrokeStore` applies when a restyle reaches a brush, and duplicated here
-     * rather than shared because that one is private to a file about brushes and this is a paint.
-     * If a third appears, hoist all three.
-     */
-    private fun Int.withOpacity(opacity: Float): Int {
-        if (opacity >= 1f) return this
-        val alpha = ((this ushr ALPHA_SHIFT and BYTE_MAX) * opacity).toInt().coerceIn(0, BYTE_MAX)
-        return (alpha shl ALPHA_SHIFT) or (this and RGB_MASK)
-    }
+    // `withOpacity` was here, duplicated from `StrokeStore.kt` with a note saying *"if a third
+    // appears, hoist all three"*. M8b's shape fill in `InkStrokeOutliner` is the third; it lives in
+    // [InkColor] now, shared by the screen, the brush and the published PDF.
 
-    private companion object {
+    internal companion object {
         const val PAGE_BORDER_COLOR = 0x22000000
 
-        /** Barb length as a multiple of the line width — proportional, so it survives a resize. */
+        /**
+         * Barb length as a multiple of the line width — proportional, so it survives a resize.
+         *
+         * ⭐ Read by [InkStrokeOutliner] as well, so a published arrow's head is the size of the
+         * drawn one. Two constants would be two arrowheads that agree until somebody tunes one.
+         */
         const val ARROW_HEAD_WIDTHS = 5f
 
-        const val ALPHA_SHIFT = 24
-        const val BYTE_MAX = 0xFF
-        const val RGB_MASK = 0x00FFFFFF
         const val LAYER_PADDING_PT = 2f
         const val MATRIX_VALUES = 9
     }

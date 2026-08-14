@@ -9,6 +9,7 @@ import androidx.ink.geometry.ImmutableVec
 import androidx.ink.geometry.MutableVec
 import androidx.ink.geometry.Parallelogram
 import androidx.ink.strokes.Stroke
+import dev.inkstone.android.ink.InkColor.withOpacity
 import dev.inkstone.core.model.AnchorTarget
 import dev.inkstone.core.model.ConnectorEndState
 import dev.inkstone.core.model.ConnectorTargets
@@ -1133,20 +1134,3 @@ internal class PagePointF(var x: Float = 0f, var y: Float = 0f) {
         set(other.x, other.y)
     }
 }
-
-/**
- * An ARGB colour at [opacity] of its own alpha — how [ObjectStyle.opacity] reaches a brush.
- *
- * Multiplied into the existing alpha rather than replacing it, so restyling a highlighter to
- * 50% gives half of *its* translucency and not half of opaque. `androidx.ink`'s brush has no
- * separate opacity, so this is the only place it can go.
- */
-private fun Int.withOpacity(opacity: Float): Int {
-    if (opacity >= 1f) return this
-    val alpha = ((this ushr ALPHA_SHIFT and BYTE_MAX) * opacity).toInt().coerceIn(0, BYTE_MAX)
-    return (alpha shl ALPHA_SHIFT) or (this and RGB_MASK)
-}
-
-private const val ALPHA_SHIFT = 24
-private const val BYTE_MAX = 0xFF
-private const val RGB_MASK = 0x00FFFFFF
