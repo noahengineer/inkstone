@@ -770,6 +770,15 @@ internal class StrokeStore {
     /** The render state behind an id, whatever kind it is. */
     fun objectOf(id: ObjectId): DryObject? = byId[id]
 
+    /**
+     * The shape behind an id, or null for any other kind — what the record editors need (M8b).
+     *
+     * A sibling of [strokeOf] and, like it, a deliberate narrowing rather than a convenience: fill,
+     * corner radius and a connector's route are properties of a [ShapeRecord], and a caller holding
+     * a [DryStroke] has nothing to write one to.
+     */
+    fun shapeOf(id: ObjectId): DryShape? = byId[id] as? DryShape
+
     // --- Rendering ----------------------------------------------------------
 
     /**

@@ -53,6 +53,14 @@ public fun foldPage(
  *   them back verbatim (SPEC §5.8).
  * @property texts the winning `SetTextContent` register per object — see [textOf].
  */
+// ⚠️ Ten constructor parameters, suppressed **here** rather than by moving the shared threshold.
+// Every one is a distinct thing a fold produces, and a holder type grouping some of them would be
+// a second shape for a caller to learn without removing anything: `texts` and `formats` are side
+// tables precisely *because* they are not on the payload (SPEC §4.8.2, §4.9.2), so folding them
+// back into an object is the exact mistake those sections argue against. The count grew by one in
+// M8b and one in M8c, and each addition is the register that a `when` had previously dropped in
+// silence.
+@Suppress("LongParameterList")
 public class FoldedPage(
     public val pageId: PageId,
     public val size: PageSize,

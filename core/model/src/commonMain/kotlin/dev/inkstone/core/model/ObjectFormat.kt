@@ -177,6 +177,10 @@ internal object ObjectFormatCodec {
         setOf(K_FONT, K_SIZE, K_ALIGN, K_LIST_LEVEL, K_LIST_STYLE, K_CROP_RECT, K_CROP_POLY)
 
     private const val RECT_PARTS = 4
+    private const val RECT_LEFT = 0
+    private const val RECT_TOP = 1
+    private const val RECT_RIGHT = 2
+    private const val RECT_BOTTOM = 3
     private const val MIN_POLYGON_POINTS = 3
 
     fun encode(format: ObjectFormat): String {
@@ -235,15 +239,29 @@ internal object ObjectFormatCodec {
      * unreadable crop is no reason to forget a font size.
      */
     private fun applyKnown(format: ObjectFormat, key: String, value: String): ObjectFormat = when (key) {
-        K_FONT -> fontOf(value)?.let { format.copy(font = it) } ?: format
-        K_SIZE -> value.toFloatOrNull()?.takeIf { it > 0f }?.let { format.copy(sizePt = it) } ?: format
-        K_ALIGN -> alignOf(value)?.let { format.copy(align = it) } ?: format
-        K_LIST_LEVEL -> value.toIntOrNull()?.takeIf { it >= 0 }?.let { format.copy(listLevel = it) } ?: format
-        K_LIST_STYLE -> listOf(value)?.let { format.copy(listStyle = it) } ?: format
+        K_FONT -> format.withFont(value)
+        K_SIZE -> format.withSize(value)
+        K_ALIGN -> format.withAlign(value)
+        K_LIST_LEVEL -> format.withListLevel(value)
+        K_LIST_STYLE -> format.withListStyle(value)
         K_CROP_RECT -> decodeRect(value)?.let { format.copy(crop = it) } ?: format
         K_CROP_POLY -> decodePolygon(value)?.let { format.copy(crop = it) } ?: format
         else -> format
     }
+
+    // One per key, so the dispatch above stays a table. Each is the fail-closed rule spelled once:
+    // an unreadable value leaves its own property alone and touches nothing else.
+    private fun ObjectFormat.withFont(value: String) = fontOf(value)?.let { copy(font = it) } ?: this
+
+    private fun ObjectFormat.withSize(value: String) =
+        value.toFloatOrNull()?.takeIf { it > 0f }?.let { copy(sizePt = it) } ?: this
+
+    private fun ObjectFormat.withAlign(value: String) = alignOf(value)?.let { copy(align = it) } ?: this
+
+    private fun ObjectFormat.withListLevel(value: String) =
+        value.toIntOrNull()?.takeIf { it >= 0 }?.let { copy(listLevel = it) } ?: this
+
+    private fun ObjectFormat.withListStyle(value: String) = listOf(value)?.let { copy(listStyle = it) } ?: this
 
     private fun encodeRect(crop: ImageCrop.Rect): String = listOf(
         crop.left,
@@ -256,10 +274,12 @@ internal object ObjectFormatCodec {
         val parts = value.split(PART)
         if (parts.size != RECT_PARTS) return null
         val numbers = parts.map { it.toFloatOrNull() ?: return null }
-        val left = numbers[0]
-        val top = numbers[1]
-        val right = numbers[2]
-        val bottom = numbers[3]
+        // Named indices: `parts` is known to be [RECT_PARTS] long here, and the order is the wire
+        // format's, not an arbitrary one.
+        val left = numbers[RECT_LEFT]
+        val top = numbers[RECT_TOP]
+        val right = numbers[RECT_RIGHT]
+        val bottom = numbers[RECT_BOTTOM]
         // A degenerate crop would render an image with no pixels and no way back through the UI.
         if (right <= left || bottom <= top) return null
         return ImageCrop.Rect(left, top, right, bottom)

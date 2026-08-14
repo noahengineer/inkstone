@@ -5,6 +5,7 @@ import androidx.annotation.ColorInt
 import dev.inkstone.core.model.Alignment
 import dev.inkstone.core.model.AlignmentGuides
 import dev.inkstone.core.model.Camera
+import dev.inkstone.core.model.ConnectorRoute
 import dev.inkstone.core.model.Lasso
 import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectId
@@ -17,6 +18,8 @@ import dev.inkstone.core.model.SelectedObject
 import dev.inkstone.core.model.SelectionEdit
 import dev.inkstone.core.model.SelectionGesture
 import dev.inkstone.core.model.ShapeEdit
+import dev.inkstone.core.model.ShapeGeometry
+import dev.inkstone.core.model.ShapeRecord
 import kotlin.math.atan2
 import kotlin.math.hypot
 import kotlin.math.max
@@ -57,7 +60,36 @@ public interface InkSelection {
 
     /** Drop the selection without changing anything on the page. */
     public fun clear()
+
+    /**
+     * ⭐ ROADMAP M8b — *"fill colour with opacity"*. Null clears the fill.
+     *
+     * Ignored for anything that is not a shape, and for a shape with no interior
+     * ([ShapeGeometry.isFillable] — a line has none, whatever colour you ask for). A mixed
+     * selection therefore fills the boxes and leaves the ink alone, which is what the user can
+     * see happening.
+     */
+    public fun setFill(@ColorInt colorArgb: Int?, opacity: Float = 1f)
+
+    /** ROADMAP M8b — *"rounded corners"*. Rectangles only ([ShapeGeometry.roundsCorners]). */
+    public fun setCornerRadius(radiusPt: Float)
+
+    /** ROADMAP M8b — elbow and curved. Applies to connectors; a plain shape has no route. */
+    public fun setRoute(route: ConnectorRoute)
+
+    /** How many selected objects are shapes, and how many of those are connectors. */
+    public val shapeCounts: ShapeSelectionCounts
 }
+
+/**
+ * What a selection contains, so the toolbar can offer only what applies.
+ *
+ * ⚠️ Offering *"fill"* for a selection of pen strokes is a button that does nothing, which is the
+ * dishonest-button problem `UndoStack.commit` exists to avoid one screen further down. The
+ * toolbar shows the shape row only when [shapes] is non-zero and the route chip only when
+ * [connectors] is.
+ */
+public data class ShapeSelectionCounts(val shapes: Int, val connectors: Int)
 
 /**
  * ⭐ ROADMAP M8a — the selection gesture: lasso, move, resize, rotate.
@@ -92,6 +124,16 @@ public interface InkSelection {
  * resulting matrix, not a delta" (ROADMAP M8a) is that composition, and the reason it composes
  * against the start rather than against the last frame.
  */
+// ⚠️ Suppressed **on this class**, with a reason, rather than by raising the shared threshold —
+// which would hand the same exemption to every class in the module. `SelectionController` is two
+// things by necessity: a `MotionEvent` gesture state machine, and the implementation of
+// [InkSelection], whose size is set by how many commands a toolbar offers a selection. M8b added
+// three (fill, corners, route) and the count crossed 30. Splitting the command half into its own
+// type is the real answer and it is a public-API change (`surface.selection.setFill(…)` becomes
+// `surface.selection.shapes.setFill(…)`), which is not a thing to do in the same change that adds
+// the commands — M8a already reshaped this seam once and had to re-run the whole emulator walk to
+// prove nothing had come unhooked.
+@Suppress("TooManyFunctions")
 internal class SelectionController(
     private val store: StrokeStore,
     private val brushes: InkBrushFactory,
@@ -455,6 +497,59 @@ internal class SelectionController(
                 recorder::newClock,
             ),
         )
+    }
+
+    // --- The record's own properties (M8b) ----------------------------------
+
+    override val shapeCounts: ShapeSelectionCounts
+        get() {
+            val shapes = selection.mapNotNull { store.shapeOf(it) }
+            return ShapeSelectionCounts(shapes.size, shapes.count { it.isConnector })
+        }
+
+    override fun setFill(colorArgb: Int?, opacity: Float) = editRecords { shape, record ->
+        // A line has no interior. Refused here rather than written and ignored by the painter,
+        // because a record that says "filled" for something unfillable is a value two builds could
+        // read differently — and it would survive into a build that *can* fill it.
+        if (!ShapeGeometry.isFillable(shape.obj.shape)) {
+            null
+        } else {
+            record.copy(fillArgb = colorArgb, fillOpacity = opacity.coerceIn(0f, 1f))
+        }
+    }
+
+    override fun setCornerRadius(radiusPt: Float) = editRecords { shape, record ->
+        if (!ShapeGeometry.roundsCorners(shape.obj.shape)) null else record.copy(cornerRadiusPt = radiusPt)
+    }
+
+    override fun setRoute(route: ConnectorRoute) = editRecords { _, record ->
+        // A plain shape has no route, and writing one would put a string in the file for every
+        // rectangle in the selection — see `ShapeEdit.create` on why a default record is omitted.
+        if (!record.isConnector) null else record.copy(route = route)
+    }
+
+    /**
+     * One `SetTextContent` per selected shape whose record actually changes — one gesture, so one
+     * undo entry (SPEC §4.6).
+     *
+     * ⚠️ **[change] returns null to mean "not this one"**, and the whole record otherwise. The
+     * record is read from the [DryShape] and copied, never rebuilt: it carries a `fillOpacity` this
+     * toolbar does not set and an `extras` map a *later build* may have written (SPEC §4.8.2), and
+     * reconstructing it from the fields the caller knows about would drop both — the same
+     * forward-compatibility loss `OpExtras` exists to prevent, one level down.
+     *
+     * A record that comes back equal writes nothing, so pressing "elbow" twice costs one op rather
+     * than two, and an object the change does not apply to is skipped rather than rewritten.
+     */
+    private fun editRecords(change: (DryShape, ShapeRecord) -> ShapeRecord?) {
+        val recorder = store.recorder ?: return
+        val ops = selection.mapNotNull { id ->
+            val shape = store.shapeOf(id) ?: return@mapNotNull null
+            val next = change(shape, shape.record) ?: return@mapNotNull null
+            if (next == shape.record) return@mapNotNull null
+            ShapeEdit.writeRecord(id, next, recorder::newOpId, recorder::newClock)
+        }
+        applyAsGesture(ops)
     }
 
     /**

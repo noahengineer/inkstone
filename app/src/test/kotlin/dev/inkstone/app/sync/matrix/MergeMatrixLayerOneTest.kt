@@ -1,7 +1,16 @@
 package dev.inkstone.app.sync.matrix
 
+import dev.inkstone.core.model.ConnectorEnd
+import dev.inkstone.core.model.ConnectorEndState
+import dev.inkstone.core.model.ConnectorRouting
 import dev.inkstone.core.model.Matrix3
+import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PageRect
+import dev.inkstone.core.model.ShapeKind
+import dev.inkstone.core.model.ShapeObject
+import dev.inkstone.core.model.ShapeRecord
+import dev.inkstone.core.model.recordOf
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -324,6 +333,121 @@ class MergeMatrixLayerOneTest {
         assertEquals(onA.transform, onB.transform, "the two devices disagree about the transform")
     }
 
+    /**
+     * ⭐ **Row 4b — a connector's attachment survives a sync round trip, and a peer's move of the
+     * shape it points at sends nothing about the route.**
+     *
+     * ROADMAP M8b's fourth acceptance criterion, and the companion the table did not ask for. It
+     * asserts three separable things, because each fails differently:
+     *
+     * 1. **The binding arrives.** A `SetTextContent` carrying a `ShapeRecord` is an ordinary op on
+     *    an ordinary `ShapeObject`, so this is really the assertion that SPEC §4.8.2's choice of
+     *    register survives the transport — which is the whole reason that choice was available.
+     * 2. **The route is identical on both devices without either having sent one.** Every input to
+     *    it is a value the merge already converges on, so the two agree with **zero** bytes about
+     *    the route exchanged (SPEC §4.8.3).
+     * 3. ⭐ **Moving the target writes no record.** The op count for `SetTextContent` is unchanged
+     *    across a move that visibly re-routes the connector on both devices. This is the assertion
+     *    that would fail if a future change ever "helpfully" persisted a route — and it is the one
+     *    an eyeball test cannot make, because a persisted route looks *correct* right up until two
+     *    devices write one concurrently.
+     */
+    @Test
+    fun `row 4b - a connector attachment survives a round trip and a peer move sends no route`() = matrixRow(
+        row = "row 4b (connector attachment)",
+        proven = "a binding crossing the wire, a route derived identically on both sides, and no op for a reroute",
+        notProven = "anything about how the route is drawn — that is ShapeSnapController and the painter",
+    ) { devices ->
+        val id = devices.share("Row4b")
+        val page = devices.a.firstPage(id)
+        val from = devices.a.addShape(id, ShapeKind.RECTANGLE, PageRect(0f, 0f, BOX, BOX))
+        val to = devices.a.addShape(id, ShapeKind.RECTANGLE, PageRect(FAR, 0f, FAR + BOX, BOX))
+        val connector = devices.a.addShape(
+            id,
+            ShapeKind.ARROW,
+            PageRect(BOX, BOX / 2f, FAR, BOX / 2f),
+            ShapeRecord(endA = ConnectorEnd.Attached(from), endB = ConnectorEnd.Attached(to)),
+        )
+        devices.syncBothWays()
+
+        // 1 — the binding crossed.
+        val onB = devices.b.page(id, page)
+        assertEquals(
+            ShapeRecord(endA = ConnectorEnd.Attached(from), endB = ConnectorEnd.Attached(to)),
+            onB.recordOf(connector),
+            "device-b did not receive the attachment",
+        )
+
+        // 2 — and both devices derive the same route from it, having exchanged nothing about it.
+        assertEquals(routeOf(devices.a.page(id, page), connector), routeOf(onB, connector))
+
+        // 3 — b moves the box; a re-routes without either writing a record.
+        val recordsBefore = devices.a.opsOn(id, page).count { it is PageOp.SetTextContent }
+        devices.b.transform(id, to, Matrix3.translate(0f, FAR))
+        devices.syncBothWays()
+
+        val movedOnA = devices.a.page(id, page)
+        assertEquals(
+            recordsBefore,
+            devices.a.opsOn(id, page).count { it is PageOp.SetTextContent },
+            "a reroute wrote a record — the route is being persisted (SPEC §4.8.3)",
+        )
+        val rerouted = assertNotNull(routeOf(movedOnA, connector))
+        assertTrue(rerouted.a.isAttached && rerouted.b.isAttached, "an end detached across the move")
+        assertEquals(rerouted, routeOf(devices.b.page(id, page), connector), "the devices disagree about the route")
+        assertTrue(rerouted.b.point.y > BOX, "the connector did not follow the box that moved")
+    }
+
+    /**
+     * ⚑ Row 4c — deleting the shape a connector points at.
+     *
+     * ROADMAP's third criterion, *"a defined state (detached, not dangling or crashing)"*, across
+     * the wire. The record is **untouched** by the delete — detachment is derived from the fold,
+     * never stored (SPEC §4.8.4) — and both devices agree on the fallback geometry, so an undo of
+     * the delete on either side re-attaches with no op at all.
+     */
+    @Test
+    fun `row 4c - deleting a connected shape detaches without writing anything`() = matrixRow(
+        row = "row 4c (derived detachment)",
+        proven = "a tombstoned target detaching identically on both devices with the record unchanged",
+        notProven = "the not-yet-arrived case, which ConnectorTest covers — it needs no server",
+    ) { devices ->
+        val id = devices.share("Row4c")
+        val page = devices.a.firstPage(id)
+        val from = devices.a.addShape(id, ShapeKind.RECTANGLE, PageRect(0f, 0f, BOX, BOX))
+        val to = devices.a.addShape(id, ShapeKind.RECTANGLE, PageRect(FAR, 0f, FAR + BOX, BOX))
+        val connector = devices.a.addShape(
+            id,
+            ShapeKind.ARROW,
+            PageRect(BOX, BOX / 2f, FAR, BOX / 2f),
+            ShapeRecord(endA = ConnectorEnd.Attached(from), endB = ConnectorEnd.Attached(to)),
+        )
+        devices.syncBothWays()
+
+        val record = devices.a.page(id, page).recordOf(connector)
+        devices.b.deleteObjectAt(id, to, COLLISION_COUNTER)
+        devices.syncBothWays()
+
+        for (device in listOf(devices.a, devices.b)) {
+            val folded = device.page(id, page)
+            assertEquals(record, folded.recordOf(connector), "${device.name} rewrote the record on a delete")
+            val routed = assertNotNull(routeOf(folded, connector))
+            assertEquals(
+                ConnectorEndState.DETACHED_TOMBSTONED,
+                routed.b.state,
+                "${device.name} did not derive the detachment",
+            )
+            assertTrue(routed.a.isAttached, "${device.name} detached the end that was untouched")
+        }
+    }
+
+    /** The route as both devices derive it — the thing that is never sent. */
+    private fun routeOf(page: dev.inkstone.core.model.FoldedPage, connector: ObjectId) = ConnectorRouting.route(
+        assertNotNull(page.find(connector) as? ShapeObject, "the connector is not on the page"),
+        page.recordOf(connector),
+        page,
+    )
+
     private companion object {
         /**
          * A counter far above anything the fixture's own gestures reach, so "the same counter on
@@ -331,6 +455,10 @@ class MergeMatrixLayerOneTest {
          */
         const val COLLISION_COUNTER = 10_000L
         const val RED = 0xFFCC0000.toInt()
+
+        /** Two boxes far enough apart that the connector between them has an unambiguous direction. */
+        const val BOX = 100f
+        const val FAR = 400f
 
         /** π/2, as a literal so the test has no arithmetic of its own to be wrong about. */
         const val QUARTER_TURN = 1.5707964f

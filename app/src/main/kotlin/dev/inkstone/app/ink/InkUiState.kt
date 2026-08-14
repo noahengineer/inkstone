@@ -55,6 +55,16 @@ class InkUiState {
     /** How many objects the lasso currently holds — what the selection actions are enabled by. */
     var selectionSize by mutableIntStateOf(0)
 
+    /**
+     * ⭐ M8b — how much of the selection the shape row applies to.
+     *
+     * Kept beside [selectionSize] rather than derived from it, because only the ink surface knows
+     * what kind each selected object is: `:app` holds ids and a count, never the render state.
+     */
+    var selectedShapes by mutableIntStateOf(0)
+
+    var selectedConnectors by mutableIntStateOf(0)
+
     /** SPEC §3.5, revised in M1: partial erase is the default. */
     var eraseMode by mutableStateOf(EraseMode.PARTIAL)
 

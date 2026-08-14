@@ -815,11 +815,11 @@ public class InkSurfaceView @JvmOverloads constructor(
             activeStrokeId = null
             strokePointerId = MotionEvent.INVALID_POINTER_ID
         },
-        onSnapped = { kind ->
+        onSnapped = { kind, attached ->
             dryView.onStoreChanged()
             onStrokeCountChanged?.invoke(strokes.size)
             onHistoryChanged?.invoke()
-            onShapeSnapped?.invoke(kind)
+            onShapeSnapped?.invoke(kind, attached)
         },
     )
 
@@ -875,11 +875,32 @@ public class InkSurfaceView @JvmOverloads constructor(
      */
     private fun snapNow() {
         val widthPt = pen.widthDp * displayMetrics.density / pixelsPerPoint
-        if (snap.snap(pen.colorArgb, widthPt)) strokes.endEdit()
+        // ⭐ In **page** points, through the camera — ROADMAP M8b's "snap-to-other-shapes for
+        // endpoints" is a reach on the glass, not on the page. A constant in page units is a
+        // different physical distance at every zoom, so a line would bind to a box it is nowhere
+        // near when zoomed out and refuse one it is touching when zoomed in.
+        //
+        // ⚠️ **`dp × density ÷ scale`, and NOT the `÷ pixelsPerPoint` that `widthPt` above needs.**
+        // The two conversions look interchangeable and are not: a *width* is authored in page
+        // points, so dp reaches it through `pixelsPerPoint`; a *reach on the glass* is view pixels,
+        // and view pixels are page units times the camera scale. Dividing by both shrank the radius
+        // by a factor of `pixelsPerPoint`, and the emulator found it immediately — a line drawn
+        // 20 px short of a box, which is how a person draws one, did not attach, while a line drawn
+        // *through* both boxes did. `SelectionController.snapTolerance` is the same conversion and
+        // is the one to copy; its own KDoc records the identical bug in the alignment guides.
+        val bindSlopPt = ENDPOINT_BIND_SLOP_DP * displayMetrics.density / camera.scale
+        if (snap.snap(pen.colorArgb, widthPt, bindSlopPt)) strokes.endEdit()
     }
 
-    /** Fired after a gesture snapped, so the toolbar can say what it became. */
-    public var onShapeSnapped: ((ShapeKind) -> Unit)? = null
+    /**
+     * Fired after a gesture snapped, so the toolbar can say what it became.
+     *
+     * The boolean is whether both — or either — end **attached** to a shape. Worth surfacing
+     * because a line and a connector are pixel-identical the instant they are drawn and behave
+     * completely differently the moment anything moves; without it the user has no way to tell
+     * whether the binding took except by dragging a box and seeing what happens.
+     */
+    public var onShapeSnapped: ((ShapeKind, Boolean) -> Unit)? = null
 
     private fun onMove(event: MotionEvent): Boolean {
         val strokeId = activeStrokeId
@@ -1022,6 +1043,16 @@ public class InkSurfaceView @JvmOverloads constructor(
          */
         val LOAD_CLOCK = LamportClock(0, "load")
         const val ZOOM_TOGGLE_THRESHOLD = 1.2f
+
+        /**
+         * How close a snapped line's end must come to a shape to attach to it (ROADMAP M8b).
+         *
+         * A little wider than the selection tool's 12 dp snap, because a person drawing a line
+         * *to* a box habitually stops a few millimetres short of it — the gap is how the drawing
+         * reads. Too small and almost nothing binds; too large and a line passing near a box
+         * attaches to it. ⚠️ Not measured on a device, like the dwell constants (SPEC §4.8.7).
+         */
+        const val ENDPOINT_BIND_SLOP_DP = 20f
 
         val IDENTITY = Matrix()
     }

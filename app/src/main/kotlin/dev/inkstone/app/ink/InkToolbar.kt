@@ -33,6 +33,7 @@ import dev.inkstone.android.ink.EraseMode
 import dev.inkstone.android.ink.InkBrushKind
 import dev.inkstone.android.ink.InkInputModel
 import dev.inkstone.android.ink.InkTool
+import dev.inkstone.core.model.ConnectorRoute
 import dev.inkstone.core.model.FitMode
 import kotlin.math.roundToInt
 
@@ -197,8 +198,13 @@ private const val GATE_STROKE_COUNT = 5000
  * `SetStyle` is per object), so the slider is an instruction rather than a readout. Dragging it
  * says "make them this wide"; it does not claim they already are.
  */
+// ⚠️ A **Column**, and it is not decoration. This composable is called from an
+// `AnimatedVisibility`, whose content slot lays its children out in a Box — so the two rows below
+// were drawn *on top of each other*, "1 selected" over "1 shape" and every button over another
+// button. Compiled, ran, and was unreadable; a screenshot is what found it, which is the second
+// time in this milestone that looking at the screen beat reading the code.
 @Composable
-private fun SelectionRow(state: InkUiState, actions: InkToolbarActions) {
+private fun SelectionRow(state: InkUiState, actions: InkToolbarActions) = Column {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
         Text(
             "${state.selectionSize} selected",
@@ -213,7 +219,52 @@ private fun SelectionRow(state: InkUiState, actions: InkToolbarActions) {
         }
         TextButton(onClick = actions.onClearSelection) { Text("Deselect") }
     }
+    ShapeRow(state, actions)
 }
+
+/**
+ * ⭐ ROADMAP M8b — fill, rounded corners and a connector's route.
+ *
+ * ## Why this row appears and disappears
+ *
+ * It is shown only when the selection holds a shape, and the route chip only when one of them is a
+ * connector. A *"Fill"* button over a selection of pen strokes is a button that does nothing when
+ * pressed — the dishonest-button problem `UndoStack.commit` fixes one layer down, and the same
+ * answer applies here: do not offer what cannot happen.
+ *
+ * ## Why these are toggles and not a property panel
+ *
+ * A fill picker, an opacity slider and a radius slider are what this wants to become, and none of
+ * them is in ROADMAP M8b's scope list — which asks for fill, opacity and rounded corners to
+ * *exist*, not for a panel to set them from (CLAUDE.md: *"don't gold-plate"*). Fill takes the pen's
+ * current colour, which is the colour the user most recently chose and is already on screen beside
+ * this row; the opacity is fixed at [FILL_OPACITY] so that a filled box does not hide the ink drawn
+ * over it. Both are one tap and both undo.
+ */
+@Composable
+private fun ShapeRow(state: InkUiState, actions: InkToolbarActions) {
+    if (state.selectedShapes == 0) return
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text("${state.selectedShapes} shape", style = MaterialTheme.typography.labelSmall)
+        TextButton(onClick = { actions.onFillSelection(state.pen.colorArgb, FILL_OPACITY) }) { Text("Fill") }
+        TextButton(onClick = { actions.onFillSelection(null, 1f) }) { Text("No fill") }
+        TextButton(onClick = { actions.onRoundSelection(CORNER_RADIUS_PT) }) { Text("Round") }
+        TextButton(onClick = { actions.onRoundSelection(0f) }) { Text("Square") }
+        if (state.selectedConnectors > 0) {
+            ConnectorRoute.entries.forEach { route ->
+                TextButton(onClick = { actions.onRouteSelection(route) }) {
+                    Text(route.name.lowercase().replaceFirstChar { it.uppercase() })
+                }
+            }
+        }
+    }
+}
+
+/** Translucent enough that ink drawn over a filled box still reads. Not user-settable — see [ShapeRow]. */
+private const val FILL_OPACITY = 0.35f
+
+/** One tap's worth of rounding — a visible radius at any page size, and not a pill. */
+private const val CORNER_RADIUS_PT = 8f
 
 /** Brushes, eraser, erase mode, colour swatch and width. */
 @Composable

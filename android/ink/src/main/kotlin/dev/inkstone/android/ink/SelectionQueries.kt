@@ -9,6 +9,7 @@ import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.SelectedObject
+import dev.inkstone.core.model.ShapeHit
 
 /*
  * ⭐ M8a — asking a page of ink what a lasso or a tap just hit.
@@ -79,6 +80,41 @@ internal fun StrokeStore.objectAt(x: Float, y: Float, slopPageUnits: Float): Obj
         // being a shape you cannot select.
         val dab = ErasedRegion.Capsule(local.x, local.y, local.x, local.y, slop)
         if (dry.hitBy(tip, dab)) hit = dry.id
+    }
+    return hit
+}
+
+/**
+ * ⭐ M8b — the topmost **shape** a connector endpoint would attach to, or null.
+ *
+ * ROADMAP M8b's *"snap-to-other-shapes for endpoints"*. Deliberately not [objectAt]:
+ *
+ * - **Shapes only.** `ConnectorRouting` can anchor against a local box and nothing else, so a
+ *   binding naming a stroke resolves as `DETACHED_UNANCHORABLE` forever (SPEC §4.8.4). Offering
+ *   the user an attachment that can never resolve is worse than not offering one — the connector
+ *   would look right at the moment it was drawn and detach on the next fold.
+ * - **The whole box, not the outline.** [objectAt] asks *"did the tap land on the ink"*, which is
+ *   right for selecting and wrong here: dropping a line's end in the **middle** of a rectangle is
+ *   the clearest way a person can say "attach to this box", and an outline test would answer no.
+ *   [ShapeHit] with `filled = true` is that question, asked of the shape's own outline.
+ *
+ * @param slopPageUnits how far outside the shape the endpoint may land and still bind. A drawn
+ *   line usually stops just short of the box it points at, so zero slop would bind almost nothing.
+ */
+internal fun StrokeStore.shapeAt(x: Float, y: Float, slopPageUnits: Float): ObjectId? {
+    var hit: ObjectId? = null
+    val local = PagePointF()
+    forEachInRenderOrder(visibleBounds = null) { dry ->
+        if (dry !is DryShape) return@forEachInRenderOrder
+        // A connector is not an anchor. Attaching one to another is expressible and routable, but
+        // the route would then depend on a route, and two connectors attached to each other have
+        // no fixed point to resolve from — so it is refused here rather than left to converge.
+        if (dry.isConnector) return@forEachInRenderOrder
+        val bounds = dry.pageBounds
+        if (bounds != null && !bounds.containsWithin(x, y, slopPageUnits)) return@forEachInRenderOrder
+        if (!dry.toLocal(x, y, local)) return@forEachInRenderOrder
+        val slop = dry.toLocalLength(slopPageUnits)
+        if (ShapeHit.hitsPoint(dry.outline, filled = true, x = local.x, y = local.y, reach = slop)) hit = dry.id
     }
     return hit
 }

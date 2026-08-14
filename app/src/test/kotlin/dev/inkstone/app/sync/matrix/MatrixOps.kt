@@ -5,14 +5,19 @@ import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.EraseCapsule
 import dev.inkstone.core.model.ErasedArea
 import dev.inkstone.core.model.FoldedPage
+import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.SelectedObject
 import dev.inkstone.core.model.SelectionEdit
+import dev.inkstone.core.model.ShapeEdit
+import dev.inkstone.core.model.ShapeKind
+import dev.inkstone.core.model.ShapeRecord
 import dev.inkstone.core.model.StrokeGeometry
 import dev.inkstone.core.model.StrokeObject
 import dev.inkstone.core.model.selected
@@ -133,6 +138,48 @@ internal suspend fun Device.setStyle(noteId: DocumentId, target: ObjectId, color
             ),
         )
         style
+    }
+
+/**
+ * ⭐ M8b — a shape, built through `ShapeEdit.create`, i.e. the same function the ink surface calls.
+ *
+ * A row that hand-built its own `AddObject` would be testing the row (CLAUDE.md: *"distrust a
+ * fixture that is more generous than production"*), and this one has a second reason to go through
+ * production: `create` **omits the record when it is default**, so a fixture that always wrote one
+ * would hide the case where a plain shape writes no `SetTextContent` at all.
+ */
+internal suspend fun Device.addShape(
+    noteId: DocumentId,
+    kind: ShapeKind,
+    box: PageRect,
+    record: ShapeRecord = ShapeRecord.None,
+): ObjectId = edit(noteId) { session, page ->
+    val id = ids.newObjectId()
+    session.apply(
+        page,
+        ShapeEdit.create(
+            id = id,
+            placement = ShapeEdit.place(kind, box),
+            z = FractionalKey.between(null, null),
+            record = record,
+            nextOpId = session::nextOpId,
+            nextClock = session::nextClock,
+        ),
+    )
+    id
+}
+
+/**
+ * ⭐ M8b — re-attach or re-style a connector, through `ShapeEdit.writeRecord`.
+ *
+ * The one op M8b ever writes about a connector (SPEC §4.8.2). Everything else about a route —
+ * where it runs, whether each end is attached — is derived at draw time and never sent, which is
+ * what the row using this exists to demonstrate.
+ */
+internal suspend fun Device.writeRecord(noteId: DocumentId, target: ObjectId, record: ShapeRecord): ShapeRecord =
+    edit(noteId) { session, page ->
+        session.apply(page, listOf(ShapeEdit.writeRecord(target, record, session::nextOpId, session::nextClock)))
+        record
     }
 
 /**

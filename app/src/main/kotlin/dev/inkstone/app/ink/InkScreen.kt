@@ -148,6 +148,9 @@ private fun inkToolbarActions(
     onBringSelectionToFront = { surface?.selection?.bringToFront() },
     onSendSelectionToBack = { surface?.selection?.sendToBack() },
     onClearSelection = { surface?.selection?.clear() },
+    onFillSelection = { colorArgb, opacity -> surface?.selection?.setFill(colorArgb, opacity) },
+    onRoundSelection = { radiusPt -> surface?.selection?.setCornerRadius(radiusPt) },
+    onRouteSelection = { route -> surface?.selection?.setRoute(route) },
 )
 
 /**
@@ -277,10 +280,24 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
                 onRedoRequested = { editor.redo() }
                 onEraserAutoReleased = { ui.tool = InkTool.PEN }
                 // ⭐ M8a — what the selection action row is shown and enabled by.
-                onSelectionChanged = { count -> ui.selectionSize = count }
+                onSelectionChanged = { count ->
+                    ui.selectionSize = count
+                    // Asked of the surface here rather than pushed through the callback, because
+                    // the counts are a *property of the selection* and this is the one moment it
+                    // is known to have changed — a second callback would be a second thing to
+                    // forget to fire.
+                    val counts = selection.shapeCounts
+                    ui.selectedShapes = counts.shapes
+                    ui.selectedConnectors = counts.connectors
+                }
                 // ⭐ M8b — the acknowledgement. Without it the first snap is indistinguishable
                 // from the app having eaten the stroke and drawn something else.
-                onShapeSnapped = { kind -> ui.lastSnapped = kind.name.lowercase() }
+                // "attached" rather than the kind, when it bound: a connector and a line are
+                // pixel-identical when drawn and behave differently the moment a box moves, so
+                // the acknowledgement has to say which one the user got.
+                onShapeSnapped = { kind, attached ->
+                    ui.lastSnapped = if (attached) "${kind.name.lowercase()} · attached" else kind.name.lowercase()
+                }
                 // ⭐ M12 §3 — the timeline's only input. Fired on the UI thread in the frame the
                 // dry layer redraws, so the view model does one subtraction and one enqueue and
                 // returns (CLAUDE.md rule 7); the file append rides the journal's own rhythm.

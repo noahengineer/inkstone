@@ -1,8 +1,9 @@
 # M8b — Shapes and connectors
 
-**Status: shapes are drawn, draw-and-hold works and is reachable from the toolbar. Connectors
-are specified, implemented and unit-tested, but nothing in the UI creates one yet.**
-§7 is the remaining work with the traps each step inherits.
+**Status: all four acceptance criteria met.** Draw-and-hold snapping, fill with opacity, rounded
+corners, connectors that attach on drawing and reroute on move, derived detachment, and a merge row
+for the round trip. §7 is what is *not* done — chiefly the published PDF, which M8b's scope list
+does not ask for, and the tablet.
 
 This document is what was decided and why, in the order the milestone's prompt asked for it —
 the three known disagreements first, because they had to be resolved before any code.
@@ -316,6 +317,64 @@ commit and running the same subset is what separates them; the difference betwee
   The **framework link** (`linkIosCore`) logs `SKIPPED` on Windows and is the macOS CI job's to
   prove. This is not a claim that it passed.
 - **Definition of done #4 (the Galaxy Tab): not met, and not close.** Nothing runs.
+
+---
+
+## 6b. Connectors, and the two bugs the emulator found that nothing else would have
+
+### A connector is drawn, not moded
+
+ROADMAP's *"snap-to-other-shapes for endpoints"* turned out to be the whole feature rather than a
+refinement of it. **Draw a line between two shapes and hold**: draw-and-hold already produces the
+line, and binding its ends is the same gesture noticing what it landed on. A modal connector tool
+was the obvious design and was rejected — it adds a mode to an eight-chip toolbar to express
+something the existing gesture says unambiguously (CLAUDE.md: *"don't gold-plate"*).
+
+What is deliberately refused, each because the alternative is worse than not binding: a rectangle
+whose corners touch two boxes (every diagram's outer box would start re-routing); both ends on one
+shape (two `Auto` anchors facing the same centre have no direction to resolve from); and attaching
+to another **connector** (its route would depend on a route, with no fixed point). An unbound end is
+left `null` rather than `ConnectorEnd.Free` — identical geometry today, and they differ the moment
+the connector is *moved*, where null follows the transform and `Free` would stay behind.
+
+### ⚠️ The bind radius divided by `pixelsPerPoint` as well as the camera scale
+
+The two conversions in `snapNow` look interchangeable and are not. A **width** is authored in page
+points, so dp reaches it through `pixelsPerPoint`. A **reach on the glass** is view pixels, and view
+pixels are page units times the camera scale. Doing both shrank the radius by a factor of
+`pixelsPerPoint`.
+
+It failed in exactly the way that is hardest to catch by reading: a line drawn *through* both boxes
+attached, so every reasonable test passed. A line drawn the way a person draws one — stopping
+20 px short of the box it points at, because the gap is how the drawing reads — did not. The first
+emulator attempt did precisely that and reported `snapped to line` instead of
+`snapped to line · attached`. `SelectionController.snapTolerance` is the same conversion done
+correctly, and its own KDoc records the identical bug in the alignment guides, fixed one commit
+earlier.
+
+### ⚠️ Two toolbar rows drawn on top of each other
+
+`AnimatedVisibility`'s content slot lays its children out in a **Box**, so adding a second `Row`
+beside the selection row stacked them: *"1 selected"* over *"1 shape"*, every button over another
+button. It compiled, it ran, and it was unreadable. A screenshot found it — the second time in this
+milestone that looking at the screen beat reading the code, after M8a's *"the colour panel was
+covering that part of the screen"*.
+
+### The walk
+
+| Gesture | Result |
+|---|---|
+| Two boxes, each drawn and held | "snapped to rectangle", 0 → 2 |
+| Line between them with a realistic gap, held | **"snapped to line · attached"** |
+| Select, tap box edge | "1 selected · 1 shape", **Fill/No fill/Round/Square** appear, no route chips |
+| Drag that box down | connector followed; **both** ends re-anchored on the boundaries |
+| Delete the box | connector fell back to its authored geometry, still attached at the other end |
+| Fill, then Round | translucent fill and rounded corners, connector still on the filled box's edge |
+
+⚠️ **Tapping an unfilled box's *centre* selects nothing** — you tap its edge. That is `ShapeHit`'s
+rule (*"you can erase through a hollow box without touching it"*) applied to the tap test, on
+purpose, and it is the same predicate for both so the two cannot drift. It reads as correct once
+the box is filled, and it is worth knowing before deciding it is a bug.
 
 ---
 

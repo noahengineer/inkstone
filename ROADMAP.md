@@ -981,7 +981,18 @@ Add sync round-trip tests for transform and partial-erase (SPEC §13.2 rows 3, 7
 
 **Bigger than it looks.** Connectors that stay attached and reroute when a shape moves is a small diagramming engine.
 
-> ⚠️ **Partially delivered. Shapes work; connectors are built but unreachable.**
+> ✅ **All four acceptance criteria met, each driven on `emulator-5554` or asserted by a merge row.**
+> Draw-and-hold snapping, fill with opacity, rounded corners, connectors that attach on drawing
+> and reroute on move, and derived detachment. A connector is created by **drawing a line between
+> two shapes and holding** — the scope list's *"snap-to-other-shapes for endpoints"* — rather than
+> by a modal tool.
+>
+> ⚠️ **Two things M8b's scope list does not ask for and this does not do**: shapes are not written
+> into the published PDF (they live in the bundle, which is the truth — SPEC §5.1 — but a reader
+> that is not this app sees a note without them), and definition-of-done #4 is unmet, so the dwell
+> and confidence constants have never met a hand. `docs/M8-CONNECTORS.md` §7.
+>
+> *Historical note, superseded:* **Partially delivered. Shapes work; connectors are built but unreachable.**
 > What exists: the connector data structure decided, specified (SPEC §4.8) and implemented in
 > `:core:model`; routing, anchoring and detachment derived and tested; the record carried safely
 > through every storage path that rebuilds a page from something other than its raw log. **Shapes
@@ -1017,13 +1028,17 @@ arrow. SPEC §4.8.7.
       box and an arrow snapped; a zigzag squiggle did not, and stayed ink in `journal.ops`. **Not
       yet judged by a hand on the tablet**, which is the only place the confidence bar can be
       settled — SPEC §4.8.7.)*
-- [ ] Connectors stay attached and reroute when a connected shape is moved or resized *(implemented
-      and unit-tested against translate, resize and rotate; **no UI creates a connector**, so this
-      has never run in the app)*
-- [ ] Deleting a shape leaves its connectors in a defined state (detached, not dangling or crashing)
-      *(derived, tested in `ConnectorTest` and `ShapeRecordStorageTest`; same caveat)*
-- [ ] Connector attachment survives a sync round-trip *(survives a bundle round trip, a compaction
-      snapshot and both duplicate paths; **not yet exercised through `:core:sync`**)*
+- [x] Connectors stay attached and reroute when a connected shape is moved or resized *(emulator:
+      drew a line between two boxes → "snapped to line · attached"; dragged one box with the select
+      tool and the connector followed, both ends re-anchoring on the boundaries. Resize and rotate
+      are `ConnectorTest`, asserting page coordinates.)*
+- [x] Deleting a shape leaves its connectors in a defined state (detached, not dangling or crashing)
+      *(emulator: deleted a connected box and the connector fell back to its authored geometry,
+      still attached at the other end. Merge row 4c asserts the record is **unchanged** by the
+      delete — the detachment is derived, never stored.)*
+- [x] Connector attachment survives a sync round-trip *(merge matrix **row 4b**, against the
+      in-process server: the binding crosses, both devices derive an identical route having
+      exchanged nothing about it, and a peer's move of the target writes **no** `SetTextContent`.)*
 
 ⚠️ **The third criterion must not be read as "persist a detachment"** (M8b). SPEC §4.2 already
 says a delete of an object that has not arrived records its tombstone anyway, and that an op

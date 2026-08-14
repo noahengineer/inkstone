@@ -1,8 +1,11 @@
 package dev.inkstone.android.ink
 
+import dev.inkstone.core.model.ConnectorEnd
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.ShapeEdit
 import dev.inkstone.core.model.ShapeKind
+import dev.inkstone.core.model.ShapeRecord
+import dev.inkstone.core.model.SnapCandidate
 
 /**
  * ⭐ ROADMAP M8b — draw a shape, hold still, and the ink becomes the shape.
@@ -31,13 +34,15 @@ import dev.inkstone.core.model.ShapeKind
  *   has to be tombstoned afterwards. A stroke created and then deleted would keep its geometry in
  *   the log forever (CLAUDE.md rule 1) and would sync.
  * @param onSnapped fired after the shape is on the page, so the toolbar can say what it became.
- *   Without it, the first snap is indistinguishable from the app having eaten the stroke.
+ *   Without it, the first snap is indistinguishable from the app having eaten the stroke. The
+ *   boolean is whether it also **attached** — a line and a connector look identical the instant
+ *   they are drawn, and they behave completely differently the moment anything moves.
  */
 internal class ShapeSnapController(
     private val store: StrokeStore,
     private val brushes: InkBrushFactory,
     private val cancelWetStroke: () -> Unit,
-    private val onSnapped: (ShapeKind) -> Unit,
+    private val onSnapped: (ShapeKind, Boolean) -> Unit,
 ) {
 
     private val detector = ShapeSnapDetector()
@@ -73,17 +78,20 @@ internal class ShapeSnapController(
      * @return true when a shape was made. False leaves the ink exactly as it was, which is what a
      *   gesture that matched nothing well must do (SPEC §4.8.7).
      */
-    fun snap(colorArgb: Int, widthPt: Float): Boolean {
+    fun snap(colorArgb: Int, widthPt: Float, bindSlopPt: Float = 0f): Boolean {
         val candidate = detector.classify() ?: return false
         val recorder = store.recorder ?: return false
+        val kind = kindFor(candidate.kind)
+        val record = connectorRecordFor(candidate, kind, bindSlopPt)
         cancelWetStroke()
 
         val ops = ShapeEdit.create(
             id = recorder.newObjectId(),
-            placement = candidate.placement(bandPt = widthPt, asKind = kindFor(candidate.kind)),
+            placement = candidate.placement(bandPt = widthPt, asKind = kind),
             z = store.allocateTopZ(1).single(),
             // The pen's own colour and width, so a snapped shape looks like the ink it replaced.
             style = ObjectStyle(colorArgb, widthPt),
+            record = record,
             nextOpId = recorder::newOpId,
             nextClock = recorder::newClock,
         )
@@ -91,8 +99,52 @@ internal class ShapeSnapController(
         // undo come through. One construction path and one insertion path, so the screen cannot
         // disagree with the log about what was made.
         store.applyOps(ops, brushes, record = true)
-        onSnapped(kindFor(candidate.kind))
+        onSnapped(kind, record.isConnector)
         return true
+    }
+
+    /**
+     * ⭐ ROADMAP M8b's *"snap-to-other-shapes for endpoints"* — a drawn line between two boxes
+     * **becomes** an attached connector.
+     *
+     * ## Why this is not a tool
+     *
+     * A modal connector tool was the obvious design and is the wrong one for this app. Drawing a
+     * line from one shape to another is already the gesture people use on paper, and draw-and-hold
+     * already turns it into a line; binding its ends is the same gesture noticing what it landed
+     * on. A tool would add a mode to a toolbar that is already eight chips wide, to express
+     * something the existing gesture says unambiguously (CLAUDE.md: *"don't gold-plate"*).
+     *
+     * ## What is deliberately refused
+     *
+     * - **Anything but a line or an arrow.** A rectangle whose corners happen to touch two boxes is
+     *   not a connector, and treating it as one would make every diagram's outermost box start
+     *   re-routing.
+     * - **Both ends on the same shape.** Two `Auto` anchors on one box both face its own centre,
+     *   so the route has no direction to resolve from. It stays a plain line, which is what was
+     *   drawn.
+     * - **Neither end on a shape.** Returns [ShapeRecord.None], and `ShapeEdit.create` then emits
+     *   the `AddObject` alone — so an ordinary snapped line still writes **no record at all** and
+     *   costs no string in the file.
+     *
+     * ## An unbound end is left null rather than [ConnectorEnd.Free]
+     *
+     * Both resolve to the same page point today — the connector's own payload endpoint. They
+     * differ the moment the connector is *moved*: a null end follows the object's transform, which
+     * is what dragging a half-attached connector should do, while a `Free` end is an absolute page
+     * point that would stay behind. Null is also fewer bytes on a path that runs per snapped line.
+     */
+    private fun connectorRecordFor(candidate: SnapCandidate, kind: ShapeKind, slopPt: Float): ShapeRecord {
+        if (kind != ShapeKind.LINE && kind != ShapeKind.ARROW) return ShapeRecord.None
+        if (slopPt <= 0f) return ShapeRecord.None
+        val from = store.shapeAt(candidate.from.x, candidate.from.y, slopPt)
+        val to = store.shapeAt(candidate.to.x, candidate.to.y, slopPt)
+        if (from == null && to == null) return ShapeRecord.None
+        if (from != null && from == to) return ShapeRecord.None
+        return ShapeRecord(
+            endA = from?.let { ConnectorEnd.Attached(it) },
+            endB = to?.let { ConnectorEnd.Attached(it) },
+        )
     }
 
     /**
