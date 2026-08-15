@@ -99,17 +99,27 @@ internal class ShapeSnapDetector(
         val dx = pageX - anchorX
         val dy = pageY - anchorY
         val movedSquared = dx * dx + dy * dy
-        append(pageX, pageY)
 
         if (movedSquared > holdRadiusPt * holdRadiusPt) {
             // Moved out of the dwell window: this is drawing, not holding. The window restarts
             // here, and the distance counts towards "was this a gesture at all".
+            append(pageX, pageY)
             travel += sqrtOf(movedSquared)
             anchorX = pageX
             anchorY = pageY
             anchorAt = eventTimeMillis
             return NOT_HOLDING
         }
+        // ⚠️ Deliberately NOT appended. A sample inside the dwell window is the *hold*, not the
+        // drawing, and recording it corrupts the very gesture the hold exists to classify: half a
+        // second of tremor at 240 Hz piles ~130 points onto one spot, which inflates `pathLength`
+        // without moving the endpoints. `ShapeSnap` divides by that length twice — a line's
+        // straightness fell below the bar, and a closed shape's end-gap ratio fell *under*
+        // `CLOSED_MAX_GAP`, so holding still made an open arc look closed. Both got worse the
+        // longer the user held, which is the opposite of what holding longer should mean.
+        //
+        // Dropping them also makes sampling uniform in arc length rather than in time, so a shape
+        // drawn slowly and one drawn quickly present the same evidence.
         if (travel < minTravelPt) return NOT_HOLDING
         val remaining = holdMillis - (eventTimeMillis - anchorAt)
         if (remaining > 0) return remaining

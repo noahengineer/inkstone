@@ -162,20 +162,26 @@ fun ImageRow(state: ObjectToolState, actions: ObjectActions) {
             )
         }
         val focused = state.image ?: return@Column
+
+        // ⭐ While cropping the row is the crop's own controls and nothing else. A Rotate button
+        // live during a crop would write a `SetTransform` under the overlay's feet — the handles
+        // are positioned from the frame it just changed — and the user would watch the frame jump
+        // off the picture.
+        if (state.cropping != null) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text("drag the corners", style = MaterialTheme.typography.labelSmall)
+                TextButton(onClick = { state.commitCrop(actions) }) { Text("Done") }
+                TextButton(onClick = { state.cancelCrop() }) { Text("Cancel") }
+                TextButton(onClick = { state.resetCrop() }) { Text("Reset") }
+            }
+            return@Column
+        }
+
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             TextButton(onClick = { actions.onTurn(focused.id, QUARTER_TURN, false, false) }) { Text("Rotate") }
             TextButton(onClick = { actions.onTurn(focused.id, 0f, true, false) }) { Text("Flip ⇄") }
             TextButton(onClick = { actions.onTurn(focused.id, 0f, false, true) }) { Text("Flip ⇅") }
-            FilterChip(
-                selected = state.cropping == CropMode.RECT,
-                onClick = { state.cropping = if (state.cropping == CropMode.RECT) null else CropMode.RECT },
-                label = { Text("Crop ▭") },
-            )
-            FilterChip(
-                selected = state.cropping == CropMode.FREEHAND,
-                onClick = { state.cropping = if (state.cropping == CropMode.FREEHAND) null else CropMode.FREEHAND },
-                label = { Text("Crop ✎") },
-            )
+            TextButton(onClick = { state.beginCrop() }) { Text("Crop") }
             TextButton(onClick = { actions.onCrop(focused.id, null) }) { Text("Uncrop") }
         }
     }

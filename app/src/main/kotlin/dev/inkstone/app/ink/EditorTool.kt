@@ -34,7 +34,17 @@ enum class EditorTool(val ink: InkTool) {
     /** Tap to place a text box, or tap an existing one to edit it. */
     TEXT(InkTool.SELECT),
 
-    /** Tap an image to rotate, flip or crop it; the insert buttons are in the toolbar. */
+    /**
+     * Select an image to rotate, flip or crop it; the insert buttons are in the toolbar.
+     *
+     * ⚠️ **This tool does not own touch unless it is cropping**, and that is the fix for *"you can't
+     * move an image without the select tool"*. It used to: a full-screen overlay sat in front of the
+     * surface and offered a tap and nothing else, so while the one tool that knew about images was
+     * active the surface received no events at all and a drag was not merely unimplemented, it was
+     * unreachable. Falling through to [InkTool.SELECT] gives move, resize and rotate — the code that
+     * already works for every other object — and the bar now follows `InkSelection.soleImage`
+     * however the picture got selected.
+     */
     IMAGE(InkTool.SELECT),
 
     /** Drag a box to capture an Element; tap to stamp the one the panel has selected. */
@@ -64,6 +74,12 @@ enum class EditorTool(val ink: InkTool) {
      * `ACTION_DOWN`, which is what makes it free on the ink path (CLAUDE.md rule 7). Making it a
      * tool would have made *"the ruler is out"* and *"I am drawing"* mutually exclusive, which is
      * the opposite of what a ruler is for.
+     *
+     * ⚠️ **[IMAGE] is no longer here**, and its absence is the fix for *"you can't move an image
+     * without the select tool"* — see that value's KDoc. Cropping does not bring it back either:
+     * `CropOverlay` is its own composable with its own `pointerInput`, shown only while a crop is
+     * open, so the one gesture that genuinely needs to be captured says so where it happens
+     * instead of making the whole tool modal.
      */
-    val ownsTouch: Boolean get() = this == TEXT || this == IMAGE || this == ELEMENT
+    val ownsTouch: Boolean get() = this == TEXT || this == ELEMENT
 }

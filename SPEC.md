@@ -872,10 +872,34 @@ exactly that reason.
 
 Classification is a **bounding box and a shoelace area**, not a recogniser: a rectangle fills its
 box, an ellipse `π/4` of it, a triangle half. Those are facts about the shapes rather than tuning.
+
+⚠️ **The box is the *minimum-area* one, at any angle — not the axis-aligned one.** M8b used the
+axis-aligned box and that made the feature measure the wrong thing entirely: a square's fill against
+an axis-aligned box is `1 / (1 + k·sin 2θ)`, which sweeps the whole feature range as the user tilts
+their hand, so a rectangle drawn 7° off-axis classified as an **ellipse** and one at 45° as a
+**triangle at confidence 1.000**. A circle's axis-aligned fill is `π/4` at *every* angle, so the
+ellipse was the one kind that could be measured at all — the user's report was *"i can like only do
+ovels/circles"*, and it was exact. Against the minimum-area box (convex hull + rotating calipers,
+`OrientedBounds`) all three ratios are rotation-invariant by construction, and the shape is also
+**placed at the angle it was drawn** rather than flattened onto the axes.
+
+Two thresholds travel with that. The closure test is `endGap / pathLength ≤ 0.12`; at M8b's 0.22 an
+open **300° arc** passed it and became an ellipse at confidence 0.84, so every large open curve held
+still was eaten — a second, independent mechanism behind the same complaint. And the dwell's own
+samples are **not** appended to the gesture: half a second of tremor at 240 Hz piles ~130 points onto
+one spot, inflating `pathLength`, which both sank a line's straightness below its bar and pulled a
+*open* gesture's end-gap ratio under the closure threshold. Both got worse the longer the user held.
+
 What *is* tuned is the confidence bar and the window around each target, and M7's rule applies —
 a synthetic fixture is the worst possible witness for a geometric heuristic, so *"no fighting it
 to draw a freehand curve"* is settled on the tablet and nowhere else. A gesture that matches
 nothing well leaves the ink alone, which is the default.
+
+A snapped shape is **selected the moment it is made**, so the handles that edit it (§4.8.9) are
+already there. The tool is deliberately not changed — a flowchart is five boxes in a row, and
+stealing the pen after each would cost five taps to give back; the toolbar offers **Adjust**, one
+tap, which switches to Select without dropping the selection. ⚠️ That sentence was in this spec and
+in `InkSurfaceView`'s KDoc for two milestones before the button existed.
 
 `ARROW` is never recognised. An arrowhead is a few samples at one end of a gesture,
 indistinguishable from a hooked pen-lift; it is a tool the user picks.
@@ -887,6 +911,65 @@ would make `ShapeKind.valueOf` throw in every older build (§4.8.1), which is th
 whole section is arranged to avoid. **SPEC wins; POLYGON is dropped.** A closed run of straight
 segments remains expressible as an ordinary ink stroke with no format change at all, which is
 where it should go if it is ever wanted — it simply cannot carry a fill.
+
+#### 4.8.9 Editing a shape by its points, and the curve ⭐
+
+*A shape's selection frame can move, scale and rotate it as a lump. That is the wrong instrument
+for a shape whose points are the thing being drawn, and for two kinds it is not merely coarse but
+incapable: no scale turns one triangle into another, and an axis-aligned line's frame has no height
+to grab. This section is what a point drag writes.*
+
+**Three points are an affine map, so a point drag is a placement and not new geometry.** A
+`ShapeObject` is a kind, a local box, and the matrix that places it (§4.8.6). A 2-D affine map is
+determined by exactly three point correspondences — so *"put this vertex there and leave the other
+two"* has one answer, and that answer is a matrix. Every vertex drag therefore emits the ordinary
+absolute `SetTransform` §4.2 froze in M2. No new op, no new object kind, no geometry stored beside
+the payload, and undo, the merge matrix, the PDF and a peer's copy keep working because none of
+them can tell a point drag from a drag of the whole shape.
+
+| Kind | Handles | A drag solves |
+|---|---|---|
+| `TRIANGLE` | 3 vertices | the exact affine; the other two vertices are pinned |
+| `LINE` / `ARROW` | 2 ends + 1 bend | a **similarity** about the far end; the bend writes the record |
+| `RECTANGLE` | 4 corners | a scale on **both** local axes about the opposite corner |
+| `ELLIPSE` | 4 quadrant points | a scale on **one** local axis about the opposite point |
+
+⚠️ **Only the triangle gets the free affine, and the restriction is the feature.** A rectangle has
+four corners and an affine has three degrees of freedom, so *"drag one corner, pin the other
+three"* has **no** solution — the fourth is `B + D − A` by construction. Solving it as a free
+affine anyway would silently turn every rectangle into a parallelogram the moment a corner was
+touched. Scaling the shape's **own** axes keeps the right angles, and because they are the shape's
+and not the page's, the dragged corner still lands exactly under the finger at any rotation. A
+corner drag past its own pin is clamped rather than allowed to mirror the shape.
+
+**The curve is the one thing a placement cannot express**, because a straight segment and a bent
+one are different paths and no affine map turns one into the other. It is therefore the one point
+of new state, and it goes where §4.8.2 put attachment: the `SetTextContent` register, as
+`ShapeRecord.bend` — the shape's **own-space** on-curve midpoint of a `LINE` or an `ARROW`.
+
+- **A sixth `ShapeKind` was not available** (§4.8.8, which dropped `POLYGON` for this reason).
+- **The degrade is the best one there is**: a build that predates the key keeps the bytes,
+  re-encodes them verbatim, and draws the line **straight** — the same fallback a detached
+  connector already uses, and exactly what the payload has always described.
+- **Own-space, for §4.8.3's reason**: a point in the object's box is carried by the object's
+  absolute matrix, so moving, resizing or rotating a curve writes one `SetTransform` and nothing
+  else.
+- **The handle is the curve's midpoint, not the Bézier's control point.** A control point sits off
+  the curve, and someone dragging one is aiming at a place the ink never goes. The conversion is
+  exact: a quadratic's midpoint is `(A + 2C + B)/4`.
+- A bend within **14 dp of the chord snaps to straight**, and straight is stored as *no bend* —
+  which restores `ShapeRecord.isDefault` and stops the line costing a string in the file.
+
+**Creating a curve is bending a line**, not recognising one. Draw-and-hold deliberately refuses an
+open arc (§4.8.7 — *"no fighting it to draw a freehand curve"* is an acceptance criterion, and
+snapping arcs is how it would be broken), so the gesture is: snap a line, then pull its middle
+handle. That also means a curve is only ever created by an explicit edit.
+
+**A connector has no point handles.** Its geometry is derived from what its ends are attached to
+and re-derived on every fold (§4.8.3), so a vertex drag would write a correct `SetTransform` that
+the reroute paints straight over — an honest-looking dead grip. Dragging an endpoint onto a
+*different* shape is the gesture a connector actually wants, and it is still owed
+(`docs/M8-CONNECTORS.md` §7.7).
 
 ### 4.9 Text boxes, images, and the format register ⭐
 
@@ -958,6 +1041,24 @@ vocabulary — a flip is a matrix negation. ROADMAP M8c says as much and it is r
 monotonically with the gesture; a crop is a single absolute region the user can widen again. They
 would fight over one register, and "erase part of a photo" and "crop a photo" are different
 operations a user can perform on the same image.
+
+⚠️ **A crop is two ops, and the second is what makes it a crop rather than a zoom.** `SetFormat`
+says *which pixels*; it says nothing about how big the picture is, and the renderer scales whatever
+the crop selects to fill the object's unchanged `widthPt × heightPt` box. So a crop written alone
+does not crop — it **zooms**, and cropping a square photo to a tall sliver returns that sliver
+stretched back out to a square, discarding the aspect ratio insert-time downscaling went to trouble
+to preserve. What a person means by *crop* is that the frame shrinks to the part they kept and the
+pixels do not move: that is an ordinary absolute `SetTransform` alongside the `SetFormat`
+(`ImageEdit.crop`), emitted as **one gesture** so one undo puts both back.
+
+The frame is always recomputed from the **whole-source** frame (`ImageEdit.uncroppedFrame`), never
+composed onto the frame the previous crop left. That is what keeps a crop widen-able — including all
+the way back to no crop at all — and it is the difference between a crop and an erase that rule 1
+requires. It also makes the crop UI's numbers correct without a composition step: the overlay shows
+the **whole uncropped picture** with the current crop as draggable corner handles, so what the user
+drags is already fractions of the source. Editing a freehand (`Polygon`) crop degrades it to its
+bounding box, because the overlay drags a rectangle; an existing polygon crop still renders and
+publishes unchanged.
 
 #### 4.9.3 What an older build does with such a note
 

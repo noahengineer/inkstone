@@ -66,6 +66,24 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
     var record: ShapeRecord = record
         private set
 
+    /**
+     * ⭐ The bend a handle drag is currently proposing, or null when none is.
+     *
+     * ⚠️ **A preview, and therefore not the truth** — the sibling of [StrokeStore.previewTransform]
+     * and there for the same reason: a curve has to follow the finger at 240 Hz and must produce
+     * exactly **one** `SetTextContent` when the finger lifts, not one per frame. Held here rather
+     * than pushed through [setRecord] so that a preview cannot be mistaken for a register write:
+     * [record] is what the log says and what a peer will see, and it is unchanged until the commit
+     * comes back through [StrokeStore.applyOps] like every other op.
+     *
+     * `null` is *"no preview"*, not *"straight"* — a drag back onto the chord previews a bend that
+     * [ShapeGeometry.outline] itself renders straight, so the two never have to be told apart here.
+     */
+    private var bendPreview: PagePoint? = null
+
+    /** True while [bendPreview] is standing in for the record's own bend. */
+    private var previewingBend = false
+
     /** How each end resolved, for a UI that wants to say "the shape this pointed at was deleted". */
     var routing: ConnectorPath? = null
         private set
@@ -88,7 +106,29 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
     /** The render side of `SetTextContent` — a shape's record is that register (SPEC §4.8.2). */
     fun setRecord(text: String?) {
         record = ShapeRecord.decode(text) ?: ShapeRecord.None
+        // The register is the truth again, so a preview standing in front of it is over. Without
+        // this, committing a bend would leave the preview shadowing the value it just wrote — and
+        // the *next* op to arrive on this shape, from an undo or a peer, would be drawn with the
+        // last drag's curve.
+        clearBendPreview()
         rebuild(plainOutline())
+    }
+
+    /**
+     * Show [local] as this shape's bend without writing anything. Null ends the preview.
+     *
+     * @return true when the outline actually changed, so a caller can skip a repaint for a frame
+     *   the finger did not move enough to matter.
+     */
+    fun previewBend(local: PagePoint?): Boolean {
+        previewingBend = local != null
+        bendPreview = local
+        return rebuildIfChanged(plainOutline())
+    }
+
+    private fun clearBendPreview() {
+        previewingBend = false
+        bendPreview = null
     }
 
     /**
@@ -111,7 +151,17 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
     private fun asAnchorTarget(): AnchorTarget = obj.asAnchorTarget().copy(transform = transform)
 
     private fun plainOutline(): ShapePath =
-        ShapeGeometry.outline(obj.shape, obj.widthPt, obj.heightPt, record.cornerRadiusPt)
+        ShapeGeometry.outline(obj.shape, obj.widthPt, obj.heightPt, record.cornerRadiusPt, bendNow())
+
+    /**
+     * The bend to draw with: the drag in flight, else the register's.
+     *
+     * ⭐ **Public, because the handle has to sit on the curve the user can see.** `ShapePoints.of`
+     * takes the live bend so the middle handle tracks the ink during the drag rather than snapping
+     * to it on release — and reading it off the record instead would put the handle back where the
+     * curve *was* every frame.
+     */
+    fun bendNow(): PagePoint? = if (previewingBend) bendPreview else record.bend
 
     private fun rebuildIfChanged(next: ShapePath): Boolean {
         if (next == outline) return false
@@ -208,6 +258,21 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
         toY = capsule.toY,
         radius = capsule.radius,
         slop = (style?.widthPt ?: obj.style?.widthPt ?: 0f) / 2f,
+    )
+
+    /**
+     * A tap anywhere **inside** a closed shape is on it, filled or not — see [DryObject.tappedAt].
+     *
+     * This is the one kind that overrides, because it is the one kind whose eraser rule says its
+     * middle is empty. A line and an arrow are not closed, so they keep the outline test and are
+     * still grabbed by reach alone.
+     */
+    override fun tappedAt(localX: Float, localY: Float, reach: Float): Boolean = ShapeHit.hitsPoint(
+        path = outline,
+        filled = outline.closed,
+        x = localX,
+        y = localY,
+        reach = reach + (style?.widthPt ?: obj.style?.widthPt ?: 0f) / 2f,
     )
 
     /** The outline in page space — what a lasso and the tap test measure against. */

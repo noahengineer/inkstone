@@ -437,11 +437,18 @@ what M8b does *not* cover, and what a later milestone inherits.
    and the **resize/rotate handles** have not been driven against a shape on a device. The
    arithmetic is shared with strokes and the hit-test is shared with the eraser, so the risk is
    low — and it is still an untried path, which is the same sentence M6's inert features had.
+   ✅ **Partly closed by `docs/M8-SHAPE-POINTS.md`:** a shape's own **point** handles replaced the
+   eight frame grips and were driven on the emulator for a line and a rectangle. The lasso against
+   a shape, and rotate, are still untried on a device.
 7. ⚠️ **A connector cannot be re-attached after it is drawn.** The register supports it — that is
    the whole reason attachment is a register and not payload (SPEC §4.8.2) — and
    `ShapeEdit.writeRecord` is the single op it needs. What is missing is the *gesture*: dragging an
    endpoint onto a different shape. Today you delete the connector and draw it again, which works
    and is not what the format was built for.
+   ⚠️ **Still open, and now conspicuous.** M8 follow-up 3 gave every other shape draggable points
+   and deliberately gave a connector none — its route is derived, so a vertex drag would write a
+   correct `SetTransform` that the reroute paints straight over (SPEC §4.8.9). A connector is now
+   the one shape with no point editing, which is a better argument for building this than it had.
 8. ⚠️ **Tapping an unfilled shape's centre selects nothing** — you tap its edge. `ShapeHit`'s rule
    (*"you can erase through a hollow box without touching it"*) applied to the tap test, with one
    predicate for both so they cannot drift. It reads as correct once the shape is filled. Whether

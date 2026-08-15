@@ -61,17 +61,36 @@ public object ShapeGeometry {
      */
     public fun roundsCorners(kind: ShapeKind): Boolean = kind == ShapeKind.RECTANGLE
 
+    /** Only a segment bends. A box with a bend is a box — see [outline]'s [bendLocal]. */
+    public fun bends(kind: ShapeKind): Boolean = kind == ShapeKind.LINE || kind == ShapeKind.ARROW
+
     /**
      * [kind]'s outline in its own space.
      *
      * @param cornerRadiusPt clamped to half the shorter side, so a large radius degrades into a
      *   stadium rather than into self-intersecting arcs. Ignored where [roundsCorners] is false.
+     * @param bendLocal ⭐ the **on-curve midpoint** of a [ShapeKind.LINE] or [ShapeKind.ARROW], in
+     *   this shape's own space — the third of [ShapePoints]' three handles. Null, or a point on the
+     *   chord, draws the straight segment. Ignored where [bends] is false.
+     *
+     *   ⚠️ Defaulted, like [cornerRadiusPt] beside it, and CLAUDE.md's *"when a default argument
+     *   can lose data, delete the parameter"* was weighed against that. It stays a default because
+     *   there is exactly **one** production caller — `DryShape.plainOutline`, which passes
+     *   `record.bend` — and because the failure mode is bounded in a way `NoteSession.apply`'s was
+     *   not: forgetting it draws a straight line for one frame, while the bend is still in the
+     *   record and still on disk. Nothing is destroyed by getting it wrong.
      */
-    public fun outline(kind: ShapeKind, widthPt: Float, heightPt: Float, cornerRadiusPt: Float = 0f): ShapePath {
+    public fun outline(
+        kind: ShapeKind,
+        widthPt: Float,
+        heightPt: Float,
+        cornerRadiusPt: Float = 0f,
+        bendLocal: PagePoint? = null,
+    ): ShapePath {
         val w = max(widthPt, 0f)
         val h = max(heightPt, 0f)
         return when (kind) {
-            ShapeKind.LINE, ShapeKind.ARROW -> segment(w, h)
+            ShapeKind.LINE, ShapeKind.ARROW -> segment(w, h, bendLocal)
             ShapeKind.RECTANGLE -> rectangle(w, h, cornerRadiusPt)
             ShapeKind.ELLIPSE -> ellipse(w, h)
             ShapeKind.TRIANGLE -> triangle(w, h)
@@ -124,9 +143,49 @@ public object ShapeGeometry {
     // Outlines
     // -----------------------------------------------------------------------
 
-    private fun segment(w: Float, h: Float): ShapePath {
+    /**
+     * The line, straight or bent.
+     *
+     * ⭐ **A curve is one quadratic Bézier, written as a cubic, and [bend] is a point *on* it.** Two
+     * decisions are worth reading here.
+     *
+     * The handle is the curve's **midpoint** rather than the Bézier's control point, because a
+     * control point sits off the curve and a person dragging one is aiming at a place the ink never
+     * goes. The conversion is exact: a quadratic's midpoint is `(A + 2C + B) / 4`, so the control
+     * point that puts the curve under the finger is `C = 2M − (A + B)/2`.
+     *
+     * A **quadratic** rather than a cubic with two handles, because three points is the whole of
+     * what was asked for and a quadratic through three points is unique — two independent control
+     * points would need four handles and would make *"pull the middle"* ambiguous. [ShapeSegment]
+     * has no quadratic (PDF has no quadratic operator — see its KDoc), so the degree is raised here,
+     * once, where both renderers and the PDF writer read the same answer.
+     *
+     * A bend on the chord is not a bend: the curve degenerates to the straight segment anyway, and
+     * emitting a cubic for it would make *"is this line straight"* a question about float noise.
+     */
+    private fun segment(w: Float, h: Float, bend: PagePoint?): ShapePath {
         val y = h / 2f
-        return ShapePath(listOf(ShapeSegment.MoveTo(0f, y), ShapeSegment.LineTo(w, y)), closed = false)
+        val start = ShapeSegment.MoveTo(0f, y)
+        val straight = ShapePath(listOf(start, ShapeSegment.LineTo(w, y)), closed = false)
+        if (bend == null || abs(bend.y - y) < STRAIGHT_EPSILON_PT) return straight
+        // The quadratic control point that puts the curve's midpoint exactly on the handle.
+        val cx = 2f * bend.x - w / 2f
+        val cy = 2f * bend.y - y
+        // Degree-raise: a quadratic (A, C, B) is the cubic (A, A + ⅔(C−A), B + ⅔(C−B), B).
+        return ShapePath(
+            listOf(
+                start,
+                ShapeSegment.CubicTo(
+                    THIRDS * cx,
+                    y + THIRDS * (cy - y),
+                    w + THIRDS * (cx - w),
+                    y + THIRDS * (cy - y),
+                    w,
+                    y,
+                ),
+            ),
+            closed = false,
+        )
     }
 
     private fun rectangle(w: Float, h: Float, radiusPt: Float): ShapePath {
@@ -256,6 +315,20 @@ public object ShapeGeometry {
 
     /** Circle-to-cubic control fraction: `4/3 · (√2 − 1)`. */
     private const val KAPPA = 0.5522847498f
+
+    /** Quadratic-to-cubic control fraction — the ⅔ in `A + ⅔(C − A)`. */
+    private const val THIRDS = 2f / 3f
+
+    /**
+     * A bend nearer the chord than this is straight.
+     *
+     * ⚠️ **A numerical guard, not the user's straighten tolerance.** That one is
+     * [ShapePoints.STRAIGHTEN_DP], measured on the glass and applied while the finger is still
+     * down; by the time a bend reaches here it has already been through it. This only stops a
+     * float's worth of offset from turning a line into a cubic that is straight to the eye and not
+     * to `ShapePath.segments`.
+     */
+    private const val STRAIGHT_EPSILON_PT = 0.02f
 
     private const val EPSILON = 1e-6f
 }

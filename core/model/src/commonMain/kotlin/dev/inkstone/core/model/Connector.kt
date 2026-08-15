@@ -83,6 +83,28 @@ public data class ShapeRecord(
     val fillOpacity: Float = 1f,
     /** Rectangle only — see [ShapeGeometry.roundsCorners]. */
     val cornerRadiusPt: Float = 0f,
+    /**
+     * ⭐ **The curve.** A [ShapeKind.LINE] or [ShapeKind.ARROW]'s on-curve midpoint, in the shape's
+     * **own space**; null for a straight one. See [ShapeGeometry.outline] and [ShapePoints].
+     *
+     * ## Why a curve is a register on a line and not a sixth [ShapeKind]
+     *
+     * `OpCodec.decodeObject` reads the kind with `ShapeKind.valueOf` and `BundleReader` decodes a
+     * page's ops unguarded, so a new constant is not a degrade — it is **an older build failing to
+     * open a note it has already synced** (docs/M8-CONNECTORS.md §1.1, which dropped `POLYGON` for
+     * exactly this). Here the degrade is the best one available: a build that predates this key
+     * keeps the bytes, re-encodes them verbatim, and draws the line **straight** — the same
+     * fallback a detached connector already uses, and the same picture the payload has always
+     * described.
+     *
+     * ## Why the shape's own space and not the page's
+     *
+     * The same reason [ConnectorAnchor.Pinned] is normalised: a point in the object's own box is
+     * carried by the object's absolute matrix, so moving, resizing or rotating a curve writes one
+     * `SetTransform` and nothing else. A page-space bend would need rewriting on every one of
+     * them — the register ROADMAP M8b forbids, arrived at from a third direction.
+     */
+    val bend: PagePoint? = null,
     /** Null for a plain shape. Non-null at *either* end makes this object a connector. */
     val endA: ConnectorEnd? = null,
     val endB: ConnectorEnd? = null,
@@ -94,9 +116,17 @@ public data class ShapeRecord(
     /** A shape is a connector exactly when it has at least one end. Nothing else marks it. */
     public val isConnector: Boolean get() = endA != null || endB != null
 
-    /** True when this record says nothing — the state a plain drawn shape starts in. */
+    /**
+     * True when this record says nothing — the state a plain drawn shape starts in.
+     *
+     * ⚠️ [bend] belongs in here, and forgetting it would be quiet: `ShapeEdit.create` omits a
+     * default record entirely, and `SelectionController.editRecords` writes its undo **baseline**
+     * only for a shape whose record is default. A curved line reading as "default" would therefore
+     * be published with no record at all by one path, and given a baseline that erases its curve by
+     * the other.
+     */
     public val isDefault: Boolean
-        get() = fillArgb == null && cornerRadiusPt == 0f && !isConnector && extras.isEmpty()
+        get() = fillArgb == null && cornerRadiusPt == 0f && bend == null && !isConnector && extras.isEmpty()
 
     /**
      * Every object this record names, for the id remap a note or page duplicate needs.
@@ -467,7 +497,7 @@ public object ConnectorRouting {
  * The wire form of a [ShapeRecord] — what goes in the `SetTextContent` register.
  *
  * ```
- * is1;f=-16777216;fo=0.5;r=8;a=o:0192…-…:0.5:1;b=o:0192…-…;rt=e
+ * is1;f=-16777216;fo=0.5;r=8;a=o:0192…-…:0.5:1;b=o:0192…-…;rt=e;bd=40:-12.5
  * ```
  *
  * Deliberately terse and ASCII-only. It is written on the same two-second autosave as everything
@@ -511,6 +541,12 @@ internal object ShapeRecordCodec {
     private const val K_END_B = "b"
     private const val K_ROUTE = "rt"
 
+    /** `bd=x:y` — the curve's on-curve midpoint, in the shape's own space. */
+    private const val K_BEND = "bd"
+
+    /** `x:y`, and nothing else — an arity that is not two is a value from a build that meant more. */
+    private const val BEND_PARTS = 2
+
     private const val TAG_FREE = "p"
     private const val TAG_OBJECT = "o"
 
@@ -521,7 +557,7 @@ internal object ShapeRecordCodec {
     private const val PINNED_U = 2
     private const val PINNED_V = 3
 
-    private val knownKeys = setOf(K_FILL, K_FILL_OPACITY, K_RADIUS, K_END_A, K_END_B, K_ROUTE)
+    private val knownKeys = setOf(K_FILL, K_FILL_OPACITY, K_RADIUS, K_END_A, K_END_B, K_ROUTE, K_BEND)
 
     fun encode(record: ShapeRecord): String {
         val parts = ArrayList<String>()
@@ -532,6 +568,7 @@ internal object ShapeRecordCodec {
         record.endA?.let { parts += "$K_END_A$EQUALS${encodeEnd(it)}" }
         record.endB?.let { parts += "$K_END_B$EQUALS${encodeEnd(it)}" }
         if (record.route != ConnectorRoute.STRAIGHT) parts += "$K_ROUTE$EQUALS${encodeRoute(record.route)}"
+        record.bend?.let { parts += "$K_BEND$EQUALS${format(it.x)}$PART${format(it.y)}" }
         // Sorted, so identical content produces identical bytes whatever order a future build
         // happened to read them in — the same discipline `BundleReader` applies to unknown
         // manifest members (SPEC §5.8).
@@ -572,10 +609,28 @@ internal object ShapeRecordCodec {
         K_FILL -> record.withFill(value)
         K_FILL_OPACITY -> record.withFillOpacity(value)
         K_RADIUS -> record.withRadius(value)
-        K_END_A -> decodeEnd(value)?.let { record.copy(endA = it) } ?: record
-        K_END_B -> decodeEnd(value)?.let { record.copy(endB = it) } ?: record
+        K_END_A -> record.withEnd(value, isA = true)
+        K_END_B -> record.withEnd(value, isA = false)
         K_ROUTE -> record.copy(route = decodeRoute(value))
+        K_BEND -> record.withBend(value)
         else -> record
+    }
+
+    private fun ShapeRecord.withEnd(value: String, isA: Boolean): ShapeRecord {
+        val end = decodeEnd(value) ?: return this
+        return if (isA) copy(endA = end) else copy(endB = end)
+    }
+
+    /** Fail-closed like every branch above: an unreadable bend leaves the line straight. */
+    private fun ShapeRecord.withBend(value: String): ShapeRecord {
+        val parts = value.split(PART)
+        if (parts.size != BEND_PARTS) return this
+        val x = parts[0].toFloatOrNull() ?: return this
+        val y = parts[1].toFloatOrNull() ?: return this
+        // A non-finite bend would reach `ShapeGeometry.outline` and put NaN into a path — which
+        // propagates into the object's bounds, the culling test and the PDF, none of which report it.
+        if (!x.isFinite() || !y.isFinite()) return this
+        return copy(bend = PagePoint(x, y))
     }
 
     private fun ShapeRecord.withFill(value: String) = value.toIntOrNull()?.let { copy(fillArgb = it) } ?: this

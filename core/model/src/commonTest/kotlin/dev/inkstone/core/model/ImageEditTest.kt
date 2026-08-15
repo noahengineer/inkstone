@@ -187,6 +187,109 @@ class ImageEditTest {
         assertTrue(distance(unexpected, actual) > TOLERANCE, "$message: unexpectedly equal to $unexpected")
     }
 
+    // -----------------------------------------------------------------------
+    // Crop — the frame, not just the region
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `a crop writes the region and the frame as one gesture`() {
+        val ops = ImageEdit.crop(
+            target = IMAGE,
+            current = ObjectFormat.Default,
+            currentTransform = Matrix3.translate(20f, 30f),
+            widthPt = WIDTH,
+            heightPt = HEIGHT,
+            crop = ImageCrop.Rect(0.25f, 0f, 0.75f, 1f),
+            nextOpId = ::nextOpId,
+            nextClock = ::nextClock,
+        )
+        assertEquals(2, ops.size, "a crop that writes only SetFormat zooms instead of cropping")
+        assertTrue(ops[0] is PageOp.SetFormat)
+        assertTrue(ops[1] is PageOp.SetTransform)
+    }
+
+    @Test
+    fun `cropping shrinks the frame and does not move or rescale the pixels`() {
+        // ⭐ The bug this exists for: SetFormat alone leaves the object box the same size, and the
+        // renderer stretches whatever the crop selected to fill it. Crop a 160x90 photo to its
+        // middle half horizontally and it came back 2x wide.
+        val whole = Matrix3.translate(20f, 30f)
+        val region = ImageCrop.Rect(0.25f, 0f, 0.75f, 1f)
+        val framed = ImageEdit.croppedFrame(whole, WIDTH, HEIGHT, region)
+
+        // The kept region's top-left was at local (0.25*160, 0) = (40, 0) -> page (60, 30).
+        assertClose(PagePoint(60f, 30f), framed.map(PagePoint(0f, 0f)))
+        // …and its bottom-right at local (120, 90) -> page (140, 120).
+        assertClose(PagePoint(140f, 120f), framed.map(PagePoint(WIDTH, HEIGHT)))
+    }
+
+    @Test
+    fun `widening a crop back out restores the frame exactly`() {
+        // CLAUDE.md rule 1: a crop is a region the user can widen again, unlike an erase. If the
+        // frame were composed onto the previous crop's frame instead of onto the whole-source one,
+        // this would ratchet inwards and the picture could never be got back.
+        val whole = Matrix3.translate(20f, 30f) * Matrix3.rotate(0.4f)
+        val tight = ImageCrop.Rect(0.3f, 0.2f, 0.6f, 0.7f)
+        val format = ObjectFormat.Default.copy(crop = tight)
+        val framed = ImageEdit.croppedFrame(whole, WIDTH, HEIGHT, tight)
+
+        assertClose(whole, ImageEdit.uncroppedFrame(framed, WIDTH, HEIGHT, format.crop))
+
+        // …and going through the op path, clearing the crop returns the original frame.
+        val ops = ImageEdit.crop(
+            target = IMAGE,
+            current = format,
+            currentTransform = framed,
+            widthPt = WIDTH,
+            heightPt = HEIGHT,
+            crop = null,
+            nextOpId = ::nextOpId,
+            nextClock = ::nextClock,
+        )
+        assertClose(whole, (ops[1] as PageOp.SetTransform).absolute)
+    }
+
+    @Test
+    fun `cropping twice equals cropping once to the intersection`() {
+        val whole = Matrix3.translate(12f, 8f)
+        val first = ImageCrop.Rect(0.2f, 0.1f, 0.9f, 0.8f)
+        val second = ImageCrop.Rect(0.4f, 0.3f, 0.7f, 0.5f)
+
+        val afterFirst = ImageEdit.croppedFrame(whole, WIDTH, HEIGHT, first)
+        val ops = ImageEdit.crop(
+            target = IMAGE,
+            current = ObjectFormat.Default.copy(crop = first),
+            currentTransform = afterFirst,
+            widthPt = WIDTH,
+            heightPt = HEIGHT,
+            crop = second,
+            nextOpId = ::nextOpId,
+            nextClock = ::nextClock,
+        )
+        // The second crop's fractions are of the SOURCE — the overlay shows the whole picture — so
+        // the frame is the second region measured from the whole, not from the first.
+        assertClose(ImageEdit.croppedFrame(whole, WIDTH, HEIGHT, second), (ops[1] as PageOp.SetTransform).absolute)
+    }
+
+    @Test
+    fun `a whole or degenerate crop leaves the frame alone`() {
+        val whole = Matrix3.translate(5f, 5f)
+        assertClose(whole, ImageEdit.croppedFrame(whole, WIDTH, HEIGHT, null))
+        assertClose(whole, ImageEdit.croppedFrame(whole, WIDTH, HEIGHT, ImageCrop.Rect(0f, 0f, 1f, 1f)))
+    }
+
+    @Test
+    fun `a freehand crop shrinks the frame to the polygon's bounds`() {
+        val whole = Matrix3.Identity
+        val polygon = ImageCrop.Polygon(listOf(0.5f, 0.5f, 0.9f, 0.5f, 0.9f, 1f, 0.5f, 1f))
+        val bounds = assertNotNull(polygon.bounds())
+        assertEquals(ImageCrop.Rect(0.5f, 0.5f, 0.9f, 1f), bounds)
+        assertClose(
+            ImageEdit.croppedFrame(whole, WIDTH, HEIGHT, bounds),
+            ImageEdit.croppedFrame(whole, WIDTH, HEIGHT, polygon),
+        )
+    }
+
     private fun distance(a: Matrix3, b: Matrix3): Float = maxOf(
         abs(a.m00 - b.m00),
         abs(a.m01 - b.m01),

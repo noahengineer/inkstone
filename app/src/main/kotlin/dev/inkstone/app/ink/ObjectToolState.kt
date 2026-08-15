@@ -5,12 +5,16 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import dev.inkstone.app.elements.Element
+import dev.inkstone.core.model.ImageCrop
+import dev.inkstone.core.model.ImageEdit
 import dev.inkstone.core.model.ImageObject
+import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.TextBoxObject
+import dev.inkstone.core.model.bounds
 
 /**
  * ⭐ ROADMAP M8c — what the screen is doing with a text box, an image or an Element right now.
@@ -48,12 +52,25 @@ class ObjectToolState {
     /** The editing box's style. Never null — SPEC §4.9.2; see [DEFAULT_TEXT_STYLE]. */
     var style by mutableStateOf(DEFAULT_TEXT_STYLE)
 
-    /** The image the Image tool last tapped — what Rotate, Flip and Crop act on. */
+    /**
+     * The selected image — what Rotate, Flip and Crop act on.
+     *
+     * ⚠️ Written from `InkSelection.soleImage` on every selection change, **not** by a tap in an
+     * overlay. That is what let the Image tool stop owning touch, which is what let an image be
+     * dragged at all — see [EditorTool.IMAGE].
+     */
     var image by mutableStateOf<ImageFocus?>(null)
         private set
 
-    /** Which crop gesture is armed, or null when not cropping. */
-    var cropping by mutableStateOf<CropMode?>(null)
+    /**
+     * The crop being dragged, or null when not cropping.
+     *
+     * ⚠️ Holds the **region**, because a crop is now adjusted rather than drawn once: the handles
+     * move this and nothing is written until Done. The old `CropMode` said only *which gesture was
+     * armed*, which is all a one-shot crop needed and is exactly why it could not be adjusted.
+     */
+    var cropping by mutableStateOf<CropSession?>(null)
+        private set
 
     /** Whether the Elements panel is open. */
     var elementsOpen by mutableStateOf(false)
@@ -104,16 +121,82 @@ class ObjectToolState {
         draft = ""
     }
 
+    /**
+     * The selection changed to exactly this image, or to none.
+     *
+     * ⚠️ A crop in progress survives a *re-report of the same image* and is dropped for anything
+     * else. `onSelectionChanged` fires for reasons that are not the user changing their mind — a
+     * peer's op arriving, a bounds refresh after a drag — and tearing down a half-dragged crop
+     * because a merge landed would lose work the user could see on screen.
+     */
+    fun focusImage(image: ImageFocus?, format: ObjectFormat) {
+        if (image?.id != this.image?.id) cropping = null
+        this.image = image
+        if (image != null) {
+            this.format = format
+            stopEditing()
+        }
+    }
+
     fun focus(image: ImageObject, bounds: PageRect, format: ObjectFormat) {
-        this.image = ImageFocus(image.id, bounds, image.widthPt, image.heightPt)
-        this.format = format
-        cropping = null
-        stopEditing()
+        focusImage(ImageFocus(image.id, bounds, image.widthPt, image.heightPt), format)
     }
 
     fun clearFocus() {
         image = null
         cropping = null
+    }
+
+    // -----------------------------------------------------------------------
+    // Cropping
+    // -----------------------------------------------------------------------
+
+    /**
+     * Open the crop overlay on the focused picture.
+     *
+     * The session is built from the **whole-source** frame, recovered from the live transform and
+     * whatever crop is already applied — see `ImageEdit.uncroppedFrame`. That is what makes the
+     * handles start on the current crop and the fractions mean what `ImageCrop.Rect` says they
+     * mean, and it is the step whose absence made a second crop select the wrong pixels.
+     */
+    fun beginCrop() {
+        val focus = image ?: return
+        cropping = CropSession(
+            id = focus.id.value,
+            source = ImageEdit.uncroppedFrame(focus.transform, focus.widthPt, focus.heightPt, format.crop),
+            widthPt = focus.widthPt,
+            heightPt = focus.heightPt,
+            region = format.crop.asRegion(),
+        )
+    }
+
+    /** A handle moved. Writes nothing — see [commitCrop]. */
+    fun dragCrop(region: ImageCrop.Rect) {
+        cropping = cropping?.copy(region = region)
+    }
+
+    /** Back to the whole picture, without leaving the overlay — so it can be re-tightened. */
+    fun resetCrop() {
+        cropping = cropping?.copy(region = WHOLE)
+    }
+
+    fun cancelCrop() {
+        cropping = null
+    }
+
+    /**
+     * Write the crop: one `SetFormat` and one `SetTransform`, as one gesture.
+     *
+     * A region covering the whole picture is written as **null** rather than as `0,0,1,1`. Both
+     * render identically, but null is the absence of a record — it costs no bytes in the file, no
+     * upload, and it is what `Uncrop` produces, so a picture cropped back out by hand and one never
+     * cropped are the same document rather than two that merely look alike.
+     */
+    fun commitCrop(actions: ObjectActions) {
+        val session = cropping ?: return
+        val focus = image ?: return
+        cropping = null
+        actions.onCrop(focus.id, session.region.takeIf { !it.isWhole })
     }
 
     /**
@@ -153,15 +236,33 @@ class ObjectToolState {
 @androidx.compose.runtime.Immutable
 data class TextEditing(val id: ObjectId?, val bounds: PageRect)
 
-/** Which image the transform and crop buttons act on. Extents are the object's own, for the crop maths. */
+/**
+ * Which image the transform and crop buttons act on.
+ *
+ * Carries the object's own extents **and its live transform**, because both are needed to recover
+ * the whole-source frame the crop handles are placed on ([ObjectToolState.beginCrop]).
+ */
 @androidx.compose.runtime.Immutable
-data class ImageFocus(val id: ObjectId, val bounds: PageRect, val widthPt: Float, val heightPt: Float)
+data class ImageFocus(
+    val id: ObjectId,
+    val bounds: PageRect,
+    val widthPt: Float,
+    val heightPt: Float,
+    val transform: Matrix3 = Matrix3.Identity,
+)
 
 /**
- * ROADMAP M8c — *"crop (rectangular and freehand)"*.
+ * The crop this picture already has, as a rectangle the handles can start on.
  *
- * Two gestures, one register. `ObjectFormat` carries either an `ImageCrop.Rect` or an
- * `ImageCrop.Polygon`, so which one the user is drawing has to be chosen before the drag rather
- * than inferred from it — a slow rectangle and a fast lasso are the same stream of points.
+ * A polygon degrades to its bounding box: the overlay drags a rectangle, and offering handles that
+ * silently discarded a freehand outline on first touch would be worse than showing the box it
+ * occupies. A freehand crop is still readable and still renders — it is only *editing* one that
+ * turns it into a rectangle, which is what dragging a rectangular frame means.
  */
-enum class CropMode { RECT, FREEHAND }
+private fun ImageCrop?.asRegion(): ImageCrop.Rect = when (this) {
+    null -> WHOLE
+    is ImageCrop.Rect -> this
+    is ImageCrop.Polygon -> bounds() ?: WHOLE
+}
+
+private val WHOLE = ImageCrop.Rect(0f, 0f, 1f, 1f)

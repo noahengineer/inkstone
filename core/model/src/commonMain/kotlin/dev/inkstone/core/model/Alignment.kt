@@ -41,20 +41,31 @@ public object AlignmentGuides {
         others: List<PageRect>,
         page: PageSize,
         tolerancePt: Float = DEFAULT_TOLERANCE_PT,
+    ): Alignment = forMove(moving, AlignmentTargets(others, page), tolerancePt)
+
+    /**
+     * The overload a *drag* should use, with the targets built once per gesture.
+     *
+     * [forMove] runs on every preview frame of a move, and the target list — three entries per
+     * non-selected object — depends only on what is **not** being dragged, which cannot change
+     * while the finger is down. Rebuilding it per call made every drag frame O(page) in
+     * allocations; building [AlignmentTargets] once in the gesture's `begin` makes the per-frame
+     * cost the float compares alone.
+     */
+    public fun forMove(
+        moving: PageRect,
+        targets: AlignmentTargets,
+        tolerancePt: Float = DEFAULT_TOLERANCE_PT,
     ): Alignment {
         val vertical = candidates(
             movingEdges = listOf(moving.left, moving.centreX, moving.right),
-            targets = targetsOn(others, page.widthPt / HALF) { rect ->
-                Triple(rect.left, rect.centreX, rect.right)
-            },
+            targets = targets.vertical,
             axis = GuideAxis.VERTICAL,
             tolerancePt = tolerancePt,
         )
         val horizontal = candidates(
             movingEdges = listOf(moving.top, moving.centreY, moving.bottom),
-            targets = targetsOn(others, page.heightPt / HALF) { rect ->
-                Triple(rect.top, rect.centreY, rect.bottom)
-            },
+            targets = targets.horizontal,
             axis = GuideAxis.HORIZONTAL,
             tolerancePt = tolerancePt,
         )
@@ -127,6 +138,18 @@ public object AlignmentGuides {
     }
 
     private class AxisSnap(val offset: Float, val guides: List<AlignmentGuide>)
+
+    /**
+     * Every snap position on both axes, precomputed from the objects a drag cannot change.
+     *
+     * Built once per move gesture — see the drag overload of [forMove].
+     */
+    public class AlignmentTargets(others: List<PageRect>, page: PageSize) {
+        internal val vertical: List<Pair<Float, GuideKind>> =
+            targetsOn(others, page.widthPt / HALF) { rect -> Triple(rect.left, rect.centreX, rect.right) }
+        internal val horizontal: List<Pair<Float, GuideKind>> =
+            targetsOn(others, page.heightPt / HALF) { rect -> Triple(rect.top, rect.centreY, rect.bottom) }
+    }
 
     /** About 2 mm on the page. Tuned on the tablet is the only tuning that counts. */
     private const val DEFAULT_TOLERANCE_PT = 6f

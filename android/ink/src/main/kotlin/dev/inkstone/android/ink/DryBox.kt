@@ -158,18 +158,37 @@ internal sealed class DryBox(val obj: InkObject, val widthPt: Float, val heightP
     )
 
     /**
-     * The four corners in page space — what a lasso is tested against.
+     * The outline in page space — what a lasso is tested against.
      *
      * The **declared** box and not the painted extent, so that a text box whose words overflow it
      * is still lassoed by the frame the user can see handles on. [DryTextBox] widens [bounds] to
      * cover the overflow so that culling and erasing do not clip it; selection deliberately does
      * not follow, because the frame a resize is computed against has to be the object's own box.
+     *
+     * ⚠️ **The edges are walked, not just the four corners**, and the difference is why a lasso used
+     * to slide off a photo. `Lasso.selects` takes a **majority** of the points offered, so an object
+     * that offers four had to have two full corners inside the loop: a lasso drawn *within* a large
+     * picture enclosed none of them and selected nothing, and a band dragged across its middle
+     * enclosed none either — while the identical gesture over handwriting worked, because a stroke
+     * offers every vertex of its outline and a shape offers its flattened path. The box kinds were
+     * the only ones sampled so sparsely that the majority rule could not see them.
      */
     final override fun forEachPagePoint(scratch: MutableVec, action: (Float, Float) -> Unit) {
-        corner(0f, 0f, action)
-        corner(widthPt, 0f, action)
-        corner(widthPt, heightPt, action)
-        corner(0f, heightPt, action)
+        edge(0f, 0f, widthPt, 0f, action)
+        edge(widthPt, 0f, widthPt, heightPt, action)
+        edge(widthPt, heightPt, 0f, heightPt, action)
+        edge(0f, heightPt, 0f, 0f, action)
+    }
+
+    /**
+     * One edge, sampled at [EDGE_SAMPLES] points including its start and excluding its end — the
+     * next edge's start. Sampling in the object's own space keeps it uniform under any transform.
+     */
+    private inline fun edge(x0: Float, y0: Float, x1: Float, y1: Float, action: (Float, Float) -> Unit) {
+        for (step in 0 until EDGE_SAMPLES) {
+            val t = step.toFloat() / EDGE_SAMPLES
+            corner(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, action)
+        }
     }
 
     private inline fun corner(x: Float, y: Float, action: (Float, Float) -> Unit) {
@@ -178,6 +197,13 @@ internal sealed class DryBox(val obj: InkObject, val widthPt: Float, val heightP
     }
 
     private companion object {
+        /**
+         * Points per edge for [forEachPagePoint]. Eight puts 32 around the box, which is the same
+         * order a small shape's flattened outline offers, so the majority rule treats the kinds
+         * alike. Cheap: this runs once per object per lasso settle, not per frame.
+         */
+        const val EDGE_SAMPLES = 8
+
         /**
          * What an object created without a style is painted with — see [effectiveStyle].
          *

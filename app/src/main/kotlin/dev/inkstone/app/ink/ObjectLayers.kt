@@ -67,10 +67,14 @@ fun ObjectLayers(
             objects = objects,
             gestures = PageGestures(
                 onTap = { point -> scope.launch { onTap(point, ui, objects, editor) } },
-                onDragBox = { box -> scope.launch { onDragBox(box, ui, objects, editor, actions) } },
-                onLasso = { points -> scope.launch { onLasso(points, objects, editor, actions) } },
+                onDragBox = { box -> scope.launch { onDragBox(box, ui, objects) } },
             ),
         )
+        // ⭐ Above the page overlay and below the panels: while it is up it owns the touches, which
+        // is what stops a crop drag from also panning the page underneath.
+        objects.cropping?.let { session ->
+            CropOverlay(session = session, camera = ui.camera, onRegion = objects::dragCrop)
+        }
         TextBoxLayer(ui, objects, actions)
         if (objects.elementsOpen) {
             ElementPanel(
@@ -101,7 +105,6 @@ private suspend fun onTap(point: PagePoint, ui: InkUiState, objects: ObjectToolS
     val fold = editor.currentFold() ?: return
     when (ui.tool) {
         EditorTool.TEXT -> tapText(point, fold, objects, editor)
-        EditorTool.IMAGE -> tapImage(point, fold, objects)
         EditorTool.ELEMENT -> objects.pendingElement?.let { editor.stampElement(it, point) }
         else -> Unit
     }
@@ -135,54 +138,23 @@ private suspend fun tapText(
     }
 }
 
-private fun tapImage(point: PagePoint, fold: FoldedPage, objects: ObjectToolState) {
-    val hit = fold.objects.topmostAt(point) { it is ImageObject } as? ImageObject
-    if (hit == null) {
-        objects.clearFocus()
-        return
-    }
-    hit.pageBounds()?.let { objects.focus(hit, it, fold.formatting(hit.id)) }
-}
+// ⚠️ `tapImage` is gone. It hit-tested against `InkObject.pageBounds()` — the **axis-aligned** hull
+// of the four mapped corners — while the ink surface's own tap test maps the point through the
+// object's inverse and tests the true quad. Two tools therefore disagreed about where a rotated
+// picture was, and the one that owned images was the one that was wrong. Selection is the single
+// answer now; see `InkSelection.soleImage`.
 
 /**
- * A dragged rectangle: a rectangular crop, or an Element capture.
+ * A dragged rectangle: an Element capture.
  *
- * ⚠️ The crop is normalised against the image's **own** box, not against the page — SPEC §4.9.2, so
- * that a later resize or rotate carries it rather than having to rewrite it in a second register
- * that could then disagree. `CropMath` does the arithmetic; this only decides which gesture it was.
+ * ⚠️ **The crop used to arrive here too**, and that is what made it a one-shot gesture rather than
+ * a frame you adjust — the drag ended, `cropping` cleared, and changing your mind meant drawing a
+ * whole new region over a picture that was by then showing the *previous* crop's pixels. It lives
+ * in `CropOverlay` now, which holds the region across the whole interaction and writes once.
  */
-private suspend fun onDragBox(
-    box: PageRect,
-    ui: InkUiState,
-    objects: ObjectToolState,
-    editor: NoteEditorViewModel,
-    actions: ObjectActions,
-) {
-    if (ui.tool == EditorTool.ELEMENT) {
-        objects.capturedArea = box
-        return
-    }
-    if (ui.tool != EditorTool.IMAGE || objects.cropping != CropMode.RECT) return
-    val focused = objects.image ?: return
-    val obj = editor.currentFold()?.find(focused.id) ?: return
-    val crop = CropMath.rectOf(obj, PagePoint(box.left, box.top), PagePoint(box.right, box.bottom)) ?: return
-    actions.onCrop(focused.id, crop)
-    objects.cropping = null
-}
-
-/** The freehand crop's lasso — a closed polygon of fractions of the source image. */
-private suspend fun onLasso(
-    points: List<PagePoint>,
-    objects: ObjectToolState,
-    editor: NoteEditorViewModel,
-    actions: ObjectActions,
-) {
-    val focused = objects.image ?: return
-    val fold = editor.currentFold() ?: return
-    val obj = fold.find(focused.id) ?: return
-    val crop = CropMath.polygonOf(obj, points) ?: return
-    actions.onCrop(focused.id, crop)
-    objects.cropping = null
+private fun onDragBox(box: PageRect, ui: InkUiState, objects: ObjectToolState) {
+    if (ui.tool != EditorTool.ELEMENT) return
+    objects.capturedArea = box
 }
 
 /**

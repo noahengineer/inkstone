@@ -76,7 +76,16 @@ public class FoldedPage(
 
     public val isEmpty: Boolean get() = objects.isEmpty()
 
-    public fun find(id: ObjectId): InkObject? = objects.firstOrNull { it.id == id }
+    /**
+     * Built on first use, not per call. [find] used to be a linear scan, which made
+     * [Undo.inverseOf] over a K-op gesture O(K × page) — five of its seven branches look the
+     * target up in `before` — and a select-all move on a full page paid millions of id
+     * compares before the fold itself even started. A [FoldedPage] is immutable, so one map
+     * answers every lookup for its whole life.
+     */
+    private val objectsById: Map<ObjectId, InkObject> by lazy { objects.associateBy { it.id } }
+
+    public fun find(id: ObjectId): InkObject? = objectsById[id]
 
     /**
      * The `SetFormat` register's winning value for [id] — SPEC §4.9.2.
@@ -399,12 +408,44 @@ public class PageLog(
         }
     }
 
-    /** Fold several ops in, reporting the most serious outcome any of them caused. */
+    /**
+     * Fold several ops in, reporting the most serious outcome any of them caused.
+     *
+     * ⭐ Builds the folded state **once**, after the loop — not once per op. [apply] rebuilds per
+     * call, which is right for one op and quadratic for a batch: a selection gesture emits one op
+     * per object and the autosave tick folds the whole batch on the main thread, so moving a
+     * large lasso selection paid one full materialise-and-sort build *per selected object* for a
+     * single visible change. The per-op decision is [apply]'s exactly — same branches, same
+     * outcomes — and deferring the re-fold to the end produces the same state as [apply]'s
+     * immediate ones, because a re-fold replays the whole log in sorted order either way.
+     */
     public fun applyAll(ops: Iterable<PageOp>): FoldOutcome {
         var outcome = FoldOutcome.APPENDED
+        var through = state.throughClock
+        val snapshotClock = snapshot?.throughClock
+        var appended = false
+        var needsRefold = false
         for (op in ops) {
-            val one = apply(op)
-            if (one.ordinal > outcome.ordinal) outcome = one
+            log += op
+            if (snapshotClock != null && op.clock <= snapshotClock) {
+                snapshotStale = true
+                needsRefold = true
+                outcome = FoldOutcome.SNAPSHOT_STALE
+            } else if (through == null || op.clock > through) {
+                // Absorbing is pointless once a re-fold is owed — it replays the whole log.
+                if (!needsRefold) {
+                    folder.absorb(op)
+                    appended = true
+                }
+                through = op.clock
+            } else {
+                needsRefold = true
+                if (outcome == FoldOutcome.APPENDED) outcome = FoldOutcome.REFOLDED
+            }
+        }
+        when {
+            needsRefold -> refold()
+            appended -> state = folder.build()
         }
         return outcome
     }

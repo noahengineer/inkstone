@@ -76,7 +76,7 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     }
 
     Box(modifier = modifier.fillMaxSize()) {
-        InkSurface(ui = ui, editor = editor, onCreated = { surface = it })
+        InkSurface(ui = ui, objects = objects, editor = editor, onCreated = { surface = it })
 
         // ⭐ M8c — between the ink surface and the toolbar, deliberately. Above the surface so a
         // tap with the Text tool reaches it; below the toolbar so the format bar is still pressable
@@ -160,9 +160,14 @@ private fun ObjectEffects(
     // loss the field's focus-loss handler exists to prevent by a different route. `updateText` is
     // idempotent, so the two firing together costs nothing. And the reset has to happen or crop
     // handles stay drawn over a page they do not belong to.
+    //
+    // ⚠️ **The reset is not inside the null check**, and it used to be. `objects.editing` is null
+    // whenever a *picture* is what is focused, so the early return skipped `reset()` for exactly
+    // the case the comment above describes: the crop handles were the thing that stayed drawn over
+    // a page they did not belong to, and every image button then acted on an id
+    // `NoteEditor.setCrop` could no longer find — no message, no snackbar, nothing happening.
     LaunchedEffect(note.pageIndex, ui.tool) {
-        val editing = objects.editing ?: return@LaunchedEffect
-        actions.onTextChanged(editing.id, objects.draft)
+        objects.editing?.let { actions.onTextChanged(it.id, objects.draft) }
         objects.reset()
     }
 }
@@ -440,7 +445,12 @@ private fun SurfaceEffects(ui: InkUiState, note: NoteEditorState, surface: InkSu
  * is view interop and callback wiring, the other is layout.
  */
 @Composable
-private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (InkSurfaceView) -> Unit) {
+private fun InkSurface(
+    ui: InkUiState,
+    objects: ObjectToolState,
+    editor: NoteEditorViewModel,
+    onCreated: (InkSurfaceView) -> Unit,
+) {
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { context ->
@@ -476,6 +486,14 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
                     val counts = selection.shapeCounts
                     ui.selectedShapes = counts.shapes
                     ui.selectedConnectors = counts.connectors
+                    // ⭐ The image bar follows the selection, by the same argument. This is what
+                    // let the Image tool give up owning touch — and giving that up is what let an
+                    // image be dragged at all (see `EditorTool.IMAGE`).
+                    val picture = selection.soleImage
+                    objects.focusImage(
+                        picture?.let { ImageFocus(it.id, it.bounds, it.widthPt, it.heightPt, it.transform) },
+                        picture?.format ?: objects.format,
+                    )
                 }
                 // ⭐ M8b — the acknowledgement. Without it the first snap is indistinguishable
                 // from the app having eaten the stroke and drawn something else.
@@ -483,7 +501,15 @@ private fun InkSurface(ui: InkUiState, editor: NoteEditorViewModel, onCreated: (
                 // pixel-identical when drawn and behave differently the moment a box moves, so
                 // the acknowledgement has to say which one the user got.
                 onShapeSnapped = { kind, attached ->
-                    ui.lastSnapped = if (attached) "${kind.name.lowercase()} · attached" else kind.name.lowercase()
+                    // A connector's geometry is derived from what it is attached to, so it is the
+                    // one snapped shape with no point handles to offer (see
+                    // `SelectionController.soleShape`) — which is why only the other branch
+                    // mentions them.
+                    ui.lastSnapped = if (attached) {
+                        "${kind.name.lowercase()} · attached"
+                    } else {
+                        "${kind.name.lowercase()} · drag its points"
+                    }
                 }
                 // ⭐ M12 §3 — the timeline's only input. Fired on the UI thread in the frame the
                 // dry layer redraws, so the view model does one subtraction and one enqueue and

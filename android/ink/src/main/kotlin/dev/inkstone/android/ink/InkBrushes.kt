@@ -5,6 +5,8 @@ import androidx.annotation.ColorInt
 import androidx.ink.brush.Brush
 import androidx.ink.brush.BrushFamily
 import androidx.ink.brush.ExperimentalInkCustomBrushApi
+import dev.inkstone.android.ink.InkColor.withOpacity
+import dev.inkstone.core.model.ObjectStyle
 
 /**
  * ⭐ ROADMAP M8a — which tool the toolbar has selected.
@@ -210,6 +212,38 @@ public class InkBrushFactory(
             colorIntArgb = colorArgb,
             size = sizePt,
             epsilon = epsilonPt,
+        )
+    }
+
+    /**
+     * ⭐ The brush a stroke's `SetStyle` register asks for, over what it was captured with.
+     *
+     * One rule with two callers — [DryStroke.restyle] for a live restyle, and
+     * `StrokeGeometryCodec.decode` for the load path — so a stroke restyled on screen and the
+     * same stroke reloaded from disk cannot tessellate differently. Giving the load path the
+     * style *before* the first tessellation is also what lets it tessellate **once**: it used
+     * to build the captured brush and then restyle over it, re-tessellating every styled
+     * stroke a second time, on the main thread, per page turn.
+     *
+     * A zero [ObjectStyle.widthPt] means "keep the width", matching [DryStroke.restyle]'s
+     * long-standing reading of it.
+     */
+    internal fun brushFor(
+        kind: InkBrushKind,
+        @ColorInt capturedColorArgb: Int,
+        capturedSizePt: Float,
+        epsilonPt: Float,
+        inputModel: InkInputModel,
+        style: ObjectStyle?,
+    ): Brush = if (style == null) {
+        brushFor(kind, capturedColorArgb, capturedSizePt, epsilonPt, inputModel)
+    } else {
+        brushFor(
+            kind = kind,
+            colorArgb = style.colorArgb.withOpacity(style.opacity),
+            sizePt = if (style.widthPt > 0f) style.widthPt else capturedSizePt,
+            epsilonPt = epsilonPt,
+            inputModel = inputModel,
         )
     }
 

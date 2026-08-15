@@ -219,6 +219,114 @@ class ShapesTest {
         assertTrue(ShapeKind.ARROW !in kinds)
     }
 
+    // -----------------------------------------------------------------------
+    // Rotation invariance — the property M8b's classifier did not have
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `every closed kind survives being drawn at an angle`() {
+        // ⭐ The regression this file exists for. Against the AXIS-ALIGNED box a square's fill is
+        // 1/(1 + k·sin 2θ), which sweeps the entire feature range as the hand tilts — so a square
+        // drawn at 7° classified as an ELLIPSE and one at 45° as a TRIANGLE at confidence 1.000,
+        // while a circle (the one shape whose axis-aligned fill does not move) worked at every
+        // angle. That is the whole of "i can only do ovels/circles".
+        //
+        // Against the minimum-area box the fill is a property of the shape and nothing else.
+        for (degrees in listOf(0, 3, 7, 12, 20, 30, 45, 60, 89)) {
+            val turn = degrees * PI.toFloat() / 180f
+            assertEquals(
+                ShapeKind.RECTANGLE,
+                assertNotNull(ShapeSnap.recognise(turned(rectangle(200f, 120f), turn)), "rect at $degrees°").kind,
+                "a rectangle drawn at $degrees°",
+            )
+            assertEquals(
+                ShapeKind.ELLIPSE,
+                assertNotNull(ShapeSnap.recognise(turned(ellipse(200f, 120f), turn)), "ellipse at $degrees°").kind,
+                "an ellipse drawn at $degrees°",
+            )
+            assertEquals(
+                ShapeKind.TRIANGLE,
+                assertNotNull(ShapeSnap.recognise(turned(triangle(200f, 120f), turn)), "tri at $degrees°").kind,
+                "a triangle drawn at $degrees°",
+            )
+        }
+    }
+
+    @Test
+    fun `a square drawn at forty-five degrees is a rectangle and not a triangle`() {
+        // Named separately because it is the single worst case of the old feature: fill was exactly
+        // 0.5, which is the TRIANGLE target, so a diamond scored triangle at confidence 1.000 —
+        // maximum confidence, maximally wrong.
+        val candidate = assertNotNull(ShapeSnap.recognise(turned(rectangle(160f, 160f), PI.toFloat() / 4f)))
+        assertEquals(ShapeKind.RECTANGLE, candidate.kind)
+    }
+
+    @Test
+    fun `a rectangle drawn at an angle is placed at that angle`() {
+        val turn = 25f * PI.toFloat() / 180f
+        val candidate = assertNotNull(ShapeSnap.recognise(turned(rectangle(200f, 120f), turn)))
+        val oriented = assertNotNull(candidate.oriented, "a closed candidate carries its oriented box")
+        assertClose(turn, oriented.angleRadians, "placed at the angle it was drawn")
+        // The extents are the shape's own, not the axis-aligned hull's — which for this rectangle
+        // would be 232 x 193 rather than 200 x 120.
+        assertClose(200f, oriented.widthPt)
+        assertClose(120f, oriented.heightPt)
+    }
+
+    @Test
+    fun `a nearly-square rectangle is straightened rather than left visibly tilted`() {
+        // Nobody draws to within two degrees on purpose, and a shape sitting at 1.4° next to a line
+        // of text reads as a mistake the user cannot easily correct.
+        val candidate = assertNotNull(ShapeSnap.recognise(turned(rectangle(200f, 120f), 0.017f)))
+        assertEquals(0f, assertNotNull(candidate.oriented).angleRadians)
+    }
+
+    @Test
+    fun `an open arc is not an ellipse however far round it goes`() {
+        // M8b's CLOSED_MAX_GAP of 0.22 let a 300° arc through at ellipse-confidence 0.84, so a C,
+        // a bracket or any large open curve held still was eaten and turned into an oval. This is
+        // a completely separate mechanism from the fill ratio and the second half of the complaint.
+        for (sweep in listOf(180, 240, 270, 300)) {
+            assertNull(ShapeSnap.recognise(arc(200f, 120f, sweep)), "a $sweep° arc must stay ink")
+        }
+        // …while a circle the user closed properly still snaps.
+        assertEquals(ShapeKind.ELLIPSE, assertNotNull(ShapeSnap.recognise(arc(200f, 120f, 355))).kind)
+    }
+
+    @Test
+    fun `the minimum-area box of a tilted rectangle is the rectangle itself`() {
+        // The theorem the classifier now rests on, asserted directly: the minimal enclosing
+        // rectangle of a convex polygon is flush with one of its edges.
+        val turn = 33f * PI.toFloat() / 180f
+        val points = turned(rectangle(180f, 100f), turn)
+        val xs = FloatArray(points.size) { points[it].x }
+        val ys = FloatArray(points.size) { points[it].y }
+        val box = assertNotNull(OrientedBounds.minimumArea(xs, ys, points.size))
+        assertClose(180f * 100f, box.area, "no larger than the rectangle drawn")
+    }
+
+    @Test
+    fun `the minimum-area box of a triangle is twice its area at every angle`() {
+        for (degrees in listOf(0, 17, 40, 70)) {
+            val points = turned(triangle(200f, 120f), degrees * PI.toFloat() / 180f)
+            val xs = FloatArray(points.size) { points[it].x }
+            val ys = FloatArray(points.size) { points[it].y }
+            val box = assertNotNull(OrientedBounds.minimumArea(xs, ys, points.size))
+            // A triangle of base w and height h has area wh/2; its minimal box is wh.
+            assertTrue(
+                abs(box.area - 200f * 120f) < 200f * 120f * 0.02f,
+                "at $degrees° expected ~24000 but was ${box.area}",
+            )
+        }
+    }
+
+    @Test
+    fun `collinear points have no orientation to find`() {
+        val xs = FloatArray(10) { it * 10f }
+        val ys = FloatArray(10) { it * 10f }
+        assertNull(OrientedBounds.minimumArea(xs, ys, 10))
+    }
+
     @Test
     fun `the allocation-free entry point agrees with the readable one`() {
         // The ink path calls the FloatArray form; every test above calls the list form. If they
@@ -344,6 +452,22 @@ class ShapesTest {
     private fun ellipse(w: Float, h: Float): List<PagePoint> = (0..STEPS).map { step ->
         val angle = 2f * PI.toFloat() * step / STEPS
         PagePoint(w / 2f + w / 2f * cos(angle), h / 2f + h / 2f * sin(angle))
+    }
+
+    /** [sweepDegrees] of an ellipse, left open — the gesture `CLOSED_MAX_GAP` has to refuse. */
+    private fun arc(w: Float, h: Float, sweepDegrees: Int): List<PagePoint> {
+        val steps = STEPS * 2
+        return (0..steps).map { step ->
+            val angle = sweepDegrees * PI.toFloat() / 180f * step / steps
+            PagePoint(w / 2f + w / 2f * cos(angle), h / 2f + h / 2f * sin(angle))
+        }
+    }
+
+    /** [points] rotated by [radians] about the origin — the same shape, drawn by a tilted hand. */
+    private fun turned(points: List<PagePoint>, radians: Float): List<PagePoint> {
+        val cosine = cos(radians)
+        val sine = sin(radians)
+        return points.map { PagePoint(it.x * cosine - it.y * sine, it.x * sine + it.y * cosine) }
     }
 
     /** A closed polygon walked corner to corner, sampled so the path length is realistic. */

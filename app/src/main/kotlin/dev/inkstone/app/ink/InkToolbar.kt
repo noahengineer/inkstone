@@ -102,6 +102,18 @@ fun InkToolbar(
                 )
                 state.lastSnapped?.let {
                     Text("snapped to $it", style = MaterialTheme.typography.labelSmall)
+                    // ⭐ **Adjust** — the one tap between "the shape appeared" and being able to
+                    // edit it. `InkSurfaceView.onSnapped` deliberately does *not* switch the tool
+                    // (someone snapping five boxes for a flowchart would pay five taps to get the
+                    // pen back) and it selects the new shape instead, so its point handles are
+                    // already on screen — under a pen that draws straight through them.
+                    //
+                    // ⚠️ Its own KDoc has claimed since M8b that *"InkScreen surfaces an 'Adjust'
+                    // action instead"*. It did not: nothing in `:app` had ever contained the word.
+                    // A comment describing a caller that does not exist is CLAUDE.md's
+                    // definition-of-done #6 written down as a promise, and the handles this
+                    // milestone adds are exactly what it was promising access to.
+                    TextButton(onClick = { state.tool = EditorTool.SELECT }) { Text("Adjust") }
                 }
             }
 

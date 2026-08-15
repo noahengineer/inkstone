@@ -1,5 +1,8 @@
 package dev.inkstone.android.ink
 
+import androidx.ink.geometry.ImmutableParallelogram
+import androidx.ink.geometry.ImmutableSegment
+import androidx.ink.geometry.ImmutableVec
 import androidx.ink.geometry.MutableVec
 import androidx.ink.geometry.Parallelogram
 import dev.inkstone.core.model.FractionalKey
@@ -202,6 +205,32 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
     abstract fun hitBy(sweptTip: Parallelogram, capsule: ErasedRegion.Capsule): Boolean
 
     /**
+     * True when a **tap** at `(localX, localY)`, in this object's own space, is on it.
+     *
+     * ⚠️ **Deliberately not [hitBy], and the difference is only about a hollow shape.** The eraser's
+     * rule is that an unfilled outline is empty in the middle — you can drag an eraser straight
+     * through a hollow box without biting it, which is what its emptiness *looks like*, and
+     * `ShapeHit`'s KDoc argues that case well. A tap is the opposite: nobody aims at the two-point
+     * line of a rectangle's edge, and *"tap the shape to select it"* means the shape, not its
+     * perimeter.
+     *
+     * Sharing one predicate for both — which is what M8b did — made a snapped rectangle
+     * approximately unselectable: the shape carries no fill (`ShapeSnapController` writes
+     * `ShapeRecord.None`), so `filled` was false, so `ShapeHit` skipped the interior test entirely
+     * and the user had to land inside 8 dp of a hairline. That is most of *"it does not let me
+     * adjust it after"* — the shape was adjustable and could not be got hold of.
+     *
+     * The default is [hitBy], so a stroke and a text box are unaffected; only [DryShape] overrides.
+     */
+    open fun tappedAt(localX: Float, localY: Float, reach: Float): Boolean {
+        val tip = ImmutableParallelogram.fromSegmentAndPadding(
+            ImmutableSegment(ImmutableVec(localX, localY), ImmutableVec(localX, localY)),
+            reach,
+        )
+        return hitBy(tip, ErasedRegion.Capsule(localX, localY, localX, localY, reach))
+    }
+
+    /**
      * Every silhouette vertex, in **page space** — what a lasso is tested against.
      *
      * The painted outline rather than any input path: a lasso drawn inside a thick loop must select
@@ -226,4 +255,16 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
      * answers false for one.
      */
     open fun isErasedAway(region: ErasedRegion): Boolean = false
+
+    /**
+     * The number of point-against-capsule distance tests [isErasedAway] would run if called
+     * now — the unit `pruneFullyErased`'s budget is denominated in — or 0 when a cheap gate
+     * already answers it.
+     *
+     * The base answers 0 because the base [isErasedAway] answers false without work. [DryStroke]
+     * overrides with the real estimate; the budget used to charge the *capsule count* while the
+     * work was points × capsules, an under-count of about the point count (~100×) that let one
+     * eraser pen-up run for hundreds of milliseconds inside the very bound built to prevent it.
+     */
+    open fun eraseCoverageCost(region: ErasedRegion): Long = 0L
 }

@@ -139,6 +139,31 @@ public object ShapeEdit {
     }
 
     /**
+     * Place [kind] into an oriented box — the closed-shape placement for a snapped gesture.
+     *
+     * ⭐ The counterpart of [place] for a shape the user did not draw square to the page. A
+     * rectangle drawn at 20° has a minimum-area box at 20°, and placing it through [place] would
+     * put an *axis-aligned* rectangle around it: bigger than what was drawn, differently
+     * proportioned, and visibly not the gesture. The local box still runs `[0, w] × [0, h]` like
+     * every other shape's, so nothing downstream — outline, hit test, connector anchor, PDF — needs
+     * to know this happened.
+     *
+     * A line is still placed by its endpoints: [OrientedBox] of a straight gesture is a degenerate
+     * sliver whose height is the hand's wobble, which is not the band a line wants.
+     */
+    public fun placeOriented(kind: ShapeKind, box: OrientedBox): ShapePlacement {
+        if (kind == ShapeKind.LINE || kind == ShapeKind.ARROW) {
+            return placeSegment(box.centreX, box.centreY, box.centreX + box.widthPt, box.centreY, kind = kind)
+        }
+        return ShapePlacement(
+            kind = kind,
+            widthPt = max(box.widthPt, ShapeGeometry.MIN_EXTENT_PT),
+            heightPt = max(box.heightPt, ShapeGeometry.MIN_EXTENT_PT),
+            transform = box.transform(),
+        )
+    }
+
+    /**
      * Place a [ShapeKind.LINE] or [ShapeKind.ARROW] from one page point to another.
      *
      * ⚠️ **A rotation, never a scale**, and this is the reason [ShapeGeometry]'s local segment runs

@@ -69,17 +69,10 @@ internal fun StrokeStore.objectAt(x: Float, y: Float, slopPageUnits: Float): Obj
         if (!dry.toLocal(x, y, local)) return@forEachInRenderOrder
         // Erased away here means not here: tapping a hole in a stroke must not select it.
         if (dry.erased?.covers(local.x, local.y) == true) return@forEachInRenderOrder
-        val slop = dry.toLocalLength(slopPageUnits)
-        val tip = ImmutableParallelogram.fromSegmentAndPadding(
-            ImmutableSegment(ImmutableVec(local.x, local.y), ImmutableVec(local.x, local.y)),
-            slop,
-        )
-        // A tap is a zero-length sweep, and it is handed over in both forms for the reason
-        // [DryObject.hitBy] gives: a mesh is measured by ink, a shape's outline by arithmetic.
-        // Using one predicate for the tap and the eraser is what stops a shape you can erase from
-        // being a shape you cannot select.
-        val dab = ErasedRegion.Capsule(local.x, local.y, local.x, local.y, slop)
-        if (dry.hitBy(tip, dab)) hit = dry.id
+        // [DryObject.tappedAt] rather than `hitBy`: a tap and an eraser disagree about the inside
+        // of a hollow shape, and only about that. See its KDoc — sharing one predicate is what made
+        // a snapped rectangle need an 8 dp landing on a hairline.
+        if (dry.tappedAt(local.x, local.y, dry.toLocalLength(slopPageUnits))) hit = dry.id
     }
     return hit
 }

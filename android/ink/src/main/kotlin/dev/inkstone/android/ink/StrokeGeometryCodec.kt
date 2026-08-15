@@ -11,6 +11,7 @@ import androidx.ink.storage.encode
 import androidx.ink.strokes.ImmutableStrokeInputBatch
 import androidx.ink.strokes.Stroke
 import androidx.ink.strokes.StrokeInputBatch
+import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.StrokeGeometry
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -108,7 +109,7 @@ internal object StrokeGeometryCodec {
     // Every return is a different way the blob is unreadable, and they all mean the same thing
     // to the caller: a stroke that does not draw. See the KDoc on why that is not an exception.
     @Suppress("ReturnCount")
-    fun decode(geometry: StrokeGeometry, brushes: InkBrushFactory): DecodedStroke? {
+    fun decode(geometry: StrokeGeometry, brushes: InkBrushFactory, style: ObjectStyle? = null): DecodedStroke? {
         val bytes = geometry.bytes
         if (bytes.size < HEADER_SIZE || !bytes.startsWithMagic()) return null
         if (bytes[VERSION_OFFSET] > FORMAT_VERSION) return null
@@ -123,7 +124,10 @@ internal object StrokeGeometryCodec {
             StrokeInputBatchSerializer.decode(ByteArrayInputStream(bytes, HEADER_SIZE, bytes.size - HEADER_SIZE))
         }.getOrNull() ?: return null
 
-        val brush = brushes.brushFor(kind, colorArgb, sizePt, epsilonPt, inputModel)
+        // The style register's brush, when the caller has one — tessellation is the decode's
+        // whole cost, and building the captured brush only to restyle over it paid that cost
+        // twice for every restyled stroke on every page load.
+        val brush = brushes.brushFor(kind, colorArgb, sizePt, epsilonPt, inputModel, style)
         return DecodedStroke(Stroke(brush, inputs), kind, inputModel)
     }
 

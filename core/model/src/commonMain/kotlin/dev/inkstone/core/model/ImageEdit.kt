@@ -103,6 +103,102 @@ public object ImageEdit {
     ): PageOp = TextBoxEdit.setFormat(target, current.copy(crop = crop), nextOpId, nextClock)
 
     /**
+     * ⭐ A crop, as the **two** ops it really takes: the region, and the frame that region is drawn
+     * into.
+     *
+     * ## Why a crop is not one op, and what shipped when it was
+     *
+     * `SetFormat` alone says *which pixels*; it says nothing about **how big the picture is**. The
+     * renderer scales whatever the crop selects to fill the object's whole `widthPt × heightPt` box
+     * (`PagePainter` draws `sourceRect → 0,0,widthPt,heightPt`), so a crop written on its own does
+     * not crop at all — it **zooms**. Crop a square photo down to a tall sliver and you get that
+     * sliver stretched back out to a square, silently, with the aspect ratio `ImageDownscale` went
+     * to real trouble to preserve at insert time thrown away one gesture later.
+     *
+     * What a person means by *crop* is that the **frame shrinks to the part they kept** and the
+     * pixels do not move or change size. That is [croppedFrame], and it is an ordinary absolute
+     * `SetTransform` (rule 8) — no new op, no new field.
+     *
+     * ## Why it is non-destructive, and stays so
+     *
+     * The frame is always recomputed from the **whole-source** frame ([uncroppedFrame]), never
+     * composed onto the frame the last crop left. So cropping twice is the same as cropping once to
+     * the intersection, and widening a crop back out — including all the way back to
+     * `crop = null` — puts the picture back exactly where it was. A crop that could only tighten
+     * would be an erase, which is the distinction SPEC §4.9.2 draws and CLAUDE.md rule 1 requires.
+     *
+     * @param crop null clears the crop and restores the whole picture at its original size.
+     * @return `SetFormat` then `SetTransform`, as one gesture so one undo puts both back.
+     */
+    @Suppress("LongParameterList") // Two registers and the box they are measured against.
+    public fun crop(
+        target: ObjectId,
+        current: ObjectFormat,
+        currentTransform: Matrix3,
+        widthPt: Float,
+        heightPt: Float,
+        crop: ImageCrop?,
+        nextOpId: () -> String,
+        nextClock: () -> LamportClock,
+    ): List<PageOp> {
+        val whole = uncroppedFrame(currentTransform, widthPt, heightPt, current.crop)
+        return listOf(
+            setCrop(target, current, crop, nextOpId, nextClock),
+            PageOp.SetTransform(nextOpId(), nextClock(), target, croppedFrame(whole, widthPt, heightPt, crop)),
+        )
+    }
+
+    /**
+     * The frame this image would have if it were showing its **whole** source, given that [applied]
+     * is the crop currently on it.
+     *
+     * The inverse of [croppedFrame], and the reason a crop can be widened again: every crop is
+     * measured from here rather than from the frame the previous one left behind.
+     *
+     * Returns [current] unchanged when the crop is absent, whole, or degenerate — and when the
+     * frame's own matrix cannot be inverted, which is a picture that has been scaled to nothing and
+     * for which there is no sane frame to recover.
+     */
+    public fun uncroppedFrame(current: Matrix3, widthPt: Float, heightPt: Float, applied: ImageCrop?): Matrix3 {
+        val region = regionOf(applied) ?: return current
+        return current * insetOf(region, widthPt, heightPt).inverse().let { it ?: return current }
+    }
+
+    /** [whole]'s frame narrowed to [crop] — the picture unmoved, the frame shrunk around it. */
+    public fun croppedFrame(whole: Matrix3, widthPt: Float, heightPt: Float, crop: ImageCrop?): Matrix3 {
+        val region = regionOf(crop) ?: return whole
+        return whole * insetOf(region, widthPt, heightPt)
+    }
+
+    /**
+     * The local-space map from the cropped box onto the region of the whole box it shows.
+     *
+     * `translate(l·w, t·h) · scale(r−l, b−t)` — so the cropped box's `(0,0)` lands on the region's
+     * top-left and its `(w,h)` on the region's bottom-right, which is precisely where those pixels
+     * were already being drawn. That is what makes the crop move nothing.
+     */
+    private fun insetOf(region: ImageCrop.Rect, widthPt: Float, heightPt: Float): Matrix3 =
+        Matrix3.translate(region.left * widthPt, region.top * heightPt) *
+            Matrix3.scale(region.right - region.left, region.bottom - region.top)
+
+    /**
+     * [crop] as the rectangle the frame has to follow, or null when the frame should not move.
+     *
+     * A [ImageCrop.Polygon]'s **bounding box**, because the frame is a rectangle whatever shape the
+     * clip is — a freehand crop shrinks the frame to what it encloses and then clips inside it.
+     */
+    private fun regionOf(crop: ImageCrop?): ImageCrop.Rect? {
+        val rect = when (crop) {
+            null -> return null
+            is ImageCrop.Rect -> crop
+            is ImageCrop.Polygon -> crop.bounds() ?: return null
+        }
+        if (rect.isWhole) return null
+        if (rect.right - rect.left < MIN_EXTENT || rect.bottom - rect.top < MIN_EXTENT) return null
+        return rect
+    }
+
+    /**
      * ⭐ The image's transform **after** a flip about its own centre — an absolute matrix, never a
      * delta (CLAUDE.md rule 8).
      *
@@ -163,4 +259,31 @@ public object ImageEdit {
 
     private const val HALF = 0.5f
     private const val HALF_TURN_DEGREES = 180.0
+
+    /** Below this a crop region is a line; the frame is left alone rather than collapsed. */
+    private const val MIN_EXTENT = 0.001f
+}
+
+/**
+ * A polygon crop's bounding box, or null when it has no area.
+ *
+ * The frame a crop shrinks to is always a rectangle — see [ImageEdit.crop] — so a freehand crop
+ * needs its extent even though its clip is a shape.
+ */
+public fun ImageCrop.Polygon.bounds(): ImageCrop.Rect? {
+    if (pointCount < 1) return null
+    var left = points[0]
+    var right = points[0]
+    var top = points[1]
+    var bottom = points[1]
+    for (index in 1 until pointCount) {
+        val x = points[index * 2]
+        val y = points[index * 2 + 1]
+        if (x < left) left = x
+        if (x > right) right = x
+        if (y < top) top = y
+        if (y > bottom) bottom = y
+    }
+    if (right <= left || bottom <= top) return null
+    return ImageCrop.Rect(left, top, right, bottom)
 }

@@ -102,12 +102,15 @@ internal class DryStroke(
     override fun restyle(style: ObjectStyle?, brushes: InkBrushFactory) {
         super.restyle(style, brushes)
         if (style == null) return
+        // The captured-vs-style rule lives on the factory, shared with the load path, so a
+        // stroke restyled here and one reloaded from disk cannot tessellate differently.
         val brush = brushes.brushFor(
             kind = kind,
-            colorArgb = style.colorArgb.withOpacity(style.opacity),
-            sizePt = if (style.widthPt > 0f) style.widthPt else stroke.brush.size,
+            capturedColorArgb = stroke.brush.colorIntArgb,
+            capturedSizePt = stroke.brush.size,
             epsilonPt = stroke.brush.epsilon,
             inputModel = inputModel,
+            style = style,
         )
         stroke = Stroke(brush, stroke.inputs)
         // Through [DryObject.setBounds], so the page-space box is rebuilt with the object-space
@@ -152,6 +155,21 @@ internal class DryStroke(
      * the comparison correct for a moved stroke without any mapping at all.
      */
     override fun isErasedAway(region: ErasedRegion): Boolean = isFullyErased(stroke, bounds, region)
+
+    override fun eraseCoverageCost(region: ErasedRegion): Long {
+        val bounds = bounds
+        // The same cheap gates `isFullyErased` opens with: a stroke they reject costs four
+        // compares, and charging it the full estimate would spend the whole budget on strokes
+        // the test never actually measures.
+        if (region.isEmpty || bounds == null || !region.contains(bounds)) return 0L
+        // Input points plus outline vertices, and the outline runs to roughly two vertices per
+        // input. An upper-boundish estimate is all a budget needs.
+        return stroke.inputs.size.toLong() * COVERAGE_POINTS_PER_INPUT * region.capsules.size
+    }
+
+    private companion object {
+        const val COVERAGE_POINTS_PER_INPUT = 3L
+    }
 
     /**
      * Every silhouette vertex, in **page space** — what a lasso is tested against.
@@ -606,19 +624,19 @@ internal class StrokeStore {
     }
 
     private fun dryStrokeFor(obj: StrokeObject, brushes: InkBrushFactory): DryStroke? {
-        val decoded = StrokeGeometryCodec.decode(obj.geometry, brushes) ?: return null
-        val dry = DryStroke(
+        // The style goes INTO the decode, so a restyled stroke tessellates once. Decoding, then
+        // restyling — which rebuilds the mesh — tessellated every styled stroke twice, on the
+        // main thread, on every page turn.
+        val decoded = StrokeGeometryCodec.decode(obj.geometry, brushes, obj.style) ?: return null
+        return DryStroke(
             id = obj.id,
             stroke = decoded.stroke,
             kind = decoded.kind,
             inputModel = decoded.inputModel,
             transform = obj.transform,
+            style = obj.style,
             z = obj.z,
-        )
-        // After the constructor, so the rebuilt mesh and its bounds are the ones cached.
-        obj.style?.let { dry.restyle(it, brushes) }
-        dry.setErased(obj.erased.toRegion())
-        return dry
+        ).also { it.setErased(obj.erased.toRegion()) }
     }
 
     /** Drop everything on screen without touching the page's log. Used when switching pages. */
@@ -649,10 +667,17 @@ internal class StrokeStore {
      */
     fun clear() {
         beginEdit()
-        for (dry in byId.values.toList()) {
+        // The same bookkeeping [remove] does per object, in bulk: `ArrayList.remove` is a linear
+        // scan plus an arraycopy, so removing every object one at a time made clearing a page
+        // O(N²) — ~12.5M element shifts for 5,000 strokes, in one frame, on the UI thread.
+        for (dry in byId.values) {
             removedThisGesture += dry.id
-            remove(dry)
+            tombstones += dry.id
         }
+        ink.clear()
+        highlight.clear()
+        byId.clear()
+        routesDirty = true
         endEdit()
         revision++
     }
@@ -680,6 +705,24 @@ internal class StrokeStore {
         // op count is unchanged because a preview emits no ops at all.
         routesDirty = true
         revision++
+    }
+
+    /**
+     * ⚠️ **The curve's half of [previewTransform], and it is a different register.**
+     *
+     * A vertex drag previews through a transform; the middle handle of a line previews through
+     * this, because a bend is not expressible as a placement (see `ShapePoints`). Everything that
+     * makes [previewTransform] safe applies unchanged: it emits nothing, the commit goes through
+     * [applyOps] with the recorder, and passing null puts the shape back to whatever its record
+     * says — which is what a cancelled pointer needs.
+     *
+     * Silently ignores an id that is not a shape. A bend on a stroke is not an error a caller can
+     * do anything about; it is a selection that changed under a gesture, which `onStoreChanged`
+     * already handles one layer up.
+     */
+    fun previewBend(id: ObjectId, local: PagePoint?) {
+        val shape = byId[id] as? DryShape ?: return
+        if (shape.previewBend(local)) revision++
     }
 
     // --- Shapes and connectors (M8b) ----------------------------------------
@@ -909,6 +952,13 @@ internal class StrokeStore {
     private class LocalSweep(val from: PagePointF = PagePointF(), val to: PagePointF = PagePointF())
 
     /**
+     * One instance, on the store — this class is single-UI-thread. It used to be constructed
+     * inside [applyErase], which runs twice per eraser sample, so the "no allocation per
+     * sample" scratch was itself six allocations per sample.
+     */
+    private val localSweepScratch = LocalSweep()
+
+    /**
      * The capsule this sweep takes out of [dry], **in [dry]'s own space**, or null when it takes
      * none.
      *
@@ -960,7 +1010,7 @@ internal class StrokeStore {
         mode: EraseMode,
     ): Int {
         var touched = 0
-        val scratch = LocalSweep()
+        val scratch = localSweepScratch
         val iterator = objects.iterator()
         while (iterator.hasNext()) {
             val dry = iterator.next()
@@ -1001,35 +1051,58 @@ internal class StrokeStore {
      * killed the app on exactly this input.
      */
     fun pruneFullyErased() {
-        var removed = false
         var budget = PRUNE_BUDGET
         for (list in listOf(ink, highlight)) {
             val iterator = list.iterator()
             while (iterator.hasNext() && budget > 0) {
                 val dry = iterator.next()
                 val region = dry.erased ?: continue
-                budget -= region.capsules.size
-                // ⭐ M8c: the kind check is [DryObject.isErasedAway]'s default rather than a cast
-                // here — one rejection, one `continue`, and the same shape [sweptCapsuleFor] uses.
-                // Only a stroke answers true; the others refuse for the reason [DryTextBox] gives,
-                // which is that dropping one costs the user their object until the page reloads.
-                if (dry.isErasedAway(region)) {
-                    iterator.remove()
-                    byId.remove(dry.id)
-                    removed = true
-                }
+                budget -= pruneIfAffordable(iterator, dry, region, budget)
             }
         }
-        if (removed) revision++
+    }
+
+    /**
+     * Coverage-test [dry] if the remaining [budget] can pay for the test, drop it when it is
+     * fully erased, and return what was spent.
+     *
+     * Charged in the unit the work actually happens in — point × capsule distance tests,
+     * estimated by the object itself ([DryObject.eraseCoverageCost]). The budget used to charge
+     * `capsules.size` while `isErasedAway` ran points × capsules, an under-count of the whole
+     * point factor: one pen-up after scribbling over a dense, heavily-erased area ran ~100× the
+     * bound and froze the UI at exactly the moment the budget exists to protect.
+     *
+     * A stroke too big for what is left is *skipped* (spend 0), not stopped at — smaller ones
+     * after it may still fit, and the degradation stays "not pruning yet".
+     *
+     * ⭐ M8c: the kind check is [DryObject.isErasedAway]'s default rather than a cast here. Only
+     * a stroke answers true; the others refuse for the reason [DryTextBox] gives, which is that
+     * dropping one costs the user their object until the page reloads.
+     */
+    private fun pruneIfAffordable(
+        iterator: MutableIterator<DryObject>,
+        dry: DryObject,
+        region: ErasedRegion,
+        budget: Long,
+    ): Long {
+        val cost = dry.eraseCoverageCost(region)
+        if (cost > budget) return 0L
+        if (dry.isErasedAway(region)) {
+            iterator.remove()
+            byId.remove(dry.id)
+            revision++
+        }
+        return cost
     }
 
     private companion object {
         /**
-         * Capsule-tests allowed per prune pass. Sized so the worst case stays comfortably
+         * Point-against-capsule distance tests allowed per prune pass — the unit
+         * [DryObject.eraseCoverageCost] estimates in. Sized so the worst case stays comfortably
          * inside one frame rather than by measurement — the number to trust is whatever the
          * device says, not this one.
          */
-        const val PRUNE_BUDGET = 200_000
+        const val PRUNE_BUDGET = 200_000L
 
         /**
          * Ids for a store with no page bound — the synthetic-load harness and previews. They

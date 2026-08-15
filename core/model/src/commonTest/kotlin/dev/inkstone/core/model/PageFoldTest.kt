@@ -277,6 +277,59 @@ class PageFoldTest {
         assertEquals(whole.throughClock, incremental.throughClock)
     }
 
+    /**
+     * `applyAll` builds the folded state once per batch — a selection gesture is one op per
+     * object, and the per-op build behind the old `applyAll` was a page-turn-sized cost per
+     * autosave tick — and the batching must be invisible: same state, same worst outcome as
+     * [PageLog.apply] one op at a time, for a batch mixing in-order and late ops.
+     */
+    @Test
+    fun `applyAll matches per-op apply for a batch with a late op`() {
+        val target = ObjectId("obj-1")
+        val ops = listOf(
+            PageOp.AddObject(op(), clock(1), stroke("obj-1")),
+            PageOp.AddObject(op(), clock(3), stroke("obj-2", z = "Z")),
+            // Late: sorts before obj-2's add, so the batch must re-fold — and the winning
+            // transform must still be the clock-6 write below, not this one.
+            PageOp.SetTransform(op(), clock(2), target, Matrix3.scale(3f)),
+            PageOp.SetTransform(op(), clock(6), target, Matrix3.translate(1f, 1f)),
+        )
+        val oneAtATime = PageLog(pageId)
+        var worst = FoldOutcome.APPENDED
+        for (one in ops) {
+            val each = oneAtATime.apply(one)
+            if (each.ordinal > worst.ordinal) worst = each
+        }
+
+        val batched = PageLog(pageId)
+        val outcome = batched.applyAll(ops)
+
+        assertEquals(FoldOutcome.REFOLDED, outcome)
+        assertEquals(worst, outcome)
+        assertEquals(oneAtATime.state.objects.map { it.id }, batched.state.objects.map { it.id })
+        assertEquals(oneAtATime.state.throughClock, batched.state.throughClock)
+        assertEquals(oneAtATime.state.opCount, batched.state.opCount)
+        assertEquals(Matrix3.translate(1f, 1f), assertNotNull(batched.state.find(target)).transform)
+    }
+
+    @Test
+    fun `applyAll reports a stale snapshot and refolds without it`() {
+        val snapshot = foldPage(pageId, listOf(PageOp.AddObject(op(), clock(10), stroke("obj-1"))))
+        val log = PageLog(pageId, snapshot = snapshot)
+
+        val outcome = log.applyAll(
+            listOf(
+                PageOp.AddObject(op(), clock(4), stroke("obj-2")),
+                PageOp.AddObject(op(), clock(12), stroke("obj-3")),
+            ),
+        )
+
+        assertEquals(FoldOutcome.SNAPSHOT_STALE, outcome)
+        assertTrue(log.snapshotStale)
+        // Refolded from the log alone: the stale snapshot's object is gone, both batch ops are in.
+        assertEquals(setOf(ObjectId("obj-2"), ObjectId("obj-3")), log.state.objects.map { it.id }.toSet())
+    }
+
     // -----------------------------------------------------------------------
     // Forward compatibility (SPEC §5.8)
     // -----------------------------------------------------------------------

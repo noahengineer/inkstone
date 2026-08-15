@@ -257,6 +257,9 @@ A milestone is done when:
 | **M7 recognition/search decisions + the segmented-vs-blob numbers** | `docs/M7-RECOGNITION.md` |
 | **M8a selection/transform decisions + the per-feature check table** | `docs/M8-SELECTION.md` |
 | **M8b connector format decided + what is still not built** | `docs/M8-CONNECTORS.md` (§6 is the remainder) |
+| **M8 follow-up — snap rotation-invariance, image drag, the crop tool** | `docs/M8-UX-FIXES.md` |
+| **M8 follow-up 2 — two-finger undo, selection staleness, perf (and the deferred dry-layer cache)** | `docs/M8-PERF-UNDO.md` |
+| **M8 follow-up 3 — shape point handles, the 3-point curve, and why neither is a new `ShapeKind`** | `docs/M8-SHAPE-POINTS.md` (SPEC §4.8.9) |
 | **M12 lecture recording — capture built, alignment still designed** | `docs/M12-AUDIO.md` (§15 is what exists) |
 
 ---
@@ -392,6 +395,72 @@ Collected during research so they don't get reintroduced from stale training dat
   non-crashing and visibly wrong — while "change a fill, press undo" ate the press and did nothing.
   Copying is one shared `copiedObjectOps` now. The habit that catches this is grepping for
   everything that *copies an object*, not everything that reads the new field.
+- ⚠️ **A geometric feature can be independent of the property it is meant to measure, and then no
+  amount of tuning is the fix** (M8 follow-up). `ShapeSnap` scored a shape by the fraction of its
+  **axis-aligned** box it filled. For a square that is `1/(1 + k·sin 2θ)` — a function of how the
+  user was holding the tablet, sweeping the whole feature range — so a rectangle at 7° scored
+  *ellipse* and one at 45° scored *triangle at confidence 1.000*. A **circle's** axis-aligned box is
+  the same at every angle, so the ellipse was the one kind that could be measured at all, and the
+  user's report was the exact truth: *"i can only do ovels/circles"*. The fix is the **minimum-area**
+  box (`OrientedBounds`), against which all three ratios are rotation-invariant by construction. The
+  habit that catches this: before tuning a threshold, ask what the feature is a function of and
+  write that function down — `1/(1+k·sin2θ)` has no fix in the constants.
+- ⚠️ **Two thresholds beside it were also read as their own constants and are not.** The accepted
+  fill half-width is `FILL_WINDOW × (1 − DEFAULT_CONFIDENCE)`, not `FILL_WINDOW`; a line's
+  straightness bar was `MIN + confidence × (1 − MIN)` = 0.9685, not the 0.93 its constant names.
+  **A confidence gate downstream of a ramp silently narrows every window the ramp feeds.**
+- ⚠️ **A dwell's own samples must not join the gesture it is classifying** (M8 follow-up). Half a
+  second of tremor at 240 Hz piles ~130 points on one spot; `ShapeSnap` divides by `pathLength`
+  twice, so holding still sank a line below its straightness bar *and* pulled an open arc's end-gap
+  ratio under the closure threshold — i.e. **holding longer made the answer worse**, which is the
+  opposite of what the gesture promises.
+- ⚠️ **An eraser and a tap disagree about the inside of a hollow shape, and sharing one predicate
+  makes a snapped shape nearly unselectable** (M8 follow-up). `ShapeHit`'s `filled` rule is right for
+  the eraser — you can drag one through a hollow box, which is what its emptiness looks like — and
+  wrong for a tap, where "tap the shape" means the shape and not its perimeter. A snapped shape has
+  no fill, so the interior test was skipped and the user had to land within 8 dp of a hairline.
+  `DryObject.tappedAt` is the split; only `DryShape` overrides it.
+- ⚠️ **A tool that "owns touch" with a full-screen overlay makes every gesture it does not implement
+  *unreachable*, not merely missing** (M8 follow-up). `EditorTool.IMAGE` put a Compose overlay in
+  front of `InkSurfaceView` and offered a tap, so while the one tool that knew about images was
+  active the surface received **no events at all** — an image was the only object on the page that
+  could not be dragged, and the fix was to stop owning touch rather than to implement a drag.
+  Corollary: `onSelectionChanged` carried an `Int`, so *"an image is selected"* was unrepresentable
+  in `:app` and a contextual bar had nothing to key off.
+- ⚠️ **A tap was reclassified as a lasso after 3.0 page-points of *path*** (M8 follow-up), because
+  the guard counted **samples** (`points.size < 3`, one appended per 1.5 pt) while the slop beside it
+  measured **net displacement** in dp. The tighter, differently-dimensioned test always bound first,
+  so the 8 dp slop was decorative and a hand tremor while pressing selected nothing *and* cleared the
+  selection. When two guards on one decision measure different quantities, only the tighter one is
+  real — check which.
+- ⚠️ **`Lasso.selects` takes a *majority* of the points an object offers, so an object that offers
+  four is nearly unlassoable** (M8 follow-up). A `DryBox` emitted only its corners, so a lasso drawn
+  *inside* a photo enclosed none of them while the identical gesture over handwriting worked — a
+  stroke offers every outline vertex. Sample edges, not corners.
+- ⚠️ **`SetFormat` alone does not crop a picture, it zooms it** (M8 follow-up). The renderer scales
+  whatever the crop selects to fill the object's unchanged box, so a crop written as one op returns a
+  tall sliver stretched back out to a square — silently discarding the aspect ratio insert-time
+  downscaling preserved. A crop is `SetFormat` **+** an absolute `SetTransform`, as one gesture, and
+  the frame must be recomputed from the *whole-source* frame every time (`ImageEdit.uncroppedFrame`)
+  or it ratchets inward and can never be widened again.
+- ⚠️ **Never key a `pointerInput` on the value the gesture is editing** (M8 follow-up).
+  `.pointerInput(id, camera, session.region)` reads naturally and tears the handler down **mid-drag**
+  on the first delta it reports, so the thing being dragged moves one frame and stops. It looks
+  exactly like a hit-test bug. `rememberUpdatedState` and read the value at the down.
+- ⚠️ **Draw-and-hold cannot be driven from the shell without a *stationary* sample, and the failure
+  looks exactly like a broken feature** (M8 follow-up 3). Two things, both cheap and neither a bug.
+  `ShapeSnapDetector.sample` schedules the dwell timer only when a sample lands **inside** the hold
+  radius, so a gesture whose last event is a large `MOVE` answers `NOT_HOLDING`, schedules nothing,
+  and the `sleep 1.5` after it waits on a timer that was never set. And `ShapeSnap.recognise` wants
+  **six** points, which a four-`MOVE` gesture does not have. The recipe is
+  `DOWN …; 10× MOVE …; MOVE <1pt away>; sleep 1.6; UP`. Two walk attempts were read as *"the snap
+  is broken"* before this was worked out; the same shape as the `screencap`/`uiautomator` note
+  below — the instrument was wrong, not the feature.
+- ⚠️ **`uiautomator dump` piped through `adb shell cat` can yield a 0-byte file, and every grep
+  against it then "passes"** (M8 follow-up). Three device measurements in a row reported *"nothing is
+  selected"* while the screen plainly showed a selection, and one of them was briefly believed to be
+  a real regression. Check the artifact is non-empty before believing what it does not contain;
+  `screencap` was the instrument that worked.
 - **`EncryptedSharedPreferences` was deprecated in 2025.** Keystore AES-GCM directly.
 - Nextcloud's `loginName` is **not** the WebDAV path segment. Fetch the UID from `/ocs/v2.php/cloud/user`.
 - Nextcloud forbids only `\` and `/` by default — **not** the Windows character set. Read the real rules from capabilities.

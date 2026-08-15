@@ -1331,13 +1331,38 @@ class NoteEditor(
     }
 
     /**
-     * An image's crop — one `SetFormat` carrying the object's whole format (SPEC §4.9.2).
+     * An image's crop — `SetFormat` **and** `SetTransform`, as one gesture (SPEC §4.9.2).
      *
      * Null clears it. That is a *value* of the register rather than an absence, which is why it is
      * expressible at all where "no style" is not.
+     *
+     * ⚠️ **Two ops, not one, and the second is what makes it a crop rather than a zoom.**
+     * `SetFormat` says which pixels; the renderer then scales them to fill the object's unchanged
+     * box, so a crop written alone stretches the picture — crop a square photo to a tall sliver and
+     * the sliver comes back square. `ImageEdit.crop` computes the frame that keeps the pixels
+     * exactly where they are, always measured from the *whole-source* frame so the crop stays
+     * widen-able (CLAUDE.md rule 1). One `apply`, so one undo puts both back.
      */
     fun setCrop(id: ObjectId, crop: ImageCrop?) {
-        updateFormat(id) { it.copy(crop = crop) }
+        withPage { session, page ->
+            saveLocked()
+            val before = session.page(page)
+            val image = before.find(id) as? ImageObject ?: return@withPage
+            val ops = ImageEdit.crop(
+                target = id,
+                current = ObjectFormat.decode(before.formatOf(id)),
+                // The live transform: a fold collapses every register onto the payload, so this is
+                // where the object is *now* and not where it was created.
+                currentTransform = image.transform,
+                widthPt = image.widthPt,
+                heightPt = image.heightPt,
+                crop = crop,
+                nextOpId = session::nextOpId,
+                nextClock = session::nextClock,
+            )
+            session.apply(page, ops)
+            afterEdit(session, page, before)
+        }
     }
 
     /**

@@ -128,8 +128,21 @@ public class InkSurfaceView @JvmOverloads constructor(
     private var activeStrokeId: InProgressStrokeId? = null
     private var activeStrokeKind = InkBrushKind.FOUNTAIN
 
+    /**
+     * Whether the live stroke is being drawn by a stylus. With finger drawing on, a *finger*
+     * reaches [beginStroke], and its moves must not stamp [PalmGuard] as stylus activity —
+     * that blacked out every finger gesture (undo tap, pan) for the guard's whole grace
+     * window after each finger-drawn stroke.
+     */
+    private var activeStrokeIsStylus = true
+
     private val eraser = EraserController(strokes, displayMetrics.density) {
         dryView.onStoreChanged()
+        // A flipped pen tip erases whatever the toolbar says, so it can delete a *selected*
+        // stroke (WHOLE_STROKE, or the end-of-gesture prune) with the selection standing.
+        // `onStoreChanged` prunes the dead id and fires onChanged only when the selection
+        // actually changed, so the per-sample cost with nothing selected is one empty check.
+        selectionController.onStoreChanged()
         onStrokeCountChanged?.invoke(strokes.size)
     }
 
@@ -140,13 +153,28 @@ public class InkSurfaceView @JvmOverloads constructor(
     // The explicit type is required: the callback reads `selection` back, and without it the
     // compiler cannot infer the property's type from an initialiser that mentions the property.
     private val selectionController: SelectionController =
-        SelectionController(strokes, brushFactory, displayMetrics.density, pixelsPerPoint) {
-            dryView.onStoreChanged()
-            overlay.onSelectionChanged()
-            onStrokeCountChanged?.invoke(strokes.size)
-            onSelectionChanged?.invoke(selectionController.size)
-            onHistoryChanged?.invoke()
-        }
+        SelectionController(
+            store = strokes,
+            brushes = brushFactory,
+            displayDensity = displayMetrics.density,
+            pixelsPerPoint = pixelsPerPoint,
+            // Per preview frame during a drag: repaint the ink and the chrome, and nothing else.
+            // The membership-shaped callbacks below used to fire here too, per input event —
+            // shapeCounts is O(selection) with a list allocation and soleImage builds a fresh
+            // object, so a drag fanned hundreds of recomputations per second into Compose for
+            // values that cannot change while the finger is down.
+            onPreview = {
+                dryView.onStoreChanged()
+                overlay.onSelectionChanged()
+            },
+            onChanged = {
+                dryView.onStoreChanged()
+                overlay.onSelectionChanged()
+                onStrokeCountChanged?.invoke(strokes.size)
+                onSelectionChanged?.invoke(selectionController.size)
+                onHistoryChanged?.invoke()
+            },
+        )
 
     /**
      * ⭐ ROADMAP M8c — the straight edge. See [RulerController] for how the snap is applied.
@@ -574,6 +602,11 @@ public class InkSurfaceView @JvmOverloads constructor(
     public fun applyOps(ops: List<PageOp>, record: Boolean = true) {
         if (ops.isEmpty()) return
         strokes.applyOps(ops, brushFactory, record)
+        // ⭐ Before the repaint: the selection caches ids and a box, and this is the door an
+        // undo's DeleteObject or a peer's move comes through. Without it, "undo something
+        // selected" left the outline and grips round objects that had just been deleted or
+        // moved back — drawn stale, hit-tested stale, and reported stale to the toolbar.
+        selectionController.onStoreChanged()
         dryView.onStoreChanged()
         onStrokeCountChanged?.invoke(strokes.size)
         onHistoryChanged?.invoke()
@@ -720,6 +753,10 @@ public class InkSurfaceView @JvmOverloads constructor(
      */
     public fun clearPage() {
         wetView.cancelUnfinishedStrokes()
+        // Same line, same reason as [loadPage]: everything is about to go, and a selection of
+        // deleted objects would keep its box, its grips and its toolbar row standing over an
+        // empty page.
+        selectionController.clear()
         strokes.clear()
         dryView.onStoreChanged()
         onStrokeCountChanged?.invoke(strokes.size)
@@ -784,9 +821,31 @@ public class InkSurfaceView @JvmOverloads constructor(
             return true
         }
 
+        fingerPointerDown(event, index, pointerId)
+        return true
+    }
+
+    /**
+     * A finger landed. The order of the gates is load-bearing:
+     *
+     * ⭐ **The tap detector is fed BEFORE the palm guard**, and that placement is the fix for
+     * "two-finger undo feels very inconsistent". The S Pen reports hover from ~1 cm out and
+     * every hover event refreshes the guard, so with the pen held anywhere near the page —
+     * the normal posture when tapping with the other hand, and inevitable right after
+     * writing — the guard swallowed the fingers before the detector ever saw them. The guard
+     * exists to stop a palm *panning the page* or *drawing*; a tap moves nothing and writes
+     * nothing, and the detector's own slop and timeout are what reject a palm (a palm slides
+     * or lingers; two clean sub-slop sub-400 ms contacts are a person asking for undo).
+     * The camera, the ruler and finger drawing stay behind the guard, exactly as before.
+     */
+    private fun fingerPointerDown(event: MotionEvent, index: Int, pointerId: Int) {
         val gestureInFlight = activeStrokeId != null || eraser.isActive ||
             selectionController.isActive || rulerController.isActive || laser.isActive
-        if (gestureInFlight || !palmGuard.allowsFinger(event)) return true
+        if (gestureInFlight) return
+
+        taps.onPointerDown(event)
+
+        if (!palmGuard.allowsFinger(event)) return
 
         // ⭐ M8c — before the camera and before finger drawing. A finger that lands on the straight
         // edge moves the edge; a finger anywhere else pans the page, exactly as before. Checked
@@ -795,19 +854,16 @@ public class InkSurfaceView @JvmOverloads constructor(
         if (rulerController.begin(event, index, pointerId, camera)) {
             taps.cancel()
             parent?.requestDisallowInterceptTouchEvent(true)
-            return true
+            return
         }
-
-        taps.onPointerDown(event)
 
         if (fingerDrawingEnabled) {
             requestUnbufferedDispatch(event)
             beginDrawOrErase(event, index, pointerId, hardwareEraserAllowed = false)
-            return true
+            return
         }
 
         gestures.addPointer(event, pointerId)
-        return true
     }
 
     /**
@@ -869,6 +925,7 @@ public class InkSurfaceView @JvmOverloads constructor(
         strokes.beginEdit()
         activeStrokeKind = pen.kind
         strokePointerId = pointerId
+        activeStrokeIsStylus = event.isStylusPointer(pointerIndex)
         val ruled = rulerController.appliesTo(event, pointerIndex)
         // ⭐ M8b — armed here, fed in `onMove`, and it allocates nothing on either path.
         // ⚠️ Not armed while the ruler is out. Draw-and-hold measures dwell against the *raw*
@@ -911,10 +968,23 @@ public class InkSurfaceView @JvmOverloads constructor(
             activeStrokeId = null
             strokePointerId = MotionEvent.INVALID_POINTER_ID
         },
-        onSnapped = { kind, attached ->
+        onSnapped = { id, kind, attached ->
             dryView.onStoreChanged()
             onStrokeCountChanged?.invoke(strokes.size)
             onHistoryChanged?.invoke()
+            // ⭐ Select what was just made. The shape the user drew a second ago is the one they are
+            // about to want to resize, and leaving the selection empty meant the only way back to it
+            // was to switch tools and land a tap on it — on an *unfilled* outline, which until
+            // [DryObject.tappedAt] meant hitting a hairline. Selecting here is also what puts the
+            // shape row (fill, corner radius) on screen without a hunt.
+            //
+            // The tool is deliberately **not** changed: someone drawing a flowchart snaps five boxes
+            // in a row, and stealing the pen after each one would cost five taps to give back.
+            // `InkToolbar` surfaces an "Adjust" action instead, which is one tap and is not a mode
+            // change nobody asked for. ⚠️ It did not until this milestone — the sentence was here,
+            // the button was not, and the selection made above therefore had no gesture behind it
+            // for anyone still holding the pen.
+            selectionController.select(listOf(id))
             onShapeSnapped?.invoke(kind, attached)
         },
     )
@@ -999,6 +1069,14 @@ public class InkSurfaceView @JvmOverloads constructor(
     public var onShapeSnapped: ((ShapeKind, Boolean) -> Unit)? = null
 
     private fun onMove(event: MotionEvent): Boolean {
+        // ⭐ Disqualification bookkeeping only — two subtractions per tracked pointer, no camera
+        // effect — and it runs before every gate on purpose. It used to sit behind the
+        // palm-guard/camera gate below, so a two-finger PAN whose moves the guard was rejecting
+        // was never disqualified as a tap, and a quick flick could lift into a spurious undo:
+        // the page did not move and the last stroke vanished. Movement must always disqualify,
+        // whatever the guard thinks of the individual events. (During a stylus gesture the
+        // detector is already cancelled, so this is two compares and a return.)
+        taps.onMove(event)
         if (stylusGestureMove(event)) return true
         // ⭐ M8c — no `noteStylusEvent`: the ruler is dragged by a **finger**, and telling the palm
         // guard a stylus had been near would then block the very pointer that is doing the moving.
@@ -1007,7 +1085,6 @@ public class InkSurfaceView @JvmOverloads constructor(
             return true
         }
         if (!gestures.isActive || !palmGuard.allowsFinger(event)) return false
-        taps.onMove(event)
         camera = gestures.onMove(event, camera).leashed()
         return true
     }
@@ -1025,7 +1102,11 @@ public class InkSurfaceView @JvmOverloads constructor(
     private fun stylusGestureMove(event: MotionEvent): Boolean {
         val strokeId = activeStrokeId
         if (strokeId != null) {
-            palmGuard.noteStylusEvent(event)
+            // ⭐ Only when the stroke is really a stylus's. With finger drawing on, this branch is
+            // reached by a *finger*, and stamping the palm guard from it blacked out every finger
+            // gesture — the two-finger undo of the stroke just drawn, first among them — for
+            // 300 ms after each stroke.
+            if (activeStrokeIsStylus) palmGuard.noteStylusEvent(event)
             // Four float compares. See StylusStats on why this is allowed here.
             event.findPointerIndex(strokePointerId).takeIf { it >= 0 }?.let { stylus.record(event, it) }
             // The whole MotionEvent goes in, historical samples and all —

@@ -1,6 +1,7 @@
 package dev.inkstone.android.ink
 
 import dev.inkstone.core.model.ConnectorEnd
+import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.ShapeEdit
 import dev.inkstone.core.model.ShapeKind
@@ -33,16 +34,19 @@ import dev.inkstone.core.model.SnapCandidate
  *   stroke never reaches `onStrokesFinished`, so no `AddObject` for it is ever built and nothing
  *   has to be tombstoned afterwards. A stroke created and then deleted would keep its geometry in
  *   the log forever (CLAUDE.md rule 1) and would sync.
- * @param onSnapped fired after the shape is on the page, so the toolbar can say what it became.
- *   Without it, the first snap is indistinguishable from the app having eaten the stroke. The
- *   boolean is whether it also **attached** — a line and a connector look identical the instant
- *   they are drawn, and they behave completely differently the moment anything moves.
+ * @param onSnapped fired after the shape is on the page, so the toolbar can say what it became and
+ *   the surface can select it. Without it, the first snap is indistinguishable from the app having
+ *   eaten the stroke. The boolean is whether it also **attached** — a line and a connector look
+ *   identical the instant they are drawn, and they behave completely differently the moment
+ *   anything moves. The [ObjectId] is what makes *"adjust it after"* reachable at all: the shape
+ *   the user just drew is the one they are about to want handles on, and without its id the only
+ *   route to it is a tap that has to find it again.
  */
 internal class ShapeSnapController(
     private val store: StrokeStore,
     private val brushes: InkBrushFactory,
     private val cancelWetStroke: () -> Unit,
-    private val onSnapped: (ShapeKind, Boolean) -> Unit,
+    private val onSnapped: (ObjectId, ShapeKind, Boolean) -> Unit,
 ) {
 
     private val detector = ShapeSnapDetector()
@@ -85,8 +89,13 @@ internal class ShapeSnapController(
         val record = connectorRecordFor(candidate, kind, bindSlopPt)
         cancelWetStroke()
 
+        // ⚠️ Hoisted out of the `create(...)` argument list, where it used to be minted inline. The
+        // id was therefore unreachable the instant it was used, so nothing could select, report or
+        // undo *this particular* shape — which is why the shape a user had just drawn was the one
+        // object on the page they had to go hunting for.
+        val id = recorder.newObjectId()
         val ops = ShapeEdit.create(
-            id = recorder.newObjectId(),
+            id = id,
             placement = candidate.placement(bandPt = widthPt, asKind = kind),
             z = store.allocateTopZ(1).single(),
             // The pen's own colour and width, so a snapped shape looks like the ink it replaced.
@@ -99,7 +108,7 @@ internal class ShapeSnapController(
         // undo come through. One construction path and one insertion path, so the screen cannot
         // disagree with the log about what was made.
         store.applyOps(ops, brushes, record = true)
-        onSnapped(kind, record.isConnector)
+        onSnapped(id, kind, record.isConnector)
         return true
     }
 

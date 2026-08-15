@@ -71,8 +71,8 @@ fun PageOverlay(ui: InkUiState, objects: ObjectToolState, gestures: PageGestures
     Box(
         modifier = modifier
             .fillMaxSize()
-            .pointerInput(tool, camera, objects.cropping, objects.pendingElement) {
-                gestureFor(objects.cropping, dragging(tool, objects), camera, gestures) { preview = it }
+            .pointerInput(tool, camera, objects.pendingElement) {
+                gestureFor(dragging(tool, objects), camera, gestures) { preview = it }
             },
     ) {
         androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
@@ -96,10 +96,8 @@ fun PageOverlay(ui: InkUiState, objects: ObjectToolState, gestures: PageGestures
 class PageGestures(
     /** A tap: place a text box, focus an image, or stamp the pending Element. */
     val onTap: (PagePoint) -> Unit,
-    /** A dragged rectangle: a rectangular crop, or an Element capture area. */
+    /** A dragged rectangle: an Element capture area. */
     val onDragBox: (PageRect) -> Unit,
-    /** A freehand trace: the freehand crop's lasso. */
-    val onLasso: (List<PagePoint>) -> Unit,
 )
 
 /**
@@ -111,24 +109,18 @@ class PageGestures(
  * and *"with something armed"* is a tap, and that is a fact about the panel, not about the tool.
  */
 private suspend fun PointerInputScope.gestureFor(
-    cropping: CropMode?,
     drag: Boolean,
     camera: Camera,
     gestures: PageGestures,
     onPreview: (Preview?) -> Unit,
 ) {
-    when {
-        cropping == CropMode.FREEHAND -> traceGesture(camera) { points, done ->
-            onPreview(points?.let(Preview::Trace))
-            if (done && points != null) gestures.onLasso(points)
-        }
-
-        drag || cropping == CropMode.RECT -> boxGesture(camera) { box, done ->
+    if (drag) {
+        boxGesture(camera) { box, done ->
             onPreview(box?.let(Preview::Box))
             if (done && box != null) gestures.onDragBox(box)
         }
-
-        else -> tapGesture(camera, gestures.onTap)
+    } else {
+        tapGesture(camera, gestures.onTap)
     }
 }
 
@@ -190,28 +182,11 @@ private suspend fun PointerInputScope.boxGesture(camera: Camera, onBox: (PageRec
     }
 }
 
-private suspend fun PointerInputScope.traceGesture(camera: Camera, onTrace: (List<PagePoint>?, Boolean) -> Unit) {
-    awaitEachGesture {
-        val down = awaitFirstDown()
-        down.consume()
-        val points = ArrayList<PagePoint>()
-        points += camera.toPage(down.position)
-        var pressed = true
-        while (pressed) {
-            val change = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
-            if (change == null) {
-                pressed = false
-            } else {
-                points += camera.toPage(change.position)
-                change.consume()
-                onTrace(points.toList(), false)
-                pressed = change.pressed
-            }
-        }
-        onTrace(null, false)
-        if (points.size >= MIN_TRACE_POINTS) onTrace(points.toList(), true)
-    }
-}
+// ⚠️ `traceGesture` was here and is gone with the freehand crop it served. That gesture — "draw
+// over the picture to say what to keep" — is the one the user named as the thing to get rid of, and
+// it had no other caller. A freehand `ImageCrop.Polygon` written by an older build or by a peer
+// still decodes, still renders and still publishes; there is simply no longer a way to *author* one
+// by hand, and `CropOverlay` degrades one to its bounding box when you edit it.
 
 private fun Camera.toPage(view: Offset): PagePoint = viewToPage(ViewOffset(view.x, view.y), this)
 
@@ -240,8 +215,6 @@ private const val TAP_SLOP_PX = 24f
 
 /** Page points. Below this a drag is a mis-hit, not a rectangle. */
 private const val MIN_DRAG_PT = 4f
-
-private const val MIN_TRACE_POINTS = 3
 
 private const val LASSO_ARGB = 0xFF1D4ED8.toInt()
 private const val OUTLINE_PX = 2f

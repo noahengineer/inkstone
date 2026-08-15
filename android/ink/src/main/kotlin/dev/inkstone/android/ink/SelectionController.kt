@@ -1,5 +1,7 @@
 package dev.inkstone.android.ink
 
+import android.os.Looper
+import android.view.Choreographer
 import android.view.MotionEvent
 import androidx.annotation.ColorInt
 import dev.inkstone.core.model.Alignment
@@ -10,6 +12,7 @@ import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.Lasso
 import dev.inkstone.core.model.Matrix3
+import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageOp
@@ -21,6 +24,10 @@ import dev.inkstone.core.model.SelectionEdit
 import dev.inkstone.core.model.SelectionGesture
 import dev.inkstone.core.model.ShapeEdit
 import dev.inkstone.core.model.ShapeGeometry
+import dev.inkstone.core.model.ShapeKind
+import dev.inkstone.core.model.ShapePoint
+import dev.inkstone.core.model.ShapePointRole
+import dev.inkstone.core.model.ShapePoints
 import dev.inkstone.core.model.ShapeRecord
 import dev.inkstone.core.model.TextBoxObject
 import kotlin.math.atan2
@@ -82,7 +89,43 @@ public interface InkSelection {
 
     /** How many selected objects are shapes, and how many of those are connectors. */
     public val shapeCounts: ShapeSelectionCounts
+
+    /**
+     * ⭐ The one selected image, or null when the selection is not exactly one image.
+     *
+     * ## Why the selection had to start answering this
+     *
+     * The Image tool used to be a *mode*: a full-screen Compose overlay in front of the surface,
+     * whose tap wrote which picture the Rotate / Flip / Crop buttons acted on. That overlay is why
+     * an image could not be dragged — the surface never received a single event while the tool that
+     * owned images was the active one, so *"move this photo"* meant switching to the Select tool
+     * first. Two tools disagreed about images, and only one of them could move them.
+     *
+     * Driving the image bar off the **selection** instead collapses the two: the Image tool now
+     * falls through to `InkTool.SELECT` like every other object tool, so move, resize and rotate are
+     * the ones that already work, and the buttons follow whatever is selected however it got
+     * selected. `onSelectionChanged` is the one moment this is known to have changed, which is why
+     * it is asked for here rather than pushed through a second callback (the argument
+     * [shapeCounts] already makes).
+     */
+    public val soleImage: SelectedImage?
 }
+
+/**
+ * The single selected image — what the image bar and the crop overlay act on.
+ *
+ * Carries the object's own extents and its live format because both are needed to place crop
+ * handles, and reading them back out of the fold from `:app` would be a second source for a number
+ * the surface already has.
+ */
+public data class SelectedImage(
+    val id: ObjectId,
+    val bounds: PageRect,
+    val widthPt: Float,
+    val heightPt: Float,
+    val transform: Matrix3,
+    val format: ObjectFormat,
+)
 
 /**
  * What a selection contains, so the toolbar can offer only what applies.
@@ -142,11 +185,12 @@ internal class SelectionController(
     private val brushes: InkBrushFactory,
     private val displayDensity: Float,
     private val pixelsPerPoint: Float,
+    private val onPreview: () -> Unit,
     private val onChanged: () -> Unit,
 ) : InkSelection {
 
     /** What the gesture in flight is doing. */
-    private enum class Mode { LASSO, MOVE, RESIZE, ROTATE }
+    private enum class Mode { LASSO, MOVE, RESIZE, ROTATE, POINT }
 
     /** The current selection, in render order. Empty when nothing is selected. */
     var selection: List<ObjectId> = emptyList()
@@ -158,6 +202,16 @@ internal class SelectionController(
 
     /** The lasso being drawn, in page space, or null. Read by the overlay. */
     var lasso: List<PagePoint>? = null
+        private set
+
+    /**
+     * ⭐ The sole selected shape's editable points, in page space — empty for anything else.
+     *
+     * Maintained by [refreshBounds], which is the one place the selection's derived geometry is
+     * recomputed, so the handles cannot describe a shape the frame does not. Read by the overlay to
+     * draw them and by [begin] to hit-test them.
+     */
+    var points: List<PointHandle> = emptyList()
         private set
 
     /** ROADMAP M8a — *"dashed = centre, solid = edge"*. Non-empty only during a move. */
@@ -181,6 +235,9 @@ internal class SelectionController(
     /** [marquee] as it was when the gesture began — see [begin]. */
     private var lassoIsRectangle = false
 
+    /** Cumulative path of the current lasso, in page points. See [settleLasso]. */
+    private var pathTravelled = 0f
+
     private var mode = Mode.LASSO
     private var pageSize: PageSize = PageSize.Letter
 
@@ -201,8 +258,81 @@ internal class SelectionController(
     private var startBounds: PageRect? = null
     private var startHandle: SelectionHandle? = null
 
-    /** Boxes of everything *not* selected, sampled once per gesture — the guides' targets. */
-    private var guideTargets: List<PageRect> = emptyList()
+    /** The shape handle grabbed at pen-down, and the shape as it was then. Both null off [Mode.POINT]. */
+    private var startPoint: ShapePoint? = null
+    private var startShape: PointTarget? = null
+
+    /** Snap positions of everything *not* selected, built once per gesture — the guides' targets. */
+    private var guideTargets: AlignmentGuides.AlignmentTargets? = null
+
+    /** The snap radius in page points, refreshed per event. The camera cannot change mid-gesture. */
+    private var snapTolerancePt = 0f
+
+    /**
+     * How near the chord a dragged bend counts as straight, in page points.
+     *
+     * ⚠️ Set in [begin] as well as [extend], and that is not belt and braces: a press on the bend
+     * handle that never moves still reaches [flushPreview] from [end], and with a zero tolerance
+     * the bend it computes is *"exactly on the chord"* rather than *"none"* — which is a record
+     * written, a string added to the file, and a `SetTextContent` synced, for a line the user
+     * merely touched.
+     */
+    private var straightenTolerancePt = 0f
+
+    private var previewScheduled = false
+
+    /**
+     * ⭐ One preview per drawn frame, not per input event.
+     *
+     * A stylus reports at up to 240 Hz and the display draws at most 120, so previewing from
+     * [extend] computed two to four frames' worth of guide searches and per-object transforms
+     * per frame and threw the extra away — on the UI thread, scaling with page fullness and
+     * selection size. The event handler now only records where the finger *is*; this callback
+     * does the work once per frame the user can actually see.
+     */
+    private val previewFrame = Choreographer.FrameCallback {
+        previewScheduled = false
+        if (isActive && mode != Mode.LASSO) flushPreview()
+    }
+
+    private fun schedulePreview() {
+        // A thread with no looper cannot frame-throttle — the instrumented tests drive this
+        // controller directly from the instrumentation thread — so apply immediately there.
+        // Production input dispatch is always the main thread, which has one.
+        if (Looper.myLooper() == null) {
+            flushPreview()
+            return
+        }
+        if (previewScheduled) return
+        previewScheduled = true
+        Choreographer.getInstance().postFrameCallback(previewFrame)
+    }
+
+    private fun unschedulePreview() {
+        if (!previewScheduled) return
+        previewScheduled = false
+        Choreographer.getInstance().removeFrameCallback(previewFrame)
+    }
+
+    /**
+     * Apply the gesture as it currently stands: guides, preview transforms, chrome.
+     *
+     * Runs once per drawn frame while the finger moves, and once more synchronously from [end],
+     * because the committed matrix must be the last previewed one — the guides are part of the
+     * gesture and a snap must be decided while the finger is still down, not recomputed after.
+     */
+    private fun flushPreview() {
+        if (mode == Mode.MOVE) {
+            val box = startBounds
+            val targets = guideTargets
+            if (box != null && targets != null) {
+                val moved = box.translated(current.x - start.x, current.y - start.y)
+                alignment = AlignmentGuides.forMove(moved, targets, snapTolerancePt)
+            }
+        }
+        if (isBendGesture()) previewBend() else preview(currentGesture())
+        onPreview()
+    }
 
     // -----------------------------------------------------------------------
     // The gesture
@@ -216,9 +346,15 @@ internal class SelectionController(
         current.set(start)
         alignment = Alignment.None
 
+        snapTolerancePt = snapTolerance(camera)
+        straightenTolerancePt = straightenTolerance(camera)
+
         val box = bounds
-        val handle = box?.let { SelectionHandle.at(start.x, start.y, it, handleReach(camera)) }
+        val reach = handleReach(camera)
+        val point = pointAt(start.x, start.y, reach)
+        val handle = gripAt(box, reach, claimedByAPoint = point != null)
         mode = when {
+            point != null -> Mode.POINT
             handle == SelectionHandle.ROTATE -> Mode.ROTATE
             handle != null -> Mode.RESIZE
             box != null && box.containsWithin(start.x, start.y, 0f) -> Mode.MOVE
@@ -231,13 +367,23 @@ internal class SelectionController(
                 // half-drawn lasso into a rectangle it never was.
                 lassoIsRectangle = marquee
                 lasso = mutableListOf(PagePoint(start.x, start.y))
+                pathTravelled = 0f
             }
 
             else -> {
                 startHandle = handle
+                startPoint = point
+                // The placement as it is *now*, for the same reason [startSelected] is captured
+                // here: every frame solves the drag against where the shape started, so composing
+                // against what is on screen would apply the gesture once per frame.
+                startShape = point?.let { soleShape()?.asPointTarget() }
                 startBounds = box
                 startSelected = store.selected(selection)
-                guideTargets = if (mode == Mode.MOVE) store.pageBoundsExcluding(selection) else emptyList()
+                guideTargets = if (mode == Mode.MOVE) {
+                    AlignmentGuides.AlignmentTargets(store.pageBoundsExcluding(selection), pageSize)
+                } else {
+                    null
+                }
             }
         }
         onChanged()
@@ -270,28 +416,31 @@ internal class SelectionController(
             } else {
                 appendToLasso()
             }
+            // The lasso is chrome only; invalidates coalesce, so per-event is already per-frame.
+            onPreview()
         } else {
-            // The guides are recomputed here rather than inside `moveGesture`, because `commit`
-            // calls that too and a snap must be decided once, while the finger is still down.
-            if (mode == Mode.MOVE) {
-                val box = startBounds
-                if (box != null) {
-                    val moved = box.translated(current.x - start.x, current.y - start.y)
-                    // Divided by the camera scale so the snap radius is constant on the glass —
-                    // the conversion [AlignmentGuides.forMove]'s own KDoc asks the caller for,
-                    // and which was missing here: 6 pt of page was 2 mm at 100% and 8 mm of
-                    // reach at 25%, snapping things nowhere near each other.
-                    alignment = AlignmentGuides.forMove(moved, guideTargets, pageSize, snapTolerance(camera))
-                }
-            }
-            preview(currentGesture())
+            // Divided by the camera scale so the snap radius is constant on the glass — the
+            // conversion [AlignmentGuides.forMove]'s own KDoc asks the caller for, and which was
+            // missing here once: 6 pt of page was 2 mm at 100% and 8 mm of reach at 25%,
+            // snapping things nowhere near each other.
+            snapTolerancePt = snapTolerance(camera)
+            straightenTolerancePt = straightenTolerance(camera)
+            // The guides and transforms are applied in [flushPreview], once per drawn frame.
+            schedulePreview()
         }
-        onChanged()
     }
 
     /** Finish the gesture: settle the selection, or write the transform it produced. */
     fun end(camera: Camera) {
-        if (mode == Mode.LASSO) settleLasso(camera) else commit(currentGesture())
+        if (mode == Mode.LASSO) {
+            settleLasso(camera)
+        } else {
+            // The previewed matrix and the committed one must be the same arithmetic over the
+            // same inputs, so the last preview runs synchronously before the commit reads it.
+            unschedulePreview()
+            flushPreview()
+            if (isBendGesture()) commitBend() else commit(currentGesture())
+        }
         finishGesture()
     }
 
@@ -299,12 +448,16 @@ internal class SelectionController(
     fun cancel() {
         if (mode != Mode.LASSO) {
             for (obj in startSelected) store.previewTransform(obj.id, obj.transform)
+            // A bend previews through its own register, so restoring the transforms does not undo
+            // it. Null is "no preview", which puts the shape back to whatever its record says.
+            startShape?.let { store.previewBend(it.id, null) }
             refreshBounds()
         }
         finishGesture()
     }
 
     private fun finishGesture() {
+        unschedulePreview()
         pointerId = MotionEvent.INVALID_POINTER_ID
         lasso = null
         lassoIsRectangle = false
@@ -312,7 +465,9 @@ internal class SelectionController(
         startSelected = emptyList()
         startBounds = null
         startHandle = null
-        guideTargets = emptyList()
+        startPoint = null
+        startShape = null
+        guideTargets = null
         onChanged()
     }
 
@@ -326,8 +481,10 @@ internal class SelectionController(
         // A point per pixel of travel is enough for a containment test and keeps the polygon
         // short enough that `Lasso.contains` — which is O(edges) per sampled point per object —
         // stays cheap on a page of 5,000 strokes.
-        if (hypot(current.x - last.x, current.y - last.y) < LASSO_STEP_PT) return
+        val step = hypot(current.x - last.x, current.y - last.y)
+        if (step < LASSO_STEP_PT) return
         points += PagePoint(current.x, current.y)
+        pathTravelled += step
     }
 
     /**
@@ -342,7 +499,20 @@ internal class SelectionController(
         val points = lasso.orEmpty()
         val travelled = hypot(current.x - start.x, current.y - start.y)
         // A marquee's outline is always four derived corners, so its tap test is travel alone.
-        val isTap = travelled < tapSlop(camera) && (lassoIsRectangle || points.size < TAP_MAX_POINTS)
+        //
+        // ⚠️ The second test is on **path length**, not on the number of points, and that is the
+        // difference between the Select tool working on a photo and not. It used to be
+        // `points.size < 3`: `appendToLasso` adds a point every 1.5 pt, so **3 pt of cumulative
+        // path** — a hand's tremor while pressing — reclassified a tap as a lasso. The resulting
+        // three-point squiggle contains nothing, so the tap selected nothing *and* cleared what was
+        // already selected, intermittently and with no feedback. It bound long before the 8 dp net
+        // slop beside it (~6 pt at fit-width), so that slop was decorative.
+        //
+        // A guard is still needed — a deliberate tiny loop returns to where it started, so net
+        // displacement alone would call it a tap — but the quantity that separates the two is how
+        // far the pen *went*, not how many samples it left.
+        val isTap =
+            travelled < tapSlop(camera) && (lassoIsRectangle || pathTravelled < tapPathSlop(camera))
         val hits = when {
             isTap -> listOfNotNull(store.objectAt(start.x, start.y, tapSlop(camera)))
 
@@ -368,8 +538,54 @@ internal class SelectionController(
         select(emptyList())
     }
 
+    /**
+     * ⭐ The store changed under the selection — an undo, a redo, a peer's ops, or an erase.
+     *
+     * Everything this class caches is a snapshot of the store: [selection] holds ids the store
+     * may since have deleted, and [bounds] is where the objects *were*. Every path that changes
+     * the store without coming through this class's own gestures must call this, or the overlay
+     * keeps drawing a box round objects that moved or no longer exist, [begin] hit-tests the
+     * next pen-down against that phantom box, and `:app` keeps a toolbar up for a selection of
+     * nothing — with the colour picker captured by it (InkToolbar reroutes swatch taps to the
+     * selection while `selectionSize > 0`).
+     *
+     * The empty early-return keeps the common case free, and [onChanged] fires only when the
+     * selection actually changed — membership or box — so an erase drag *near* a selection does
+     * not fan out into Compose per sample.
+     */
+    fun onStoreChanged() {
+        if (selection.isEmpty()) return
+        val alive = selection.filter { store.objectOf(it) != null }
+        val membershipChanged = alive.size != selection.size
+        if (membershipChanged) selection = alive
+        val oldBounds = bounds
+        // ⚠️ The points as well as the box, because a record can change without the box moving —
+        // straightening a shallow curve is the case, and the handle would then be drawn on a bend
+        // that is no longer there until something else happened to invalidate the overlay. The
+        // comparison is at most four data-class points, against a callback that fans out to Compose.
+        val oldPoints = points
+        refreshBounds()
+        if (membershipChanged || bounds != oldBounds || points != oldPoints) onChanged()
+    }
+
     private fun refreshBounds() {
         bounds = if (selection.isEmpty()) null else store.pageBoundsOf(selection)
+        points = editablePoints()
+    }
+
+    /**
+     * ⭐ The handles for the one selected shape, in page space — the whole of what the overlay draws
+     * and what [begin] hit-tests.
+     *
+     * Computed from the shape's **live** transform and its **live** bend, so during a drag the
+     * handles are on the ink rather than where it was when the finger went down. That is the same
+     * reason this sits in [refreshBounds]: the frame and the handles describe one shape and are
+     * recomputed together, at every door the store can change through.
+     */
+    private fun editablePoints(): List<PointHandle> {
+        val shape = soleShape() ?: return emptyList()
+        return ShapePoints.of(shape.obj.shape, shape.obj.widthPt, shape.obj.heightPt, shape.bendNow())
+            .map { PointHandle(it, shape.transform.map(it.local)) }
     }
 
     // -----------------------------------------------------------------------
@@ -386,6 +602,7 @@ internal class SelectionController(
         Mode.MOVE -> moveGesture()
         Mode.RESIZE -> resizeGesture()
         Mode.ROTATE -> rotateGesture()
+        Mode.POINT -> pointGesture()
         Mode.LASSO -> null
     }
 
@@ -425,6 +642,119 @@ internal class SelectionController(
     }
 
     // -----------------------------------------------------------------------
+    // ⭐ Editing a shape by its points
+    // -----------------------------------------------------------------------
+
+    /**
+     * The shape whose points may be edited: exactly one selected, and not a connector.
+     *
+     * ⚠️ **A connector is excluded, and the reason is that its handles would be honest-looking and
+     * dead.** Its geometry is *derived* from what its ends are attached to and re-derived on every
+     * fold (SPEC §4.8.3) — so a vertex drag would write a perfectly correct `SetTransform` that
+     * `DryShape.reroute` then paints straight over, and a bend would be discarded the same way.
+     * Dragging an endpoint onto a *different* shape is the gesture a connector actually wants
+     * (docs/M8-CONNECTORS.md §7.7, still owed); until it exists, a connector keeps the frame it has
+     * always had rather than gaining a grip that does nothing.
+     */
+    private fun soleShape(): DryShape? = selection.singleOrNull()?.let { store.shapeOf(it) }?.takeIf { !it.isConnector }
+
+    private fun DryShape.asPointTarget() = PointTarget(id, obj.shape, obj.widthPt, obj.heightPt, transform)
+
+    /**
+     * ⭐ Which **frame** grip the press at [start] claims — and the rule that keeps the two sets of
+     * grips from fighting.
+     *
+     * A point handle wins outright, and when a shape offers any, the eight frame grips are not
+     * offered at all — the overlay hides them for the same reason. A rectangle's corners sit
+     * exactly on the frame's corner grips, so both gestures would claim the same pixels and the one
+     * the user can *see* (the shape's own corner, which follows the finger at any rotation) would
+     * lose to the one drawn underneath it.
+     *
+     * The rotate grip survives, because it floats outside the box and collides with nothing, and
+     * because rotating is not something the points can express: three of them pinned is a shear.
+     */
+    private fun gripAt(box: PageRect?, reach: Float, claimedByAPoint: Boolean): SelectionHandle? = when {
+        claimedByAPoint || box == null -> null
+        points.isEmpty() -> SelectionHandle.at(start.x, start.y, box, reach)
+        else -> SelectionHandle.ROTATE.takeIf { it.isWithin(start.x, start.y, box, reach) }
+    }
+
+    /** The handle within [reach] of ([x], [y]), nearest first, or null. */
+    private fun pointAt(x: Float, y: Float, reach: Float): ShapePoint? {
+        var best: ShapePoint? = null
+        var bestDistance = reach
+        for (handle in points) {
+            val distance = hypot(x - handle.page.x, y - handle.page.y)
+            if (distance <= bestDistance) {
+                bestDistance = distance
+                best = handle.point
+            }
+        }
+        return best
+    }
+
+    /** True while the finger is on a segment's middle handle — the one that writes a register. */
+    private fun isBendGesture(): Boolean = mode == Mode.POINT && startPoint?.role == ShapePointRole.BEND
+
+    private fun pointGesture(): Matrix3? {
+        val target = startShape ?: return null
+        val point = startPoint ?: return null
+        return ShapePoints.gesture(
+            kind = target.kind,
+            widthPt = target.widthPt,
+            heightPt = target.heightPt,
+            transform = target.transform,
+            point = point,
+            toPage = PagePoint(current.x, current.y),
+        )
+    }
+
+    /** Where the bend is right now, in the shape's own space, or null for straight. */
+    private fun currentBend(): PagePoint? {
+        val target = startShape ?: return null
+        return ShapePoints.bend(
+            heightPt = target.heightPt,
+            transform = target.transform,
+            toPage = PagePoint(current.x, current.y),
+            straightenTolerancePt = straightenTolerancePt,
+        )
+    }
+
+    private fun previewBend() {
+        val target = startShape ?: return
+        store.previewBend(target.id, currentBend())
+        // The curve's own extent moved, and so did the handle sitting on it — both are read out of
+        // the store by [refreshBounds], which is why the bend preview goes through it and a
+        // transform preview does too.
+        refreshBounds()
+    }
+
+    /**
+     * One `SetTextContent`, through the same baseline-then-change path a fill takes.
+     *
+     * ⚠️ [editRecords] is not a convenience here, it is the fix: `SetTextContent` cannot say
+     * "unset", so the **first** record a plain shape ever gets has no inverse and `UndoStack.commit`
+     * drops the gesture — *"bend a line, press undo"* would eat the press and leave the curve. The
+     * baseline it writes is the default record, which renders identically and gives the bend
+     * something to be undone to. See [editRecords]' own KDoc.
+     */
+    private fun commitBend() {
+        val target = startShape ?: return
+        val bend = currentBend()
+        editRecords { shape, record ->
+            // The kind test is the same one the geometry makes, so a bend cannot be written onto
+            // something that would ignore it — a filled record on a line's sibling problem
+            // ([setFill] refuses the mirror case for the same reason).
+            if (ShapeGeometry.bends(shape.obj.shape) && !record.isConnector) record.copy(bend = bend) else null
+        }
+        // The register is the truth again. `setRecord` clears the preview when an op actually
+        // lands, and this covers the case where none did — a drag that ended where it started
+        // writes nothing and must still stop previewing.
+        store.previewBend(target.id, null)
+        refreshBounds()
+    }
+
+    // -----------------------------------------------------------------------
     // Committing — the only place this class writes ops
     // -----------------------------------------------------------------------
 
@@ -453,6 +783,11 @@ internal class SelectionController(
         store.beginEdit()
         store.applyOps(ops, brushes, record = true)
         store.endEdit()
+        // A restyle can genuinely move the box: `SetStyle` re-tessellates and a widened stroke
+        // has a wider extent. Without this, thickening a selected stroke left the dashed frame
+        // snug round the old width with the ink poking past it. A no-op for the actions whose
+        // bounds cannot change.
+        refreshBounds()
         onChanged()
     }
 
@@ -508,6 +843,24 @@ internal class SelectionController(
         get() {
             val shapes = selection.mapNotNull { store.shapeOf(it) }
             return ShapeSelectionCounts(shapes.size, shapes.count { it.isConnector })
+        }
+
+    /**
+     * Exactly one, deliberately. Rotate, flip and crop each act on a single picture, and a bar that
+     * appears for a mixed selection would offer a crop that silently applied to one of them.
+     */
+    override val soleImage: SelectedImage?
+        get() {
+            val image = selection.singleOrNull()?.let { store.objectOf(it) } as? DryImage ?: return null
+            val bounds = image.pageBounds ?: return null
+            return SelectedImage(
+                id = image.id,
+                bounds = PageRect(bounds.xMin, bounds.yMin, bounds.xMax, bounds.yMax),
+                widthPt = image.widthPt,
+                heightPt = image.heightPt,
+                transform = image.transform,
+                format = image.decodedFormat,
+            )
         }
 
     override fun setFill(colorArgb: Int?, opacity: Float) = editRecords { shape, record ->
@@ -765,7 +1118,19 @@ internal class SelectionController(
     /** A constant snap distance on the glass, like [handleReach] — see the note in [extend]. */
     private fun snapTolerance(camera: Camera): Float = SNAP_TOLERANCE_DP * displayDensity / camera.scale
 
+    /**
+     * How near the chord a bend counts as straight, on the glass.
+     *
+     * ⚠️ Divided by the camera scale and **not** by [pixelsPerPoint], which is the pair of
+     * conversions M8b got wrong for the connector bind radius: a *reach on the glass* is view
+     * pixels, and view pixels are page units times the camera scale. A width is the other one.
+     */
+    private fun straightenTolerance(camera: Camera): Float = ShapePoints.STRAIGHTEN_DP * displayDensity / camera.scale
+
     private fun tapSlop(camera: Camera): Float = TAP_SLOP_DP * displayDensity / camera.scale
+
+    /** How far the pen may wander in total and still have been a tap. See [settleLasso]. */
+    private fun tapPathSlop(camera: Camera): Float = TAP_PATH_SLOP_DP * displayDensity / camera.scale
 
     /** Never resize a selection to nothing: a box with no extent cannot be grabbed again. */
     private fun minimumSize(from: PageRect): Float = max(MIN_SIZE_PT, min(from.width, from.height) * MIN_SIZE_FRACTION)
@@ -781,7 +1146,16 @@ internal class SelectionController(
         const val LASSO_STEP_PT = 1.5f
         const val HANDLE_TOUCH_DP = 22f
         const val TAP_SLOP_DP = 8f
-        const val TAP_MAX_POINTS = 3
+
+        /**
+         * Total path a tap may wander, in dp. Replaces `TAP_MAX_POINTS = 3`, which was the same
+         * test expressed in *samples* and therefore fired after 3 pt of travel — see [settleLasso].
+         *
+         * Generous on purpose: the cost of calling a tiny lasso a tap is that the user selects the
+         * one object under their pen instead of the nothing their loop enclosed, and the cost of
+         * the reverse is the bug this replaced.
+         */
+        const val TAP_PATH_SLOP_DP = 28f
 
         /** Enough that the copy is obviously not the original, small enough to stay on screen. */
         const val DUPLICATE_OFFSET_PT = 18f
@@ -804,6 +1178,32 @@ internal class SelectionController(
         val DEFAULT_STYLE = ObjectStyle(colorArgb = 0xFF1A1A1A.toInt(), widthPt = 3f)
     }
 }
+
+/**
+ * One of [SelectionController.points]: a shape handle and where it currently is on the page.
+ *
+ * The local point and the page point are carried together because the two consumers want different
+ * ones — the overlay draws at [page], the solve in `ShapePoints` works from [ShapePoint.local] — and
+ * deriving either from the other at the call site would be a second place the shape's transform is
+ * applied.
+ */
+internal data class PointHandle(val point: ShapePoint, val page: PagePoint)
+
+/**
+ * The shape a point drag is editing, as it was when the finger went **down**.
+ *
+ * A snapshot rather than the [DryShape] itself, for the reason [SelectedObject] is one: holding the
+ * live object would make it far too easy to read `transform` mid-drag — which is the previewed
+ * matrix, not the one the gesture must compose against — and that mistake looks like acceleration
+ * rather than like a bug.
+ */
+internal data class PointTarget(
+    val id: ObjectId,
+    val kind: ShapeKind,
+    val widthPt: Float,
+    val heightPt: Float,
+    val transform: Matrix3,
+)
 
 /** The style a stroke was drawn with, read off its brush — see [SelectionController.restyle]. */
 internal fun DryStroke.capturedStyle(): ObjectStyle =
@@ -943,6 +1343,12 @@ internal enum class SelectionHandle {
         val outY = if (this == BOTTOM_LEFT || this == BOTTOM_RIGHT) 1f else -1f
         val along = (dx * outX * box.width + dy * outY * box.height) / diagonal
         return (1f + along / diagonal).coerceAtLeast(0f)
+    }
+
+    /** Whether this grip is within [reach] of ([x], [y]) — [at], asked of one grip. */
+    fun isWithin(x: Float, y: Float, box: PageRect, reach: Float): Boolean {
+        val position = positionOn(box, ROTATE_OFFSET_PT)
+        return hypot(x - position.x, y - position.y) <= reach
     }
 
     companion object {
