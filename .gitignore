@@ -78,3 +78,31 @@ tools/web/.cache/
 # The reader's container secrets (tools/web/compose.yaml). Real credentials, one per file.
 secrets/
 .env
+
+# Claude Code hook payloads. A hook writes a JSON object to stdout; a shell
+# redirection that names its target by a number — `2>1`, `head -1090`, a bare
+# `> $LOG` with $LOG unset — lands it in a file called `1`, `120`, `1090`. Two of
+# them (`1`, `120`) were tracked for a while and one was committed by fa05aab.
+/[0-9]*
+tools/web/[0-9]*
+
+# Unpacked AARs and jars, from reading a library's API with `javap`. Extract to a
+# scratch directory instead — these landed at the repo root and brought along
+# `META-INF/`, `res/values/values.xml`, `classes.jar`, `R.txt` and a `com/` tree.
+/META-INF/
+/classes.jar
+/R.txt
+/proguard.txt
+/public.txt
+/AndroidManifest.xml
+/res/
+
+# adb and debugging scratch: `uiautomator dump` XML, `screencap` PNGs, journals
+# read out of a note, sqlite copies pulled with `run-as`, captured stdio.
+/*.ops
+/ui*.xml
+/s[0-9]*.png
+/shot*.png
+/*.db
+/out.txt
+/stderr.txt
