@@ -260,6 +260,30 @@ internal class StrokeStore {
 
     private val byId = HashMap<ObjectId, DryObject>()
 
+    /**
+     * ⭐ Strokes [pruneFullyErased] has taken off the page, held so an **un-erase can put them
+     * back**.
+     *
+     * ⚠️ Without this, erasing a stroke away and pressing undo did nothing on screen and stayed
+     * wrong until the page was reloaded. The chain is entirely reasonable one link at a time:
+     * pruning emits no op (a fully erased stroke is not deleted — its `SetErasedRegion` already
+     * describes it), so the object is still in the fold; `NoteEditor.reconcile` therefore sees it
+     * in **both** folds and emits a bare `SetErasedRegion` rather than an `AddObject`; and
+     * [applyRegister] opened with `byId[target] ?: return false`. Correct op, correct fold, one
+     * consumer that could not act on it — the shape CLAUDE.md's definition-of-done #6 is about,
+     * and the same one `DryShape`'s missing `setErased` had (M8 follow-up 3). It was intermittent
+     * because pruning is capped by [PRUNE_BUDGET], so whether a given stroke had actually left the
+     * page depended on how much else had been erased.
+     *
+     * Retaining the object costs the memory the page was already carrying: pruning is a **render**
+     * optimisation by its own KDoc, not a way to release a stroke, and nothing about it was ever
+     * meant to be one-way.
+     *
+     * Only strokes ever appear here — [DryObject.isErasedAway] answers true for nothing else — so
+     * this map holds no [DryShape] and [shapes] has nothing to say about it.
+     */
+    private val prunedByErase = HashMap<ObjectId, DryObject>()
+
     /** Set when a z key changed or an object was inserted out of order. See [ink]. */
     private var orderDirty = false
 
@@ -268,8 +292,8 @@ internal class StrokeStore {
      *
      * Re-routing is lazy and happens at most once per frame, in [forEachInRenderOrder], because a
      * drag emits a `previewTransform` per frame and re-routing eagerly on each would do the work
-     * twice for the frames that never get drawn. It is O(connectors), not O(objects): a page has a
-     * handful of connectors and thousands of strokes.
+     * twice for the frames that never get drawn. It is O(shapes), not O(objects) — see [shapes],
+     * which is where that stopped being merely an aspiration.
      *
      * ⚠️ **This is not a cache of a persisted value.** Nothing about a route is ever written down
      * (SPEC §4.8.3); this flag only decides *when* to recompute something that is always derived.
@@ -277,10 +301,53 @@ internal class StrokeStore {
     private var routesDirty = false
 
     /**
+     * ⭐ Every [DryShape] on the page, in insertion order — the whole population
+     * [rerouteConnectors] walks.
+     *
+     * ## Why this exists
+     *
+     * [routesDirty]'s KDoc has claimed since M8b that the re-route is *"O(connectors), not
+     * O(objects): a page has a handful of connectors and thousands of strokes"*. That was true of
+     * the **work** and false of the **scan that found it**: the pass walked [ink] looking for
+     * connectors, so a page with 5,000 strokes and *no* connectors paid a 5,000-element scan, per
+     * drawn frame, to find something it could not contain. And [routesDirty] is set by ordinary
+     * object mutation — an insert, a delete, a `SetTransform`, every frame of a drag's
+     * [previewTransform] — so it is set more or less continuously while the user is editing. A
+     * KDoc that describes the cost of the answer rather than the cost of the search is the
+     * expensive kind; the claim is true of both halves now.
+     *
+     * ## ⚠️ Why it indexes shapes and not connectors
+     *
+     * Being a *connector* is a property of the record register, and `SetTextContent` can turn it
+     * on and off (SPEC §4.8.2, [ShapeRecord.isConnector]). A set of *connectors* would therefore
+     * need maintaining at every writer of that register — and a writer that forgets is a connector
+     * that silently stops following the box it is attached to, which reads to the user as *"the
+     * arrow doesn't move"* and to a reviewer as nothing at all.
+     *
+     * Being a *shape* is a property of the object's kind and cannot change while it is on the
+     * page. So membership is decided in exactly the two places an object enters ([insert]) and
+     * leaves ([unindex]) the store — the same two places `byId` is maintained, so forgetting one
+     * breaks the id lookup first and loudly. What is left at re-route time is a field read per
+     * shape, and the shapes on a page are the handful the original claim was always about.
+     */
+    private val shapes = LinkedHashSet<DryShape>()
+
+    /**
+     * How many objects one re-route pass visits — the entire cost of [rerouteConnectors].
+     *
+     * Exposed because the only honest thing to assert about that pass is a **bound**, and a bound
+     * cannot be read off a screen or a screenshot: the pass was O(objects) for as long as
+     * connectors have existed while its KDoc said O(connectors), and every test of it passed
+     * throughout. `StrokeStoreConnectorIndexTest` asserts this is **zero** for a page of pure
+     * handwriting.
+     */
+    internal val reroutePassSize: Int get() = shapes.size
+
+    /**
      * Ids this store has seen deleted, so a detached connector can say *which* kind of detached.
      *
      * Grows with the page's deletions and is cleared by [reset], which is the same lifetime as
-     * everything else here. See [remove].
+     * everything else here. See [tombstone]; [clear] is the only other writer, in bulk.
      */
     private val tombstones = HashSet<ObjectId>()
 
@@ -400,8 +467,10 @@ internal class StrokeStore {
         val z = allocateTopZ()
         val recorded = recorder?.strokeFinished(stroke, kind, inputModel, z)
         val id = recorded ?: ObjectId(UNBOUND_ID_PREFIX + size)
-        insert(DryStroke(id, stroke, kind, inputModel, z = z))
+        val dry = DryStroke(id, stroke, kind, inputModel, z = z)
+        insert(dry)
         revision++
+        noteAppendedOnTop(dry)
         return recorded
     }
 
@@ -416,9 +485,122 @@ internal class StrokeStore {
         for ((stroke, kind) in strokes) add(stroke, kind)
     }
 
+    // --- The append log, so a full page need not be re-recorded per stroke -------------------
+
+    /**
+     * ⭐ Objects that went on **top of everything** and the revision each arrived at.
+     *
+     * ## Why this exists
+     *
+     * `DryStrokesView` caches the page as a display list keyed on [revision], so writing on a full
+     * page re-recorded every object roughly once per six strokes — **measured at 48–105 ms per
+     * re-record at 1,121 objects**, at fit-width, where nothing is off screen to cull. That is the
+     * stutter a user reports as *"it lags when there are a lot of strokes"*, and no amount of
+     * culling helps: at fit-width the whole page is visible by definition.
+     *
+     * ## Why it is safe, which is the only interesting part
+     *
+     * [appendsSince] answers **null — meaning "re-record everything"— unless it can prove the
+     * store did nothing but append.** The proof is arithmetic, not bookkeeping: [add] is the one
+     * path that files an entry here and it bumps [revision] by exactly one when it does, so the
+     * filed revisions must come out **contiguous and complete** across the queried range. Any
+     * other mutation — an erase, a transform, a peer's op, an undo, a restyle, a delete — bumps
+     * [revision] without filing anything, which leaves a gap, which is refused.
+     *
+     * That direction matters. A mutation site added later that forgets this list costs a
+     * re-record; it cannot leave a stale picture on the glass. The opposite design — a flag each
+     * mutation must remember to clear — fails the other way, and CLAUDE.md has six entries about
+     * features that were correct in every test and wrong in the app.
+     */
+    private class Append(val revision: Long, val dry: DryObject)
+
+    private val appends = ArrayDeque<Append>()
+
+    /**
+     * File [dry] as an append, if drawing it *after* everything already recorded is the same
+     * picture as re-sorting the page.
+     *
+     * Two conditions, both about render order. Its key must genuinely be the page's top — [add]
+     * allocates one, but `SetZOrder` may since have put something above it. And it must not be an
+     * ink stroke on a page that has highlighters: the cached recording holds both bands, and
+     * SPEC §3.4 draws the highlighter band **last**, so appending ink after it would put the
+     * writing over the highlight instead of under it.
+     */
+    private fun noteAppendedOnTop(dry: DryObject) {
+        if (!dry.drawsOverInk && highlight.isNotEmpty()) return
+        if (topZ != dry.z) return
+        appends.addLast(Append(revision, dry))
+        while (appends.size > MAX_APPENDS) appends.removeFirst()
+    }
+
+    /**
+     * Fills [out] with the objects appended since [since], or returns **false if the page must be
+     * re-recorded**.
+     *
+     * ⚠️ **The caller supplies the list because this is called from `onDraw`** (CLAUDE.md rule 7 —
+     * no allocation there). The first version returned `List<DryObject>?` and built it with
+     * `map`, which allocated an `ArrayList` of up to [MAX_APPENDS] on every frame the user was
+     * writing — in the one loop this whole mechanism exists to make cheap.
+     *
+     * @param since the revision the caller last recorded the whole page at.
+     */
+    fun appendsSince(since: Long, out: MutableList<DryObject>): Boolean {
+        out.clear()
+        if (since == revision) return true
+        if (since > revision) return false
+        val wanted = revision - since
+        if (wanted > appends.size) return false
+        val first = appends.size - wanted.toInt()
+        // Contiguous and complete, or something that is not an append happened in the gap.
+        for (index in first until appends.size) {
+            if (appends[index].revision != since + (index - first) + 1) {
+                out.clear()
+                return false
+            }
+            out += appends[index].dry
+        }
+        return true
+    }
+
+    /**
+     * How many objects carry an erased region — each of which costs a `saveLayer` plus a
+     * `DST_OUT` composite **per frame** (SPEC §3.5), not merely a draw call.
+     *
+     * Exposed because the erase half of the frame budget is otherwise unmeasurable from outside
+     * the process, so *"is this note slow because of draw calls or because of render-pass
+     * switches?"* cannot be answered on a real user's real note. Memoised on [revision]: the
+     * Measure panel recomposes on every camera change, and an O(N) walk there would land once
+     * per pan frame — measuring the measurement, which is the trap [LatencyStats] documents.
+     */
+    val erasedCount: Int
+        get() {
+            if (erasedCountRevision != revision) {
+                erasedCountValue = ink.count { it.erased != null } + highlight.count { it.erased != null }
+                erasedCountRevision = revision
+            }
+            return erasedCountValue
+        }
+
+    private var erasedCountValue = 0
+    private var erasedCountRevision = -1L
+
+    /**
+     * Whether the page holds any highlighter object.
+     *
+     * ⚠️ Worth surfacing because **one highlighter silently disables the append fast path** for
+     * every pen stroke on the page — [noteAppendedOnTop] refuses ink while the highlight band is
+     * occupied, since the recording holds both bands and SPEC §3.4 draws highlighters last. A note
+     * that is slow to write on while a visually identical one is not is otherwise a mystery.
+     */
+    val hasHighlighter: Boolean get() = highlight.isNotEmpty()
+
     private fun insert(dry: DryObject) {
         (if (dry.drawsOverInk) highlight else ink).add(dry)
         byId[dry.id] = dry
+        // ⭐ The re-route pass walks this instead of every object on the page. Beside `byId`
+        // deliberately: this is the one door into the store, and an index maintained where the id
+        // lookup is maintained is one that cannot be half-updated. See [shapes].
+        if (dry is DryShape) shapes += dry
         // ⭐ Every object, whatever kind. A key that reached the page without passing through here
         // is a key `topZ` has not seen, and the next stroke then lands below it.
         raiseTop(dry.z)
@@ -431,12 +613,67 @@ internal class StrokeStore {
 
     private fun remove(dry: DryObject) {
         (if (dry.drawsOverInk) highlight else ink).remove(dry)
+        tombstone(dry)
+    }
+
+    /**
+     * Drop [dry] from the lookups — **the only place besides [reset] and [clear] that `byId` and
+     * [shapes] lose an entry.**
+     *
+     * ⚠️ Every path that takes an object off the page comes through here or through [tombstone],
+     * and it has to: a path that removed an object from its band and forgot this would leave a
+     * [DryShape] in [shapes] re-routing forever against a page it is no longer on, and `byId` still
+     * answering [objectOf] for something nothing draws.
+     *
+     * Deliberately says nothing about *why* the object went. [tombstone] is a deletion; this is the
+     * render-only drop [pruneFullyErased] does, which records no deletion at all because a fully
+     * erased stroke is not deleted — its `SetErasedRegion` already describes it.
+     */
+    private fun unindex(dry: DryObject) {
         byId.remove(dry.id)
-        // ⚠️ Kept, so `unresolvedState` can tell a *deleted* target from one whose `AddObject` has
-        // not arrived (SPEC §4.8.4). The geometry is identical either way; only the label differs,
-        // and a store that dropped the id could never say which.
+        if (dry is DryShape) shapes -= dry
+    }
+
+    /**
+     * [unindex], plus the two things a **deletion** owes the rest of the page.
+     *
+     * ⚠️ The tombstone is kept so `unresolvedState` can tell a *deleted* target from one whose
+     * `AddObject` has not arrived (SPEC §4.8.4). The geometry is identical either way; only the
+     * label differs, and a store that dropped the id could never say which.
+     *
+     * ⚠️ And [routesDirty], because an object vanishing is an **anchor target vanishing**: a
+     * connector attached to it has to fall back to its own authored segment and start reporting
+     * that end as detached, with no op of its own. The eraser's whole-object branch removed an
+     * object by iterator and dropped it straight out of `byId` instead of coming through here, so
+     * rubbing out a box left the arrow pointing at where the box used to be until something else
+     * happened to dirty the routes — which, being a lazy flag, could be the next gesture or never.
+     */
+    private fun tombstone(dry: DryObject) {
+        unindex(dry)
         tombstones += dry.id
         routesDirty = true
+    }
+
+    /**
+     * Write [region] onto a stroke [pruneFullyErased] took off the page, and put it back if the
+     * region no longer covers it.
+     *
+     * The inverse of the drop in [pruneIfAffordable], and the render half of undoing an erase.
+     * A region that still covers the stroke leaves it pruned and reports **no change**, because
+     * nothing on screen moved — bumping the revision there would repaint the page for a stroke
+     * that is invisible either way.
+     *
+     * ⚠️ [DryObject.isErasedAway] is the same points × capsules test [PRUNE_BUDGET] exists to
+     * ration, and it is unrationed here on purpose: this runs once per op in an undo, not once
+     * per eraser sample, and the alternative — restoring optimistically and re-pruning later —
+     * leaves a fully erased stroke back in the render list until the next erase gesture ends.
+     */
+    private fun unprune(dry: DryObject, region: ErasedRegion?): Boolean {
+        dry.setErased(region)
+        if (region != null && dry.isErasedAway(region)) return false
+        prunedByErase -= dry.id
+        insert(dry)
+        return true
     }
 
     /**
@@ -460,9 +697,16 @@ internal class StrokeStore {
         val changed = when (op) {
             is PageOp.AddObject -> addObject(op, brushes)
 
+            // ⚠️ The pruned branch is not tidiness: an object dropped from [prunedByErase]
+            // without a tombstone would leave a connector aimed at it reporting *not yet
+            // arrived* rather than *deleted* (SPEC §4.8.4), and the entry would outlive the
+            // page. Nothing is drawn either way, so this reports no change.
             is PageOp.DeleteObject -> byId[op.target]?.let {
                 remove(it)
                 true
+            } ?: prunedByErase.remove(op.target)?.let {
+                tombstone(it)
+                false
             } ?: false
 
             else -> applyRegister(op, brushes)
@@ -486,6 +730,11 @@ internal class StrokeStore {
      */
     private fun applyRegister(op: PageOp, brushes: InkBrushFactory): Boolean {
         val target = op.target ?: return false
+        // ⭐ The one register that can name a stroke which is not on the page: an un-erase.
+        // See [prunedByErase] — the lookup below would answer null and the op would be dropped.
+        if (op is PageOp.SetErasedRegion) {
+            prunedByErase[target]?.let { return unprune(it, op.absolute.toRegion()) }
+        }
         val dry = byId[target] ?: return false
         return when (op) {
             // Absolute: the whole region is replaced, never merged.
@@ -605,38 +854,25 @@ internal class StrokeStore {
      * @return null only when the object has geometry that could not be decoded, which is a stroke
      *   whose blob this build cannot read. Everything else is held.
      */
-    private fun dryObjectFor(obj: InkObject, brushes: InkBrushFactory): DryObject? = when (obj) {
-        is StrokeObject -> dryStrokeFor(obj, brushes)
+    private fun dryObjectFor(obj: InkObject, brushes: InkBrushFactory): DryObject? = buildDryObject(obj, brushes)
 
-        // ⭐ M8b — a shape paints itself now. It arrives with no record: the `SetTextContent` that
-        // carries one is a separate op and may sort either side of this `AddObject` (SPEC §4.2),
-        // so the record is applied by `applyRegister` whenever it turns up and the shape is drawn
-        // plain until it does. A connector therefore appears as its own authored segment first and
-        // routes on the next op — which is exactly what it does for a detached end anyway.
-        is ShapeObject -> DryShape(obj).also { routesDirty = true }
-
-        // ⭐ M8c. Both arrive without their `SetFormat`, for the same reason a shape arrives
-        // without its record — it is a separate op that may sort either side of this one — so both
-        // are drawn in the default presentation until it turns up.
-        is TextBoxObject -> DryTextBox(obj)
-
-        is ImageObject -> DryImage(obj)
-    }
-
-    private fun dryStrokeFor(obj: StrokeObject, brushes: InkBrushFactory): DryStroke? {
-        // The style goes INTO the decode, so a restyled stroke tessellates once. Decoding, then
-        // restyling — which rebuilds the mesh — tessellated every styled stroke twice, on the
-        // main thread, on every page turn.
-        val decoded = StrokeGeometryCodec.decode(obj.geometry, brushes, obj.style) ?: return null
-        return DryStroke(
-            id = obj.id,
-            stroke = decoded.stroke,
-            kind = decoded.kind,
-            inputModel = decoded.inputModel,
-            transform = obj.transform,
-            style = obj.style,
-            z = obj.z,
-        ).also { it.setErased(obj.erased.toRegion()) }
+    /**
+     * ⭐ Replace everything on the page with a [PreparedPage] built elsewhere.
+     *
+     * The main-thread half of an asynchronous page load: [reset] plus one [insert] per object,
+     * which is list appends and index maintenance and nothing else. Every expensive part — the
+     * geometry decode and the native tessellation — already happened in [PreparedPage.of], on
+     * whatever thread the caller chose.
+     *
+     * The registers come after **all** the adds rather than interleaved with them, which is what
+     * `InkPageThumbnailRenderer.toStrokeStore` already does and for the same reason: a record may
+     * name an object that sorts after it, and applying it before that object exists drops it.
+     */
+    fun install(prepared: PreparedPage, brushes: InkBrushFactory) {
+        reset()
+        for (dry in prepared.objects) insert(dry)
+        if (prepared.registers.isNotEmpty()) applyOps(prepared.registers, brushes, record = false)
+        revision++
     }
 
     /** Drop everything on screen without touching the page's log. Used when switching pages. */
@@ -644,6 +880,11 @@ internal class StrokeStore {
         ink.clear()
         highlight.clear()
         byId.clear()
+        // Another page's erased-away strokes are not this page's to restore.
+        prunedByErase.clear()
+        // Beside `byId.clear()` for the reason [unindex] gives: the two are one index in two maps,
+        // and a page's shapes outliving the page would re-route against the next one's objects.
+        shapes.clear()
         removedThisGesture.clear()
         erasedThisGesture.clear()
         inGesture = false
@@ -677,6 +918,8 @@ internal class StrokeStore {
         ink.clear()
         highlight.clear()
         byId.clear()
+        prunedByErase.clear()
+        shapes.clear()
         routesDirty = true
         endEdit()
         revision++
@@ -720,9 +963,27 @@ internal class StrokeStore {
      * do anything about; it is a selection that changed under a gesture, which `onStoreChanged`
      * already handles one layer up.
      */
-    fun previewBend(id: ObjectId, local: PagePoint?) {
+    fun previewBend(id: ObjectId, local: PagePoint) {
         val shape = byId[id] as? DryShape ?: return
         if (shape.previewBend(local)) revision++
+    }
+
+    /** [previewBend] for a closed shape's vertices. */
+    fun previewPoints(id: ObjectId, local: List<PagePoint>) {
+        val shape = byId[id] as? DryShape ?: return
+        if (shape.previewPoints(local)) revision++
+    }
+
+    /**
+     * End a shape's live preview — the drag committed, or the pointer was cancelled.
+     *
+     * ⚠️ **Its own method, not `preview*(null)`.** Null already means *"straight"* to a bend and
+     * *"unedited"* to a vertex list, and overloading it with *"stop previewing"* is what made a
+     * flattened curve spring back to its stored arc mid-drag (see [DryShape.previewBend]).
+     */
+    fun endShapePreview(id: ObjectId) {
+        val shape = byId[id] as? DryShape ?: return
+        if (shape.endPreview()) revision++
     }
 
     // --- Shapes and connectors (M8b) ----------------------------------------
@@ -748,12 +1009,17 @@ internal class StrokeStore {
      * ⭐ **This writes nothing** (SPEC §4.8.3). It is called from [forEachInRenderOrder] when
      * something has moved, so a re-route costs at most one pass per drawn frame; a connector whose
      * geometry did not actually change is skipped, which is most of them on most frames.
+     *
+     * ⚠️ **Over [shapes], never over [ink].** It walked the whole ink band for as long as
+     * connectors have existed, which made *"at most one pass per drawn frame"* a 5,000-element
+     * scan per frame on a page of handwriting that could not contain a connector at all. Nothing
+     * about it was visibly wrong; it is a comment that costs frames. See [shapes].
      */
     private fun rerouteConnectors() {
         routesDirty = false
         var changed = false
-        for (dry in ink) {
-            if (dry is DryShape && dry.isConnector && dry.reroute(targets)) changed = true
+        for (shape in shapes) {
+            if (shape.isConnector && shape.reroute(targets)) changed = true
         }
         if (changed) revision++
     }
@@ -939,7 +1205,18 @@ internal class StrokeStore {
         return touched
     }
 
-    /** One eraser sample, in page space, with the query objects an identity transform can reuse. */
+    /**
+     * One eraser sample, in page space, with the query objects an identity transform can reuse.
+     *
+     * ⚠️ **[pageCapsule] has to be a fresh object per sample and cannot be pooled the way
+     * [LocalSweep] is**, however tempting it looks beside a rule-7 allocation count. It is the one
+     * thing built here that is *retained*: [DryObject.eraseCapsule] stores it in the object's
+     * [ErasedRegion], which is the durable form that becomes `SetErasedRegion`'s payload. A shared,
+     * mutated instance would rewrite every capsule already recorded — a whole gesture's erasing
+     * collapsing onto its last sample, silently, in the log and on every peer. The same holds for
+     * the local capsule [sweptCapsuleFor] builds for a transformed object. What can be pooled is
+     * the pair of endpoints, and it is.
+     */
     private class EraserSweep(
         val from: PagePointF,
         val to: PagePointF,
@@ -1023,7 +1300,10 @@ internal class StrokeStore {
             if (mode == EraseMode.WHOLE_STROKE) {
                 removedThisGesture += dry.id
                 iterator.remove()
-                byId.remove(dry.id)
+                // ⚠️ [tombstone], not a bare `byId.remove`. This *is* a delete — [endEdit] emits a
+                // `DeleteObject` for everything in `removedThisGesture` — so it owes the page a
+                // tombstone and a re-route exactly as `DeleteObject` does. See [tombstone].
+                tombstone(dry)
             } else {
                 dry.eraseCapsule(capsule)
                 // One entry per stroke per gesture; the op carries the whole region at the end.
@@ -1052,44 +1332,88 @@ internal class StrokeStore {
      */
     fun pruneFullyErased() {
         var budget = PRUNE_BUDGET
+        // ⛔ **At least one candidate per pass runs whatever it costs, and without this the
+        // degradation was not "not pruning yet" but "never pruning".**
+        //
+        // [pruneIfAffordable] skips a stroke whose estimate exceeds what is left. The estimate is
+        // `inputs × 3 × capsules`, the region only ever grows (it is append-only, and
+        // `SetErasedRegion` is absolute), and `inputs` is fixed — so a stroke that once exceeded
+        // [PRUNE_BUDGET] exceeds it on **every future pass, forever**. The threshold is
+        // `inputs × 3 × capsules > 200_000`: a 200-sample stroke needs only ~333 capsules, and one
+        // second of scribbled erasing at 240 Hz is ~240. In other words essentially every stroke a
+        // user really scribbles over becomes permanently unprunable.
+        //
+        // What that costs is not the prune — it is the *drawing*. A fully erased stroke is
+        // invisible and still costs `PagePainter` a `saveLayer` + `DST_OUT` sandwich in every
+        // record of the page, and `DryStrokesView` re-records the whole page 120 ms after any
+        // scale change. So the bill is paid on every pinch, in proportion to how much the user has
+        // erased — which is exactly the report: *"when there are a lot of erases when you zoom in
+        // and out it seem to lag"*.
+        //
+        // Letting the first candidate through guarantees forward progress: each pass retires at
+        // least one over-budget stroke (or settles that it is not erased away), and a prune runs
+        // per erase gesture, so a page cleans itself up over the next few gestures instead of
+        // never. The work is still bounded — one stroke's coverage test, now with
+        // [ErasedRegion.coveringCapsule]'s rolling hint under it — which is what the budget was
+        // really protecting against.
+        var forceAllowed = true
         for (list in listOf(ink, highlight)) {
             val iterator = list.iterator()
             while (iterator.hasNext() && budget > 0) {
                 val dry = iterator.next()
-                val region = dry.erased ?: continue
-                budget -= pruneIfAffordable(iterator, dry, region, budget)
+                val cost = coverageCostToSpend(dry, budget, forceAllowed)
+                if (cost <= 0L) continue
+                // Over budget and taken anyway: that was this pass's one forced candidate.
+                if (cost > budget) forceAllowed = false
+                budget -= pruneCandidate(iterator, dry, cost)
             }
         }
     }
 
     /**
-     * Coverage-test [dry] if the remaining [budget] can pay for the test, drop it when it is
-     * fully erased, and return what was spent.
+     * What examining [dry] would cost, or `0` for *"skip it"*.
      *
-     * Charged in the unit the work actually happens in — point × capsule distance tests,
+     * Zero covers three different noes, and none of them is worth telling apart here: the object
+     * has no erased region at all; [DryObject.eraseCoverageCost]'s own cheap gates rejected it in
+     * four compares (empty region, no bounds, or the stroke reaches outside the region's box, all
+     * of which mean it cannot be fully erased); or it is over budget and this pass has already
+     * spent its one forced candidate.
+     */
+    private fun coverageCostToSpend(dry: DryObject, budget: Long, forceAllowed: Boolean): Long {
+        val region = dry.erased ?: return 0L
+        val cost = dry.eraseCoverageCost(region)
+        if (cost == 0L) return 0L
+        return if (cost > budget && !forceAllowed) 0L else cost
+    }
+
+    /**
+     * Coverage-test [dry], drop it when it is fully erased, and return the [cost] that was spent.
+     *
+     * ⚠️ **The affordability decision is the caller's**, and it moved there when "too expensive"
+     * turned out to mean "forever" — see [pruneFullyErased]. This runs the test unconditionally;
+     * it does not get to refuse.
+     *
+     * [cost] is charged in the unit the work actually happens in — point × capsule distance tests,
      * estimated by the object itself ([DryObject.eraseCoverageCost]). The budget used to charge
      * `capsules.size` while `isErasedAway` ran points × capsules, an under-count of the whole
      * point factor: one pen-up after scribbling over a dense, heavily-erased area ran ~100× the
      * bound and froze the UI at exactly the moment the budget exists to protect.
      *
-     * A stroke too big for what is left is *skipped* (spend 0), not stopped at — smaller ones
-     * after it may still fit, and the degradation stays "not pruning yet".
-     *
      * ⭐ M8c: the kind check is [DryObject.isErasedAway]'s default rather than a cast here. Only
      * a stroke answers true; the others refuse for the reason [DryTextBox] gives, which is that
      * dropping one costs the user their object until the page reloads.
      */
-    private fun pruneIfAffordable(
-        iterator: MutableIterator<DryObject>,
-        dry: DryObject,
-        region: ErasedRegion,
-        budget: Long,
-    ): Long {
-        val cost = dry.eraseCoverageCost(region)
-        if (cost > budget) return 0L
+    private fun pruneCandidate(iterator: MutableIterator<DryObject>, dry: DryObject, cost: Long): Long {
+        val region = dry.erased ?: return 0L
         if (dry.isErasedAway(region)) {
             iterator.remove()
-            byId.remove(dry.id)
+            // [unindex], not [tombstone]: this emits no ops and deletes nothing (see the KDoc
+            // above), so claiming a tombstone would make a connector aimed at this object report
+            // its target as *deleted* when the log still holds it whole.
+            unindex(dry)
+            // ⭐ And kept, because the log still holds it whole — so an undo of this erase has
+            // something to put back. See [prunedByErase].
+            prunedByErase[dry.id] = dry
             revision++
         }
         return cost
@@ -1103,6 +1427,16 @@ internal class StrokeStore {
          * device says, not this one.
          */
         const val PRUNE_BUDGET = 200_000L
+
+        /**
+         * How many appended objects [appendsSince] will answer for before demanding a re-record.
+         *
+         * Each one is a draw call the dry layer issues *in addition* to replaying the cached
+         * recording, so the tail is work repeated every frame while a full re-record is work done
+         * once. 48 keeps the per-frame tail far below the cost of the re-record it defers on any
+         * page big enough for this to matter, and bounds the deque.
+         */
+        const val MAX_APPENDS = 48
 
         /**
          * Ids for a store with no page bound — the synthetic-load harness and previews. They

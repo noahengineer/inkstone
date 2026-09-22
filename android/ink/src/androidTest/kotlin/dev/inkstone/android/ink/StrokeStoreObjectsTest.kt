@@ -57,11 +57,13 @@ import org.junit.runner.RunWith
  *
  * ## Geometry is hand-built, and deliberately without orientation
  *
- * Same reasoning as [StrokeStoreSelectionTest], repeated because it is the reason these tests are
- * independent of the ten M1 failures on x86_64: `SyntheticInk` computes an `orientationRadians` it
- * never clamps to `[0, 2π)` and x86_64 rounding puts it a thousandth outside, which `androidx.ink`
- * rejects. The strokes here carry **no orientation and no tilt**, so there is nothing to be out of
- * range. Every expected coordinate is arithmetic a reader can check.
+ * Same reasoning as [StrokeStoreSelectionTest]. The strokes here carry **no orientation and no
+ * tilt**, so every expected coordinate is arithmetic a reader can check.
+ *
+ * ⚠️ This used to say the file was *"independent of the ten M1 failures on x86_64"*, caused by
+ * `SyntheticInk` leaving `orientationRadians` outside `[0, 2π)`. That fixture bug was real but
+ * never x86_64's doing — it was the seed — and it is fixed (`SyntheticInk.turn`). Hand-built
+ * geometry is still preferred here, for legibility rather than for immunity.
  */
 @RunWith(AndroidJUnit4::class)
 class StrokeStoreObjectsTest {

@@ -8,10 +8,12 @@ import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.MaterializedFile
 import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectStyle
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageRef
 import dev.inkstone.core.model.PdfPublisher
 import dev.inkstone.core.model.StrokeOutliner
 import dev.inkstone.core.model.TextBoxObject
+import dev.inkstone.core.model.contentBounds
 import dev.inkstone.core.model.foldPage
 import dev.inkstone.core.storage.InkstoneMarker
 import dev.inkstone.core.storage.NoteLayout
@@ -151,7 +153,11 @@ public class InkstonePdfMaterializer internal constructor(
     /** Pages a from-scratch note needs generated. Sizes and templates come from the fold. */
     private suspend fun generatedBase(note: OpenNote): List<BasePage> = note.document.livePages.map { ref ->
         val page = fold(note, ref)
-        BasePage(page.size, page.background)
+        // The stored canvas, not the grown one: this is the *base*, written once and rebased on
+        // for the life of the note (SPEC §5.2), and it is the update section that carries the
+        // page's real box. Growing here would bake one session's canvas into bytes that are never
+        // rewritten.
+        BasePage(page.canvas, page.background)
     }
 
     private suspend fun plansFor(note: OpenNote, original: ByteArray): List<PdfPagePlan> {
@@ -160,10 +166,20 @@ public class InkstonePdfMaterializer internal constructor(
         val assets = assetsFor(note, folds.map { it.second })
         return folds.map { (ref, folded) ->
             val outlines = outliner.outline(folded)
+            // ⭐ SPEC §4.5 — the paper this page is published on, derived from what is on it by
+            // exactly the arithmetic the editor uses. On a fixed page this is the page's own
+            // rectangle and always has been; on an infinite one it is however much of it the
+            // writing needs.
+            //
+            // Derived here rather than read out of a register, and that is what makes it safe
+            // against a merge: a peer's strokes are in `folded` whether or not their device ever
+            // told this one how big the paper had got, so the box written below holds them.
+            val canvas = folded.canvasFor(folded.contentBounds(outlines))
             PdfPagePlan(
-                source = sourceFor(folded, sourcePages),
+                source = sourceFor(folded, canvas, sourcePages),
                 pageId = ref.id,
                 sortKey = ref.sortKey,
+                canvas = canvas,
                 // SPEC §6.4's density decision, made from the count that will actually be
                 // written — a page whose strokes were all erased away is not dense, and M8c's
                 // text boxes and images are page content rather than annotations, so they do not
@@ -218,13 +234,19 @@ public class InkstonePdfMaterializer internal constructor(
     private fun textBoxFor(page: FoldedPage, obj: TextBoxObject): PdfTextBox? {
         val text = page.textOf(obj.id) ?: obj.text
         if (text.isEmpty()) return null
+        val format = ObjectFormat.decode(page.formatOf(obj.id))
         return PdfTextBox(
             objectId = obj.id,
             text = text,
-            widthPt = obj.widthPt,
-            heightPt = obj.heightPt,
+            // ⚠️ The **frame**, on the same argument as the words one line up: resizing a text box
+            // writes `SetFormat`, not a scale (`ObjectFormat.boxWidthPt`), so a publish that laid
+            // out to the payload's extents would wrap the paragraph at the width the box was
+            // *placed* at — a PDF that disagrees with the screen about every line after the first,
+            // silently, and only for boxes the user has dragged.
+            widthPt = format.frameWidth(obj.widthPt),
+            heightPt = format.frameHeight(obj.heightPt),
             transform = obj.transform,
-            format = ObjectFormat.decode(page.formatOf(obj.id)),
+            format = format,
             style = obj.style ?: UNSTYLED,
         )
     }
@@ -282,18 +304,18 @@ public class InkstonePdfMaterializer internal constructor(
      * it is what a note looks like when its source PDF was replaced by something
      * shorter, and drawing the ink on fresh paper keeps the ink.
      */
-    private fun sourceFor(page: FoldedPage, sourcePages: Int): PageSource {
+    private fun sourceFor(page: FoldedPage, canvas: PageCanvas, sourcePages: Int): PageSource {
         val background = page.background
         return if (background is Background.SourcePdfPage && background.index < sourcePages) {
             PageSource.Existing(background.index)
         } else {
-            PageSource.Generated(page.size, background)
+            PageSource.Generated(canvas, background)
         }
     }
 
     private suspend fun fold(note: OpenNote, ref: PageRef): FoldedPage {
         val loaded = store.loadPage(note, ref.id)
-        return foldPage(ref.id, loaded.ops, defaultSize = loaded.size, defaultBackground = loaded.background)
+        return foldPage(ref.id, loaded.ops, defaultCanvas = loaded.canvas, defaultBackground = loaded.background)
     }
 
     private companion object {

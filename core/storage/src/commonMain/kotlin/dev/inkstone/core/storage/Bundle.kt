@@ -6,14 +6,17 @@ import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.PageRef
 import dev.inkstone.core.model.PageSize
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonArray
@@ -145,6 +148,20 @@ public object Bundle {
 
     internal const val F_SIZE = "size"
     internal const val F_BACKGROUND = "background"
+
+    /**
+     * ⭐ The infinite canvas (SPEC §4.5) — the paper's top-left in page space, and whether it
+     * grows. **Both omitted when they hold their defaults**, so a fixed page's bundle is
+     * byte-for-byte what this writer produced before they existed and every committed fixture
+     * still round-trips (ROADMAP M2's *"save → load → save → byte-identical"*).
+     *
+     * The page record has to carry them, rather than leaving them to the ops: a compaction
+     * snapshot *is* a bundle (SPEC §4.7), and the `SetPageMeta` that turned the page infinite is
+     * exactly the kind of old op compaction drops. Keeping them here is what stops a compaction
+     * quietly turning a grown canvas back into a sheet of Letter.
+     */
+    internal const val F_ORIGIN = "origin"
+    internal const val F_INFINITE = "infinite"
     internal const val F_OPS = "ops"
 }
 
@@ -228,11 +245,14 @@ public class BundleContents(
  *   path pay for a JSON round trip per page is how opening a 200-page notebook gets slow.
  */
 public class PageContents(
-    public val size: PageSize,
+    public val canvas: PageCanvas,
     public val background: Background,
     public val ops: List<PageOp>,
     public val text: ByteArray? = null,
-)
+) {
+    /** The paper's extent. Where it *is* is [canvas]'s business (SPEC §4.5). */
+    public val size: PageSize get() = canvas.size
+}
 
 /**
  * Serialises a [BundleContents] to bytes.
@@ -258,6 +278,9 @@ public object BundleWriter {
                 put(Bundle.F_PAGE_ID, JsonPrimitive(ref.id.value))
                 put(Bundle.F_SIZE, OpCodec.encodeSize(page.size))
                 put(Bundle.F_BACKGROUND, OpCodec.encodeBackground(page.background))
+                val canvas = page.canvas
+                if (canvas.origin != PagePoint(0f, 0f)) put(Bundle.F_ORIGIN, OpCodec.encodePoint(canvas.origin))
+                if (canvas.infinite) put(Bundle.F_INFINITE, JsonPrimitive(true))
                 put(Bundle.F_OPS, ops)
             }
             entries += Zip.Entry(Bundle.pageJson(ref.id), json.toBytes())
@@ -437,7 +460,11 @@ public class BundleReader private constructor(
         val geometry = GeometryReader(blob)
         val ops = json[Bundle.F_OPS]?.jsonArray.orEmptyArray().map { OpCodec.decode(it.jsonObject, geometry).op }
         return PageContents(
-            size = json[Bundle.F_SIZE]?.let { OpCodec.decodeSize(it.jsonArray) } ?: PageSize.Letter,
+            canvas = PageCanvas(
+                size = json[Bundle.F_SIZE]?.let { OpCodec.decodeSize(it.jsonArray) } ?: PageSize.Letter,
+                origin = json[Bundle.F_ORIGIN]?.let { OpCodec.decodePoint(it.jsonArray) } ?: PagePoint(0f, 0f),
+                infinite = json[Bundle.F_INFINITE]?.jsonPrimitive?.boolean ?: false,
+            ),
             background = json[Bundle.F_BACKGROUND]?.let { OpCodec.decodeBackground(it.jsonObject) }
                 ?: Background.Blank,
             ops = ops,

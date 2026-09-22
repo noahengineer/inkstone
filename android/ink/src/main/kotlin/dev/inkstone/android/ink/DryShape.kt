@@ -84,6 +84,16 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
     /** True while [bendPreview] is standing in for the record's own bend. */
     private var previewingBend = false
 
+    /**
+     * ⭐ The vertices a handle drag is currently proposing — [bendPreview]'s sibling for a closed
+     * shape, and there for the same reason: a drag must be visible at 240 Hz and must write exactly
+     * one `SetTextContent` when the finger lifts.
+     *
+     * Null is *"no preview"*, never *"no points"*: a shape whose vertices have been cleared is not a
+     * state this app can reach, and conflating the two would make a cancelled drag erase an edit.
+     */
+    private var pointsPreview: List<PagePoint>? = null
+
     /** How each end resolved, for a UI that wants to say "the shape this pointed at was deleted". */
     var routing: ConnectorPath? = null
         private set
@@ -101,6 +111,22 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
 
     init {
         rebuild(plainOutline())
+        // ⚠️ **A shape was the one kind that dropped its erased region on load**, and the symptom was
+        // as bad as it sounds: *"if you erase or delete a shape then leave the note and enter it
+        // again, the shape is back"*.
+        //
+        // `SetErasedRegion` was written to the journal correctly and applied to the screen
+        // correctly, so nothing looked wrong until the note was re-opened. The fold then collapses
+        // the register onto `ShapeObject.erased` (SPEC §4.2) and hands the payload here — and this
+        // constructor read the transform, the style and the z key off it and **ignored the erased
+        // region**, so the shape came back whole. `dryStrokeFor` and `DryBox`'s own init both did
+        // it; a shape simply never had the line. It also cost the *published PDF* the erasure, since
+        // `InkStrokeOutliner` subtracts whatever this holds.
+        //
+        // In the init rather than at the call site, like [DryBox]'s, because there are two
+        // construction paths — `StrokeStore.dryObjectFor` on load and `addShape` on creation — and a
+        // rule that has to be remembered at each of them is the rule that was missed here.
+        setErased(obj.erased.toRegion())
     }
 
     /** The render side of `SetTextContent` — a shape's record is that register (SPEC §4.8.2). */
@@ -115,20 +141,39 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
     }
 
     /**
-     * Show [local] as this shape's bend without writing anything. Null ends the preview.
+     * Show [local] as this shape's bend without writing anything.
+     *
+     * ⚠️ **Non-null, and [endPreview] is how a drag finishes.** It took a nullable and read null as
+     * *"stop previewing"*, which collided with the *other* thing a null bend means — **straight**.
+     * Flattening a curve therefore fell back to [record]'s bend and sprang back to the original arc
+     * mid-drag. See [BendDrag], which is where the two meanings were separated.
      *
      * @return true when the outline actually changed, so a caller can skip a repaint for a frame
      *   the finger did not move enough to matter.
      */
-    fun previewBend(local: PagePoint?): Boolean {
-        previewingBend = local != null
+    fun previewBend(local: PagePoint): Boolean {
+        previewingBend = true
         bendPreview = local
+        return rebuildIfChanged(plainOutline())
+    }
+
+    /** End any preview in flight — the drag committed, or the pointer was cancelled. */
+    fun endPreview(): Boolean {
+        if (!previewingBend && pointsPreview == null) return false
+        clearBendPreview()
+        return rebuildIfChanged(plainOutline())
+    }
+
+    /** Show [local] as this shape's vertices without writing anything. See [endPreview]. */
+    fun previewPoints(local: List<PagePoint>): Boolean {
+        pointsPreview = local
         return rebuildIfChanged(plainOutline())
     }
 
     private fun clearBendPreview() {
         previewingBend = false
         bendPreview = null
+        pointsPreview = null
     }
 
     /**
@@ -151,7 +196,10 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
     private fun asAnchorTarget(): AnchorTarget = obj.asAnchorTarget().copy(transform = transform)
 
     private fun plainOutline(): ShapePath =
-        ShapeGeometry.outline(obj.shape, obj.widthPt, obj.heightPt, record.cornerRadiusPt, bendNow())
+        ShapeGeometry.outline(obj.shape, obj.widthPt, obj.heightPt, record.cornerRadiusPt, bendNow(), pointsNow())
+
+    /** The vertices to draw with: the drag in flight, else the register's. See [bendNow]. */
+    fun pointsNow(): List<PagePoint>? = pointsPreview ?: record.points
 
     /**
      * The bend to draw with: the drag in flight, else the register's.
@@ -187,16 +235,64 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
         setBounds(boundsOf(next))
     }
 
+    /**
+     * ⛔ **Inflated by half the pen, and it was the bare outline for four milestones** — which made
+     * an *axis-aligned* straight line impossible to move.
+     *
+     * A shape's outline is its centre line; [PagePainter] then strokes it with a paint of
+     * [effectiveStyle]'s width, so the ink really occupies half that width either side. Both hit
+     * tests beside this one already know it — [tappedAt] and [hitBy] each add
+     * `widthPt / 2` to their reach — and this was the sibling that did not, which is the shape of
+     * bug CLAUDE.md keeps finding by *"grepping for the sibling implementations of the invariant,
+     * not for the symptom"*.
+     *
+     * It stayed invisible while a bounding box was only ever used to *cull*: a box a hairline too
+     * small still overlaps the viewport, so nothing was ever wrongly culled by much. What made it
+     * a real bug is that a **straight segment's outline is two points**, so for a horizontal or
+     * vertical line the box had one extent of exactly **zero** — and `SelectionController.begin`
+     * decides MOVE by asking whether the press is inside the selection box. A zero-width box
+     * cannot contain anything, so the press fell through to `Mode.LASSO`: the line did not move,
+     * and the lasso then cleared the selection. Reproduced on the emulator against a diagonal
+     * line, whose box is a proper rectangle and which moved correctly with the identical gesture.
+     *
+     * ⚠️ This makes the box depend on the **style**, so [restyle] has to rebuild it. The base
+     * class only records the register (see `DryObject.restyle`); `DryStroke` already overrides for
+     * the same reason, because for a stroke the width is geometry too.
+     */
     private fun boundsOf(shape: ShapePath): PageBounds? {
         val points = shape.flattened()
         if (points.isEmpty()) return null
+        val reach = effectiveStyle().widthPt / 2f
         return PageBounds(
-            points.minOf { it.x },
-            points.minOf { it.y },
-            points.maxOf { it.x },
-            points.maxOf { it.y },
+            points.minOf { it.x } - reach,
+            points.minOf { it.y } - reach,
+            points.maxOf { it.x } + reach,
+            points.maxOf { it.y } + reach,
         )
     }
+
+    /**
+     * Record the register, then rebuild the box — because [boundsOf] measures the pen.
+     *
+     * Widening a shape's stroke really does make it cover more paper, so a box left at the old
+     * width would under-report the ink on screen: the shape would cull, lasso and grab as though
+     * it were still thin.
+     */
+    override fun restyle(style: ObjectStyle?, brushes: InkBrushFactory) {
+        super.restyle(style, brushes)
+        setBounds(boundsOf(outline))
+    }
+
+    /**
+     * ⭐ Whether this shape draws an arrowhead right now: the record's override, then the kind.
+     *
+     * ⚠️ **The one place the question is answered**, and it has two readers already — the screen
+     * ([PagePainter]) and the published PDF ([InkStrokeOutliner]) — both of which reach it through
+     * [arrowHead]. A second copy of *"is this an arrow"* is how a note comes out of this app with a
+     * head on screen and none in the file, which is the class of bug `docs/M4-PDF.md` is about.
+     */
+    val hasArrowHead: Boolean
+        get() = record.arrow ?: (obj.shape == ShapeKind.ARROW)
 
     /**
      * The arrowhead's two barbs, in this object's space, or null when there is none to draw.
@@ -205,9 +301,12 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
      * elbow route's head points along the leg it arrives on rather than along the connector's
      * nominal axis — which is the difference between an arrow that points at the box and one that
      * points past it.
+     *
+     * ⭐ Gated on [hasArrowHead], which is the register **or** the kind — not the kind alone, which
+     * it was until a user asked to be able to say *"if its an arrow or not"* after drawing one.
      */
     fun arrowHead(lengthPt: Float): Path? {
-        if (obj.shape != ShapeKind.ARROW) return null
+        if (!hasArrowHead) return null
         val points = outline.flattened()
         if (points.size < 2) return null
         val tip = points.last()

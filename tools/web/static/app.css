@@ -1,0 +1,540 @@
+/* Inkstone reader — the app's own design language, on the web.
+ *
+ * Every colour below is read off `app/src/main/kotlin/dev/inkstone/app/ui/InkTokens.kt`, so the
+ * website and the tablet agree. docs/M10-DESIGN.md §1: a near-black canvas with a 24 dp dot grid,
+ * chrome floating on it as translucent pills with a 1 dp hairline edge, controls that are **words
+ * rather than icons** — uppercase, tracked out, inverting to near-white when active — and numbers
+ * set in a monospaced face.
+ *
+ * Two departures, both deliberate:
+ *
+ * 1. `backdrop-filter` is used here. M10 §2 records that a backdrop blur is *impossible* in the
+ *    app — `InProgressStrokesView` front-buffers through a SurfaceView, so a blur pass would
+ *    sample everything except the ink. That reason is about Android's compositor and does not
+ *    exist in a browser, and the blur is what the original brief asked for. It is kept very
+ *    light so a panel still reads as the app's translucency rather than as frosted glass.
+ *
+ * 2. The transcript is set in a **serif**, against a UI that is otherwise a grotesque. That is the
+ *    one real risk in this design and it earns its place: everything else on the page is chrome
+ *    you operate, and the transcript is the thing you *read* — often for twenty minutes at a
+ *    stretch. Giving it the typographic manners of a document rather than of an interface is what
+ *    makes a wall of speech readable.
+ */
+
+:root {
+  /* Ink.* — InkTokens.kt */
+  --canvas: #09090B;
+  --canvas-dot: rgba(113, 113, 121, 0.15);
+  --panel: rgba(24, 24, 27, 0.90);
+  --panel-solid: #18181B;
+  --panel-raised: #212124;
+  --panel-border: rgba(63, 63, 70, 0.30);
+  --hairline: #3F3F46;
+  --chip-pressed: rgba(63, 63, 70, 0.40);
+  --accent: #E4E4E7;
+  --on-accent: #09090B;
+  --focus: #38BDF8;
+  --text-strong: #E4E4E7;
+  --text: #A1A1AA;
+  --muted: #71717A;
+
+  /* ⚠️ The dimmest text on the page, and it was #52525B — **2.34:1** over a panel, well under
+   * WCAG AA's 4.5:1 and under even the 3:1 for large text. That is a design token borrowed from
+   * the tablet, where the same grey sits on a *canvas* rather than on a translucent panel and the
+   * text it carries is a control label you can also identify by position. Here it carried three
+   * things a reader has to actually read: the ribbon's time axis, the keyboard hint, and the
+   * sentence explaining that a recording is not anchored to pages.
+   *
+   * #8A8A93 is 4.6:1 on the panel and still reads as the quietest thing on screen. */
+  --faint: #8A8A93;
+  --danger: #F87171;
+  --recording: #EF4444;
+  --paper: #FFFFFF;
+
+  --segment-track: rgba(39, 39, 42, 0.40);
+
+  /* Ink.Radius / Ink.Spacing */
+  --r-panel: 16px;
+  --r-chip: 10px;
+  --edge: 12px;
+  --dot-spacing: 24px;
+
+  --ui: "Inter", "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --mono: "JetBrains Mono", "Cascadia Mono", "Consolas", ui-monospace, SFMono-Regular, monospace;
+  --read: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+
+  --topbar-h: 56px;
+}
+
+* { box-sizing: border-box; }
+
+/* ⚠️ `hidden` is a UA-stylesheet `display: none`, so ANY author rule that sets `display` beats
+ * it — and `.pane { display: flex }` below did exactly that. The pane stayed on screen with a
+ * "The page" header and an empty frame for every recording with no PDF beside it. Silent, and
+ * it looks like a data bug rather than a specificity one. Anything toggled by `hidden` in this
+ * file needs this line to exist. */
+[hidden] { display: none !important; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background-color: var(--canvas);
+  /* The 24 dp dot grid, as one repeating gradient rather than ~7,000 draw calls — the same
+     conclusion `rememberDotGridBrush` reached on the device (M10). */
+  background-image: radial-gradient(var(--canvas-dot) 1px, transparent 1.2px);
+  background-size: var(--dot-spacing) var(--dot-spacing);
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* ---------------------------------------------------------------- chrome */
+
+.chip {
+  font-family: var(--ui);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  color: var(--text);
+  background: var(--segment-track);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-chip);
+  padding: 7px 11px;
+  min-height: 32px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+.chip:hover { background: var(--chip-pressed); color: var(--text-strong); }
+.chip:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.chip.is-active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.chip[disabled] { opacity: 0.4; cursor: default; }
+.chip-quiet { background: transparent; }
+
+.micro {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.micro-dim { color: var(--faint); letter-spacing: 0.06em; text-transform: none; font-weight: 500; }
+
+.readout {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-strong);
+}
+.readout-dim { color: var(--muted); }
+
+/* --------------------------------------------------------------- topbar */
+
+.topbar {
+  height: var(--topbar-h);
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 0 var(--edge);
+  border-bottom: 1px solid var(--panel-border);
+  background: var(--panel);
+  backdrop-filter: blur(10px);
+  position: relative;
+  z-index: 5;
+}
+
+.brand { display: flex; align-items: baseline; gap: 8px; }
+.mark {
+  width: 10px; height: 10px;
+  border-radius: 3px;
+  background: var(--accent);
+  align-self: center;
+}
+.brand-name { color: var(--text-strong); font-weight: 650; letter-spacing: 0.02em; }
+.brand-sub { color: var(--muted); font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; }
+
+.search { flex: 1; display: flex; gap: 8px; max-width: 640px; margin: 0 auto; }
+.search input {
+  flex: 1;
+  background: var(--segment-track);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-chip);
+  color: var(--text-strong);
+  font-family: var(--ui);
+  font-size: 13px;
+  padding: 8px 12px;
+  min-width: 0;
+}
+.search input::placeholder { color: var(--muted); }
+.search input:focus { outline: none; border-color: var(--focus); }
+
+.status { display: flex; align-items: center; gap: 8px; }
+.status-text { font-size: 11px; color: var(--muted); letter-spacing: 0.04em; max-width: 34ch;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; }
+.dot.ok { background: #4ADE80; }
+.dot.bad { background: var(--danger); }
+
+/* ---------------------------------------------------------------- shell */
+
+.shell {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  height: calc(100% - var(--topbar-h));
+  min-height: 0;
+}
+
+.library {
+  border-right: 1px solid var(--panel-border);
+  background: rgba(24, 24, 27, 0.55);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.library-head, .library-filter {
+  display: flex; align-items: center; gap: 6px;
+  padding: 10px var(--edge);
+}
+.library-head { justify-content: space-between; }
+.library-filter { padding-top: 0; }
+.chip-tab { padding: 5px 9px; min-height: 26px; font-size: 11px; }
+
+.library-list { flex: 1; overflow-y: auto; padding: 0 8px 12px; min-height: 0; }
+.library-foot { padding: 8px var(--edge) 12px; border-top: 1px solid var(--panel-border); }
+
+.group-label {
+  padding: 14px 6px 6px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase;
+  color: var(--faint);
+}
+
+.item {
+  display: block; width: 100%; text-align: left;
+  background: transparent; border: 1px solid transparent;
+  border-radius: var(--r-chip);
+  padding: 9px 10px;
+  margin-bottom: 2px;
+  cursor: pointer;
+  color: inherit;
+  font-family: inherit;
+}
+.item:hover { background: var(--segment-track); }
+.item.is-active { background: var(--panel-raised); border-color: var(--panel-border); }
+.item:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.item-title {
+  display: block; color: var(--text-strong); font-size: 13px; font-weight: 550;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.item-sub {
+  display: flex; align-items: center; gap: 6px; margin-top: 3px;
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+}
+.tag {
+  font-family: var(--ui); font-size: 9.5px; font-weight: 700;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  padding: 1px 5px; border-radius: 4px;
+  border: 1px solid var(--panel-border); color: var(--muted);
+}
+.tag-transcribed { color: #4ADE80; border-color: rgba(74, 222, 128, 0.35); }
+.tag-awaiting { color: #FBBF24; border-color: rgba(251, 191, 36, 0.35); }
+.tag-partial { color: var(--danger); border-color: rgba(248, 113, 113, 0.35); }
+
+.empty { color: var(--muted); font-size: 12px; padding: 16px 8px; }
+
+/* ---------------------------------------------------------------- stage */
+
+.stage { overflow-y: auto; min-height: 0; padding: 20px 24px 32px; position: relative; }
+
+.welcome { max-width: 62ch; margin: 8vh auto 0; }
+.welcome h1 {
+  font-family: var(--read);
+  font-weight: 400;
+  font-size: clamp(26px, 3.4vw, 40px);
+  line-height: 1.22;
+  color: var(--text-strong);
+  margin: 0 0 18px;
+}
+.welcome h1 em { font-style: normal; font-family: var(--mono); color: var(--focus); font-size: 0.85em; }
+.welcome p { font-family: var(--read); font-size: 17px; line-height: 1.65; color: var(--text); margin: 0 0 22px; }
+.legend { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 18px; }
+.legend li { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+.swatch { width: 18px; height: 8px; border-radius: 2px; }
+.swatch-ink { background: var(--accent); }
+.swatch-voice { background: var(--focus); opacity: 0.75; }
+.swatch-quiet { background: transparent; border: 1px dashed var(--hairline); }
+
+.lecture-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 14px; }
+.lecture-id h2 {
+  margin: 0; font-family: var(--read); font-weight: 400;
+  font-size: 27px; line-height: 1.2; color: var(--text-strong);
+}
+.lecture-meta { margin: 5px 0 0; font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.index-now { margin-left: 12px; vertical-align: middle; padding: 4px 9px; min-height: 24px; font-size: 10.5px; }
+.lecture-actions { display: flex; gap: 6px; flex: none; }
+
+/* ------------------------------------------------- the ribbon (signature) */
+
+.ribbon-wrap {
+  background: var(--panel);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-panel);
+  padding: 12px 14px 10px;
+  margin-bottom: 16px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+.ribbon { display: block; width: 100%; height: 132px; cursor: crosshair; touch-action: none; }
+.ribbon-axis {
+  display: flex; justify-content: space-between;
+  font-family: var(--mono); font-size: 10px; color: var(--faint);
+  padding: 2px 0 8px;
+}
+.transport { display: flex; align-items: center; gap: 10px; padding-top: 8px; border-top: 1px solid var(--panel-border); }
+.transport .readout:first-child { font-size: 15px; }
+.spacer { flex: 1; }
+.hint { letter-spacing: 0.02em; white-space: nowrap; }
+@media (max-width: 700px) { .hint-keys { display: none; } }
+
+/* Available to a screen reader and to nothing else. Not `display: none`, which removes it from the
+ * accessibility tree as well and would make `aria-describedby` point at nothing. */
+.visually-hidden {
+  position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0;
+}
+
+/* The ribbon is focusable now, so it needs to show it. */
+.ribbon:focus-visible { outline: 2px solid var(--focus, #7DD3FC); outline-offset: 2px; }
+
+/* ---------------------------------------------------------------- panes */
+
+.panes { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; }
+.panes:has(.pane-page:not([hidden])) { grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); }
+
+.pane {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-panel);
+  display: flex; flex-direction: column;
+  min-height: 0; min-width: 0;
+  overflow: hidden;
+}
+.pane-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 10px 14px; border-bottom: 1px solid var(--panel-border);
+}
+.transcript { overflow-y: auto; padding: 6px 4px 18px; max-height: 62vh; }
+.page-frame { width: 100%; height: 62vh; border: 0; background: #2a2a2e; }
+.pane-page-wide .page-frame { height: 74vh; }
+.handwriting { overflow-y: auto; padding: 12px 16px; max-height: 74vh; }
+
+/* -------------------------------------------------------- the transcript */
+
+.seg {
+  display: block; width: 100%; text-align: left;
+  background: transparent; border: 0; border-left: 2px solid transparent;
+  padding: 7px 14px 7px 16px;
+  cursor: pointer; color: inherit; font: inherit;
+}
+.seg:hover { background: rgba(63, 63, 70, 0.22); }
+.seg:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.seg.is-now { border-left-color: var(--focus); background: rgba(56, 189, 248, 0.09); }
+.seg-head { display: flex; align-items: baseline; gap: 9px; margin-bottom: 2px; }
+.seg-at { font-family: var(--mono); font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.seg-who {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--muted);
+}
+.seg.speaker-teacher .seg-who { color: var(--accent); }
+.seg-text { font-family: var(--read); font-size: 16.5px; line-height: 1.62; color: var(--text); }
+.seg.is-now .seg-text { color: var(--text-strong); }
+
+.seg-dead, .seg-pageturn, .seg-gap {
+  padding: 10px 16px; display: flex; align-items: center; gap: 10px;
+  font-size: 11.5px; color: var(--muted);
+}
+.seg-dead::before, .seg-pageturn::before {
+  content: ""; flex: 1; height: 1px; background: var(--panel-border);
+}
+.seg-dead::after, .seg-pageturn::after {
+  content: ""; flex: 1; height: 1px; background: var(--panel-border);
+}
+.seg-dead span, .seg-pageturn span { font-family: var(--mono); font-size: 10.5px; white-space: nowrap; letter-spacing: 0.02em; }
+.seg-pageturn span { color: var(--focus); }
+.seg-gap { color: var(--danger); font-family: var(--mono); font-size: 11px; }
+
+.handwriting-page { margin-bottom: 20px; }
+.handwriting-page h4 {
+  margin: 0 0 6px; font-size: 11px; font-weight: 600; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--muted);
+}
+.handwriting-page pre {
+  margin: 0; font-family: var(--read); font-size: 15px; line-height: 1.6;
+  color: var(--text); white-space: pre-wrap; word-break: break-word;
+}
+
+/* -------------------------------------------------------------- results */
+
+.results-list { display: flex; flex-direction: column; gap: 8px; }
+.result {
+  display: block; width: 100%; text-align: left; cursor: pointer;
+  background: var(--panel); border: 1px solid var(--panel-border);
+  border-radius: var(--r-chip); padding: 11px 14px; color: inherit; font: inherit;
+}
+.result:hover { border-color: var(--hairline); }
+.result:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.result-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+.result-where { font-size: 12px; color: var(--text-strong); font-weight: 550; }
+.result-at { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.result-text { font-family: var(--read); font-size: 15px; line-height: 1.55; color: var(--text); }
+.result mark { background: rgba(56, 189, 248, 0.22); color: var(--text-strong); border-radius: 2px; padding: 0 1px; }
+
+/* --------------------------------------------------------------- banner */
+
+.banner {
+  position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%);
+  max-width: min(760px, 92vw);
+  background: var(--panel-raised); border: 1px solid var(--panel-border);
+  border-left: 3px solid var(--danger);
+  border-radius: var(--r-chip); padding: 12px 16px;
+  color: var(--text); font-size: 13px; line-height: 1.55;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
+  white-space: pre-wrap;
+  z-index: 20;
+}
+.banner.info { border-left-color: var(--focus); }
+.banner-close {
+  display: block; margin-top: 10px;
+  font-family: var(--ui); font-size: 11px; font-weight: 600;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: var(--text); background: var(--segment-track);
+  border: 1px solid var(--panel-border); border-radius: 8px;
+  padding: 5px 10px; cursor: pointer;
+}
+.banner-close:hover { background: var(--chip-pressed); color: var(--text-strong); }
+.banner-close:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* ------------------------------------------------------------ responsive */
+
+@media (max-width: 1100px) {
+  .panes, .panes:has(.pane-page:not([hidden])) { grid-template-columns: minmax(0, 1fr); }
+  .page-frame { height: 52vh; }
+}
+@media (max-width: 820px) {
+  body { overflow: auto; }
+  .shell { grid-template-columns: 1fr; height: auto; }
+  .library { border-right: 0; border-bottom: 1px solid var(--panel-border); max-height: 42vh; }
+
+  /* ⚠️ The search box **wraps to its own row** here; it must never be hidden.
+   *
+   * `display: none` was the first thing written and it is the bug class docs/M10-PORTRAIT.md
+   * exists about: a control that overflows at a narrow width and is therefore *absent* rather
+   * than merely cramped — reachable by no gesture, and invisible to a search of the DOM. It is
+   * worse here than in the app, because the welcome copy tells you to search, so the layout
+   * would be contradicting the page's own instructions. */
+  .topbar { height: auto; flex-wrap: wrap; padding-top: 8px; padding-bottom: 8px; row-gap: 8px; }
+  .brand { order: 1; }
+  .status { order: 2; margin-left: auto; }
+  .search { order: 3; flex-basis: 100%; max-width: none; margin: 0; }
+  .status-text { max-width: 22ch; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; scroll-behavior: auto !important; }
+}
+
+/* "Show it" beside a page marker — turns the PDF pane to that page. */
+.seg-jump {
+  font-family: var(--ui); font-size: 10px; font-weight: 600;
+  letter-spacing: 0.09em; text-transform: uppercase;
+  color: var(--focus); background: transparent;
+  border: 1px solid var(--panel-border); border-radius: 6px;
+  padding: 2px 7px; margin-left: 10px; cursor: pointer; white-space: nowrap;
+}
+.seg-jump:hover { border-color: var(--focus); }
+.seg-jump:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+/* ------------------------------------------------------------ sign in */
+
+.signin-body { overflow: auto; display: grid; place-items: center; }
+
+.signin {
+  width: min(420px, 92vw);
+  padding: 32px;
+  background: var(--panel);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-panel);
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+.signin-brand { margin-bottom: 26px; }
+.signin h1 {
+  font-family: var(--read); font-weight: 400; font-size: 26px; line-height: 1.25;
+  color: var(--text-strong); margin: 0 0 22px;
+}
+.signin-form { display: grid; gap: 8px; }
+.signin-form label { margin-bottom: 2px; }
+.signin-form input[type="password"] {
+  background: var(--segment-track);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--r-chip);
+  color: var(--text-strong);
+  font-family: var(--ui); font-size: 15px;
+  padding: 11px 13px;
+}
+.signin-form input[type="password"]:focus { outline: none; border-color: var(--focus); }
+.signin-go { margin-top: 6px; justify-self: start; padding: 9px 18px; }
+
+.signin-error {
+  margin: 16px 0 0; padding: 10px 13px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  border-left: 3px solid var(--danger);
+  border-radius: var(--r-chip);
+  color: var(--danger); font-size: 13px;
+}
+.signin-note { margin: 22px 0 0; font-size: 12px; line-height: 1.6; color: var(--faint); }
+.signin-note code { font-family: var(--mono); color: var(--muted); }
+
+
+/* ---------------------------------------------------- connect your Nextcloud */
+
+.connect { max-width: 60ch; margin: 6vh auto 0; }
+.connect h2 {
+  font-family: var(--read); font-weight: 400; font-size: 27px; line-height: 1.2;
+  color: var(--text-strong); margin: 0 0 14px;
+}
+.connect-lead { font-family: var(--read); font-size: 16.5px; line-height: 1.6; color: var(--text); margin: 0 0 22px; }
+.connect-lead strong { color: var(--text-strong); font-weight: 400; }
+
+.connect-form { display: grid; gap: 8px; margin-bottom: 20px; }
+.connect-form input {
+  background: var(--segment-track); border: 1px solid var(--panel-border);
+  border-radius: var(--r-chip); color: var(--text-strong);
+  font-family: var(--ui); font-size: 15px; padding: 11px 13px;
+}
+.connect-form input:focus { outline: none; border-color: var(--focus); }
+.chip-go { justify-self: start; padding: 9px 18px; }
+
+.connect-waiting {
+  border: 1px solid var(--panel-border); border-left: 3px solid var(--focus);
+  border-radius: var(--r-chip); padding: 14px 16px; margin-bottom: 18px;
+  background: rgba(56, 189, 248, 0.06);
+}
+.connect-waiting p { margin: 0 0 6px; font-size: 14px; color: var(--text); }
+.connect-waiting p:last-child { margin-bottom: 0; }
+.connect-link a { color: var(--focus); }
+
+.connect-error {
+  margin: 0 0 18px; padding: 11px 14px;
+  border: 1px solid rgba(248, 113, 113, 0.35); border-left: 3px solid var(--danger);
+  border-radius: var(--r-chip); color: var(--danger); font-size: 13.5px; line-height: 1.55;
+  white-space: pre-wrap;
+}
+.connect-note { font-size: 12.5px; line-height: 1.6; color: var(--faint); margin: 0; }
+.connect-note em { font-style: normal; color: var(--muted); }

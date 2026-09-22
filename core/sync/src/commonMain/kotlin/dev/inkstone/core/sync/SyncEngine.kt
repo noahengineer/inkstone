@@ -497,6 +497,78 @@ public class SyncEngine(
         return binding
     }
 
+    /**
+     * ⭐ **The user picked a PDF that was already on their Nextcloud and asked to write on it.**
+     *
+     * Neither [bind] nor [bindPulled] says this, and using either is a documented failure:
+     *
+     * - [bind] is *"save this new note somewhere"*. It derives a path from the title, enqueues a
+     *   MKCOL, and — because a fresh binding has no ETag and no `oc:id` — sends
+     *   `If-None-Match: *` at a file that **exists**. Permanent 412, parked for a day, the note
+     *   flagged `CONFLICTED`, and the park inherited by every later edit. That is the trap
+     *   [bindPulled]'s KDoc was written about, reached from the other direction.
+     * - [bindPulled] is *"this note came **from** the server, so nothing is owed"*. Here the local
+     *   note is emphatically **not** what the server holds: the server has a plain PDF, and this
+     *   note is that PDF plus SPEC §5.6's XMP marker and an embedded bundle. Claiming
+     *   `lastSyncedRev = localRev` would mean no upload is owed, and the file would stay unmarked.
+     *
+     * ⚠️ **And an unmarked file under a binding is a conflicted copy waiting to happen.** SPEC §5.6
+     * puts identity *in the file*, so `Reconciler.changed` reads a bound path whose bytes carry no
+     * marker as layer 3 — keep-both — which is right for a stranger's file arriving at a note's
+     * path and wrong for the one this device deliberately adopted. Anything that makes the pass
+     * download it lands there: a weak ETag ([RemoteWalk.unchanged] cannot answer for one), a proxy
+     * rewriting validators, or simply somebody touching the file. So the invariant *"a bound file
+     * carries this note's marker"* is restored **immediately**, by one upload, rather than left
+     * until the user happens to draw their first stroke.
+     *
+     * What makes that upload safe is the pair of facts this method records off the download:
+     * `lastSyncedEtag` guards the write with `If-Match`, so a file that changed since the user
+     * picked it 412s instead of being overwritten (CLAUDE.md rule 1); and `lastUploadAtEpochMillis`
+     * makes [RemoteBinding.everUploaded] true, which is what stops the drainer reaching for
+     * `If-None-Match: *`. The bytes themselves lose nothing — M4's `originalLength` rebase keeps
+     * the imported PDF as the verbatim prefix of everything this app ever publishes for it
+     * (docs/M4-PDF.md §7.3), so the file the user opens in Nextcloud Files renders exactly as it
+     * did, plus their ink.
+     *
+     * `lastSyncedRev` is **0 rather than the note's revision**, and that is the honest reading
+     * rather than a trick to force the enqueue: the server holds none of *this note's* revisions.
+     * What it holds is the PDF this note was made from, and the ETag is what remembers that.
+     *
+     * No MKCOL: the folder was listed in order to pick the file out of it, so it exists.
+     *
+     * @param observed the version the **download** reported — not the PROPFIND's, which may already
+     *   be stale by the time the bytes arrive. Same rule as `Reconciler.rememberForeign`.
+     * @return the binding, or null when the account is unknown.
+     */
+    public suspend fun bindAdopted(
+        noteId: DocumentId,
+        accountId: String,
+        remotePath: String,
+        observed: RemoteVersion,
+    ): RemoteBinding? {
+        accounts.find(accountId) ?: return null
+        val now = clock.nowEpochMillis()
+        val binding = RemoteBinding(
+            noteId = noteId,
+            accountId = accountId,
+            remotePath = remotePath,
+            remoteOcId = observed.ocId,
+            lastSyncedEtag = observed.etag,
+            lastSyncedRev = 0L,
+            lastUploadAtEpochMillis = now,
+            lastChecksum = observed.checksum,
+        )
+        bindings.upsert(binding)
+        notes.setSyncState(noteId, NoteSyncState.PENDING_UPLOAD, null)
+        // A halted or signed-out account queues nothing, exactly as [noteChanged] refuses to —
+        // a row that cannot drain is M5's silent stall. `resumeAccount` rebuilds it from the
+        // binding, and the marker lands then.
+        if (!canSend(accountId)) return binding
+        enqueue(noteId, OutboxOpType.UPLOAD, notes.localRev(noteId) ?: 0L, everUploaded = true, now = now)
+        scheduler.enqueueOutboxDrain()
+        return binding
+    }
+
     // -----------------------------------------------------------------------
 
     /**

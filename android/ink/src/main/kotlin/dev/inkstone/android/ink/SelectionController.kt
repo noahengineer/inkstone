@@ -6,6 +6,7 @@ import android.view.MotionEvent
 import androidx.annotation.ColorInt
 import dev.inkstone.core.model.Alignment
 import dev.inkstone.core.model.AlignmentGuides
+import dev.inkstone.core.model.BendDrag
 import dev.inkstone.core.model.Camera
 import dev.inkstone.core.model.ConnectorRoute
 import dev.inkstone.core.model.FractionalKey
@@ -29,6 +30,8 @@ import dev.inkstone.core.model.ShapePoint
 import dev.inkstone.core.model.ShapePointRole
 import dev.inkstone.core.model.ShapePoints
 import dev.inkstone.core.model.ShapeRecord
+import dev.inkstone.core.model.ShapeRegular
+import dev.inkstone.core.model.SnapGrid
 import dev.inkstone.core.model.TextBoxObject
 import kotlin.math.atan2
 import kotlin.math.hypot
@@ -87,6 +90,28 @@ public interface InkSelection {
     /** ROADMAP M8b — elbow and curved. Applies to connectors; a plain shape has no route. */
     public fun setRoute(route: ConnectorRoute)
 
+    /**
+     * ⭐ *"buttons for makeing it a perfect circle … or perfect triangle"* — one absolute op per
+     * shape, in one gesture.
+     *
+     * The arithmetic and the meaning of "regular" per kind are [ShapeRegular]'s: a closed shape
+     * has its **vertices** rewritten and a segment its rotation, and neither touches the scale —
+     * because a non-uniform matrix stretches the pen as well as the shape, which is what
+     * *"the line sizes get messed up"* was. A shape that is already regular writes nothing, so the
+     * chip cannot produce an undo entry that does nothing.
+     */
+    public fun makeRegular()
+
+    /**
+     * ⭐ *"should be able to say if its an arrow or not if its a line"* — one `SetTextContent` per
+     * segment, carrying [ShapeRecord.arrow].
+     *
+     * An override of the kind rather than a change to it; see that property for why the kind itself
+     * cannot move. Ignored for anything that is not a segment — a rectangle has no tip to put a
+     * head on, and a record saying it had one would be a value two builds could read differently.
+     */
+    public fun setArrowHead(shown: Boolean)
+
     /** How many selected objects are shapes, and how many of those are connectors. */
     public val shapeCounts: ShapeSelectionCounts
 
@@ -109,6 +134,71 @@ public interface InkSelection {
      * [shapeCounts] already makes).
      */
     public val soleImage: SelectedImage?
+
+    /**
+     * ⭐ The one selected text box, or null when the selection is not exactly one.
+     *
+     * [soleImage]'s argument, for the kind next door: *"Edit text"* acts on a single paragraph, and
+     * a bar offering it for a mixed selection would open a field over one of them at random. Asked
+     * for inside `onSelectionChanged` for the same reason as the rest — it is a property of the
+     * selection, and a second callback is a second thing to forget to fire.
+     *
+     * It carries the words and the format because the alternative is `:app` reading them back out
+     * of the fold, which is a second source for values the surface is already holding — and the
+     * mistake `tapImage` made when two layers each had their own idea of where an object was.
+     */
+    public val soleTextBox: SelectedText?
+
+    /**
+     * ⭐ ROADMAP M10 — the page-space box round the selection, or null when nothing is selected.
+     *
+     * Exposed because the redesign's contextual toolbars *float beside the object they act on*
+     * rather than living in a global bar, so `:app` has to know where the object is. The controller
+     * has maintained this for its own handles since M8a; publishing it is what stops `:app`
+     * recomputing a second, disagreeing box — which is precisely the mistake `tapImage` made when
+     * two tools each had their own idea of where a rotated picture was.
+     *
+     * ⚠️ Read at the same moment as [shapeCounts] and [soleImage] — inside `onSelectionChanged` —
+     * for the reason those two are: it is a *property of the selection*, and a second callback is a
+     * second thing to forget to fire.
+     */
+    public val bounds: PageRect?
+
+    /**
+     * ⭐ The page-space box every grip's **centre** sits inside — [bounds], plus the rotate grip that
+     * floats above it. Null when nothing is selected.
+     *
+     * Published so a toolbar can stay off the grips. The bar used to anchor to [bounds] with a 14 dp
+     * gap while the rotate grip floated 28 pt above the same edge, so the bar was drawn squarely over
+     * it: *"it covers the rotation handle for the object"*. Only the controller knows where its grips
+     * are, so it says so rather than `:app` copying the offset and drifting from it.
+     *
+     * Add [HANDLE_REACH_DP] round it on screen for the area a finger can actually grab.
+     */
+    public val chromeBounds: PageRect?
+
+    /**
+     * ⭐ True while a pen is **moving, resizing, rotating or reshaping** the selection — false for a
+     * lasso, and false between gestures.
+     *
+     * A floating bar is placed from [bounds] as they were when the gesture began, so during a drag
+     * it stands still over whatever the object is being dragged across and then jumps when the pen
+     * lifts: *"it only updates its position once you let go … which makes it hard to see what you
+     * are doing"*. Chasing the finger instead would be per-frame recomposition (CLAUDE.md rule 7),
+     * so `:app` hides the bar for the gesture. It changes exactly at pen-down and pen-up, which are
+     * both moments `onSelectionChanged` already fires.
+     */
+    public val isManipulating: Boolean
+
+    public companion object {
+        /**
+         * How far from a grip's centre a press still takes the grip, in dp on the glass.
+         *
+         * Public so a toolbar can keep out of it: the drawn grip is 6 dp, and a bar clear of the
+         * drawing but inside the touch target is a grip the user can see and cannot press.
+         */
+        public const val HANDLE_REACH_DP: Float = 22f
+    }
 }
 
 /**
@@ -128,14 +218,112 @@ public data class SelectedImage(
 )
 
 /**
- * What a selection contains, so the toolbar can offer only what applies.
+ * The single selected text box — what *"Edit text"* opens a field over.
+ *
+ * @property frame the box in its **own** space, which is [ObjectFormat.boxWidthPt] when the user has
+ *   dragged it and the payload's extents otherwise. The pair with [bounds] is what lets the editor
+ *   convert a handle drag in page points back into the frame it writes: a box that has also been
+ *   scaled has `bounds.width != frame.first`, and the ratio between them is the scale to divide by.
+ */
+public data class SelectedText(
+    val id: ObjectId,
+    val bounds: PageRect,
+    val widthPt: Float,
+    val heightPt: Float,
+    val text: String,
+    val format: ObjectFormat,
+    val style: ObjectStyle,
+)
+
+/**
+ * What the selection's shapes can *have done to them*, so the toolbar offers only what applies.
  *
  * ⚠️ Offering *"fill"* for a selection of pen strokes is a button that does nothing, which is the
- * dishonest-button problem `UndoStack.commit` exists to avoid one screen further down. The
- * toolbar shows the shape row only when [shapes] is non-zero and the route chip only when
- * [connectors] is.
+ * dishonest-button problem `UndoStack.commit` exists to avoid one screen further down. [shapes] and
+ * [connectors] were enough for that while every shape could be filled and only a rectangle could be
+ * rounded; they are not enough now. **Capabilities, not kinds** — a `ROUNDED` chip over a selected
+ * ellipse is the same dishonest button, one kind lower down.
+ *
+ * `:app` holds ids and counts and never the render state, so *"is there anything here I could
+ * round?"* has to be answered on this side.
+ *
+ * @param fillable how many have an interior ([ShapeGeometry.isFillable]).
+ * @param roundable how many have corners ([ShapeGeometry.roundsCorners]).
+ * @param rounded how many of those actually are rounded right now, so one toggle can show its state.
  */
-public data class ShapeSelectionCounts(val shapes: Int, val connectors: Int)
+public data class ShapeSelectionCounts(
+    val shapes: Int,
+    val connectors: Int,
+    val fillable: Int = 0,
+    val roundable: Int = 0,
+    val rounded: Int = 0,
+    /** ⭐ How many selected shapes [ShapeRegular] would actually change. */
+    val irregular: Int = 0,
+    /** ⭐ Segments — the only kind an arrowhead means anything for — and how many show one. */
+    val arrowable: Int = 0,
+    val arrowed: Int = 0,
+    /**
+     * ⭐ The kind every selected shape is, or null for a mixed or empty selection.
+     *
+     * Published so the bar can say **Circle** over an ellipse and **Equal** over a triangle rather
+     * than one word for all of them: "regular" is the concept and nobody thinks in it. `:app` maps
+     * the kind to the word, because a label is not a fact about the selection.
+     */
+    val soleKind: ShapeKind? = null,
+)
+
+/**
+ * [SelectedText] for a lone selected text box, or null for anything else. Top-level for
+ * `countShapes`'s reason — it costs [SelectionController] no size.
+ */
+private fun selectedTextOf(dry: DryObject?): SelectedText? {
+    val box = dry as? DryTextBox ?: return null
+    val bounds = box.pageBounds ?: return null
+    return SelectedText(
+        id = box.id,
+        bounds = PageRect(bounds.xMin, bounds.yMin, bounds.xMax, bounds.yMax),
+        // The **live** frame, not `source.widthPt`: the payload is first-write-wins and says how big
+        // the box was placed, which stops being the truth the first time a handle is dragged
+        // (`DryBox.widthPt`).
+        widthPt = box.widthPt,
+        heightPt = box.heightPt,
+        // The register, then the payload — `PageFolder.materialise` copies the winning
+        // `SetTextContent` onto the payload, so the two agree today and only one of them is the
+        // source (`InkstonePdfMaterializer.textBoxFor` makes the same choice).
+        text = box.content ?: box.source.text,
+        format = box.decodedFormat,
+        style = box.effectiveStyle(),
+    )
+}
+
+/** [ShapeSelectionCounts] over the selection's shapes. Top-level so it costs the class no size. */
+private fun countShapes(shapes: List<DryShape>): ShapeSelectionCounts {
+    val roundable = shapes.filter { ShapeGeometry.roundsCorners(it.obj.shape) }
+    // ⚠️ A **connector** is left out of the arrow count deliberately, and not because a head would
+    // not draw: `ConnectorRouting` re-derives its geometry every fold, so a head follows the route
+    // perfectly well. It is left out because the two chips would then disagree about the same
+    // object — the route chips already own a connector's ends — and because the head a connector
+    // carries came from the tool that drew it. Say so here, once, rather than in the bar.
+    val segments = shapes.filter { ShapeGeometry.bends(it.obj.shape) && !it.isConnector }
+    return ShapeSelectionCounts(
+        shapes = shapes.size,
+        connectors = shapes.count { it.isConnector },
+        fillable = shapes.count { ShapeGeometry.isFillable(it.obj.shape) },
+        roundable = roundable.size,
+        rounded = roundable.count { it.record.cornerRadiusPt > 0f },
+        irregular = shapes.count { !it.isRegular },
+        arrowable = segments.size,
+        arrowed = segments.count { it.hasArrowHead },
+        soleKind = shapes.map { it.obj.shape }.distinct().singleOrNull(),
+    )
+}
+
+/**
+ * Whether [ShapeRegular] would leave this shape alone — asked of the **live** outline and matrix,
+ * never of the payload, so the chip disappears the moment the press has done its work.
+ */
+private val DryShape.isRegular: Boolean
+    get() = ShapeRegular.isRegular(obj.shape, obj.widthPt, obj.heightPt, record.points, transform)
 
 /**
  * ⭐ ROADMAP M8a — the selection gesture: lasso, move, resize, rotate.
@@ -187,6 +375,16 @@ internal class SelectionController(
     private val pixelsPerPoint: Float,
     private val onPreview: () -> Unit,
     private val onChanged: () -> Unit,
+    /**
+     * ⭐ A tap that landed on nothing — *"if you just tap the screen it unselects **and exits the
+     * select tool**"*.
+     *
+     * Reported here rather than inferred from [onChanged] because the two are different facts: a
+     * selection can empty for half a dozen reasons (an undo, a peer's delete, an erase), and only
+     * one of them is a person tapping bare paper to say *"I am done"*. Inferring it would put the
+     * user back on the pen because a collaborator deleted something.
+     */
+    private val onTappedAway: () -> Unit = {},
 ) : InkSelection {
 
     /** What the gesture in flight is doing. */
@@ -197,8 +395,18 @@ internal class SelectionController(
         private set
 
     /** The page-space box round [selection], or null when nothing is selected. */
-    var bounds: PageRect? = null
+    override var bounds: PageRect? = null
         private set
+
+    /**
+     * [bounds] stretched up to the rotate grip. Every selection has one — the point handles replace
+     * the eight frame grips, never the rotate grip (see [gripAt]) — so this is unconditional.
+     */
+    override val chromeBounds: PageRect?
+        get() = bounds?.let { PageRect(it.left, it.top - SelectionHandle.ROTATE_OFFSET_PT, it.right, it.bottom) }
+
+    /** A lasso is excluded: it replaces the selection rather than moving it. */
+    override val isManipulating: Boolean get() = isActive && mode != Mode.LASSO
 
     /** The lasso being drawn, in page space, or null. Read by the overlay. */
     var lasso: List<PagePoint>? = null
@@ -232,6 +440,15 @@ internal class SelectionController(
      */
     var marquee: Boolean = false
 
+    /**
+     * ⭐ The lattice a shape drag lands on — see [InkSurfaceView.gridSnapEnabled].
+     *
+     * [SnapGrid.None] when the setting is off. Read **once per gesture** into [gestureGrid]: a
+     * toggle flipped mid-drag must not change what the finger is already doing, for the same
+     * reason [lassoIsRectangle] is latched at pen-down.
+     */
+    var grid: SnapGrid = SnapGrid.None
+
     /** [marquee] as it was when the gesture began — see [begin]. */
     private var lassoIsRectangle = false
 
@@ -264,6 +481,13 @@ internal class SelectionController(
 
     /** Snap positions of everything *not* selected, built once per gesture — the guides' targets. */
     private var guideTargets: AlignmentGuides.AlignmentTargets? = null
+
+    /**
+     * ⭐ [grid] as it applies to **this** gesture, or [SnapGrid.None].
+     *
+     * Shapes only — the predicate and the reasoning behind it are [StrokeStore.gridFor]'s.
+     */
+    private var gestureGrid: SnapGrid = SnapGrid.None
 
     /** The snap radius in page points, refreshed per event. The camera cannot change mid-gesture. */
     private var snapTolerancePt = 0f
@@ -330,7 +554,11 @@ internal class SelectionController(
                 alignment = AlignmentGuides.forMove(moved, targets, snapTolerancePt)
             }
         }
-        if (isBendGesture()) previewBend() else preview(currentGesture())
+        when {
+            isBendGesture() -> previewBend()
+            isVertexGesture() -> previewPoints()
+            else -> preview(currentGesture())
+        }
         onPreview()
     }
 
@@ -355,9 +583,21 @@ internal class SelectionController(
         val handle = gripAt(box, reach, claimedByAPoint = point != null)
         mode = when {
             point != null -> Mode.POINT
+
             handle == SelectionHandle.ROTATE -> Mode.ROTATE
+
             handle != null -> Mode.RESIZE
-            box != null && box.containsWithin(start.x, start.y, 0f) -> Mode.MOVE
+
+            // ⚠️ **[tapSlop], not `0f`.** A selection box can legitimately be a hairline — a
+            // straight segment's is (`ShapeEdit.placeSegment` gives it the pen's width as its
+            // band, and an axis-aligned one collapses that to nothing in page space) — and with
+            // no slop the press then lands *outside* a box drawn right under the user's finger.
+            // It fell through to [Mode.LASSO], which moves nothing and clears the selection on
+            // the way past. The same 8 dp that decides "you tapped this object" in [objectAt] is
+            // the honest answer to "you grabbed this selection"; the two used to measure
+            // different quantities for one decision, which is a trap this repo has sprung before.
+            box != null && box.containsWithin(start.x, start.y, tapSlop(camera)) -> Mode.MOVE
+
             else -> Mode.LASSO
         }
 
@@ -384,9 +624,55 @@ internal class SelectionController(
                 } else {
                     null
                 }
+                gestureGrid = store.gridFor(selection, grid)
             }
         }
         onChanged()
+    }
+
+    /**
+     * ⭐ Hand a **live** pointer straight to the point handle under it.
+     *
+     * Draw a line, hold, and it snaps — and the pen is still on the glass, resting on the end of
+     * what was just drawn, which is exactly where that shape's endpoint handle now is. This is what
+     * lets the same unbroken gesture carry on into adjusting it: no lift, no re-aim, no hunting for
+     * a 6 dp circle. `InkSurfaceView` calls it the instant a snap lands.
+     *
+     * ⚠️ **[Mode.POINT] or nothing.** It deliberately does not fall through to [Mode.MOVE] or
+     * [Mode.LASSO] the way [begin] does. Falling through to MOVE would mean a pen that twitched
+     * after a snap dragged the whole shape off its own ink; falling through to LASSO would mean it
+     * drew a marquee that, on the lift, *replaced* the selection of the shape just made. Both are
+     * silent, and both undo work the user thought was finished. If there is no handle under the
+     * pen this answers false and the surface leaves the pointer alone.
+     *
+     * @return true when a handle was there and the drag is now live on [pointerId].
+     */
+    fun beginPointDrag(pageX: Float, pageY: Float, pointerId: Int, camera: Camera, pageSize: PageSize): Boolean {
+        if (isActive) return false
+        val point = pointAt(pageX, pageY, handleReach(camera)) ?: return false
+        val shape = soleShape()?.asPointTarget() ?: return false
+
+        this.pointerId = pointerId
+        this.pageSize = pageSize
+        start.set(pageX, pageY)
+        current.set(start)
+        alignment = Alignment.None
+        snapTolerancePt = snapTolerance(camera)
+        straightenTolerancePt = straightenTolerance(camera)
+
+        mode = Mode.POINT
+        startHandle = null
+        startPoint = point
+        // The placement as it is *now* — every frame solves the drag against where the shape
+        // started, so composing against what is on screen would apply the gesture once per frame.
+        startShape = shape
+        startBounds = bounds
+        startSelected = store.selected(selection)
+        guideTargets = null
+        // [soleShape] has already proved this is one shape, so the predicate would only ask again.
+        gestureGrid = grid
+        onChanged()
+        return true
     }
 
     /**
@@ -439,7 +725,11 @@ internal class SelectionController(
             // same inputs, so the last preview runs synchronously before the commit reads it.
             unschedulePreview()
             flushPreview()
-            if (isBendGesture()) commitBend() else commit(currentGesture())
+            when {
+                isBendGesture() -> commitBend()
+                isVertexGesture() -> commitPoints()
+                else -> commit(currentGesture())
+            }
         }
         finishGesture()
     }
@@ -448,9 +738,10 @@ internal class SelectionController(
     fun cancel() {
         if (mode != Mode.LASSO) {
             for (obj in startSelected) store.previewTransform(obj.id, obj.transform)
-            // A bend previews through its own register, so restoring the transforms does not undo
-            // it. Null is "no preview", which puts the shape back to whatever its record says.
-            startShape?.let { store.previewBend(it.id, null) }
+            // A bend and a vertex list preview through their own register, so restoring the
+            // transforms does not undo them. Null is "no preview", which puts the shape back to
+            // whatever its record says.
+            startShape?.let { store.endShapePreview(it.id) }
             refreshBounds()
         }
         finishGesture()
@@ -468,6 +759,7 @@ internal class SelectionController(
         startPoint = null
         startShape = null
         guideTargets = null
+        gestureGrid = SnapGrid.None
         onChanged()
     }
 
@@ -525,6 +817,11 @@ internal class SelectionController(
             else -> store.objectsIn(Lasso.freehand(points))
         }
         select(hits)
+        // ⭐ A tap on bare paper is the gesture for *"done"*: it clears the selection, and now it
+        // also hands the tool back. Only for a **tap that hit nothing** — a tap that selects
+        // something is the opposite intention, and a lasso that happens to enclose nothing is a
+        // gesture the user is still in the middle of.
+        if (isTap && hits.isEmpty()) onTappedAway()
     }
 
     fun select(ids: List<ObjectId>) {
@@ -584,8 +881,13 @@ internal class SelectionController(
      */
     private fun editablePoints(): List<PointHandle> {
         val shape = soleShape() ?: return emptyList()
-        return ShapePoints.of(shape.obj.shape, shape.obj.widthPt, shape.obj.heightPt, shape.bendNow())
-            .map { PointHandle(it, shape.transform.map(it.local)) }
+        return ShapePoints.of(
+            kind = shape.obj.shape,
+            widthPt = shape.obj.widthPt,
+            heightPt = shape.obj.heightPt,
+            bendLocal = shape.bendNow(),
+            points = shape.pointsNow(),
+        ).map { PointHandle(it, shape.transform.map(it.local)) }
     }
 
     // -----------------------------------------------------------------------
@@ -600,9 +902,17 @@ internal class SelectionController(
      */
     private fun currentGesture(): Matrix3? = when (mode) {
         Mode.MOVE -> moveGesture()
+
         Mode.RESIZE -> resizeGesture()
+
         Mode.ROTATE -> rotateGesture()
-        Mode.POINT -> pointGesture()
+
+        // ⭐ Null, and the branch is spelled out rather than folded into `LASSO` because it is the
+        // statement of a rule: **a point drag never writes a placement.** Both of its handles write
+        // geometry into the record instead, which is what *"i dont want any shape to do that no
+        // matter what"* asked for. `flushPreview` and `end` route it before this is reached.
+        Mode.POINT -> null
+
         Mode.LASSO -> null
     }
 
@@ -616,8 +926,14 @@ internal class SelectionController(
     // The gestures themselves — all page-space, all pivot-explicit (SelectionGesture)
     // -----------------------------------------------------------------------
 
-    private fun moveGesture(): Matrix3 =
-        SelectionGesture.move(current.x - start.x + alignment.dx, current.y - start.y + alignment.dy)
+    /** The finger, the guides and the lattice — see [SnapGrid.moveBy], which is all three. */
+    private fun moveGesture(): Matrix3 {
+        val dx = current.x - start.x
+        val dy = current.y - start.y
+        val box = startBounds ?: return SelectionGesture.move(dx + alignment.dx, dy + alignment.dy)
+        val delta = gestureGrid.moveBy(box, dx, dy, alignment)
+        return SelectionGesture.move(delta.x, delta.y)
+    }
 
     /**
      * The resize a handle drag describes.
@@ -630,7 +946,11 @@ internal class SelectionController(
     private fun resizeGesture(): Matrix3? {
         val from = startBounds ?: return null
         val handle = startHandle ?: return null
-        val to = handle.resize(from, current.x - start.x, current.y - start.y, minimumSize(from))
+        val minimum = minimumSize(from)
+        // ⭐ The grid rounds the edges this handle moved, and only those — see [SnapGrid.snappedResize],
+        // which is also where a corner drag gives up its aspect ratio and why.
+        val dragged = handle.resize(from, current.x - start.x, current.y - start.y, minimum)
+        val to = gestureGrid.snappedResize(from, dragged, minimum)
         return SelectionGesture.resize(from, to)
     }
 
@@ -658,7 +978,8 @@ internal class SelectionController(
      */
     private fun soleShape(): DryShape? = selection.singleOrNull()?.let { store.shapeOf(it) }?.takeIf { !it.isConnector }
 
-    private fun DryShape.asPointTarget() = PointTarget(id, obj.shape, obj.widthPt, obj.heightPt, transform)
+    private fun DryShape.asPointTarget() =
+        PointTarget(id, obj.shape, obj.widthPt, obj.heightPt, transform, record.points)
 
     /**
      * ⭐ Which **frame** grip the press at [start] claims — and the rule that keeps the two sets of
@@ -693,39 +1014,98 @@ internal class SelectionController(
         return best
     }
 
-    /** True while the finger is on a segment's middle handle — the one that writes a register. */
+    /**
+     * ⭐ Which of the three routes the handle under the finger takes.
+     *
+     * A segment's middle handle and every vertex of a closed shape write **geometry** into the
+     * `SetTextContent` record; only a segment's two ends still write a placement, because a
+     * placement expresses those exactly. See `ShapePoints` for why the split is where it is.
+     */
     private fun isBendGesture(): Boolean = mode == Mode.POINT && startPoint?.role == ShapePointRole.BEND
 
-    private fun pointGesture(): Matrix3? {
+    /**
+     * ⭐ Every handle that is not the bend, for **every** kind.
+     *
+     * Every kind edits its points now — a segment's ends stopped being a placement edit when *"i
+     * dont want any shape to do that no matter what"* arrived — so the only question left is which
+     * of the two registers this drag writes.
+     */
+    private fun isVertexGesture(): Boolean = mode == Mode.POINT && startPoint?.role == ShapePointRole.VERTEX
+
+    /** What the bend drag currently means: what to draw, and what to store. See [BendDrag]. */
+    private fun currentBend(): BendDrag? {
         val target = startShape ?: return null
-        val point = startPoint ?: return null
-        return ShapePoints.gesture(
-            kind = target.kind,
+        return ShapePoints.bend(
             widthPt = target.widthPt,
             heightPt = target.heightPt,
             transform = target.transform,
-            point = point,
-            toPage = PagePoint(current.x, current.y),
-        )
-    }
-
-    /** Where the bend is right now, in the shape's own space, or null for straight. */
-    private fun currentBend(): PagePoint? {
-        val target = startShape ?: return null
-        return ShapePoints.bend(
-            heightPt = target.heightPt,
-            transform = target.transform,
-            toPage = PagePoint(current.x, current.y),
+            // ⚠️ The *edited* endpoints, so "is this straight" is measured against the chord the
+            // user can see rather than the payload's original one.
+            points = target.points,
+            // The apex lands on the lattice too, so a curve drawn on a grid is as repeatable as
+            // the box beside it. A snap onto the chord straightens the line, which is what the
+            // handle sitting on the chord already means.
+            toPage = gestureGrid.snap(PagePoint(current.x, current.y)),
             straightenTolerancePt = straightenTolerancePt,
         )
     }
 
     private fun previewBend() {
         val target = startShape ?: return
-        store.previewBend(target.id, currentBend())
+        val drag = currentBend() ?: return
+        // ⚠️ [BendDrag.preview], never [BendDrag.stored]. The stored value is null once the drag has
+        // straightened the line, and a null preview means *"stop previewing"* — which fell back to
+        // the record and sprang the curve back to its original arc with the finger still down.
+        store.previewBend(target.id, drag.preview)
         // The curve's own extent moved, and so did the handle sitting on it — both are read out of
         // the store by [refreshBounds], which is why the bend preview goes through it and a
         // transform preview does too.
+        refreshBounds()
+    }
+
+    /** Where the dragged vertex is now, in the shape's own space, with the others untouched. */
+    private fun currentPoints(): List<PagePoint>? {
+        val target = startShape ?: return null
+        val point = startPoint ?: return null
+        // ⭐ Snapped in **page** space, before the shape's own transform is undone: the lattice is a
+        // fact about the paper, and rounding in the shape's space would round to a rotated, scaled
+        // grid that nothing draws.
+        val dragged = gestureGrid.snap(PagePoint(current.x, current.y))
+        val local = ShapePoints.toLocal(target.transform, dragged) ?: return null
+        return ShapePoints.moved(
+            kind = target.kind,
+            widthPt = target.widthPt,
+            heightPt = target.heightPt,
+            current = target.points,
+            index = point.index,
+            toLocal = local,
+        )
+    }
+
+    private fun previewPoints() {
+        val target = startShape ?: return
+        // A solve that failed leaves the last preview standing rather than ending it: dropping the
+        // preview mid-drag is the springing-back bug the bend had, one kind over.
+        val points = currentPoints() ?: return
+        store.previewPoints(target.id, points)
+        refreshBounds()
+    }
+
+    /**
+     * One `SetTextContent` carrying the whole vertex list — absolute, like every register here.
+     *
+     * ⚠️ **The list is whole and not a diff**, and that is CLAUDE.md rule 8 rather than a
+     * convenience: two devices dragging *different* corners concurrently would, with deltas, produce
+     * a shape neither of them drew. Whole means one of the two edits wins intact — SPEC §4.8.2's
+     * stated cost, and the same one a fill already pays.
+     */
+    private fun commitPoints() {
+        val target = startShape ?: return
+        val points = currentPoints()
+        editRecords { shape, record ->
+            if (points != null) record.copy(points = points) else null
+        }
+        store.endShapePreview(target.id)
         refreshBounds()
     }
 
@@ -740,7 +1120,7 @@ internal class SelectionController(
      */
     private fun commitBend() {
         val target = startShape ?: return
-        val bend = currentBend()
+        val bend = currentBend()?.stored
         editRecords { shape, record ->
             // The kind test is the same one the geometry makes, so a bend cannot be written onto
             // something that would ignore it — a filled record on a line's sibling problem
@@ -750,7 +1130,7 @@ internal class SelectionController(
         // The register is the truth again. `setRecord` clears the preview when an op actually
         // lands, and this covers the case where none did — a drag that ended where it started
         // writes nothing and must still stop previewing.
-        store.previewBend(target.id, null)
+        store.endShapePreview(target.id)
         refreshBounds()
     }
 
@@ -804,8 +1184,54 @@ internal class SelectionController(
         select(emptyList())
     }
 
+    /**
+     * ⭐ The outline **and** the fill, as one gesture.
+     *
+     * ⚠️ It was `restyle { it.copy(colorArgb = …) }` and nothing else, and for a *filled* shape that
+     * changed the outline and left the interior the colour it always was — reported as *"if you
+     * change colour of a shape, a filled shape does not work with those colour changes"*. The two
+     * live in different registers by design: a stroke's colour is `SetStyle`'s [ObjectStyle], and a
+     * shape's fill is `fillArgb` inside the `SetTextContent` record (SPEC §4.8.2). Recolouring wrote
+     * one of them.
+     *
+     * They are recoloured together rather than separately because there is no UI for a fill colour
+     * of its own — [setFill] takes the pen's colour — so *"make this shape red"* is the only thing a
+     * user can mean. [ShapeRecord.fillOpacity] is untouched, so a translucent fill stays translucent
+     * and only its hue moves.
+     *
+     * ⚠️ **One gesture, which is why this does not simply call [restyle] and then [editRecords].**
+     * Each of those applies two batches of its own, so the pair would be four — and an undo would
+     * put the outline back while leaving the interior recoloured, which is a worse state than either
+     * end. The baselines go in one batch and the changes in the other, exactly as each half does
+     * alone; see [restyle] on why a baseline is needed at all and why it costs no undo entry.
+     */
     override fun recolour(colorArgb: Int) {
-        restyle { style -> style.copy(colorArgb = colorArgb) }
+        val recorder = store.recorder ?: return
+        if (selection.isEmpty()) return
+
+        // Only shapes that are *actually* filled. A hollow one has no interior to recolour, and
+        // writing `fillArgb` into it would fill it as a side effect of changing its colour.
+        val filled = selection
+            .mapNotNull { store.shapeOf(it) }
+            .filter { it.record.fillArgb != null }
+
+        applyAsGesture(
+            styleBaseline(recorder) +
+                filled.filter { it.record.isDefault }.map { shape ->
+                    ShapeEdit.writeRecord(shape.id, shape.record, recorder::newOpId, recorder::newClock)
+                },
+        )
+        applyAsGesture(
+            styleChange(recorder) { style -> style.copy(colorArgb = colorArgb) } +
+                filled.mapNotNull { shape ->
+                    val next = shape.record.copy(fillArgb = colorArgb)
+                    if (next == shape.record) {
+                        null
+                    } else {
+                        ShapeEdit.writeRecord(shape.id, next, recorder::newOpId, recorder::newClock)
+                    }
+                },
+        )
     }
 
     override fun setWidth(widthDp: Float) {
@@ -840,10 +1266,7 @@ internal class SelectionController(
     // --- The record's own properties (M8b) ----------------------------------
 
     override val shapeCounts: ShapeSelectionCounts
-        get() {
-            val shapes = selection.mapNotNull { store.shapeOf(it) }
-            return ShapeSelectionCounts(shapes.size, shapes.count { it.isConnector })
-        }
+        get() = countShapes(selection.mapNotNull { store.shapeOf(it) })
 
     /**
      * Exactly one, deliberately. Rotate, flip and crop each act on a single picture, and a bar that
@@ -862,6 +1285,10 @@ internal class SelectionController(
                 format = image.decodedFormat,
             )
         }
+
+    /** Exactly one, for [soleImage]'s reason — a field can only be opened over one paragraph. */
+    override val soleTextBox: SelectedText?
+        get() = selectedTextOf(selection.singleOrNull()?.let { store.objectOf(it) })
 
     override fun setFill(colorArgb: Int?, opacity: Float) = editRecords { shape, record ->
         // A line has no interior. Refused here rather than written and ignored by the painter,
@@ -882,6 +1309,79 @@ internal class SelectionController(
         // A plain shape has no route, and writing one would put a string in the file for every
         // rectangle in the selection — see `ShapeEdit.create` on why a default record is omitted.
         if (!record.isConnector) null else record.copy(route = route)
+    }
+
+    override fun setArrowHead(shown: Boolean) = editRecords { shape, record ->
+        // Refused for anything that is not a segment, and for a connector — `countShapes` says why
+        // the second one, and the first is `setFill`'s rule: a record that claims a head for a
+        // rectangle is a value a later build could act on.
+        if (!ShapeGeometry.bends(shape.obj.shape) || record.isConnector) null else record.copy(arrow = shown)
+    }
+
+    override fun makeRegular() {
+        applyShapeGeometry { shape ->
+            // ⚠️ The **live** vertex list, so pressing this twice is a no-op rather than a second
+            // identical write — and so the chip disappears once there is nothing left to do.
+            val edit = ShapeRegular.regularise(
+                shape.obj.shape,
+                shape.obj.widthPt,
+                shape.obj.heightPt,
+                shape.record.points,
+                shape.transform,
+            )
+            ShapeChange(
+                transform = edit?.transform,
+                record = edit?.points?.let { shape.record.copy(points = it) },
+            )
+        }
+    }
+
+    /**
+     * ⭐ The two actions that change a shape's **geometry from a button**, as one gesture each.
+     *
+     * ⚠️ **One batch**, which is why this exists rather than a call to [editRecords] or to
+     * [commit]: the two are different ops for different kinds of the same gesture — a segment moves
+     * its box and a closed shape its vertices — and a selection can hold both. Two batches would be
+     * two undo entries for one press. `applyAsGesture` is one `beginEdit`/`endEdit` bracket, which
+     * is one entry (SPEC §4.6).
+     *
+     * ⚠️ The record **baseline** comes first and in its own batch, exactly as [editRecords] does and
+     * for the identical reason: `SetTextContent` cannot say "unset", so the first record any plain
+     * shape gets has no inverse and `UndoStack.commit` would drop the whole gesture — the press
+     * eaten, the shape changed. Its own inverse is empty, so it adds no entry of its own.
+     */
+    private fun applyShapeGeometry(change: (DryShape) -> ShapeChange) {
+        val recorder = store.recorder ?: return
+        val edits = selection.mapNotNull { id ->
+            val shape = store.shapeOf(id) ?: return@mapNotNull null
+            val next = change(shape)
+            if (next.isEmpty || next.record == shape.record) return@mapNotNull null
+            shape to next
+        }
+        if (edits.isEmpty()) return
+        applyAsGesture(
+            edits
+                .filter { (shape, next) -> next.record != null && shape.record.isDefault }
+                .map { (shape, _) ->
+                    ShapeEdit.writeRecord(shape.id, shape.record, recorder::newOpId, recorder::newClock)
+                },
+        )
+        val matrices = edits.mapNotNull { (shape, next) -> next.transform?.let { shape.id to it } }.toMap()
+        val moves = SelectionEdit.transformEach(
+            store.selected(matrices.keys),
+            { obj -> matrices[obj.id] },
+            recorder::newOpId,
+            recorder::newClock,
+        )
+        val records = edits.mapNotNull { (shape, next) ->
+            next.record?.let { ShapeEdit.writeRecord(shape.id, it, recorder::newOpId, recorder::newClock) }
+        }
+        applyAsGesture(moves + records)
+    }
+
+    /** What one shape's geometry button changes: a placement, a record, or both. */
+    private class ShapeChange(val transform: Matrix3?, val record: ShapeRecord?) {
+        val isEmpty: Boolean get() = transform == null && record == null
     }
 
     /**
@@ -951,35 +1451,43 @@ internal class SelectionController(
     private fun restyle(change: (ObjectStyle) -> ObjectStyle) {
         val recorder = store.recorder ?: return
         if (selection.isEmpty()) return
-        val baseline = selection
-            .mapNotNull { store.objectOf(it) }
-            .filter { it.style == null }
-            .mapNotNull { dry ->
-                dry.baselineStyle()?.let { style ->
-                    PageOp.SetStyle(recorder.newOpId(), recorder.newClock(), dry.id, style)
-                }
-            }
-        applyAsGesture(baseline)
-        applyAsGesture(
-            SelectionEdit.restyle(
-                objects = store.selected(selection),
-                // Each object's own style, with the one field the user changed. After the
-                // baseline above, `style` is non-null for every object in the selection, so the
-                // fallback is unreachable in practice — and it is [baselineStyle] rather than
-                // an invented default so that if it ever *is* reached, the object keeps what it
-                // is painted with instead of turning black. ⚠️ `objectOf`, never `strokeOf`:
-                // reading through `strokeOf` answered null for a shape, the DEFAULT_STYLE
-                // fallback fired, and recolouring a shape reset its width to 3 pt while
-                // set-width recoloured it black — the M8a/M8b seam bug.
-                styleOf = { obj ->
-                    val dry = store.objectOf(obj.id)
-                    change(dry?.style ?: dry?.baselineStyle() ?: DEFAULT_STYLE)
-                },
-                nextOpId = recorder::newOpId,
-                nextClock = recorder::newClock,
-            ),
-        )
+        applyAsGesture(styleBaseline(recorder))
+        applyAsGesture(styleChange(recorder, change))
     }
+
+    /**
+     * The "write what it already looks like" half. See [restyle]'s KDoc for why it exists.
+     *
+     * Split out of [restyle] so [recolour] can put it in the *same* batch as the record baseline it
+     * also needs — two halves of one gesture rather than two gestures.
+     */
+    private fun styleBaseline(recorder: PageOpRecorder): List<PageOp> = selection
+        .mapNotNull { store.objectOf(it) }
+        .filter { it.style == null }
+        .mapNotNull { dry ->
+            dry.baselineStyle()?.let { style ->
+                PageOp.SetStyle(recorder.newOpId(), recorder.newClock(), dry.id, style)
+            }
+        }
+
+    /** The change half of [restyle], for the same reason [styleBaseline] is separate. */
+    private fun styleChange(recorder: PageOpRecorder, change: (ObjectStyle) -> ObjectStyle): List<PageOp> =
+        SelectionEdit.restyle(
+            objects = store.selected(selection),
+            // Each object's own style, with the one field the user changed. After the baseline,
+            // `style` is non-null for every object in the selection, so the fallback is unreachable
+            // in practice — and it is [baselineStyle] rather than an invented default so that if it
+            // ever *is* reached, the object keeps what it is painted with instead of turning black.
+            // ⚠️ `objectOf`, never `strokeOf`: reading through `strokeOf` answered null for a shape,
+            // the DEFAULT_STYLE fallback fired, and recolouring a shape reset its width to 3 pt
+            // while set-width recoloured it black — the M8a/M8b seam bug.
+            styleOf = { obj ->
+                val dry = store.objectOf(obj.id)
+                change(dry?.style ?: dry?.baselineStyle() ?: DEFAULT_STYLE)
+            },
+            nextOpId = recorder::newOpId,
+            nextClock = recorder::newClock,
+        )
 
     /**
      * Copy the selection, offset so the copy is visibly a copy, and select it.
@@ -1144,7 +1652,9 @@ internal class SelectionController(
 
     private companion object {
         const val LASSO_STEP_PT = 1.5f
-        const val HANDLE_TOUCH_DP = 22f
+
+        /** One number for the hit test and for the toolbar that keeps out of it. */
+        const val HANDLE_TOUCH_DP = InkSelection.HANDLE_REACH_DP
         const val TAP_SLOP_DP = 8f
 
         /**
@@ -1203,6 +1713,8 @@ internal data class PointTarget(
     val widthPt: Float,
     val heightPt: Float,
     val transform: Matrix3,
+    /** The record's vertices at pen-down, or null if this shape has never been point-edited. */
+    val points: List<PagePoint>?,
 )
 
 /** The style a stroke was drawn with, read off its brush — see [SelectionController.restyle]. */

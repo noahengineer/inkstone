@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- `same-origin`, matching signin.html. `no-referrer` makes Chrome send `Origin: null` on a
+     form-submission navigation, which this server's own cross-origin check then refuses — see the
+     longer note in signin.html. This page has no form today; it is kept identical so that adding
+     one cannot resurrect the bug. -->
+<meta name="referrer" content="same-origin">
+<title>Inkstone reader</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2309090B'/><path d='M8 22 L16 9 L24 22' stroke='%23E4E4E7' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <span class="brand-name">Inkstone</span>
+    <span class="brand-sub">reader</span>
+  </div>
+
+  <form class="search" id="search-form" role="search">
+    <input id="search-input" type="search" placeholder="Search what was said, and what you wrote"
+           autocomplete="off" spellcheck="false" aria-label="Search transcripts and handwriting">
+    <button class="chip" type="submit">Search</button>
+  </form>
+
+  <div class="status" id="status">
+    <span class="dot" id="status-dot"></span>
+    <span class="status-text" id="status-text">connecting…</span>
+  </div>
+</header>
+
+<main class="shell">
+
+  <nav class="library" id="library" aria-label="Library">
+    <div class="library-head">
+      <span class="micro">Library</span>
+      <button class="chip chip-quiet" id="refresh" title="Walk Nextcloud again">Refresh</button>
+    </div>
+    <div class="library-filter">
+      <button class="chip chip-tab is-active" data-filter="all">All</button>
+      <button class="chip chip-tab" data-filter="lectures">Lectures</button>
+      <button class="chip chip-tab" data-filter="notes">Notes</button>
+    </div>
+    <div id="library-list" class="library-list">
+      <p class="empty">Walking your Nextcloud…</p>
+    </div>
+    <div class="library-foot" id="library-foot"></div>
+  </nav>
+
+  <section class="stage" id="stage">
+    <div class="welcome" id="welcome">
+      <h1>The page kept <em>58.5</em>.<br>This keeps the twenty minutes around it.</h1>
+      <p>
+        Every lesson you recorded is here with its transcript and the record of when
+        you were writing. Pick one from the library, or search for something that was said.
+      </p>
+      <ul class="legend">
+        <li><span class="swatch swatch-ink"></span> when the pen was moving</li>
+        <li><span class="swatch swatch-voice"></span> when somebody was talking</li>
+        <li><span class="swatch swatch-quiet"></span> neither — working time</li>
+      </ul>
+    </div>
+
+    <article class="lecture" id="lecture" hidden>
+      <div class="lecture-head">
+        <div class="lecture-id">
+          <h2 id="lecture-title">—</h2>
+          <p class="lecture-meta" id="lecture-meta"></p>
+        </div>
+        <div class="lecture-actions" id="lecture-actions"></div>
+      </div>
+
+      <div class="ribbon-wrap">
+        <!-- ⚠️ `role="slider"`, not `role="img"`. It was an image with an aria-label that told a
+             screen-reader user to "click or drag to move to a moment" — an interaction described
+             on an element that announced itself as a static picture, could not take focus, and
+             reported no position when it moved. A slider is what this actually is: it has a
+             value, a range, and two arrow keys that change it. `tabindex="0"` is what puts it in
+             the tab order, and `aria-valuetext` is what makes the announcement a clock rather
+             than a count of milliseconds. `seek()` updates both. -->
+        <canvas id="ribbon" class="ribbon" height="132"
+                role="slider" tabindex="0"
+                aria-label="Position in the lesson"
+                aria-describedby="ribbon-description"
+                aria-valuemin="0" aria-valuemax="0" aria-valuenow="0" aria-valuetext="00:00:00"></canvas>
+        <p id="ribbon-description" class="visually-hidden">
+          A picture of the lesson over time: an upper band showing how much was being written, and
+          a lower band showing when somebody was talking. Left and right arrow move by five
+          seconds, with shift for thirty.</p>
+        <div class="ribbon-axis" id="ribbon-axis"></div>
+        <!-- ⭐ No player. `tools/m12` trashes a recording once its transcript is written and
+             verified, so a lesson in the steady state has no audio at all — the transcript is the
+             artifact. The readout below is a position in the LESSON, not in a media file. -->
+        <div class="transport">
+          <span class="readout" id="clock">00:00:00</span>
+          <span class="readout readout-dim" id="duration">/ 00:00:00</span>
+          <span class="spacer"></span>
+          <span class="micro" id="hovered"></span>
+          <!-- ⚠️ Two spans, because the whole hint used to be `display: none` under 700 px — and
+               it is the only thing on the page that says the ribbon can be dragged at all. A
+               narrow screen is the one where that is least discoverable and most likely to be a
+               touch device, where the keyboard half is the part that does not apply. So the
+               keyboard half is what narrows away and "Drag the ribbon" always stays. -->
+          <span class="micro micro-dim hint">Drag the ribbon</span>
+          <span class="micro micro-dim hint hint-keys">· ← → 5s · shift 30s</span>
+        </div>
+      </div>
+
+      <div class="panes">
+        <div class="pane pane-transcript">
+          <div class="pane-head">
+            <span class="micro">Transcript</span>
+            <span class="micro micro-dim" id="transcript-note"></span>
+          </div>
+          <div class="transcript" id="transcript"></div>
+        </div>
+        <div class="pane pane-page" id="pane-page" hidden>
+          <div class="pane-head">
+            <span class="micro">The page</span>
+            <button class="chip chip-quiet" id="page-open">Open PDF</button>
+          </div>
+          <iframe class="page-frame" id="page-frame" title="The note this lesson was written into"></iframe>
+        </div>
+      </div>
+    </article>
+
+    <article class="note-view" id="note-view" hidden>
+      <div class="lecture-head">
+        <div class="lecture-id">
+          <h2 id="note-title">—</h2>
+          <p class="lecture-meta" id="note-meta"></p>
+        </div>
+      </div>
+      <div class="panes">
+        <div class="pane pane-page pane-page-wide">
+          <div class="pane-head">
+            <span class="micro">Pages</span>
+            <button class="chip chip-quiet" id="note-open">Open PDF</button>
+          </div>
+          <iframe class="page-frame" id="note-frame" title="The note"></iframe>
+        </div>
+        <div class="pane pane-text" id="pane-text">
+          <div class="pane-head"><span class="micro">Your handwriting, recognised</span></div>
+          <div class="handwriting" id="handwriting"></div>
+        </div>
+      </div>
+    </article>
+
+    <!-- ⛔ Shown when the source cannot be reached. The reader used to print "mint an app
+         password in Nextcloud -> Settings -> Security" here and offer nothing to press, while
+         `--login` sat on the command line doing exactly that job. -->
+    <article class="connect" id="connect" hidden>
+      <h2>Connect your Nextcloud</h2>
+      <p class="connect-lead" id="connect-lead">
+        Type your server's address. Your browser opens, you sign in there as you normally would —
+        second factor and all — and Nextcloud hands this reader a credential of its own.
+        <strong>You are never asked for a password here.</strong>
+      </p>
+
+      <form class="connect-form" id="connect-form">
+        <label class="micro" for="connect-url">Nextcloud address</label>
+        <input id="connect-url" type="url" inputmode="url" autocomplete="url" spellcheck="false"
+               placeholder="cloud.example.com" required>
+        <button class="chip chip-go" type="submit" id="connect-go">Sign in</button>
+      </form>
+
+      <div class="connect-waiting" id="connect-waiting" hidden>
+        <p>Waiting for you to approve it in your browser.</p>
+        <p class="connect-link">
+          If nothing opened, go to <a id="connect-href" href="#" target="_blank" rel="noopener noreferrer">this link</a>.
+        </p>
+        <p class="micro micro-dim" id="connect-countdown"></p>
+      </div>
+
+      <p class="connect-error" id="connect-error" hidden role="alert"></p>
+
+      <p class="connect-note">
+        The credential appears in your Nextcloud under <em>Settings → Security</em> as
+        “Inkstone Reader”. Deleting it there revokes this reader and nothing else.
+      </p>
+    </article>
+
+    <article class="results" id="results" hidden>
+      <div class="lecture-head">
+        <div class="lecture-id">
+          <h2 id="results-title">—</h2>
+          <p class="lecture-meta" id="results-meta"></p>
+        </div>
+      </div>
+      <div id="results-list" class="results-list"></div>
+    </article>
+
+    <!-- role="status" + aria-live: this is the only channel for "cannot reach your
+       Nextcloud" and for the sign-in and indexing messages, and it appears without any
+       user action. Without a live region a screen reader announces none of them. -->
+  <div class="banner" id="banner" role="status" aria-live="polite" hidden></div>
+  </section>
+</main>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

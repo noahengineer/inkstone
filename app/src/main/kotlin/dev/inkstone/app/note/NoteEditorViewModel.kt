@@ -78,6 +78,8 @@ class NoteEditorViewModel @Inject constructor(
      * suspend, which `onCleared` cannot.
      */
     private val recordings: RecordingController,
+    /** M10 — the editor's remembered toolbar. A pass-through: this class owns none of it. */
+    private val preferences: dev.inkstone.app.ink.EditorPreferences,
     /** M12 — read for the export below; the controller owns writing to it. */
     private val recordingIndex: dev.inkstone.core.database.recording.RecordingIndex,
     publisher: PdfPublisher,
@@ -85,6 +87,18 @@ class NoteEditorViewModel @Inject constructor(
     recogniser: NoteRecogniser,
     savedState: SavedStateHandle,
 ) : ViewModel() {
+
+    /**
+     * M10 — what the toolbar looked like last time, once it has been read.
+     *
+     * Null until `EditorPreferences.warm()` completes. `InkScreen` waits for the first non-null
+     * value and then stops looking: this is a **seed**, not state, and re-adopting it mid-session
+     * would fight the drag the user is in the middle of.
+     */
+    val editorPrefs = preferences.snapshot
+
+    /** Record a change. Debounced by `EditorPreferences`; see why it is not per gesture there. */
+    fun editorPrefsChanged(prefs: dev.inkstone.app.ink.EditorPrefs) = preferences.changed(prefs)
 
     private val noteId = savedState.get<String>(ARG_NOTE_ID)?.let(::DocumentId)
 
@@ -287,6 +301,9 @@ class NoteEditorViewModel @Inject constructor(
 
     fun setTemplate(template: PageTemplate) = editor.setTemplate(template)
 
+    /** SPEC §4.5 — this page grows to hold what is written on it, or it does not. */
+    fun setInfiniteCanvas(infinite: Boolean) = editor.setInfiniteCanvas(infinite)
+
     fun rename(title: String) = editor.rename(title)
 
     // -----------------------------------------------------------------------
@@ -442,9 +459,15 @@ class NoteEditorViewModel @Inject constructor(
      * Suspends, and is called *after* the ink is already on screen: a note that
      * waited for a 200-page scan to rasterise before showing anything would feel
      * slower than one that draws the strokes and fills the paper in behind them.
+     *
+     * ⚠️ **[NoteEditor.openDocumentId], not `state.value.documentId`.** This is called from inside
+     * the editor's own open, and the state flow does not carry the id until `publish()` — one
+     * statement *after* the `display()` that triggers this. Reading it there answered null, and a
+     * null here is "this page has no paper behind it", which is indistinguishable from a blank
+     * page and never retried. See that property.
      */
     suspend fun sourcePage(background: Background, size: PageSize) =
-        state.value.documentId?.let { sourcePages.render(it, background, size) }
+        editor.openDocumentId?.let { sourcePages.render(it, background, size) }
 
     override fun onCleared() {
         // Before `editor.close()`, and synchronously: a pull that reached the registry after the

@@ -1,0 +1,107 @@
+# The Inkstone reader on a server, behind a reverse proxy that already terminates TLS.
+#
+#   cp tools/web/env.example .env      # then fill it in
+#   docker compose -f tools/web/compose.yaml up -d --build
+#
+# ⚠️ Run it from the REPO ROOT — `build.context` is `../..` because the image needs both
+# `tools/web` and `tools/m12`.
+#
+# There is no `version:` key. It has been obsolete since the Compose Specification replaced the
+# v2/v3 schema, and leaving it in earns a warning and nothing else.
+
+name: inkstone-reader
+
+services:
+  reader:
+    build:
+      context: ../..
+      dockerfile: tools/web/Dockerfile
+    image: inkstone-reader:latest
+    restart: unless-stopped
+
+    # ⚠️ **No `ports:`.** That is the whole security posture, not an omission.
+    #
+    # `expose` documents the port and publishes nothing, so the container is reachable only by
+    # something on the same Docker network — your reverse proxy. Publishing 8765 to the host would
+    # put an app-password-holding process on every interface, and the app's own auth would become
+    # the only thing between the internet and a term of class recordings.
+    expose:
+      - "8765"
+
+    environment:
+      # -- what it reads ---------------------------------------------------
+      INKSTONE_NC_URL: ${INKSTONE_NC_URL:?set this in .env}
+      INKSTONE_NC_UID: ${INKSTONE_NC_UID:?set this in .env}
+      # ⚠️ The password comes from a **secret file**, not from here. See `secrets:` below.
+      INKSTONE_NC_PASSWORD_FILE: /run/secrets/nc_password
+
+      # -- who may read it -------------------------------------------------
+      INKSTONE_WEB_PASSWORD_FILE: /run/secrets/web_password
+      INKSTONE_MCP_TOKEN_FILE: /run/secrets/mcp_token
+
+      # The public name(s) this is served as. Required off loopback: it is the DNS-rebinding
+      # check, and without it every request is compared against "localhost" and refused.
+      INKSTONE_ALLOWED_HOSTS: ${INKSTONE_ALLOWED_HOSTS:?e.g. notes.example.com}
+
+      # The proxy terminates TLS, so the browser's view is HTTPS and `Secure` cookies are correct
+      # even though this container speaks plain HTTP.
+      INKSTONE_TRUST_PROXY: "1"
+
+    secrets:
+      - nc_password
+      - web_password
+      - mcp_token
+
+    volumes:
+      # Note metadata, parsed transcripts and cached media. Everything here is recoverable by
+      # fetching from Nextcloud again, so losing it costs time and nothing else — but keeping it
+      # is the difference between a page that opens instantly and one that re-downloads a library.
+      - cache:/app/cache
+
+    networks:
+      - proxy
+
+    # -- hardening, all of it cheap for a process that only reads ------------
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # The app handles SIGTERM itself (see `server._install_sigterm`), so this should never be
+    # reached; it is here so a hung process is killed in five seconds rather than ten.
+    stop_grace_period: 5s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+secrets:
+  # ⚠️ File-sourced Compose secrets **silently ignore `uid`, `gid` and `mode`**, because Compose
+  # implements them as a bind mount rather than as a real secret. So the host file must already be
+  # readable by the container's UID (10001). `chmod 640` plus `chown :10001` on the host, or
+  # simply `chmod 644` if the machine has one user — which for a personal server it does.
+  nc_password:
+    file: ../../secrets/nc_password
+  web_password:
+    file: ../../secrets/web_password
+  mcp_token:
+    file: ../../secrets/mcp_token
+
+volumes:
+  cache:
+
+networks:
+  # ⚠️ `external: true`, and deliberately NOT `internal: true`.
+  #
+  # `internal` would isolate this network from the outside world — and this container's entire job
+  # is making outbound HTTPS calls to your Nextcloud, so it would break everything while looking
+  # like a hardening win. What is wanted is the opposite: join the network your reverse proxy is
+  # already on, so it can reach the reader while nothing else can.
+  #
+  # Create it once if it does not exist:  docker network create proxy
+  proxy:
+    external: true

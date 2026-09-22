@@ -22,6 +22,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import dev.inkstone.app.ui.Ink
 import dev.inkstone.core.model.Camera
 import dev.inkstone.core.model.ImageCrop
 import dev.inkstone.core.model.Matrix3
@@ -314,19 +315,19 @@ private fun DrawScope.drawCrop(session: CropSession, camera: Camera, grabbed: Cr
         addQuad(kept, camera)
         fillType = PathFillType.EvenOdd
     }
-    drawPath(shade, Color(SHADE_ARGB))
+    drawPath(shade, Ink.Canvas.copy(alpha = SHADE_ALPHA))
 
     // The kept frame, and the thirds that make a crop feel like a crop.
     val outline = Path().apply { addQuad(kept, camera) }
-    drawPath(outline, Color(FRAME_ARGB), style = Stroke(width = FRAME_PX))
+    drawPath(outline, FrameColour, style = Stroke(width = FRAME_PX))
     drawThirds(session, camera)
 
     for (grip in CropGrip.entries) {
         if (grip == CropGrip.INSIDE) continue
         val at = camera.toView(session.gripPoint(grip))
         val radius = if (grip == grabbed) GRIP_RADIUS_PX * GRABBED_SCALE else GRIP_RADIUS_PX
-        drawCircle(Color(FRAME_ARGB), radius = radius, center = at)
-        drawCircle(Color(GRIP_FILL_ARGB), radius = radius - FRAME_PX, center = at)
+        drawCircle(FrameColour, radius = radius, center = at)
+        drawCircle(GripFill, radius = radius - FRAME_PX, center = at)
     }
 }
 
@@ -336,13 +337,13 @@ private fun DrawScope.drawThirds(session: CropSession, camera: Camera) {
         val u = r.left + (r.right - r.left) * step / THIRDS
         val v = r.top + (r.bottom - r.top) * step / THIRDS
         drawLine(
-            Color(THIRDS_ARGB),
+            FrameColour.copy(alpha = THIRDS_ALPHA),
             camera.toView(session.toPage(u, r.top)),
             camera.toView(session.toPage(u, r.bottom)),
             strokeWidth = THIRDS_PX,
         )
         drawLine(
-            Color(THIRDS_ARGB),
+            FrameColour.copy(alpha = THIRDS_ALPHA),
             camera.toView(session.toPage(r.left, v)),
             camera.toView(session.toPage(r.right, v)),
             strokeWidth = THIRDS_PX,
@@ -395,10 +396,33 @@ private const val THIRDS_PX = 1f
  * A crop overlay normally sits on a photograph, where white reads against almost anything. This one
  * sits on a *note* — white paper, and a picture that may itself be a screenshot of a white app — so
  * a white frame was invisible in exactly the case the emulator walk happened to use. The frame and
- * the grips are the same blue the selection chrome already uses, which also says *"this is chrome,
- * not part of your page"*.
+ * the grips' rings are the accent the rest of the chrome uses for *"this is live"*, which also says
+ * *"this is chrome, not part of your page"*.
+ *
+ * ⭐ ROADMAP M10 — that accent is [Ink.FocusOnPaper] and **not** [Ink.Focus]: this is drawn on the
+ * page, so it takes sky-500 rather than the canvas chrome's sky-400, which is the same split
+ * `SelectionOverlayView.ACCENT` takes and the reason a crop frame and a selection box still match.
+ * Read off the token rather than copied — a second literal of a palette colour is exactly the drift
+ * [InkDims]' KDoc is about.
  */
-private const val SHADE_ARGB = 0x99101010.toInt()
-private const val FRAME_ARGB = 0xFF1D4ED8.toInt()
-private const val GRIP_FILL_ARGB = 0xFFFFFFFF.toInt()
-private const val THIRDS_ARGB = 0x662C6BED
+private val FrameColour = Ink.FocusOnPaper
+
+/**
+ * The grips are **filled white**, and that does not contradict [FrameColour].
+ *
+ * A white *disc inside a ringed circle* is legible on white paper because the ring is what bounds
+ * it; a white *hairline frame* on white paper is not there at all. Fill and outline are different
+ * jobs, and only the outline had the problem.
+ */
+private val GripFill = Color.White
+
+/**
+ * ⚠️ 0.6, not 0.8, and it is the alpha this file has always used.
+ *
+ * The restyle swapped `0x99101010` for `Ink.Canvas.copy(alpha = …)` and rounded the alpha up on the
+ * way: `0x99` is 153/255 = **0.6**. At 0.8 the region being cut away drops from about 40 % luminance
+ * over white paper to about 20 %, i.e. from *dim but readable* to *nearly black* — and being able to
+ * see what you are cutting off is the whole reason the shade is translucent rather than opaque.
+ */
+private const val SHADE_ALPHA = 0.6f
+private const val THIRDS_ALPHA = 0.4f

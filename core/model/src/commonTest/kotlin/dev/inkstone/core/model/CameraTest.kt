@@ -116,13 +116,13 @@ class CameraTest {
         // The page is 200px wide inside a 400px viewport. The old behaviour
         // centred it and refused to move; the leash lets it go anywhere that
         // keeps `keep` pixels of it on screen.
-        val nudged = Camera(Offset(30f, 0f), scale = 2f).leashedTo(page, viewport, keep)
+        val nudged = Camera(Offset(30f, 0f), scale = 2f).leashedTo(page.canvas(), viewport, keep)
         assertClose(30f, nudged.translate.x, "a page that fits can still be moved:")
 
-        val shovedRight = Camera(Offset(9999f, 0f), scale = 2f).leashedTo(page, viewport, keep)
+        val shovedRight = Camera(Offset(9999f, 0f), scale = 2f).leashedTo(page.canvas(), viewport, keep)
         assertClose(viewport.widthPx - keep, shovedRight.translate.x, "leashed at the right:")
 
-        val shovedLeft = Camera(Offset(-9999f, 0f), scale = 2f).leashedTo(page, viewport, keep)
+        val shovedLeft = Camera(Offset(-9999f, 0f), scale = 2f).leashedTo(page.canvas(), viewport, keep)
         assertClose(keep - 200f, shovedLeft.translate.x, "leashed at the left:")
     }
 
@@ -134,7 +134,7 @@ class CameraTest {
 
         for (scale in listOf(0.2f, 1f, 8f)) {
             for (shove in listOf(-1e6f, 1e6f)) {
-                val camera = Camera(Offset(shove, shove), scale).leashedTo(page, viewport, keep)
+                val camera = Camera(Offset(shove, shove), scale).leashedTo(page.canvas(), viewport, keep)
                 val pageWidthPx = page.widthPt * scale
                 val pageHeightPx = page.heightPt * scale
                 val visibleX = minOf(camera.translate.x + pageWidthPx, viewport.widthPx) -
@@ -153,7 +153,7 @@ class CameraTest {
         // and the clamp range inverts.
         val page = PageSize(10f, 10f)
         val viewport = Viewport(widthPx = 800f, heightPx = 800f)
-        val camera = Camera(Offset(5000f, 5000f), scale = 1f).leashedTo(page, viewport, 64f)
+        val camera = Camera(Offset(5000f, 5000f), scale = 1f).leashedTo(page.canvas(), viewport, 64f)
 
         assertTrue(camera.translate.x <= viewport.widthPx, "tiny page pushed off screen")
         assertTrue(camera.translate.x + 10f >= 0f, "tiny page pushed off screen")
@@ -166,7 +166,7 @@ class CameraTest {
         val pixelsPerPoint = 2f
         val limits = ZoomLimits.forDisplay(pixelsPerPoint)
 
-        val fitWidth = cameraFor(FitMode.FIT_WIDTH, page, viewport, pixelsPerPoint, limits)
+        val fitWidth = cameraFor(FitMode.FIT_WIDTH, page.canvas(), viewport, pixelsPerPoint, limits)
         assertClose(2f, fitWidth.scale, "fit-width fills the width:")
         assertClose(0f, fitWidth.translate.x, "no horizontal slack:")
         assertClose(0f, fitWidth.translate.y, "starts at the top of a tall page:")
@@ -174,14 +174,14 @@ class CameraTest {
         // Fit modes still centre — that is the point of them. It is only
         // *panning* that is unconstrained.
         val shortPage = PageSize(612f, 100f)
-        val fitShort = cameraFor(FitMode.FIT_WIDTH, shortPage, viewport, pixelsPerPoint, limits)
+        val fitShort = cameraFor(FitMode.FIT_WIDTH, shortPage.canvas(), viewport, pixelsPerPoint, limits)
         assertClose((1000f - 200f) / 2f, fitShort.translate.y, "a short page is centred:")
 
-        val fitPage = cameraFor(FitMode.FIT_PAGE, page, viewport, pixelsPerPoint, limits)
+        val fitPage = cameraFor(FitMode.FIT_PAGE, page.canvas(), viewport, pixelsPerPoint, limits)
         assertClose(1000f / 792f, fitPage.scale, "fit-page is limited by height:")
         assertTrue(fitPage.translate.x > 0f, "fit-page centres horizontally")
 
-        val actual = cameraFor(FitMode.ACTUAL_SIZE, page, viewport, pixelsPerPoint, limits)
+        val actual = cameraFor(FitMode.ACTUAL_SIZE, page.canvas(), viewport, pixelsPerPoint, limits)
         assertClose(100f, actual.zoomPercent(pixelsPerPoint), "actual size is 100%:")
     }
 
@@ -198,4 +198,13 @@ class CameraTest {
 
         assertEquals(Camera(Offset(-20f, 65f), 1.5f), panned)
     }
+
+    /**
+     * The paper, as the camera now asks for it (SPEC §4.5).
+     *
+     * Every case in this file is a page at the page-space origin, which is what a fixed page is
+     * and what every page was before an infinite canvas could move the paper's corner. The cases
+     * where the two differ are their own tests below.
+     */
+    private fun PageSize.canvas(): PageCanvas = PageCanvas.fixed(this)
 }

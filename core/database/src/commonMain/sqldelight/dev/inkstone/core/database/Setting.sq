@@ -54,3 +54,60 @@ INSERT OR REPLACE INTO folderSetting(folderId, autoRecord) VALUES (?, ?);
 -- Back to "inherit from whatever is above me", which is a third state and not the same as 0.
 clearFolderSetting:
 DELETE FROM folderSetting WHERE folderId = ?;
+
+-- ---------------------------------------------------------------------------
+-- M10 — the generic table this file's header said could arrive one day
+-- ---------------------------------------------------------------------------
+--
+-- The header above argues *against* a generic `setting(key, value)` table, and it was right about
+-- the case it was arguing about. It also said: *"A generic `setting` table can arrive with the
+-- first genuinely global setting. Adding one now to hold a per-folder flag would be machinery for
+-- a caller that does not exist."* That caller now exists — the editor's toolbar has to remember a
+-- twelve-colour palette **in the user's own order**, six saved stroke widths, a default width, a
+-- pen per brush and three toggles.
+--
+-- ⚠️ WHAT ACTUALLY DECIDED IT WAS THE KEY SPACE BEING CLOSED, NOT "TYPED VS UNTYPED"
+--
+-- The header's objection to `autoRecord.folder.<folderId>` is that the key space is **open**: ids
+-- are minted at runtime, unbounded, and *"which folders auto-record"* is then a `LIKE` scan over
+-- stringly-typed keys with a folder id as a substring. Every word of that stands, and
+-- `folderSetting` is untouched.
+--
+-- The editor's key space is the opposite: **closed and known at compile time**. A dozen names, four
+-- of them one per `InkBrushKind` entry, read whole in one `SELECT *` at startup and never queried
+-- individually. There is no question of the form *"which keys are set"* whose answer needs a scan,
+-- because the answer is a compile-time list. That is the distinction to apply to the next such
+-- decision, and it is why both tables are correct.
+--
+-- ⚠️ THIS TABLE IS EXACTLY TWO COLUMNS, FOREVER
+--
+-- `INSERT OR REPLACE` deletes the conflicting row and inserts a fresh one, so any third column the
+-- statement omitted would be silently reset to its DEFAULT — the `remoteBinding.lastSeenRemoteAt`
+-- failure (CLAUDE.md), in a table nobody would think to check. The safe form that carries other
+-- columns forward, `ON CONFLICT(name) DO UPDATE`, **does not parse here**: no `dialect(...)` is
+-- declared anywhere in the build, so SQLDelight 2.3.2 defaults to `sqlite-3-18` and UPSERT landed
+-- in SQLite 3.24.
+--
+-- So the invariant is spelled as a shape rather than remembered as a rule: **anything you would
+-- want to add as a third column is a new key.**
+--
+-- `name` rather than `key` because `KEY` is a SQLite keyword and there is no reason to find out how
+-- this dialect feels about it. `value` is not one (`VALUES` is), and in Kotlin it is a soft keyword
+-- meaningful only in `value class`; no other `.sq` in this module declares a column by that name.
+
+CREATE TABLE setting (
+    name  TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- The whole table, which is how it is always read: at startup, into one immutable snapshot. There
+-- is deliberately no `selectSetting(name)` — a per-key read would invite a database round trip from
+-- a composable, and the whole point of a closed key space is that one query answers everything.
+selectSettings:
+SELECT * FROM setting;
+
+upsertSetting:
+INSERT OR REPLACE INTO setting(name, value) VALUES (?, ?);
+
+deleteSetting:
+DELETE FROM setting WHERE name = ?;

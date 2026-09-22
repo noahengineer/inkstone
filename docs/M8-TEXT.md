@@ -464,7 +464,12 @@ Ruler**:
   keyed by name that never evicts on object delete.
 - **Elements** — save a selection under a name and collection, browse by collection, stamp with
   fresh ids and fresh assets per insertion.
-- **Ruler** — snap plus exact numeric angle entry. **Laser** — dot and fading trail, writing no ops.
+- **Ruler** — snap plus exact numeric angle entry. ⚠️ **This row was wrong for two milestones and
+  is now true.** The edge appeared and the angle row worked, so it read as built; every stylus stroke
+  drawn while it was out **threw** inside `startStroke`, because `androidx.ink` inverts the transform
+  a projection cannot provide. See `docs/M8-RULER.md` — including why *"reachable by tapping"* is not
+  the same claim as *"works"*, which is the distinction this whole section exists to make.
+  **Laser** — dot and fading trail, writing no ops.
 
 **Not verified on a device:** image insert, the Element double-stamp, and the two-peer merge — see
 §5.

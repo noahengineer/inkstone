@@ -1,0 +1,13 @@
+-- M10 — the editor's remembered toolbar state (docs/M10-DESIGN.md §10).
+--
+-- Additive: one new table, nothing altered, so an upgrade cannot mis-default a column that
+-- already holds user data. It starts empty, and an empty table reads as "every default", which
+-- is exactly the state of every install that has never touched the palette.
+--
+-- See Setting.sq for why this is a generic key-value table when `folderSetting` beside it
+-- deliberately is not.
+
+CREATE TABLE setting (
+    name  TEXT NOT NULL PRIMARY KEY,
+    value TEXT NOT NULL
+);

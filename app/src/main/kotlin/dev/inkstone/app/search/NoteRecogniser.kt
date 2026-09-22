@@ -41,13 +41,19 @@ class NoteRecogniser @Inject constructor(
      * @param pages which pages to read. Empty means every live page — what the batch pass does.
      *   The editor passes the pages the pen has actually touched, because re-reading a
      *   200-page notebook every three seconds is not a debounce.
+     * @param gate how to get exclusive access to [session]. See [SessionGate] — the whole
+     *   point is that the ML Kit call happens **outside** it.
      */
-    suspend fun recognise(session: NoteSession, pages: Collection<PageId> = emptyList()): RecognitionReport {
-        val targets = pages.ifEmpty { session.document.livePages.map { it.id } }
+    suspend fun recognise(
+        session: NoteSession,
+        pages: Collection<PageId> = emptyList(),
+        gate: SessionGate = SessionGate.Direct,
+    ): RecognitionReport {
+        val targets = pages.ifEmpty { gate.locked { session.document.livePages.map { it.id } } }
         var read = 0
         var words = 0
         for (pageId in targets) {
-            when (val outcome = readPage(session, pageId)) {
+            when (val outcome = readPage(session, pageId, gate)) {
                 // ⚠️ Stop, and do NOT touch the index. Carrying on would spend a model
                 // download's worth of failures per page, and clearing the index would delete
                 // a working search because a phone happened to be offline.
@@ -64,21 +70,43 @@ class NoteRecogniser @Inject constructor(
         return RecognitionReport(read, words)
     }
 
-    private suspend fun readPage(session: NoteSession, pageId: PageId): PageOutcome {
-        // ⚠️ Skipping a page whose text is already current is not an optimisation, it is what
-        // stops the batch pass rewriting the bundle — and therefore re-uploading the note —
-        // every night for a notebook nobody has touched.
-        if (session.recognisedText(pageId) != null) return PageOutcome.Nothing
-
-        val noteId = session.document.id
-        val strokes = sampler.sample(session.page(pageId))
+    /**
+     * ⭐ **Three phases, and the middle one deliberately holds no lock.**
+     *
+     * Sampling reads the session and the commit writes it, so both go through [gate]. The ML Kit
+     * pass in between is a pure function of a list of sampled strokes — it cannot see the session
+     * and does not need to — and it is the part that takes **seconds** on a dense page, one
+     * recogniser call per line.
+     *
+     * ⚠️ **Holding the editor's lock across it is what made undo stop responding.** `NoteEditor`
+     * used to wrap this whole method in `serial.withLock`, and the pass fires three seconds after
+     * the pen stops — which is exactly the moment a user stops drawing and reaches for undo. Every
+     * press in that window queued, and the lot landed at once when ML Kit finished.
+     *
+     * ⭐ **And the storage layer was already written for this.** `NoteSession.recognised`'s KDoc
+     * says *"recognition is asynchronous by construction — SPEC §8.3 debounces it three seconds
+     * behind the pen — so the ink can and does change while it runs"*, and it returns **false**
+     * when the digest moved. Under the old locking that could never happen, so the guard was
+     * unreachable and the comment below about a stroke landing mid-pass described something the
+     * code prevented. Both are load-bearing now.
+     */
+    private suspend fun readPage(session: NoteSession, pageId: PageId, gate: SessionGate): PageOutcome {
+        val noteId = gate.locked { session.document.id }
+        val strokes = gate.locked {
+            // ⚠️ Skipping a page whose text is already current is not an optimisation, it is what
+            // stops the batch pass rewriting the bundle — and therefore re-uploading the note —
+            // every night for a notebook nobody has touched.
+            if (session.recognisedText(pageId) != null) null else sampler.sample(session.page(pageId))
+        } ?: return PageOutcome.Nothing
         if (strokes.isEmpty()) {
             index.forgetPage(noteId, pageId)
             return PageOutcome.Nothing
         }
 
+        // ⭐ The expensive part, outside the gate. `strokes` is plain sampled geometry; nothing
+        // here touches [session].
         return when (val outcome = recogniser.recognise(strokes)) {
-            is RecognitionOutcome.Recognised -> {
+            is RecognitionOutcome.Recognised -> gate.locked {
                 if (!session.recognised(pageId, outcome.lines, outcome.recogniser)) {
                     PageOutcome.Nothing
                 } else {

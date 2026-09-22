@@ -72,6 +72,17 @@ class ObjectToolState {
     var cropping by mutableStateOf<CropSession?>(null)
         private set
 
+    /**
+     * The selected text box, or null - what the "Edit text" chip acts on.
+     *
+     * ⚠️ Written from `InkSelection.soleTextBox` on every selection change, exactly as [image]
+     * is, and for the reason that entry's KDoc gives: the surface already holds the words, the frame
+     * and the format, and reading them back out of the fold from here would be a second source for
+     * values that must agree with what is on the glass.
+     */
+    var text by mutableStateOf<TextFocus?>(null)
+        private set
+
     /** Whether the Elements panel is open. */
     var elementsOpen by mutableStateOf(false)
 
@@ -81,12 +92,91 @@ class ObjectToolState {
     /** A captured area waiting for a name and a collection. */
     var capturedArea by mutableStateOf<PageRect?>(null)
 
+    /**
+     * Bumped once the library on disk has changed, so an **open** panel re-reads it.
+     *
+     * ⚠️ It exists because the obvious key is the wrong one. `ObjectLayers` used to reload on
+     * [capturedArea], which `onSaveElement` clears on the *first* line — before the coroutine that
+     * writes `elements/index.json` has run — so the panel re-read the index it already had and went
+     * on saying *"Nothing saved yet"*. A closed panel hid it, because opening one afterwards reads
+     * disk anyway; with the panel open, which is how anybody looking at the library saves into it,
+     * the newly captured element **never appeared, so there was nothing to arm and nothing to
+     * stamp**. Stamping itself was never broken. The general shape is this repo's oldest one: a
+     * reload keyed on the state that changes when the work *starts* rather than when it *finishes*.
+     */
+    var libraryRevision by mutableStateOf(0)
+        private set
+
+    /** Say the library on disk has changed. Called after a write completes, never before. */
+    fun libraryChanged() {
+        libraryRevision++
+    }
+
+    /**
+     * What `ObjectLayers` re-reads `elements/index.json` on.
+     *
+     * A property rather than an argument list spelled out at the `LaunchedEffect`, so that
+     * `ElementPanelRefreshTest` asserts the **production** key: written inline there, the key is a
+     * decision no JVM test can see, and the version of this that reloaded a moment too early would
+     * have gone on passing a test that named its own.
+     */
+    val libraryReloadKey: Pair<Boolean, Int> get() = elementsOpen to libraryRevision
+
     fun edit(box: TextBoxObject, bounds: PageRect, text: String, format: ObjectFormat) {
-        editing = TextEditing(box.id, bounds)
+        edit(
+            id = box.id,
+            bounds = bounds,
+            frameWidthPt = format.frameWidth(box.widthPt),
+            frameHeightPt = format.frameHeight(box.heightPt),
+            text = text,
+            format = format,
+            style = box.style ?: DEFAULT_TEXT_STYLE,
+        )
+    }
+
+    /** "Edit text" on the selection bar - the same field, reached from a selection. */
+    fun edit(focus: TextFocus) {
+        edit(
+            id = focus.id,
+            bounds = focus.bounds,
+            frameWidthPt = focus.widthPt,
+            frameHeightPt = focus.heightPt,
+            text = focus.text,
+            format = focus.format,
+            style = focus.style,
+        )
+    }
+
+    /**
+     * The one place [editing] is opened on a box that exists.
+     *
+     * [frameWidthPt] is the box in its **own** space and [bounds] is the same box in page space, so
+     * their ratio is the scale a handle drag has to be divided by before it is written back - see
+     * [TextEditing.scaleX]. Taking both rather than deriving one is deliberate: the caller is the
+     * one holding the transform, and a second guess at it here is how two layers come to disagree
+     * about where an object is.
+     */
+    @Suppress("LongParameterList") // The frame in both spaces, plus both registers. See the KDoc.
+    private fun edit(
+        id: ObjectId?,
+        bounds: PageRect,
+        frameWidthPt: Float,
+        frameHeightPt: Float,
+        text: String,
+        format: ObjectFormat,
+        style: ObjectStyle,
+    ) {
+        editing = TextEditing(
+            id = id,
+            bounds = bounds,
+            scaleX = scaleOf(bounds.width, frameWidthPt),
+            scaleY = scaleOf(bounds.height, frameHeightPt),
+        )
         draft = text
         this.format = format
-        style = box.style ?: DEFAULT_TEXT_STYLE
+        this.style = style
         image = null
+        this.text = null
         cropping = null
     }
 
@@ -105,15 +195,32 @@ class ObjectToolState {
     fun place(bounds: PageRect, format: ObjectFormat = ObjectFormat.Default) {
         editing = TextEditing(id = null, bounds = bounds)
         draft = ""
-        this.format = format
+        // ⚠️ **The frame is dropped, and the rest of the formatting is not.** Carrying the last
+        // box's font and size to the next one is the point of passing a format at all; carrying its
+        // *width* would make a new box claim a frame it does not have - `insertTextBox` takes its
+        // extents from [bounds], so the record and the payload would disagree from the first op, in
+        // a register that is absolute and wins.
+        this.format = format.copy(boxWidthPt = null, boxHeightPt = null)
         style = DEFAULT_TEXT_STYLE
         image = null
+        text = null
         cropping = null
     }
 
     /** The placed box has been created; later edits address it by id. */
     fun attach(id: ObjectId) {
         editing = editing?.copy(id = id)
+    }
+
+    /**
+     * A frame handle moved, in page space. Writes **nothing** - see `TextBoxLayer`.
+     *
+     * The same shape as [dragCrop], and for the same reason: a `SetFormat` per frame of a drag is a
+     * journal entry and an undo entry per frame, and the register is absolute, so only the last one
+     * of them was ever going to matter.
+     */
+    fun resizeFrame(bounds: PageRect) {
+        editing = editing?.copy(bounds = bounds)
     }
 
     fun stopEditing() {
@@ -142,8 +249,22 @@ class ObjectToolState {
         focusImage(ImageFocus(image.id, bounds, image.widthPt, image.heightPt), format)
     }
 
+    /**
+     * The selection changed to exactly this text box, or to none.
+     *
+     * ⚠️ **Ignored while a field is open**, which [focusImage] does not need to say because
+     * typing clears the image focus outright. Here the two are the same object: dropping the focus
+     * on a re-report of the box being typed into would take the frame handles off the screen the
+     * moment a peer's op refreshed the selection.
+     */
+    fun focusText(focus: TextFocus?) {
+        if (editing != null) return
+        text = focus
+    }
+
     fun clearFocus() {
         image = null
+        text = null
         cropping = null
     }
 
@@ -234,7 +355,47 @@ class ObjectToolState {
  * takes a nullable id for that reason, and a null means *"keep it on screen, write nothing yet"*.
  */
 @androidx.compose.runtime.Immutable
-data class TextEditing(val id: ObjectId?, val bounds: PageRect)
+data class TextEditing(val id: ObjectId?, val bounds: PageRect, val scaleX: Float = 1f, val scaleY: Float = 1f) {
+
+    /**
+     * [bounds] as a frame in the object's **own** space - what a resize writes.
+     *
+     * A text box that has also been *scaled* by the selection handles has a page-space box larger
+     * than its frame, and a handle drag measured in page points would then write a frame magnified
+     * by that scale a second time. Dividing by it is what makes the number reaching
+     * `ObjectFormat.boxWidthPt` mean what the register says it means.
+     */
+    val frameWidthPt: Float get() = bounds.width / scaleX
+
+    val frameHeightPt: Float get() = bounds.height / scaleY
+}
+
+/**
+ * The selected text box, as the "Edit text" chip needs it.
+ *
+ * The mirror of `InkSelection.soleTextBox`, kept on this side for [ImageFocus]'s reason - `:app`
+ * holds what the bar has to draw, and the surface holds the render state.
+ */
+@androidx.compose.runtime.Immutable
+data class TextFocus(
+    val id: ObjectId,
+    val bounds: PageRect,
+    val widthPt: Float,
+    val heightPt: Float,
+    val text: String,
+    val format: ObjectFormat,
+    val style: ObjectStyle,
+)
+
+/**
+ * Page points per object point along one axis, from a box measured in both.
+ *
+ * One when either is degenerate: a zero scale would divide a handle drag by nothing, and the frame
+ * that reached the register would be an infinity the codec refuses - a resize that silently does
+ * not happen.
+ */
+private fun scaleOf(pageExtent: Float, frameExtent: Float): Float =
+    if (pageExtent > 0f && frameExtent > 0f) pageExtent / frameExtent else 1f
 
 /**
  * Which image the transform and crop buttons act on.

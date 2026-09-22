@@ -7,25 +7,30 @@ import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.FilledTonalButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
@@ -34,17 +39,24 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import dev.inkstone.app.R
 import dev.inkstone.app.audio.RecordingUiState
+import dev.inkstone.app.ui.GlassBar
+import dev.inkstone.app.ui.Ink
+import dev.inkstone.app.ui.InkDims
+import dev.inkstone.app.ui.MicroLabel
+import dev.inkstone.app.ui.Readout
+import dev.inkstone.app.ui.TextChip
 import kotlinx.coroutines.delay
 
 /**
- * ⭐ M12 §10 — the record button, and while it runs, **a visible elapsed timer**.
+ * ⭐ M12 §10 / ROADMAP M10 — the design's *"Global Utilities (Top Right)"* zone.
+ *
+ * > *"A `RECORD` chip that transitions into a red pulse counter tracking elapsed time."*
+ *
+ * Which is exactly what M12 already required, in the redesign's clothes:
  *
  * > *"Unmistakable while running — a visible elapsed timer, not a tinted icon. The failure that
  * > hurts is recording for fifty minutes and finding out you were not; its mirror, believing you
  * > stopped when you had not, is the privacy version of the same bug."*
- *
- * So the running state is not a colour change: it is a red pill with a counting clock in it, and
- * it says `Stop recording` when you look at what pressing it does.
  *
  * ## The timer costs no state writes
  *
@@ -60,20 +72,15 @@ fun RecordButton(state: RecordingUiState, onToggle: () -> Unit, modifier: Modifi
     /**
      * ⚠️ **The app's first runtime permission**, and it is asked for at the press rather than at
      * launch: an app that asks for a microphone before you have done anything is one people say no
-     * to. `POST_NOTIFICATIONS` rides with it because denying that hides the recording
-     * notification while the recording continues, which is §12's privacy concern exactly — so both
-     * are requested together and the recording starts either way, since Android will not let the
-     * capture happen silently in the first place.
+     * to. `POST_NOTIFICATIONS` rides with it because denying that hides the recording notification
+     * while the recording continues, which is §12's privacy concern exactly.
+     *
+     * ⚠️ **A refused microphone must say so.** This callback used to be `if (granted) onToggle()`
+     * and nothing else, so a denial — or Android's "don't ask again", which returns denied instantly
+     * without showing a dialog at all — left the button doing absolutely nothing, forever, in
+     * silence. Once permanently denied no in-app request can re-prompt; only Settings can, so the
+     * message says that rather than inviting another press.
      */
-    // ⚠️ **A refused microphone must say so.** This callback used to be
-    // `if (granted) onToggle()` and nothing else, so a denial — or Android's "don't ask again",
-    // which returns denied instantly without showing a dialog at all — left the button doing
-    // **absolutely nothing, forever, in silence**. `recording_needs_permission` had been written
-    // in strings.xml since M12 and referenced from no Kotlin file: a message nobody could ever
-    // see. Same shape as the `= Unit` stub CLAUDE.md records from M6.
-    //
-    // Once permanently denied, no in-app request can re-prompt; only Settings can. So the message
-    // says that, rather than inviting the user to press a button that cannot work.
     val permissions =
         rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { granted ->
             if (granted[Manifest.permission.RECORD_AUDIO] == true) {
@@ -86,17 +93,22 @@ fun RecordButton(state: RecordingUiState, onToggle: () -> Unit, modifier: Modifi
     if (state.isRecording) {
         RunningPill(state = state, onStop = onToggle, modifier = modifier)
     } else {
-        FilledTonalButton(
-            onClick = {
-                if (hasMicrophone(context)) onToggle() else permissions.launch(required())
-            },
-            modifier = modifier.semantics { contentDescription = START_TAG },
-        ) {
-            Text(stringResource(R.string.recording_start))
+        GlassBar(modifier = modifier, scrollable = false) {
+            TextChip(
+                label = stringResource(R.string.recording_start),
+                onClick = { if (hasMicrophone(context)) onToggle() else permissions.launch(required()) },
+                modifier = Modifier.semantics { contentDescription = START_TAG },
+            )
         }
     }
 }
 
+/**
+ * The running state: a pulsing dot, a counting clock, and a red edge.
+ *
+ * The pill is the design's `border border-red-500/30` over the same glass as every other widget —
+ * the recording state is a *state*, not an error, so it borrows the chrome rather than replacing it.
+ */
 @Composable
 private fun RunningPill(state: RecordingUiState, onStop: () -> Unit, modifier: Modifier) {
     var elapsed by remember(state.recordingId) { mutableLongStateOf(0L) }
@@ -107,33 +119,36 @@ private fun RunningPill(state: RecordingUiState, onStop: () -> Unit, modifier: M
         }
     }
 
-    Surface(
-        modifier = modifier,
-        shape = RoundedCornerShape(PILL_CORNER_PERCENT),
-        color = MaterialTheme.colorScheme.errorContainer,
+    val pulse = rememberInfiniteTransition(label = "record")
+    val dotAlpha by pulse.animateFloat(
+        initialValue = 1f,
+        targetValue = DIM_ALPHA,
+        animationSpec = infiniteRepeatable(tween(PULSE_MILLIS), RepeatMode.Reverse),
+        label = "dot",
+    )
+
+    Row(
+        modifier = modifier
+            .clip(InkDims.Pill)
+            .background(Ink.Panel, InkDims.Pill)
+            .border(1.dp, Ink.RecordingWash, InkDims.Pill)
+            .clickable(onClick = onStop)
+            .semantics { contentDescription = STOP_TAG }
+            .padding(horizontal = PillPaddingH, vertical = PillPaddingV),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(InkDims.GroupGap),
     ) {
-        Row(modifier = Modifier.padding(horizontal = 4.dp)) {
-            Button(
-                onClick = onStop,
-                colors = ButtonDefaults.buttonColors(containerColor = Color.Transparent),
-                modifier = Modifier.semantics { contentDescription = STOP_TAG },
-            ) {
-                Text(
-                    text = formatElapsed(elapsed),
-                    color = MaterialTheme.colorScheme.onErrorContainer,
-                )
-            }
-            if (state.silenced) {
-                Spacer(Modifier.width(4.dp))
-                // §9 — the microphone was taken by something else. Said out loud, because the
-                // alternative is an hour of silence discovered afterwards.
-                Text(
-                    text = stringResource(R.string.recording_silenced),
-                    color = MaterialTheme.colorScheme.onErrorContainer,
-                    style = MaterialTheme.typography.labelSmall,
-                    modifier = Modifier.padding(top = 14.dp, end = 8.dp),
-                )
-            }
+        Box(
+            modifier = Modifier
+                .size(DotSize)
+                .alpha(dotAlpha)
+                .background(Ink.Recording, CircleShape),
+        )
+        Readout(formatElapsed(elapsed), color = Ink.Recording)
+        if (state.silenced) {
+            // §9 — the microphone was taken by something else. Said out loud, because the
+            // alternative is an hour of silence discovered afterwards.
+            MicroLabel(stringResource(R.string.recording_silenced), color = Ink.Recording)
         }
     }
 }
@@ -159,16 +174,19 @@ private fun required(): Array<String> = if (Build.VERSION.SDK_INT >= Build.VERSI
 }
 
 /**
- * Content descriptions, and they are load-bearing rather than decoration: `uiautomator dump`
- * reads them, and driving the app over `adb` is CLAUDE.md's definition-of-done #6 check that
- * catches an inert feature when a green suite does not.
+ * Content descriptions, and they are load-bearing rather than decoration: `uiautomator dump` reads
+ * them, and driving the app over `adb` is CLAUDE.md's definition-of-done #6 check that catches an
+ * inert feature when a green suite does not.
  */
 internal const val START_TAG: String = "Start recording"
 internal const val STOP_TAG: String = "Stop recording"
 
-/** A full pill: 50% of the shorter side, which is what makes it read as a status and not a button. */
-private const val PILL_CORNER_PERCENT = 50
+private val DotSize = 9.dp
+private val PillPaddingH = 16.dp
+private val PillPaddingV = 12.dp
 
+private const val DIM_ALPHA = 0.25f
+private const val PULSE_MILLIS = 900
 private const val TICK_MILLIS = 500L
 private const val MILLIS_PER_SECOND = 1_000L
 private const val SECONDS_PER_MINUTE = 60L

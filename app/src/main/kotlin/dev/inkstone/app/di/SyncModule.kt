@@ -9,6 +9,7 @@ import dev.inkstone.core.database.InkstoneDatabase
 import dev.inkstone.core.database.sync.SqlAccountStore
 import dev.inkstone.core.database.sync.SqlAttentionStore
 import dev.inkstone.core.database.sync.SqlBindingStore
+import dev.inkstone.core.database.sync.SqlBrowsedFolderStore
 import dev.inkstone.core.database.sync.SqlFolderBindingStore
 import dev.inkstone.core.database.sync.SqlForeignRemoteStore
 import dev.inkstone.core.database.sync.SqlOutboxStore
@@ -38,6 +39,7 @@ import dev.inkstone.core.sync.PendingDownloadStore
 import dev.inkstone.core.sync.ReconcileStores
 import dev.inkstone.core.sync.Reconciler
 import dev.inkstone.core.sync.RecordingUploads
+import dev.inkstone.core.sync.RemoteFolderCache
 import dev.inkstone.core.sync.RemoteMergeGate
 import dev.inkstone.core.sync.SyncCursorStore
 import dev.inkstone.core.sync.SyncEngine
@@ -141,6 +143,18 @@ object SyncModule {
     @Singleton
     fun provideDirectoryCache(database: InkstoneDatabase): DirectoryCache =
         SqlRemoteDirectoryStore(database, Dispatchers.IO)
+
+    /**
+     * The folder browser's memory of the server's tree.
+     *
+     * Provided beside the reconciler's [DirectoryCache] and deliberately a different type over a
+     * different table: one decides what a picker draws, the other decides what gets walked and
+     * what gets read as deleted. See `RemoteFolderCache`.
+     */
+    @Provides
+    @Singleton
+    fun provideRemoteFolderCache(database: InkstoneDatabase): RemoteFolderCache =
+        SqlBrowsedFolderStore(database, Dispatchers.IO)
 
     @Provides
     @Singleton

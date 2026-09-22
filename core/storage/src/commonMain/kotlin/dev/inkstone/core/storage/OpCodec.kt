@@ -17,6 +17,7 @@ import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.OpExtras
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.model.ShapeKind
@@ -30,6 +31,7 @@ import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.float
@@ -99,6 +101,19 @@ internal object OpCodec {
     private const val F_ERASED = "e"
     private const val F_BACKGROUND = "bg"
     private const val F_SIZE = "sz"
+
+    /**
+     * ⭐ The infinite canvas's two fields (SPEC §4.5): the paper's top-left in page space, and
+     * whether the page grows.
+     *
+     * **Written only when set**, which is what keeps this backwards *and* forwards compatible in
+     * the way SPEC §5.8 requires. A fixed page's ops are byte-identical to the ones this codec
+     * wrote before these existed, so every committed fixture still round-trips; and an older build
+     * meeting them treats them as unknown fields, keeps them verbatim, and draws the page at the
+     * extent it has grown to — the wrong corner of a grown canvas, and no lost ink.
+     */
+    private const val F_ORIGIN = "o"
+    private const val F_INFINITE = "inf"
     private const val F_PAGE = "p"
 
     private const val T_ADD = "add"
@@ -131,7 +146,7 @@ internal object OpCodec {
         T_TEXT to setOf(F_TARGET, F_TEXT),
         T_FORMAT to setOf(F_TARGET, F_FORMAT),
         T_ERASED to setOf(F_TARGET, F_ERASED),
-        T_PAGE_META to setOf(F_BACKGROUND, F_SIZE),
+        T_PAGE_META to setOf(F_BACKGROUND, F_SIZE, F_ORIGIN, F_INFINITE),
     )
 
     // -----------------------------------------------------------------------
@@ -206,13 +221,24 @@ internal object OpCodec {
                 put(F_ERASED, encodeErased(op.absolute))
             }
 
-            is PageOp.SetPageMeta -> {
-                op.background?.let { put(F_BACKGROUND, encodeBackground(it)) }
-                op.size?.let { put(F_SIZE, encodeSize(it)) }
-            }
+            is PageOp.SetPageMeta -> putPageMeta(op)
 
             is PageOp.Unknown -> error("handled above")
         }
+    }
+
+    /**
+     * The four page registers, each written only when the op names it.
+     *
+     * Its own function because `putPayload`'s `when` is at detekt's complexity limit, and because
+     * an omitted field is *"leave that register alone"* rather than a default — so what belongs
+     * together here is one decision made four times, not four lines of a bigger one.
+     */
+    private fun JsonObjectBuilder.putPageMeta(op: PageOp.SetPageMeta) {
+        op.background?.let { put(F_BACKGROUND, encodeBackground(it)) }
+        op.size?.let { put(F_SIZE, encodeSize(it)) }
+        op.origin?.let { put(F_ORIGIN, encodePoint(it)) }
+        op.infinite?.let { put(F_INFINITE, JsonPrimitive(it)) }
     }
 
     private fun withExtras(body: JsonObject, extras: OpExtras): JsonObject {
@@ -338,6 +364,12 @@ internal object OpCodec {
         add(JsonPrimitive(size.heightPt))
     }
 
+    /** A page-space point, in the same two-number shape as [encodeSize]. */
+    fun encodePoint(point: PagePoint): JsonArray = buildJsonArray {
+        add(JsonPrimitive(point.x))
+        add(JsonPrimitive(point.y))
+    }
+
     // -----------------------------------------------------------------------
     // Decode
     // -----------------------------------------------------------------------
@@ -441,13 +473,7 @@ internal object OpCodec {
             opExtras,
         )
 
-        T_PAGE_META -> PageOp.SetPageMeta(
-            opId = opId,
-            clock = clock,
-            background = element[F_BACKGROUND]?.let { decodeBackground(it.jsonObject) },
-            size = element[F_SIZE]?.let { decodeSize(it.jsonArray) },
-            extras = opExtras,
-        )
+        T_PAGE_META -> decodePageMeta(element, opId, clock, opExtras)
 
         else -> error("unreachable: $type was in fieldsByType")
     }
@@ -555,6 +581,24 @@ internal object OpCodec {
         }
 
     fun decodeSize(array: JsonArray): PageSize = PageSize(array[0].jsonPrimitive.float, array[1].jsonPrimitive.float)
+
+    fun decodePoint(array: JsonArray): PagePoint = PagePoint(array[0].jsonPrimitive.float, array[1].jsonPrimitive.float)
+
+    /** [putPageMeta] read back. An absent field stays null — *"this op said nothing about it"*. */
+    private fun decodePageMeta(
+        element: JsonObject,
+        opId: String,
+        clock: LamportClock,
+        opExtras: OpExtras,
+    ): PageOp.SetPageMeta = PageOp.SetPageMeta(
+        opId = opId,
+        clock = clock,
+        background = element[F_BACKGROUND]?.let { decodeBackground(it.jsonObject) },
+        size = element[F_SIZE]?.let { decodeSize(it.jsonArray) },
+        origin = element[F_ORIGIN]?.let { decodePoint(it.jsonArray) },
+        infinite = element[F_INFINITE]?.let { it.jsonPrimitive.boolean },
+        extras = opExtras,
+    )
 
     private const val O_ID = "id"
     private const val O_KIND = "k"

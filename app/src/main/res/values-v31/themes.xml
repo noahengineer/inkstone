@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      ⭐ M10 — the Android 12+ splash, which is a separate surface from the window.
+
+      From API 31 the system composes the splash itself and takes its colour from
+      `windowSplashScreenBackground`, ignoring `windowBackground` entirely. Without
+      this the app launched with its icon on a **white** field for about a second
+      and then cut to the near-black library — measured on the emulator, and the
+      one frame of the app that no amount of Compose theming can reach.
+
+      Qualified `-v31` rather than added to the base theme because the attribute
+      does not exist below API 31 and this project's minSdk is 30: an unqualified
+      entry is an aapt2 link error, not a warning.
+    -->
+    <style name="Theme.Inkstone" parent="android:Theme.DeviceDefault.DayNight">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowBackground">#09090B</item>
+        <item name="android:colorBackground">#09090B</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowSplashScreenBackground">#09090B</item>
+    </style>
+</resources>

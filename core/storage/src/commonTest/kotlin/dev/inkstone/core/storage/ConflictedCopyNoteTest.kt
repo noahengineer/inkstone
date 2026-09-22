@@ -8,6 +8,7 @@ import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
@@ -123,7 +124,12 @@ class ConflictedCopyNoteTest {
     private suspend fun foldOf(id: DocumentId, pageId: PageId): FoldedPage {
         val note = assertNotNull(store.open(id))
         val loaded = store.loadPage(note, pageId)
-        return foldPage(pageId, loaded.ops, defaultSize = loaded.size, defaultBackground = loaded.background)
+        return foldPage(
+            pageId,
+            loaded.ops,
+            defaultCanvas = PageCanvas.fixed(loaded.size),
+            defaultBackground = loaded.background,
+        )
     }
 
     private suspend fun readerOf(id: DocumentId): BundleReader =
@@ -274,7 +280,11 @@ class ConflictedCopyNoteTest {
                 // manifest — the two can disagree, and a page listed with no entry must still
                 // become a page in the copy rather than change its page count.
                 pages = mapOf(
-                    document.livePages[0].id to PageContents(PageSize.Letter, Background.Blank, emptyList()),
+                    document.livePages[0].id to PageContents(
+                        PageCanvas.fixed(PageSize.Letter),
+                        Background.Blank,
+                        emptyList(),
+                    ),
                 ),
                 highestClockCounter = 12L,
                 carried = mapOf(peerEntry to "from a newer build".encodeToByteArray()),
@@ -311,7 +321,7 @@ class ConflictedCopyNoteTest {
             BundleContents(
                 document = document,
                 pages = document.livePages.associate { ref ->
-                    ref.id to PageContents(PageSize.Letter, Background.Blank, emptyList())
+                    ref.id to PageContents(PageCanvas.fixed(PageSize.Letter), Background.Blank, emptyList())
                 },
                 highestClockCounter = 12L,
                 assets = mapOf(asset to bytes),
@@ -340,7 +350,11 @@ class ConflictedCopyNoteTest {
             BundleContents(
                 document = document.copy(schemaVersion = Document.SCHEMA_VERSION + 1),
                 pages = mapOf(
-                    document.livePages[0].id to PageContents(PageSize.Letter, Background.Blank, emptyList()),
+                    document.livePages[0].id to PageContents(
+                        PageCanvas.fixed(PageSize.Letter),
+                        Background.Blank,
+                        emptyList(),
+                    ),
                 ),
                 highestClockCounter = 0L,
             ),
@@ -363,7 +377,7 @@ class ConflictedCopyNoteTest {
                     pages = document.pages.map { it.copy(deleted = true, deletedEpochMillis = clock.millis) },
                 ),
                 pages = document.pages.associate { ref ->
-                    ref.id to PageContents(PageSize.Letter, Background.Blank, emptyList())
+                    ref.id to PageContents(PageCanvas.fixed(PageSize.Letter), Background.Blank, emptyList())
                 },
                 highestClockCounter = 0L,
             ),

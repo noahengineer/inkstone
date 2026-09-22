@@ -39,10 +39,14 @@ import kotlin.math.max
  * toolbar action, a page load, an undo or a peer's op, all of them off the pen-to-pixel path — and
  * `onDraw` does nothing but [StaticLayout.draw].
  *
- * **The box's width never changes**, which is what makes that cache sound: `widthPt` is on the
- * first-write-wins payload (SPEC §4.2) and a resize is a `SetTransform`, so the wrap width is fixed
- * for the object's life and a scaled text box re-wraps nothing. That is also the honest behaviour —
- * dragging a corner scales the words with the frame, exactly as it scales a photo.
+ * ⚠️ **The wrap width comes from the frame, which is a register and does change.** It was the
+ * payload's `widthPt` for two milestones, on the argument that a resize is a `SetTransform` and so
+ * *"dragging a corner scales the words with the frame, exactly as it scales a photo"*. That was
+ * honest and it was the wrong behaviour: resizing a paragraph means re-wrapping it, not magnifying
+ * it, and a user who widened a label got 21 pt words on one line instead of 14 pt words on two. The
+ * frame is [ObjectFormat.boxWidthPt] now (absolute, LWW, CLAUDE.md rule 8) and this rebuilds when it
+ * is written — which is the same [onPresentationChanged] the font and the words already come
+ * through, so the layout is still built off the ink path and never in `onDraw`.
  *
  * ## ⚠️ Laid out at [LAYOUT_SCALE]×, drawn at 1/[LAYOUT_SCALE]
  *
@@ -65,7 +69,7 @@ import kotlin.math.max
  * **silhouette** deliberately stays the declared rectangle ([DryBox.forEachPagePoint]), because the
  * frame a resize is computed against has to be the object's own box.
  */
-internal class DryTextBox(box: TextBoxObject) : DryBox(box, box.widthPt, box.heightPt, box.text) {
+internal class DryTextBox(val source: TextBoxObject) : DryBox(source, source.widthPt, source.heightPt, source.text) {
 
     /**
      * ⚠️ `isLinearText` and `isSubpixelText` are not polish.
@@ -95,8 +99,22 @@ internal class DryTextBox(box: TextBoxObject) : DryBox(box, box.widthPt, box.hei
     }
 
     override fun onPresentationChanged() {
+        applyFrame()
         layout = buildLayout()
         widenBoundsToText()
+    }
+
+    /**
+     * The frame the register asks for, or the extents the box was placed with.
+     *
+     * ⚠️ **Before [buildLayout], always.** The layout's wrap width is read off [widthPt], so the
+     * order is what makes a resize re-wrap in the same frame rather than one write later — a
+     * one-frame-stale paragraph is exactly the kind of thing that looks like a rendering glitch and
+     * is really an ordering bug.
+     */
+    private fun applyFrame() {
+        val format = decodedFormat
+        setFrame(format.frameWidth(source.widthPt), format.frameHeight(source.heightPt))
     }
 
     /**

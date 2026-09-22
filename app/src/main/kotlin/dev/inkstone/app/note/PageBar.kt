@@ -1,32 +1,42 @@
 package dev.inkstone.app.note
 
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.AssistChip
-import androidx.compose.material3.Card
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.RowScope
+import androidx.compose.foundation.layout.width
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import dev.inkstone.app.ui.ChipDivider
+import dev.inkstone.app.ui.ChipKind
+import dev.inkstone.app.ui.GlassBar
+import dev.inkstone.app.ui.MicroLabel
+import dev.inkstone.app.ui.Readout
+import dev.inkstone.app.ui.TextChip
 import dev.inkstone.core.model.PageTemplate
 
 /**
- * ROADMAP M2 — page management: add, delete, reorder, duplicate, and the template picker.
+ * ⭐ ROADMAP M10 — the design's *"Bottom Center (Page Bar)"* zone.
  *
- * Same rule as M1's toolbar: **don't design the toolbar here** — M10 owns that. This is the
- * plainest thing that makes every M2 acceptance criterion reachable on the tablet without a
- * rebuild, and the `local_rev` readout is there because "did that save?" is the question this
- * milestone exists to answer.
+ * > *"Paging controls `‹ Page 1 of 5 ›`, `ADD`, `DUPLICATE`, `SHARE`, and template toggles."*
+ *
+ * ROADMAP M2 built this as *"the plainest thing that makes every acceptance criterion reachable"*,
+ * under the same *"don't design the toolbar here — M10 owns it"* rule as M1's. This is M10 owning
+ * it: four groups behind dividers — where you are, what pages there are, what they look like, and
+ * how one leaves the app.
+ *
+ * ⚠️ **It has to fit between the history and zoom widgets, and it did not.** Eleven chips plus a
+ * revision readout ran about 120 dp past the space `InkScreen.BottomWidgets` leaves it, so the bar
+ * scrolled and its last chip sat clipped flush against the pill's rounded end — which reads as
+ * broken rather than as scrollable. Two things left: the page-*move* arrows, to the page overview
+ * that exists for reordering, and `local_rev`, to the diagnostics panel with the rest of the
+ * instrumentation. Nothing became unreachable and the bar now matches the brief's own chip list.
  */
 @Composable
 fun PageBar(
@@ -34,85 +44,178 @@ fun PageBar(
     actions: PageBarActions,
     modifier: Modifier = Modifier,
     /**
-     * Whether an export is in flight. UI-local rather than part of [NoteEditorState]: the
-     * export is driven from the composition, because handing a Uri to another app needs a
-     * `Context` and a chooser, and neither belongs in the editor.
+     * Whether an export is in flight. UI-local rather than part of [NoteEditorState]: the export is
+     * driven from the composition, because handing a Uri to another app needs a `Context` and a
+     * chooser, and neither belongs in the editor.
      */
     exporting: Boolean = false,
 ) {
     var templateMenuOpen by remember { mutableStateOf(false) }
 
-    Card(modifier = modifier) {
-        Row(
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            TextButton(onClick = actions.onPrevious, enabled = state.pageIndex > 0) { Text("‹") }
-            // The page counter is the overview's handle. M3 gave that sheet thumbnails, and
-            // "tap the page number to see the pages" needs no extra button to explain.
-            TextButton(onClick = actions.onShowPages) {
-                Text(
-                    text = "${state.pageIndex + 1} / ${state.pageCount}",
-                    style = MaterialTheme.typography.labelLarge,
+    GlassBar(modifier = modifier) {
+        Paging(state, actions)
+
+        ChipDivider()
+        Structure(actions)
+
+        ChipDivider()
+        TemplateChip(
+            template = state.template,
+            infinite = state.infiniteCanvas,
+            open = templateMenuOpen,
+            onOpen = { templateMenuOpen = true },
+            onDismiss = { templateMenuOpen = false },
+            onPick = actions.onTemplate,
+            onToggleInfinite = actions.onToggleInfiniteCanvas,
+        )
+
+        ChipDivider()
+        ShareChip(exporting = exporting, actions = actions)
+    }
+}
+
+/** Where you are: `‹ 3 of 12 ›`. The counter is also the overview's handle. */
+@Composable
+private fun RowScope.Paging(state: NoteEditorState, actions: PageBarActions) {
+    TextChip(
+        label = "‹",
+        kind = ChipKind.GLYPH,
+        contentDescription = "Previous page",
+        enabled = state.pageIndex > 0,
+        onClick = actions.onPrevious,
+    )
+    // M3 gave the overview sheet thumbnails, and "tap the page number to see the pages" needs no
+    // extra button to explain.
+    TextChip(
+        label = "${state.pageIndex + 1} of ${state.pageCount}",
+        kind = ChipKind.VALUE,
+        onClick = actions.onShowPages,
+        modifier = Modifier.width(CounterWidth),
+    )
+    TextChip(
+        label = "›",
+        kind = ChipKind.GLYPH,
+        contentDescription = "Next page",
+        enabled = state.pageIndex < state.pageCount - 1,
+        onClick = actions.onNext,
+    )
+}
+
+/**
+ * What pages there are: add, duplicate, delete.
+ *
+ * ⚠️ **The two page-*move* chips are not here, and reordering is not lost.** They were, and between
+ * them and the revision readout the bar was about 120 dp wider than the space between the history
+ * and zoom widgets — so its last chip was clipped flush against the pill's edge and the whole bar
+ * read as cut off. Reordering lives in the page overview (`PageOverviewSheet`), which is the screen
+ * that exists for it, shows a thumbnail of what is being moved, and is one tap away on the counter
+ * to the left. M2's *"reorder"* acceptance criterion is still met, on a better surface.
+ *
+ * Deleting stays, because it acts on *this* page and that is where you are. It is refused by the
+ * session when it is the last one rather than hidden here, so the reason arrives as a message
+ * instead of as a greyed-out chip with no explanation.
+ */
+@Composable
+private fun RowScope.Structure(actions: PageBarActions) {
+    TextChip(label = "Add", onClick = actions.onAddPage)
+    TextChip(label = "Duplicate", onClick = actions.onDuplicatePage)
+    TextChip(label = "Delete", danger = true, onClick = actions.onDeletePage)
+}
+
+/**
+ * ⭐ ROADMAP M10 — the two exports behind one `SHARE`, which is what the design's chip list names.
+ *
+ * They were two chips, *"Share PDF"* and *"Share audio"*, and together they were about a fifth of a
+ * bar that already did not fit — the pair is what pushed the page bar under the zoom widget on a
+ * 2560 px tablet (see `InkScreen.BottomWidgets`). One chip and a two-item menu is the same two taps
+ * for the PDF and the same two for a recording.
+ *
+ * ⚠️ **Both are always offered, and the recording one is never hidden when the note has none.**
+ * Whether a lecture exists is a database read, and putting one behind every recomposition of this
+ * bar is what SPEC §5.7 keeps off the drawing path; `exportRecordings` says so instead when there is
+ * nothing to hand over. This is the only route a recording has out of the app when Nextcloud is not
+ * set up (docs/M12-AUDIO.md §15.5).
+ *
+ * SPEC §5.2 — the PDF entry is disabled while an export is running rather than hidden: it
+ * materializes first, which on a large notebook takes long enough that a second tap would otherwise
+ * queue a second rewrite.
+ */
+@Composable
+private fun ShareChip(exporting: Boolean, actions: PageBarActions) {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        TextChip(
+            label = if (exporting) "Exporting…" else "Share",
+            selected = open,
+            enabled = !exporting,
+            onClick = { open = true },
+        )
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(
+                text = { MicroLabel("Published PDF") },
+                onClick = {
+                    open = false
+                    actions.onShare()
+                },
+            )
+            DropdownMenuItem(
+                text = { MicroLabel("Recordings") },
+                onClick = {
+                    open = false
+                    actions.onShareRecording()
+                },
+            )
+        }
+    }
+}
+
+/**
+ * The paper: a chip that says what this page is, and a menu of the five templates — plus the
+ * switch between a sheet and an endless canvas.
+ *
+ * ⭐ **The canvas toggle is in this menu rather than beside it**, and that is a width decision as
+ * much as a taxonomy one. `docs/M10-PORTRAIT.md` records this bar running past its own edge at
+ * 800 dp, where a control that has scrolled out of a pill is *absent from the view tree* and not
+ * merely off-screen; a twelfth chip would have spent the space that fixed. It also belongs here:
+ * "what is this page made of" is the question the chip already answers, and the ∞ on the label is
+ * what says which answer is in force without opening anything.
+ */
+@Composable
+private fun TemplateChip(
+    template: PageTemplate,
+    infinite: Boolean,
+    open: Boolean,
+    onOpen: () -> Unit,
+    onDismiss: () -> Unit,
+    onPick: (PageTemplate) -> Unit,
+    onToggleInfinite: () -> Unit,
+) {
+    Box {
+        TextChip(
+            label = if (infinite) "${template.label()} ∞" else template.label(),
+            selected = open,
+            onClick = onOpen,
+        )
+        DropdownMenu(expanded = open, onDismissRequest = onDismiss) {
+            for (entry in PageTemplate.entries) {
+                DropdownMenuItem(
+                    text = { MicroLabel(entry.label()) },
+                    onClick = {
+                        onDismiss()
+                        onPick(entry)
+                    },
                 )
             }
-            TextButton(
-                onClick = actions.onNext,
-                enabled = state.pageIndex < state.pageCount - 1,
-            ) { Text("›") }
-
-            TextButton(onClick = actions.onAddPage) { Text("Add") }
-            TextButton(onClick = actions.onDuplicatePage) { Text("Duplicate") }
-            // Deleting the last page is refused by the session rather than hidden here, so the
-            // reason arrives as a message instead of a greyed-out button with no explanation.
-            TextButton(onClick = actions.onDeletePage) { Text("Delete") }
-            TextButton(
-                onClick = actions.onMoveLeft,
-                enabled = state.pageIndex > 0,
-            ) { Text("Move ‹") }
-            TextButton(
-                onClick = actions.onMoveRight,
-                enabled = state.pageIndex < state.pageCount - 1,
-            ) { Text("Move ›") }
-
-            AssistChip(
-                onClick = { templateMenuOpen = true },
-                label = { Text(state.template.label()) },
-            )
-            DropdownMenu(expanded = templateMenuOpen, onDismissRequest = { templateMenuOpen = false }) {
-                for (template in PageTemplate.entries) {
-                    DropdownMenuItem(
-                        text = { Text(template.label()) },
-                        onClick = {
-                            templateMenuOpen = false
-                            actions.onTemplate(template)
-                        },
-                    )
-                }
-            }
-
-            // SPEC §5.2 — how the published PDF leaves the app. Disabled while an export is
-            // running rather than hidden: it materializes first, which on a large notebook
-            // takes long enough that a second tap would otherwise queue a second rewrite.
-            TextButton(onClick = actions.onShare, enabled = !exporting) {
-                Text(if (exporting) "Exporting…" else "Share PDF")
-            }
-
-            // ⭐ M12 — the only route a recording has out of the app when Nextcloud is not set up
-            // (docs/M12-AUDIO.md §15.5). Always offered rather than hidden when the note has none:
-            // whether a lecture is there is a database read, and putting one behind every
-            // recomposition of this bar is what SPEC §5.7 keeps off the drawing path. It says so
-            // instead when there is nothing to hand over.
-            TextButton(onClick = actions.onShareRecording, enabled = !exporting) {
-                Text("Share recording")
-            }
-
-            // The autosave heartbeat. `local_rev` is bumped on every committed change
-            // (SPEC §7.6), so a number that stops moving while you write is a bug you can see.
-            Text(
-                text = "rev ${state.localRev}",
-                style = MaterialTheme.typography.labelSmall,
+            HorizontalDivider()
+            DropdownMenuItem(
+                // Says what pressing it does, not what is currently true: a menu item that reads
+                // "Infinite canvas ✓" leaves the reader to work out whether the tick is a state or
+                // a promise.
+                text = { MicroLabel(if (infinite) "Fixed page" else "Infinite canvas") },
+                onClick = {
+                    onDismiss()
+                    onToggleInfinite()
+                },
             )
         }
     }
@@ -126,6 +229,9 @@ private fun PageTemplate.label(): String = when (this) {
     PageTemplate.CORNELL -> "Cornell"
 }
 
+/** Fixed, so the bar does not re-flow when the note passes page 9. */
+private val CounterWidth = 96.dp
+
 /** Everything the page bar can ask the editor to do. */
 data class PageBarActions(
     val onPrevious: () -> Unit,
@@ -136,6 +242,14 @@ data class PageBarActions(
     val onMoveLeft: () -> Unit,
     val onMoveRight: () -> Unit,
     val onTemplate: (PageTemplate) -> Unit,
+    /**
+     * ⭐ SPEC §4.5 — make this page's canvas endless, or put it back to a fixed sheet.
+     *
+     * Per page, like the template beside it. A note whose pages disagree is a real thing to want —
+     * an imported handout stays A4 while the page of workings after it grows — and "the same for
+     * every page" is what `Add` already does by inheriting the current page's paper.
+     */
+    val onToggleInfiniteCanvas: () -> Unit,
     /** ROADMAP M3 — the page overview, with a thumbnail per page. */
     val onShowPages: () -> Unit,
     /** ROADMAP M4 — materialize and hand the published PDF to another app (SPEC §5.2). */
@@ -143,8 +257,8 @@ data class PageBarActions(
     /**
      * ⭐ M12 — hand this note's lecture recordings to another app.
      *
-     * Not a convenience: a recording is in app-private storage, so without this the only copy of
-     * the one file this app cannot re-make sits on one device with no way off it (§15.5).
+     * Not a convenience: a recording is in app-private storage, so without this the only copy of the
+     * one file this app cannot re-make sits on one device with no way off it (§15.5).
      */
     val onShareRecording: () -> Unit,
 )

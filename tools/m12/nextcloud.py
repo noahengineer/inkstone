@@ -34,6 +34,10 @@ OC_NS = "{http://owncloud.org/ns}"
 # also means the server's owner can allowlist or rate-limit *this tool* rather than everything.
 USER_AGENT = "Inkstone-Watcher/1.0 (+M12 lecture transcript watcher)"
 
+#: Optional `callable(url) -> ssl.SSLContext | None`, installed by a caller that needs a different
+#: TLS policy. None means urllib's default. See `_call` for why this exists.
+ssl_context_for = None
+
 
 def parse_multistatus(xml: bytes) -> ET.Element:
     """Parse a WebDAV multistatus, refusing any document that declares a DTD.
@@ -90,7 +94,17 @@ class Nextcloud:
         request.add_header("User-Agent", USER_AGENT)
         for k, v in (headers or {}).items():
             request.add_header(k, v)
-        return urllib.request.urlopen(request)
+        # ⚠️ `ssl_context_for` is a hook, default None, meaning "urllib's own default".
+        #
+        # Python 3.14 enabled `VERIFY_X509_STRICT` in `ssl.create_default_context()`, which refuses
+        # a chain whose CA lacks an Authority Key Identifier — a conformance complaint, not a trust
+        # failure. Behind a TLS-terminating appliance (a FortiGate, a corporate proxy) whose CA the
+        # machine already trusts, that makes every request fail with a message about a certificate
+        # extension. `tools/web` installs a hook that clears exactly that flag for such a host and
+        # leaves trust, expiry and hostname checking on; the watcher, which sets nothing, keeps the
+        # stock behaviour.
+        context = ssl_context_for(url) if ssl_context_for else None
+        return urllib.request.urlopen(request, context=context)
 
     def whoami(self) -> dict:
         """SPEC §7.2's confirmation call — also the cheapest proof the credential works at all."""
@@ -143,15 +157,44 @@ class Nextcloud:
                 "is_self": urllib.parse.urlsplit(href).path.rstrip("/") == asked,
                 "size": int((props.findtext(f"{DAV_NS}getcontentlength") or 0) if props is not None else 0),
                 "content_type": (props.findtext(f"{DAV_NS}getcontenttype") if props is not None else None),
+                # ⚠️ Both of these were **requested and then discarded** for two milestones — the
+                # PROPFIND body above has always asked for `d:getetag` and `oc:fileid`, and neither
+                # reached the caller. The watcher never needed them (its idempotency is "is there a
+                # .md beside it"), so nothing noticed. `tools/web` caches on the ETag, and without
+                # this it would re-download every note PDF on every page load.
+                #
+                # ⚠️ The ETag is returned **verbatim, quotes and any `W/` prefix included**, and a
+                # caller must not strip either. SPEC §7.4: a weak ETag returned in `If-Match` is a
+                # permanent 412 loop, and "was this weak" cannot be recovered once the string has
+                # been cleaned up. Nothing here writes, so this is only a change token today — but
+                # the value must stay honest for whatever reads it next.
+                "etag": ((props.findtext(f"{DAV_NS}getetag") or "") if props is not None else ""),
+                "fileid": ((props.findtext(f"{OC_NS}fileid") or "") if props is not None else ""),
             })
         return out
 
     def exists(self, path: str) -> bool:
         return bool(self.listing(path, depth="0"))
 
-    def get(self, path: str) -> bytes:
-        with self._call("GET", self._dav(path)) as response:
-            return response.read()
+    def get(self, path: str, byte_range: tuple[int, int] | None = None) -> bytes:
+        """The whole file, or one byte range of it.
+
+        ⭐ `byte_range` is `(first, last)` inclusive, exactly as HTTP means it, and it is what lets
+        a caller read an Ogg file's **last page** to learn how long a recording is without pulling
+        the whole lecture down. `OggOpus.durationMillis` does the same 96 KB tail read on the
+        device, and for the same reason: M12 measured a duration estimated from bytes divided by
+        bitrate as **42 % high**, because `MediaRecorder` treats the requested bitrate as a hint.
+
+        ⚠️ A server that ignores `Range` answers **200 with the whole body**, not an error. A
+        caller must therefore treat what it gets as *at most* what it asked for and slice its own
+        window out of it, rather than assuming byte 0 of the response is byte `first` of the file.
+        """
+        headers = {"Range": f"bytes={byte_range[0]}-{byte_range[1]}"} if byte_range else None
+        with self._call("GET", self._dav(path), headers=headers) as response:
+            body = response.read()
+            if byte_range and response.status == 200:
+                return body[byte_range[0] : byte_range[1] + 1]
+            return body
 
     def put(self, path: str, data: bytes, content_type: str) -> None:
         self._call("PUT", self._dav(path), data, {"Content-Type": content_type}).close()

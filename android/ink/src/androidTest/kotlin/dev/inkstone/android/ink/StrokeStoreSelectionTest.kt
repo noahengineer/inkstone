@@ -34,11 +34,13 @@ import org.junit.runner.RunWith
  *
  * CLAUDE.md: *"Any new ink test should build its geometry by drawing … rather than through
  * `SyntheticInk`, or it inherits the bug."* Drawing needs a window and a `MotionEvent` pump,
- * which is `:app`'s `InkHostActivity` and not reachable from this module. The bug being avoided
- * is specific, though — `SyntheticInk` computes an `orientationRadians` it never clamps to
- * `[0, 2π)`, and x86_64 rounding puts it a thousandth outside, which `androidx.ink` rejects — so
- * these strokes simply carry **no orientation and no tilt**. There is nothing to be out of range.
- * That makes this file's ten tests independent of the ten M1 failures, which is the point.
+ * which is `:app`'s `InkHostActivity` and not reachable from this module. So these strokes simply carry
+ * **no orientation and no tilt**, which keeps every expected coordinate checkable by hand.
+ *
+ * ⚠️ The quoted advice was written when `SyntheticInk` could emit an orientation outside
+ * `[0, 2π)`. That was a seed-dependent fixture bug rather than anything to do with x86_64, and
+ * it is fixed (`SyntheticInk.turn`); the preference for hand-built geometry here now rests on
+ * legibility alone.
  *
  * The strokes are straight horizontal lines, so every expected coordinate below is arithmetic a
  * reader can check rather than a number recorded from a previous run.

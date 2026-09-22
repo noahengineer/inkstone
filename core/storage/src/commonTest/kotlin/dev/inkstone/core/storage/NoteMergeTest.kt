@@ -12,6 +12,7 @@ import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageRef
@@ -313,7 +314,11 @@ class NoteMergeTest {
             BundleContents(
                 document = note.document.copy(schemaVersion = Document.SCHEMA_VERSION + 1),
                 pages = mapOf(
-                    note.document.pages.single().id to PageContents(PageSize.Letter, Background.Blank, emptyList()),
+                    note.document.pages.single().id to PageContents(
+                        PageCanvas.fixed(PageSize.Letter),
+                        Background.Blank,
+                        emptyList(),
+                    ),
                 ),
                 highestClockCounter = 0L,
             ),
@@ -347,7 +352,11 @@ class NoteMergeTest {
                     titleClock = LamportClock(localClock.counter + 1, "device-b"),
                 ),
                 pages = mapOf(
-                    note.document.pages.single().id to PageContents(PageSize.Letter, Background.Blank, emptyList()),
+                    note.document.pages.single().id to PageContents(
+                        PageCanvas.fixed(PageSize.Letter),
+                        Background.Blank,
+                        emptyList(),
+                    ),
                 ),
                 highestClockCounter = localClock.counter + 1,
             ),
@@ -380,7 +389,11 @@ class NoteMergeTest {
             BundleContents(
                 document = note.document,
                 pages = mapOf(
-                    note.document.pages.single().id to PageContents(PageSize.Letter, Background.Blank, emptyList()),
+                    note.document.pages.single().id to PageContents(
+                        PageCanvas.fixed(PageSize.Letter),
+                        Background.Blank,
+                        emptyList(),
+                    ),
                 ),
                 highestClockCounter = 0L,
                 carried = mapOf(peerEntry to "from a newer build".encodeToByteArray()),
@@ -420,7 +433,7 @@ class NoteMergeTest {
         val peer = BundleWriter.write(
             BundleContents(
                 document = note.document,
-                pages = mapOf(pageId to PageContents(PageSize.Letter, Background.Blank, emptyList())),
+                pages = mapOf(pageId to PageContents(PageCanvas.fixed(PageSize.Letter), Background.Blank, emptyList())),
                 highestClockCounter = 0L,
                 assets = mapOf(theirImage to "theirs".encodeToByteArray()),
             ),
@@ -514,7 +527,7 @@ class NoteMergeTest {
             BundleContents(
                 document = peerDoc,
                 pages = session.document.pages.associate { ref ->
-                    ref.id to PageContents(PageSize.Letter, Background.Blank, emptyList())
+                    ref.id to PageContents(PageCanvas.fixed(PageSize.Letter), Background.Blank, emptyList())
                 },
                 highestClockCounter = 5L,
             ),
@@ -602,7 +615,13 @@ class NoteMergeTest {
         val fromTheFuture = BundleWriter.write(
             BundleContents(
                 document = note.document.copy(schemaVersion = FUTURE_SCHEMA),
-                pages = mapOf(page to PageContents(PageSize.Letter, Background.Blank, listOf(addOp("theirs", "b", 9)))),
+                pages = mapOf(
+                    page to PageContents(
+                        PageCanvas.fixed(PageSize.Letter),
+                        Background.Blank,
+                        listOf(addOp("theirs", "b", 9)),
+                    ),
+                ),
                 highestClockCounter = 9L,
             ),
         )

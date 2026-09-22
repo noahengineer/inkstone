@@ -33,7 +33,7 @@ import org.junit.runner.RunWith
  *
  * ⚠️ **It is instrumented and not a JVM test** for the reason the rest of this suite is: `Typeface`,
  * `StaticLayout` and `Path` are native, and a `Robolectric`-free JVM test cannot build one. It uses
- * no `androidx.ink` geometry at all, so it is independent of the ten M1 failures on x86_64.
+ * no `androidx.ink` geometry at all, so no fixture of ink's can affect it.
  *
  * ⚠️ **What it does not establish**: that anything reaches the glass. `PagePainter` calls
  * `layout.draw` and `drawBitmap`, and no test in this module drives a `Canvas`. The check that

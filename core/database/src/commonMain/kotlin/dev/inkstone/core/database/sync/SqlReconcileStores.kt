@@ -9,6 +9,8 @@ import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.sync.AttentionEntry
 import dev.inkstone.core.sync.AttentionLog
+import dev.inkstone.core.sync.CachedFolder
+import dev.inkstone.core.sync.CachedListing
 import dev.inkstone.core.sync.DirectoryCache
 import dev.inkstone.core.sync.ETag
 import dev.inkstone.core.sync.FolderBinding
@@ -20,6 +22,7 @@ import dev.inkstone.core.sync.PeerClockStore
 import dev.inkstone.core.sync.PendingDownload
 import dev.inkstone.core.sync.PendingDownloadStore
 import dev.inkstone.core.sync.RemoteDirectory
+import dev.inkstone.core.sync.RemoteFolderCache
 import dev.inkstone.core.sync.StaleBinding
 import dev.inkstone.core.sync.SyncCursor
 import dev.inkstone.core.sync.SyncCursorStore
@@ -131,6 +134,124 @@ public class SqlRemoteDirectoryStore(
         etagWeak = directory.etag.weakFlag,
         ocId = directory.ocId,
         seenAt = directory.seenAtEpochMillis,
+    )
+}
+
+/**
+ * ⭐ The folder browser's memory of the server's tree — what makes an upload path choosable with
+ * no network.
+ *
+ * ⚠️ **Writes only `browsedFolder`, never `remoteDirectory`.** The two tables look alike and
+ * mean opposite things: a `remoteDirectory` row is the reconciler's promise that a directory was
+ * *walked to completion* at an ETag, and a row it did not earn stops a subtree being walked or
+ * gets a note read as deleted (SPEC §7.4 rule 1). Nothing here may put one there.
+ *
+ * It does **read** them, once, in [childrenOf]: a folder the reconciler has walked is a folder
+ * that demonstrably exists, and showing it costs one query and is the difference between a
+ * useful offline picker and an empty one for every user who has never opened the browser while
+ * connected. Read-only, into a list of names, and no sync decision sees the result.
+ *
+ * @param dispatcher where SQL runs — `Dispatchers.IO` does not exist in common code.
+ */
+public class SqlBrowsedFolderStore(
+    private val database: InkstoneDatabase,
+    private val dispatcher: CoroutineDispatcher,
+) : RemoteFolderCache {
+
+    private val queries = database.syncQueries
+
+    override suspend fun childrenOf(accountId: String, path: String): CachedListing = withContext(dispatcher) {
+        val here = path.trim('/')
+        val remembered = queries.selectBrowsedChildren(accountId, here).executeAsList().map { it.toCachedFolder() }
+        val known = remembered.mapTo(mutableSetOf()) { it.path }
+
+        // The reconciler's walked directories, for display only. A folder it walked exists; the
+        // browser may never have been opened here, and an empty picker is the thing being fixed.
+        val walked = queries.selectDirectories(accountId).executeAsList()
+            .mapNotNull { directory ->
+                val candidate = directory.path.trim('/')
+                if (candidate.isEmpty() || candidate in known) return@mapNotNull null
+                if (candidate.substringBeforeLast('/', "") != here) return@mapNotNull null
+                CachedFolder(
+                    accountId = accountId,
+                    path = candidate,
+                    parentPath = here,
+                    name = candidate.substringAfterLast('/'),
+                    ocId = directory.ocId,
+                    seenAtEpochMillis = directory.seenAt,
+                )
+            }
+
+        CachedListing(
+            folders = (remembered + walked).sortedBy { it.name.lowercase() },
+            // The cache's own, never the walk's: this number answers "have I listed inside
+            // here", and a reconcile pass is not a listing of this folder for the browser's
+            // purposes. 0 stays 0, and the screen says "never looked" rather than inventing a
+            // time.
+            listedAtEpochMillis = queries.selectBrowsedFolder(accountId, here).executeAsOneOrNull()?.listedAt ?: 0L,
+        )
+    }
+
+    /**
+     * One listing, in one transaction — a half-written one is a listing that lies.
+     *
+     * The sweep is `seenAt < now`, so the rows just marked survive it by construction and
+     * anything the server did not name goes. [CachedFolder.pending] rows are exempt: they are
+     * absent from the server precisely because the MKCOL the binding enqueued has not run yet.
+     */
+    override suspend fun remember(
+        accountId: String,
+        path: String,
+        folders: List<CachedFolder>,
+        nowEpochMillis: Long,
+    ): Unit = withContext(dispatcher) {
+        val here = path.trim('/')
+        database.transaction {
+            insertIfAbsent(accountId, here)
+            queries.markBrowsedFolderListed(listedAt = nowEpochMillis, accountId = accountId, path = here)
+            for (folder in folders) {
+                val child = folder.path.trim('/')
+                if (child.isEmpty() || child == here) continue
+                insertIfAbsent(accountId, child)
+                queries.markBrowsedFolderSeen(
+                    parent = here,
+                    name = folder.name,
+                    ocId = folder.ocId,
+                    seenAt = nowEpochMillis,
+                    accountId = accountId,
+                    path = child,
+                )
+            }
+            queries.deleteBrowsedChildrenNotSeen(accountId = accountId, parent = here, cutoff = nowEpochMillis)
+        }
+    }
+
+    override suspend fun rememberPending(accountId: String, path: String, nowEpochMillis: Long): Unit =
+        withContext(dispatcher) {
+            val target = path.trim('/')
+            if (target.isEmpty()) return@withContext
+            database.transaction {
+                insertIfAbsent(accountId, target)
+                queries.markBrowsedFolderPending(accountId = accountId, path = target)
+            }
+        }
+
+    override suspend fun clearFor(accountId: String): Unit =
+        withContext(dispatcher) { queries.deleteBrowsedFoldersFor(accountId) }
+
+    /**
+     * The row, with its parent and name derived from the path.
+     *
+     * `INSERT OR IGNORE` rather than `INSERT OR REPLACE`, which would delete the conflicting row
+     * and reset every column this statement omits — `listedAt` among them, so re-listing a
+     * parent would forget that its children had ever been looked inside
+     * (`remoteBinding.lastSeenRemoteAt`'s bug, one table along).
+     */
+    private fun insertIfAbsent(accountId: String, path: String) = queries.insertBrowsedFolderIfAbsent(
+        accountId = accountId,
+        path = path,
+        parent = path.substringBeforeLast('/', ""),
+        name = path.substringAfterLast('/'),
     )
 }
 
@@ -538,4 +659,15 @@ private fun dev.inkstone.core.database.PeerClock.toPeerClock() = PeerClock(
     peerDeviceId = peerDeviceId,
     highestCounter = highestCounter,
     seenAtEpochMillis = seenAt,
+)
+
+private fun dev.inkstone.core.database.BrowsedFolder.toCachedFolder() = CachedFolder(
+    accountId = accountId,
+    path = path,
+    parentPath = parentPath,
+    name = name,
+    ocId = ocId,
+    seenAtEpochMillis = seenAt,
+    listedAtEpochMillis = listedAt,
+    pending = pending != 0L,
 )

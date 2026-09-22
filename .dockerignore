@@ -1,0 +1,47 @@
+# The build context is the repo root, which is a large Android project. Everything below is
+# excluded before the context is uploaded to the daemon, so the build stays fast and — the part
+# that matters — no credential ever reaches an image layer.
+#
+# ⚠️ **This file lives at the repo root and not beside the Dockerfile, deliberately.** BuildKit
+# does support a per-Dockerfile `tools/web/Dockerfile.dockerignore`, but it is the newer form and
+# an older or differently-configured builder ignores it silently — at which point the exclusions
+# below stop applying and `secrets/` goes into the build context. An ignore file that might not
+# be read is worse than none, because it looks like protection. The context root is where every
+# builder looks.
+
+# ⚠️ Secrets first, and never negated below. `*.local.properties` holds the Nextcloud app
+# password; `secrets/` holds the container's. Neither belongs in a build context at all: a file
+# copied into a layer stays in that layer even if a later step deletes it.
+*.local.properties
+secrets/
+.env
+.env.*
+
+# The Android build, which is most of the repository by size and none of it by relevance.
+build/
+*/build/
+**/build/
+.gradle/
+.kotlin/
+android/
+app/
+core/
+build-logic/
+gradle/
+*.jar
+*.aar
+*.apk
+
+# Working data. `recordings-pulled/` is a real 12 MB lecture used as a test fixture.
+recordings-pulled/
+graphify-out/
+.claude-flow/
+tools/web/.cache/
+**/__pycache__/
+*.pyc
+
+# Version control and editor noise.
+.git/
+.github/
+.idea/
+.vscode/

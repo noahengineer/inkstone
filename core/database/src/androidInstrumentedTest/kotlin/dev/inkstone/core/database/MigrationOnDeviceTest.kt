@@ -9,6 +9,7 @@ import app.cash.sqldelight.driver.android.AndroidSqliteDriver
 import dev.inkstone.core.database.library.LibraryIndex
 import dev.inkstone.core.database.sync.SqlAttentionStore
 import dev.inkstone.core.database.sync.SqlBindingStore
+import dev.inkstone.core.database.sync.SqlBrowsedFolderStore
 import dev.inkstone.core.database.sync.SqlForeignRemoteStore
 import dev.inkstone.core.database.sync.SqlOutboxStore
 import dev.inkstone.core.database.sync.SqlRemoteDirectoryStore
@@ -140,6 +141,14 @@ class MigrationOnDeviceTest {
         assertTrue(SqlRemoteDirectoryStore(database, dispatcher).forAccount(ACCOUNT).isEmpty())
         assertTrue(SqlForeignRemoteStore(database, dispatcher).forAccount(ACCOUNT).isEmpty())
         assertTrue(SqlAttentionStore(database, dispatcher).open().isEmpty())
+
+        // `9.sqm`'s table, same shape. ⚠️ An empty browser cache reads as *"I have never listed
+        // this folder"* and **not** as *"this folder is empty"* — the two are different sentences
+        // and only one of them is true after an upgrade, which is why `listedAt` is 0 here rather
+        // than the upgrade's own timestamp.
+        val browsed = SqlBrowsedFolderStore(database, dispatcher).childrenOf(ACCOUNT, "Inkstone")
+        assertTrue(browsed.folders.isEmpty())
+        assertEquals(0L, browsed.listedAtEpochMillis, "an upgrade has not listed anything")
     }
 
     @Test

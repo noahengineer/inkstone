@@ -17,8 +17,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import dagger.hilt.android.AndroidEntryPoint
 import dev.inkstone.app.R
+import dev.inkstone.app.ink.EditorPreferences
 import dev.inkstone.app.ink.InkScreen
 import dev.inkstone.app.sync.PollTicker
+import dev.inkstone.app.ui.DarkBars
 import dev.inkstone.app.ui.InkstoneTheme
 import javax.inject.Inject
 
@@ -62,9 +64,22 @@ class NoteActivity : ComponentActivity() {
     @Inject
     lateinit var poll: PollTicker
 
+    /**
+     * M10 — the editor's remembered toolbar (docs/M10-DESIGN.md §10).
+     *
+     * WARNING: warmed in `onCreate` **before `setContent`**, so a deep link straight into a note
+     * starts the read before the first composition rather than after it, and flushed in `onStop`
+     * because that is the last callback Android guarantees before the process can be killed. It is
+     * deliberately **not** warmed from `InkstoneApplication.onCreate`, which runs in every process
+     * — including `:crashpoint`, which has no business touching settings.
+     */
+    @Inject
+    lateinit var editorPreferences: EditorPreferences
+
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge()
+        enableEdgeToEdge(statusBarStyle = DarkBars, navigationBarStyle = DarkBars)
         super.onCreate(savedInstanceState)
+        editorPreferences.warm()
         setContent {
             InkstoneTheme {
                 val note by editor.state.collectAsState()
@@ -117,6 +132,7 @@ class NoteActivity : ComponentActivity() {
     override fun onStop() {
         poll.release()
         editor.materialize()
+        editorPreferences.flush()
         super.onStop()
     }
 

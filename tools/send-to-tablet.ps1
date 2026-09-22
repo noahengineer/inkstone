@@ -66,7 +66,6 @@ $Apk = Join-Path $RepoRoot 'app\build\outputs\apk\debug\app-debug.apk'
 $sha = (& git -C $RepoRoot rev-parse --short HEAD 2>$null)
 if (-not $sha) { $sha = 'nogit' }
 $dirty = if ((& git -C $RepoRoot status --porcelain 2>$null)) { '-dirty' } else { '' }
-$DestName = "inkstone-$sha$dirty.apk"
 
 # ---------------------------------------------------------------------------
 # 1. Build
@@ -104,6 +103,24 @@ if (-not (Test-Path $Apk)) {
 
 $expectedBytes = (Get-Item $Apk).Length
 Write-Host "APK: $expectedBytes bytes, built $((Get-Item $Apk).LastWriteTime)" -ForegroundColor Cyan
+
+# ---------------------------------------------------------------------------
+# The name carries the *content* of a dirty build, not just the commit
+# ---------------------------------------------------------------------------
+# ⚠️ It was `inkstone-<sha>-dirty.apk`, and the skip below compares **name and
+# byte count** to decide a transfer already landed. Both of those repeat for
+# every uncommitted build off the same commit -- and two builds of this app
+# really did come out at exactly 98,078,118 bytes, minutes apart, with different
+# code in them. The script printed `is already on the tablet` and copied
+# nothing, so the tablet kept the previous build while the run reported success.
+# That is the failure this repo hunts: a green report for work not done.
+#
+# A committed build is identified by its sha, which is honest. A dirty one now
+# carries eight hex of its own SHA-256, so the name changes exactly when the
+# bytes do -- which makes the skip correct by construction rather than by luck,
+# and lets you tell two dirty builds apart on the tablet's own file list.
+$stamp = if ($dirty) { '-' + (Get-FileHash $Apk -Algorithm SHA256).Hash.Substring(0, 8).ToLower() } else { '' }
+$DestName = "inkstone-$sha$dirty$stamp.apk"
 
 # ---------------------------------------------------------------------------
 # 2. Find the tablet
@@ -152,6 +169,8 @@ Copy-Item $Apk $staged -Force
 
 # An identical transfer that already landed is not worth repeating -- a re-run
 # after an interruption should be cheap when the interruption was after the copy.
+# ⚠️ Sound only because $DestName now changes with the APK's **content** (see
+# above). Name-and-size alone said "already there" about a different build.
 $already = $dest.Items() | Where-Object { $_.Name -eq $DestName }
 if ($already -and [int64]$already.ExtendedProperty('System.Size') -eq $expectedBytes) {
     Write-Host "OK  $DestName is already on the tablet, $expectedBytes bytes." -ForegroundColor Green
@@ -198,7 +217,7 @@ while ((Get-Date) -lt $deadline) {
             # sha, optionally `-dirty`. A hand-named keepsake like `inkstone-m1.apk`
             # is not this script's to delete, and `-like 'inkstone-*.apk'` would
             # have taken it.
-            $mine = '^inkstone-[0-9a-f]{7,40}(-dirty)?\.apk$'
+            $mine = '^inkstone-[0-9a-f]{7,40}(-dirty(-[0-9a-f]{8})?)?\.apk$'
             foreach ($old in @($dest.Items() | Where-Object { $_.Name -match $mine -and $_.Name -ne $DestName })) {
                 Write-Host "  removing older build $($old.Name)" -ForegroundColor DarkGray
                 $old.InvokeVerb('delete')

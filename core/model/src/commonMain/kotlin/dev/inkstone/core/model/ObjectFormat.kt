@@ -42,8 +42,33 @@ import kotlin.math.roundToLong
  * (only connectors do): one record type with defaults, and only non-defaults encoded. A per-kind
  * record would need a discriminator to tell them apart, and the object already is one.
  *
+ * ## ⚠️ Why a text box's **frame** is here and not in [PageOp.SetTransform]
+ *
+ * A text box has two different things a user could mean by "make this bigger", and until this
+ * register carried [boxWidthPt] the app could only do the wrong one. `SetTransform` scales the
+ * object's own space, so dragging a corner multiplied every glyph's size along with the frame —
+ * `DryTextBox`'s KDoc called that *"the honest behaviour … exactly as it scales a photo"*, and it
+ * is honest for a photo and wrong for a paragraph: the words the user typed at 14 pt came back at
+ * 21 pt, and nothing re-wrapped. What resizing a text box means is **a different wrap width**, so
+ * it is a change to the object's frame and not to the space its contents live in.
+ *
+ * It is a [PageOp.SetFormat] key rather than a new op for [ObjectFormat]'s own reason — the
+ * vocabulary is frozen (SPEC §4.2) and this register is the extensible one — and it is **absolute**
+ * like everything else in it (CLAUDE.md rule 8): the value written is the resulting width, never a
+ * delta, so two devices resizing the same box converge on one of the two sizes rather than on the
+ * product of both.
+ *
+ * Null means *"the extents the object was created with"* ([TextBoxObject.widthPt]). It has to mean
+ * that rather than defaulting to a number, because the payload is first-write-wins and is the only
+ * record of how big a box was placed; a default here would resize every text box in every note
+ * written before this build.
+ *
  * @property listLevel 0 means "not a list". 1 and up are nesting depths.
  * @property crop null means the whole image. Only an [ImageObject] has one.
+ * @property boxWidthPt the frame's width in page points, overriding the payload's. Null means the
+ *   payload's. Only a [TextBoxObject] uses it — an image is scaled, because scaling a photo is
+ *   what resizing one means.
+ * @property boxHeightPt the frame's height, on the same terms.
  * @property extras keys this build does not recognise, kept verbatim and written back — what
  *   [OpExtras] does for an op, one level down. Without it a later build adding a key would have it
  *   destroyed by every M8c device that opened the note.
@@ -55,8 +80,16 @@ public data class ObjectFormat(
     val listLevel: Int = 0,
     val listStyle: ListStyle = ListStyle.NONE,
     val crop: ImageCrop? = null,
+    val boxWidthPt: Float? = null,
+    val boxHeightPt: Float? = null,
     val extras: Map<String, String> = emptyMap(),
 ) {
+
+    /** The frame this object is laid out in, given the extents its payload was created with. */
+    public fun frameWidth(payloadWidthPt: Float): Float = boxWidthPt ?: payloadWidthPt
+
+    /** The frame's height, on [frameWidth]'s terms. */
+    public fun frameHeight(payloadHeightPt: Float): Float = boxHeightPt ?: payloadHeightPt
 
     /**
      * True when this is the default presentation — nothing to persist.
@@ -157,6 +190,25 @@ public sealed interface ImageCrop {
  * time a later build put a comma in an extras value — but **make the values unable to contain
  * one**.
  */
+private const val K_BOX_WIDTH = "w"
+private const val K_BOX_HEIGHT = "h"
+
+/**
+ * A text box's frame, from one record key.
+ *
+ * Top-level so it costs [ObjectFormatCodec] no size, which is the same reason `countShapes` sits
+ * beside `SelectionController` rather than inside it.
+ *
+ * A frame with no extent cannot be grabbed again and gives the object a singular matrix — what
+ * `ShapeGeometry.MIN_EXTENT_PT` guards on the payload side. **Refused rather than clamped**: an
+ * unreadable value leaves the property alone, which here means *"the extents it was created with"*,
+ * a size the user has already seen rather than one this build invented.
+ */
+private fun ObjectFormat.withFrame(key: String, value: String): ObjectFormat {
+    val extent = value.toFloatOrNull()?.takeIf { it >= ShapeGeometry.MIN_EXTENT_PT } ?: return this
+    return if (key == K_BOX_WIDTH) copy(boxWidthPt = extent) else copy(boxHeightPt = extent)
+}
+
 internal object ObjectFormatCodec {
 
     private const val PREFIX = "if1"
@@ -173,8 +225,17 @@ internal object ObjectFormatCodec {
     private const val K_CROP_RECT = "c"
     private const val K_CROP_POLY = "cp"
 
-    private val knownKeys =
-        setOf(K_FONT, K_SIZE, K_ALIGN, K_LIST_LEVEL, K_LIST_STYLE, K_CROP_RECT, K_CROP_POLY)
+    private val knownKeys = setOf(
+        K_FONT,
+        K_SIZE,
+        K_ALIGN,
+        K_LIST_LEVEL,
+        K_LIST_STYLE,
+        K_CROP_RECT,
+        K_CROP_POLY,
+        K_BOX_WIDTH,
+        K_BOX_HEIGHT,
+    )
 
     private const val RECT_PARTS = 4
     private const val RECT_LEFT = 0
@@ -200,6 +261,11 @@ internal object ObjectFormatCodec {
             is ImageCrop.Rect -> parts += "$K_CROP_RECT$EQUALS${encodeRect(crop)}"
             is ImageCrop.Polygon -> parts += "$K_CROP_POLY$EQUALS${encodePolygon(crop)}"
         }
+        // Null is "the extents it was created with", so an absent key and a key holding the payload's
+        // own number are deliberately different records: writing the second would put a frame in
+        // every note that has never been resized.
+        format.boxWidthPt?.let { parts += "$K_BOX_WIDTH$EQUALS${RecordText.number(it)}" }
+        format.boxHeightPt?.let { parts += "$K_BOX_HEIGHT$EQUALS${RecordText.number(it)}" }
         // Sorted, so identical content produces identical bytes whatever order a future build read
         // them in — the discipline `BundleReader` applies to unknown manifest members (SPEC §5.8).
         // `sortedBy`, not `toSortedMap`: the latter is JVM-only and fails the iOS compile.
@@ -240,13 +306,22 @@ internal object ObjectFormatCodec {
      */
     private fun applyKnown(format: ObjectFormat, key: String, value: String): ObjectFormat = when (key) {
         K_FONT -> format.withFont(value)
+
         K_SIZE -> format.withSize(value)
+
         K_ALIGN -> format.withAlign(value)
+
         K_LIST_LEVEL -> format.withListLevel(value)
+
         K_LIST_STYLE -> format.withListStyle(value)
+
         K_CROP_RECT -> decodeRect(value)?.let { format.copy(crop = it) } ?: format
+
         K_CROP_POLY -> decodePolygon(value)?.let { format.copy(crop = it) } ?: format
-        else -> format
+
+        // The frame, in the `else` rather than in two branches of its own. `applyKnown` is reached
+        // only for a key in [knownKeys], so the remaining two are exactly `w` and `h`.
+        else -> format.withFrame(key, value)
     }
 
     // One per key, so the dispatch above stays a table. Each is the fail-closed rule spelled once:

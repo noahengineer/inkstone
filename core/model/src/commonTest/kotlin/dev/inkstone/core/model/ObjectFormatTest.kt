@@ -57,6 +57,43 @@ class ObjectFormatTest {
     }
 
     @Test
+    fun `a text box frame round-trips`() {
+        val format = ObjectFormat(boxWidthPt = 260.5f, boxHeightPt = 88f)
+        assertEquals(format, ObjectFormat.decode(format.encode()))
+    }
+
+    @Test
+    fun `an absent frame means the extents the box was created with`() {
+        // Null has to mean *the payload* rather than a number. A default here would resize every
+        // text box in every note written before the frame existed - the payload is first-write-wins
+        // and is the only record of how big a box was placed.
+        val placed = ObjectFormat.decode("if1;f=mo")
+        assertNull(placed.boxWidthPt)
+        assertEquals(120f, placed.frameWidth(120f))
+        assertEquals(44f, placed.frameHeight(44f))
+        assertEquals(260f, ObjectFormat(boxWidthPt = 260f).frameWidth(120f))
+    }
+
+    @Test
+    fun `a frame with no extent is refused rather than clamped`() {
+        // A degenerate frame gives the object a singular matrix and cannot be grabbed again. The
+        // property is left alone, which means the size the user has already seen.
+        val decoded = ObjectFormat.decode("if1;w=0;h=-4;f=se")
+        assertNull(decoded.boxWidthPt)
+        assertNull(decoded.boxHeightPt)
+        assertEquals(TextFont.SERIF, decoded.font)
+    }
+
+    @Test
+    fun `a frame does not disturb the registers beside it`() {
+        // The whole reason the frame is a key here and not a `SetTransform`: resizing a box and
+        // restyling it are the same absolute register, so a resize must carry the font through.
+        val styled = ObjectFormat(font = TextFont.MONO, sizePt = 18f, listStyle = ListStyle.BULLET, listLevel = 1)
+        val resized = styled.copy(boxWidthPt = 300f)
+        assertEquals(resized, ObjectFormat.decode(resized.encode()))
+    }
+
+    @Test
     fun `encoding is byte-stable across a decode and re-encode`() {
         // What keeps a two-second autosave from rewriting a register nobody touched — and
         // therefore from enqueueing an upload nobody asked for.

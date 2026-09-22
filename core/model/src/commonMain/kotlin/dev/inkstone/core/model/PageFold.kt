@@ -24,12 +24,12 @@ public fun foldPage(
     pageId: PageId,
     ops: Iterable<PageOp>,
     base: FoldedPage? = null,
-    defaultSize: PageSize = PageSize.Letter,
+    defaultCanvas: PageCanvas = PageCanvas.fixed(PageSize.Letter),
     defaultBackground: Background = Background.Blank,
 ): FoldedPage {
     val folder = PageFolder(
         pageId = pageId,
-        size = base?.size ?: defaultSize,
+        canvas = base?.canvas ?: defaultCanvas,
         background = base?.background ?: defaultBackground,
         base = base,
     )
@@ -63,7 +63,16 @@ public fun foldPage(
 @Suppress("LongParameterList")
 public class FoldedPage(
     public val pageId: PageId,
-    public val size: PageSize,
+    /**
+     * ⭐ The paper: its extent, where it sits in page space, and whether it grows (SPEC §4.5).
+     *
+     * Was a bare [PageSize], on the assumption that the paper is `[0, 0, width, height]`. That
+     * assumption was never checked — so ink written beside the page was captured, journaled and
+     * synced at a page-space coordinate no PDF reader draws — and it cannot describe a canvas that
+     * grows upwards at all. [size] remains, as the extent, because that is what most callers
+     * actually want.
+     */
+    public val canvas: PageCanvas,
     public val background: Background,
     public val objects: List<InkObject>,
     public val deleted: Set<ObjectId>,
@@ -75,6 +84,24 @@ public class FoldedPage(
 ) {
 
     public val isEmpty: Boolean get() = objects.isEmpty()
+
+    /** The paper's extent. Its position is [canvas]'s business, and only a renderer's. */
+    public val size: PageSize get() = canvas.size
+
+    /**
+     * The paper this page would have if it grew to hold [content] — itself, unless something has
+     * been written outside it and the page is [PageCanvas.infinite].
+     *
+     * ⭐ **Derived, and derived in the same way by everybody**: the editor asks it after a stroke,
+     * a page load asks it after a merge, and the publisher asks it before it writes the box. That
+     * is what makes the canvas converge without a merge rule of its own — growth is grow-only and
+     * order-independent ([PageCanvas.grownToInclude]), so two devices that each grew a page
+     * differently both arrive at a paper holding *both* their ink the next time either folds it.
+     * A last-writer-wins register alone could not promise that, and what it would lose is a peer's
+     * writing, silently, outside the CropBox.
+     */
+    public fun canvasFor(content: PageRect?): PageCanvas =
+        if (!canvas.infinite || content == null) canvas else canvas.grownToInclude(content)
 
     /**
      * Built on first use, not per call. [find] used to be a linear scan, which made
@@ -114,11 +141,11 @@ public class FoldedPage(
     public companion object {
         public fun empty(
             pageId: PageId,
-            size: PageSize = PageSize.Letter,
+            canvas: PageCanvas = PageCanvas.fixed(PageSize.Letter),
             background: Background = Background.Blank,
         ): FoldedPage = FoldedPage(
             pageId = pageId,
-            size = size,
+            canvas = canvas,
             background = background,
             objects = emptyList(),
             deleted = emptySet(),
@@ -138,10 +165,14 @@ public class FoldedPage(
  */
 internal class PageFolder(
     private val pageId: PageId,
-    private var size: PageSize,
+    canvas: PageCanvas,
     private var background: Background,
     base: FoldedPage?,
 ) {
+
+    private var size: PageSize = canvas.size
+    private var origin: PagePoint = canvas.origin
+    private var infinite: Boolean = canvas.infinite
 
     /** First-write-wins: an object's payload comes from its earliest [PageOp.AddObject]. */
     private val payloads = LinkedHashMap<ObjectId, InkObject>()
@@ -156,6 +187,8 @@ internal class PageFolder(
 
     private var sizeClock: LamportClock? = null
     private var backgroundClock: LamportClock? = null
+    private var originClock: LamportClock? = null
+    private var infiniteClock: LamportClock? = null
 
     private val unknown = ArrayList<PageOp.Unknown>()
 
@@ -256,6 +289,22 @@ internal class PageFolder(
                         backgroundClock = clock
                     }
                 }
+                // ⚠️ Four independent registers, not one canvas value written whole. A device that
+                // turns the page infinite and a device that grows it are making different changes,
+                // and folding them through a single register would let one silently discard the
+                // other — which for the growth half means a peer's ink outside the box.
+                op.origin?.let {
+                    if (isLater(originClock, clock)) {
+                        origin = it
+                        originClock = clock
+                    }
+                }
+                op.infinite?.let {
+                    if (isLater(infiniteClock, clock)) {
+                        infinite = it
+                        infiniteClock = clock
+                    }
+                }
             }
 
             // A no-op by definition, but it still counts towards the log and still
@@ -295,7 +344,7 @@ internal class PageFolder(
 
         return FoldedPage(
             pageId = pageId,
-            size = size,
+            canvas = PageCanvas(size = size, origin = origin, infinite = infinite),
             background = background,
             objects = live,
             deleted = deleted,
@@ -346,7 +395,7 @@ public class PageLog(
     public val pageId: PageId,
     ops: List<PageOp> = emptyList(),
     private val snapshot: FoldedPage? = null,
-    private val defaultSize: PageSize = PageSize.Letter,
+    private val defaultCanvas: PageCanvas = PageCanvas.fixed(PageSize.Letter),
     private val defaultBackground: Background = Background.Blank,
 ) {
 
@@ -366,7 +415,7 @@ public class PageLog(
     public var snapshotStale: Boolean = false
         private set
 
-    public var state: FoldedPage = FoldedPage.empty(pageId, defaultSize, defaultBackground)
+    public var state: FoldedPage = FoldedPage.empty(pageId, defaultCanvas, defaultBackground)
         private set
 
     /** Every op this log holds — since the snapshot, if there is one. */
@@ -458,7 +507,7 @@ public class PageLog(
 
     private fun newFolder(useSnapshot: Boolean = !snapshotStale) = PageFolder(
         pageId = pageId,
-        size = snapshot?.takeIf { useSnapshot }?.size ?: defaultSize,
+        canvas = snapshot?.takeIf { useSnapshot }?.canvas ?: defaultCanvas,
         background = snapshot?.takeIf { useSnapshot }?.background ?: defaultBackground,
         base = snapshot?.takeIf { useSnapshot },
     )

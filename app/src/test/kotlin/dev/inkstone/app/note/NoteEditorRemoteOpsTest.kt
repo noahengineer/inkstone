@@ -7,6 +7,7 @@ import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
@@ -107,7 +108,7 @@ class NoteEditorRemoteOpsTest {
             BundleWriter.write(
                 BundleContents(
                     document = document.copy(schemaVersion = schemaVersion),
-                    pages = mapOf(page to PageContents(PageSize.Letter, Background.Blank, ops)),
+                    pages = mapOf(page to PageContents(PageCanvas.fixed(PageSize.Letter), Background.Blank, ops)),
                     highestClockCounter = PEER_COUNTER,
                 ),
             ),

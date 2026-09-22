@@ -7,6 +7,7 @@ import dev.inkstone.core.database.InkstoneDatabase
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.sync.AttentionEntry
+import dev.inkstone.core.sync.CachedFolder
 import dev.inkstone.core.sync.ETag
 import dev.inkstone.core.sync.FolderBinding
 import dev.inkstone.core.sync.ForeignRemote
@@ -71,6 +72,7 @@ class SqlReconcileStoresTest {
     private val attention = SqlAttentionStore(database, dispatcher)
     private val folderBindings = SqlFolderBindingStore(database, dispatcher)
     private val peers = SqlPeerClockStore(database, dispatcher)
+    private val browsed = SqlBrowsedFolderStore(database, dispatcher)
 
     private val note = DocumentId("note-1")
     private val account = "acct-1"
@@ -502,4 +504,147 @@ class SqlReconcileStoresTest {
             peers.forNote(note).associate { it.peerDeviceId to it.highestCounter },
         )
     }
+
+    // -----------------------------------------------------------------------
+    // The folder browser's cache — offline folder picking
+    // -----------------------------------------------------------------------
+
+    /**
+     * ⚠️ The one this table exists to get right, and it is a claim about SQLite rather than about
+     * Kotlin: re-listing a parent must not forget that its children have been looked inside.
+     *
+     * The obvious implementation is one `INSERT OR REPLACE` per child, which deletes the
+     * conflicting row and inserts a new one — resetting `listedAt` to its DEFAULT. Nothing would
+     * ever notice except a user, offline, being told that a folder they browsed last week has
+     * never been listed. Same shape as `remoteBinding.lastSeenRemoteAt`, one table along.
+     */
+    @Test
+    fun `re listing a parent keeps what is known about its children`() = runTest(dispatcher) {
+        browsed.remember(account, "Docs", listOf(child("Docs/Physics")), nowEpochMillis = 1_000L)
+        browsed.remember(account, "Docs/Physics", listOf(child("Docs/Physics/Term 1")), nowEpochMillis = 2_000L)
+
+        browsed.remember(account, "Docs", listOf(child("Docs/Physics")), nowEpochMillis = 3_000L)
+
+        val physics = browsed.childrenOf(account, "Docs").folders.single()
+        assertEquals(
+            2_000L,
+            physics.listedAtEpochMillis,
+            "the child was listed at 2000 and a later listing of its parent does not undo that",
+        )
+        assertEquals(
+            2_000L,
+            browsed.childrenOf(account, "Docs/Physics").listedAtEpochMillis,
+            "and the level itself still knows when it was listed",
+        )
+    }
+
+    /**
+     * A listing that succeeds is the only thing that may contradict the cache, and it does so by
+     * omission. ⚠️ Except for a `pending` folder, which is absent from the server precisely
+     * because its MKCOL has not run yet — sweeping that would take away a destination the user
+     * has already chosen.
+     */
+    @Test
+    fun `a listing sweeps what the server no longer has but never a folder made offline`() = runTest(dispatcher) {
+        browsed.remember(
+            account,
+            "Docs",
+            listOf(child("Docs/Physics"), child("Docs/Chemistry")),
+            nowEpochMillis = 1_000L,
+        )
+        browsed.rememberPending(account, "Docs/Term 2", nowEpochMillis = 1_500L)
+
+        browsed.remember(account, "Docs", listOf(child("Docs/Physics")), nowEpochMillis = 2_000L)
+
+        val names = browsed.childrenOf(account, "Docs").folders.map { it.name }
+        assertEquals(listOf("Physics", "Term 2"), names)
+        assertTrue(
+            browsed.childrenOf(account, "Docs").folders.single { it.name == "Term 2" }.pending,
+            "and it is still marked as not being on the server",
+        )
+    }
+
+    /** A live sighting of a folder made offline takes the marker off, because it is real now. */
+    @Test
+    fun `a folder made offline stops being pending once the server shows it`() = runTest(dispatcher) {
+        browsed.rememberPending(account, "Docs/Term 2", nowEpochMillis = 1_000L)
+
+        browsed.remember(account, "Docs", listOf(child("Docs/Term 2")), nowEpochMillis = 2_000L)
+
+        assertTrue(browsed.childrenOf(account, "Docs").folders.none { it.pending })
+
+        // ⚠️ And typing the name again — which is what "new folder" does when the name is
+        // already taken — must not put "not created yet" beside a folder that plainly exists.
+        browsed.rememberPending(account, "Docs/Term 2", nowEpochMillis = 3_000L)
+
+        assertTrue(browsed.childrenOf(account, "Docs").folders.none { it.pending })
+    }
+
+    /**
+     * ⚠️ A `Depth: 1` listing contains its own collection, and at the account root a folder's
+     * `parentPath` and the root's own `path` are both `""` — so without the self-entry filter the
+     * root lists itself as a child of itself, which is a folder the user can open forever.
+     * `RemoteWalk` states the same fact about the walk.
+     */
+    @Test
+    fun `the account root is not a child of itself`() = runTest(dispatcher) {
+        browsed.remember(account, "", listOf(child("Docs")), nowEpochMillis = 1_000L)
+
+        assertEquals(listOf("Docs"), browsed.childrenOf(account, "").folders.map { it.name })
+    }
+
+    /**
+     * Never listed is not empty.
+     *
+     * The two have to be tellable apart or the offline picker says "there are no folders here"
+     * when it means "I have never looked" — which reads as an empty Nextcloud.
+     */
+    @Test
+    fun `a level that was listed and is empty differs from one never listed`() = runTest(dispatcher) {
+        browsed.remember(account, "Docs/Empty", folders = emptyList(), nowEpochMillis = 5_000L)
+
+        assertEquals(5_000L, browsed.childrenOf(account, "Docs/Empty").listedAtEpochMillis)
+        assertEquals(0L, browsed.childrenOf(account, "Docs/Unseen").listedAtEpochMillis)
+    }
+
+    /**
+     * ⭐ Folders the *reconciler* has walked are offered too, so a picker is useful offline even
+     * for a user who has never opened the browser while connected.
+     *
+     * ⚠️ Read-only, one direction. Nothing here writes `remoteDirectory` — a row there is the
+     * reconciler's promise that a directory was walked to completion, and one it did not earn is
+     * how a subtree stops being walked.
+     */
+    @Test
+    fun `folders the reconciler walked are offered even where the browser has never been`() = runTest(dispatcher) {
+        directories.upsert(RemoteDirectory(account, "Docs/Physics", ETag("etag-1", weak = false), "oc-1", 900L))
+
+        val listing = browsed.childrenOf(account, "Docs")
+
+        assertEquals(listOf("Physics"), listing.folders.map { it.name })
+        assertEquals("Docs/Physics", listing.folders.single().path)
+        assertEquals(0L, listing.listedAtEpochMillis, "but the browser has still never listed here")
+    }
+
+    /** Two accounts legitimately have a `Documents` each, and neither may show the other's. */
+    @Test
+    fun `one accounts folders are not offered for another`() = runTest(dispatcher) {
+        browsed.remember(account, "Docs", listOf(child("Docs/Physics")), nowEpochMillis = 1_000L)
+        browsed.remember("acct-2", "Docs", listOf(child("Docs/Chemistry")), nowEpochMillis = 1_000L)
+
+        assertEquals(listOf("Physics"), browsed.childrenOf(account, "Docs").folders.map { it.name })
+        assertEquals(listOf("Chemistry"), browsed.childrenOf("acct-2", "Docs").folders.map { it.name })
+
+        browsed.clearFor(account)
+
+        assertTrue(browsed.childrenOf(account, "Docs").folders.isEmpty())
+        assertEquals(listOf("Chemistry"), browsed.childrenOf("acct-2", "Docs").folders.map { it.name })
+    }
+
+    private fun child(path: String, accountId: String = account) = CachedFolder(
+        accountId = accountId,
+        path = path,
+        parentPath = path.substringBeforeLast('/', ""),
+        name = path.substringAfterLast('/'),
+    )
 }

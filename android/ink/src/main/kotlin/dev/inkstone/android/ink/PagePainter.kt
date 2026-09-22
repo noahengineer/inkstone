@@ -16,7 +16,7 @@ import androidx.ink.rendering.android.canvas.CanvasStrokeRenderer
 import dev.inkstone.android.ink.InkColor.withOpacity
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Matrix3
-import dev.inkstone.core.model.PageSize
+import dev.inkstone.core.model.PageCanvas
 
 /**
  * Draws a page — paper, template, ink, erasures — onto a [Canvas] that already carries the
@@ -116,7 +116,15 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
      *   and page space is defined as the CropBox with `/Rotate` applied (SPEC §4.4) —
      *   which is exactly the rectangle a rendered page fills.
      */
-    fun paintBackground(canvas: Canvas, pageSize: PageSize, background: Background, sourcePage: Bitmap? = null) {
+    fun paintBackground(canvas: Canvas, page: PageCanvas, background: Background, sourcePage: Bitmap? = null) {
+        val pageSize = page.size
+        // ⭐ The paper's own top-left, which is the page-space origin on every fixed page and is
+        // negative on a canvas that has grown up or to the left (SPEC §4.5, [PageCanvas]).
+        // Translating here rather than offsetting each draw is what keeps everything below this
+        // line — the source page's rectangle and every template rule — written against a plain
+        // `0..width` extent, exactly as it was when the paper could only be at the origin.
+        val saved = canvas.save()
+        canvas.translate(page.left, page.top)
         canvas.drawRect(0f, 0f, pageSize.widthPt, pageSize.heightPt, paperPaint)
         if (sourcePage != null && !sourcePage.isRecycled) {
             pageBounds.set(0f, 0f, pageSize.widthPt, pageSize.heightPt)
@@ -125,11 +133,12 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
         // Under the ink, over the paper. Culling it would mean clipping every rule to the
         // viewport, and a page's worth of lines is a rounding error next to 5,000 strokes.
         template.draw(canvas, background, pageSize)
+        canvas.restoreToCount(saved)
     }
 
     /** The page's edge. Drawn last so ink cannot sit on top of it. */
-    fun paintBorder(canvas: Canvas, pageSize: PageSize) {
-        canvas.drawRect(0f, 0f, pageSize.widthPt, pageSize.heightPt, borderPaint)
+    fun paintBorder(canvas: Canvas, page: PageCanvas) {
+        canvas.drawRect(page.left, page.top, page.right, page.bottom, borderPaint)
     }
 
     /**
@@ -140,8 +149,32 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
      * @param visibleBounds page-space culling rect, or null to draw everything. A thumbnail
      *   passes null: the whole page is "on screen" by definition.
      */
-    fun paintObjects(canvas: Canvas, store: StrokeStore, pageToCanvas: Matrix, visibleBounds: Box?) {
+    fun paintObjects(canvas: Canvas, store: StrokeStore, pageToCanvas: Matrix, visibleBounds: Box?, paper: PageCanvas) {
+        val saved = clipToPaper(canvas, paper)
         store.forEachInRenderOrder(visibleBounds) { dry -> paintObject(canvas, dry, pageToCanvas) }
+        canvas.restoreToCount(saved)
+    }
+
+    /**
+     * ⭐ **The paper is where the ink stops, on screen as well as in the PDF.**
+     *
+     * A PDF annotation outside the CropBox is not drawn by any reader, so ink beyond the paper's
+     * edge was ink this app displayed and every other program dropped — invisible loss, and the
+     * kind that only shows up when the note is opened somewhere else. The pen refuses to *start*
+     * outside the paper (`InkSurfaceView.beginStroke`), which handles writing beside the page;
+     * this handles the rest of it, the stroke that begins on the page and runs off the edge.
+     *
+     * Clipped rather than culled: the stroke is untouched in the log and un-erased, exactly like
+     * every other rendering decision here (SPEC §3.5) — make the page bigger, or turn the canvas
+     * infinite, and all of it is back with nothing to reconstruct.
+     *
+     * On an infinite page this is a no-op by construction: the canvas has already grown to hold
+     * whatever was written on it, so the clip is never reached.
+     */
+    private fun clipToPaper(canvas: Canvas, paper: PageCanvas): Int {
+        val saved = canvas.save()
+        canvas.clipRect(paper.left, paper.top, paper.right, paper.bottom)
+        return saved
     }
 
     /**
@@ -161,6 +194,25 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
         style = Paint.Style.FILL
         color = 0x66FFC107
         isAntiAlias = true
+    }
+
+    /**
+     * One object, for the dry layer's append tail — the strokes drawn *after* a cached recording
+     * rather than baked into it (see [StrokeStore.appendsSince]).
+     *
+     * Deliberately the same function [paintObjects] uses per object, not a second painter: the
+     * whole reason this class exists is that a page drawn two ways is a page drawn two different
+     * ways eventually. A stroke must look identical whether it landed before the recording or
+     * after it, because it crosses that line the moment anything re-records.
+     */
+    fun paintOne(canvas: Canvas, dry: DryObject, pageToCanvas: Matrix, paper: PageCanvas) {
+        // ⚠️ The same clip as [paintObjects], for the same reason and not merely for tidiness: the
+        // tail is where a stroke lives between landing and the next re-record, so a clip applied
+        // only in the recording would let a stroke run past the paper's edge for a second or two
+        // and then get cut — which reads as the app deleting the end of a line.
+        val saved = clipToPaper(canvas, paper)
+        paintObject(canvas, dry, pageToCanvas)
+        canvas.restoreToCount(saved)
     }
 
     /**

@@ -23,16 +23,22 @@ import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.Offset
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.ShapeEdit
 import dev.inkstone.core.model.ShapeKind
+import dev.inkstone.core.model.SnapGrid
 import dev.inkstone.core.model.Viewport
 import dev.inkstone.core.model.ZoomLimits
 import dev.inkstone.core.model.cameraFor
 import dev.inkstone.core.model.centredOn
 import dev.inkstone.core.model.leashedTo
 import dev.inkstone.core.model.zoomedAround
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlin.math.hypot
 
 /**
  * The ink surface. SPEC §3, and the reason M1 exists.
@@ -121,6 +127,45 @@ public class InkSurfaceView @JvmOverloads constructor(
     /** How many finished strokes are on the page. */
     public val strokeCount: Int get() = strokes.size
 
+    /**
+     * SPEC §3.6 diagnostics, for the Measure panel — the two facts about a page that change which
+     * rendering cost dominates, and neither of which is visible from outside the process.
+     *
+     * See [StrokeStore.erasedCount] (a per-frame `saveLayer` each) and [StrokeStore.hasHighlighter]
+     * (one of them disables the append fast path for every pen stroke on the page).
+     */
+    public val erasedCount: Int get() = strokes.erasedCount
+
+    public val hasHighlighter: Boolean get() = strokes.hasHighlighter
+
+    /**
+     * Whether the dry layer is currently a rasterised texture rather than a replayed display list,
+     * and the GPU's texture ceiling it was judged against.
+     *
+     * ⚠️ Surfaced because **an oversized layer is dropped silently** — no crash, no log, just the
+     * slow path again. Without this the failure presents as "it is fast on my tablet and slow on
+     * yours" with nothing to look at, and the ceiling itself must be read off the device rather
+     * than assumed (the emulator reports the host GPU's).
+     */
+    public val dryLayerActive: Boolean get() = dryView.layerEnabled
+
+    public val dryLayerRefused: Boolean get() = dryView.layerRefused
+
+    public val maxTextureSize: String get() = "${dryView.maxTextureWidth}×${dryView.maxTextureHeight}"
+
+    /**
+     * The cached page's size **in device pixels** — i.e. the size of the texture a compositing
+     * layer rasterises it into.
+     *
+     * ⚠️ Reported because getting this wrong is invisible in every test and obvious on the glass.
+     * The first compositing-layer build positioned the node in *page* coordinates, so this read
+     * roughly 918×574 while the viewport was 2560×1600 — a texture magnified ~2.8× — and the
+     * symptom was "when you dont move around everything is very pixelated". A number that should
+     * be at least the viewport's size, printed next to the viewport, makes that a glance instead
+     * of an investigation.
+     */
+    public val dryLayerSize: String get() = "${dryView.nodeWidth}×${dryView.nodeHeight}"
+
     private var predictor: MotionEventPredictor? = null
 
     // --- Input state --------------------------------------------------------
@@ -137,6 +182,9 @@ public class InkSurfaceView @JvmOverloads constructor(
     private var activeStrokeIsStylus = true
 
     private val eraser = EraserController(strokes, displayMetrics.density) {
+        // An erase can take the outermost ink off an infinite page, and the paper follows it back
+        // down — the derivation is honest in both directions (SPEC §4.5).
+        recomputeCanvas()
         dryView.onStoreChanged()
         // A flipped pen tip erases whatever the toolbar says, so it can delete a *selected*
         // stroke (WHOLE_STROKE, or the end-of-gesture prune) with the selection standing.
@@ -168,13 +216,28 @@ public class InkSurfaceView @JvmOverloads constructor(
                 overlay.onSelectionChanged()
             },
             onChanged = {
+                // ⭐ At the *end* of the gesture, which is where this callback fires and
+                // `onPreview` deliberately does not: dragging a stroke past the paper's edge grows
+                // an infinite page, and doing it per input event would re-measure every object on
+                // the page at 240 Hz for a value that cannot settle until the finger is up.
+                recomputeCanvas()
                 dryView.onStoreChanged()
                 overlay.onSelectionChanged()
                 onStrokeCountChanged?.invoke(strokes.size)
                 onSelectionChanged?.invoke(selectionController.size)
                 onHistoryChanged?.invoke()
             },
+            onTappedAway = { onSelectTappedAway?.invoke() },
         )
+
+    /**
+     * ⭐ Fired when a tap in Select landed on bare paper — the toolbar's cue to put the pen back.
+     *
+     * The surface does not change [tool] itself, because the tool is `:app`'s state and a view that
+     * wrote it behind the toolbar's back would give the two different opinions — the bug the Image
+     * tool had when it owned touch. `:app` sets its own tool and the value flows down here as usual.
+     */
+    public var onSelectTappedAway: (() -> Unit)? = null
 
     /**
      * ⭐ ROADMAP M8c — the straight edge. See [RulerController] for how the snap is applied.
@@ -244,6 +307,21 @@ public class InkSurfaceView @JvmOverloads constructor(
      * a wrong call that is expressible is eventually made.
      */
     public var tool: InkTool = InkTool.PEN
+        set(value) {
+            if (field == value) return
+            val leavingSelect = field == InkTool.SELECT
+            field = value
+            // ⭐ **Leaving Select drops the selection**, in the user's words: *"when you move off the
+            // tool it unselects anything that is selected"*. The toolbar's own Select chip already
+            // did this; every other route out — a brush chip, the eraser, Text, "Draw again" — did
+            // not, so handles and a frame stayed on screen under a tool with no use for them. It
+            // belongs here rather than in each caller for the reason the chip's KDoc gives about
+            // itself: *"a box round objects the toolbar no longer offers actions for is chrome that
+            // lies"*, and one setter is the only place that sees every way out.
+            //
+            // Guarded on an actual change because `InkScreen` pushes this on every recomposition.
+            if (leavingSelect) selectionController.clear()
+        }
 
     /**
      * SPEC §3.4 — "steal this from Goodnotes: after erasing, auto-return to the
@@ -285,6 +363,28 @@ public class InkSurfaceView @JvmOverloads constructor(
         }
 
     /**
+     * ⭐ **Snap shapes to the paper's grid** — on draw-and-hold, and on a move, resize or point
+     * drag of a selection that is all shapes.
+     *
+     * Off by default, because a lattice is a diagram tool and this is a handwriting app: somebody
+     * ruling a margin does not want their line jumping 18 pt sideways because they had the chip on
+     * from yesterday.
+     *
+     * ⚠️ **The lattice comes from the paper, never from a constant here.** A grid page snaps to
+     * the squares it draws, a ruled page snaps y to its rules and leaves x free, and blank paper
+     * and an imported PDF page get [SnapGrid.DEFAULT_SPACING_PT] — which nothing draws, so
+     * [ToolOverlayView] draws it as chrome while this is on. See [SnapGrid.forBackground]; the rule
+     * it serves is `AlignmentGuides`': *a snap with no line is the object refusing to go where it
+     * was put.*
+     */
+    public var gridSnapEnabled: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            refreshSnapGrid()
+        }
+
+    /**
      * The input smoothing model — the "does it track the nib or chase a
      * spline" knob. See [InkInputModel]. Affects strokes drawn from now on;
      * strokes already on the page keep the geometry they were captured with.
@@ -319,12 +419,46 @@ public class InkSurfaceView @JvmOverloads constructor(
      * ("the view must not jump") can be enforced or even noticed, so the two callers now say which
      * they want: [loadPage] refits explicitly, [setPageMeta] re-leashes.
      */
-    public var pageSize: PageSize = PageSize.Letter
+    public var pageSize: PageSize
+        get() = pageCanvas.size
         set(value) {
-            field = value
-            dryView.pageSize = value
-            overlay.pageSize = value
+            adoptCanvas(storedCanvas.copy(size = value))
         }
+
+    /**
+     * ⭐ **The paper** — its extent *and* where it sits in page space (SPEC §4.5, [PageCanvas]).
+     *
+     * This used to be a [PageSize] alone, on the assumption that the paper is always the
+     * rectangle `[0, 0, width, height]`. Two things came of that. Nothing checked it, so ink
+     * written beside the page — which free panning makes easy — was captured at a negative
+     * page-space x and then dropped by every PDF reader, because an annotation outside the
+     * CropBox is not drawn. And an infinite canvas cannot be expressed by an extent at all: it
+     * grows in whichever direction the user writes.
+     *
+     * ⚠️ **Assigning this does not refit the camera**, exactly as the [pageSize] setter it
+     * replaced did not. Every write to it used to be a camera move, which `loadPage` wanted and
+     * nothing else did — and "nothing else" turned out to include a peer's paper change arriving
+     * mid-stroke. [loadPage] refits explicitly; [setPageMeta] re-leashes.
+     */
+    public var pageCanvas: PageCanvas = PageCanvas.fixed(PageSize.Letter)
+        private set(value) {
+            field = value
+            dryView.pageCanvas = value
+            overlay.pageSize = value.size
+            toolOverlay.pageCanvas = value
+        }
+
+    /**
+     * The paper **as the page's own registers describe it**, before it is grown to hold the ink.
+     *
+     * ⭐ The two are different values on an infinite page and the same one everywhere else, and
+     * keeping them apart is what lets the canvas come back *down* — erase the one stroke in the
+     * far corner, and [recomputeCanvas] re-derives from this rather than from the acre the page
+     * had grown to. Deriving from the effective canvas instead would make every growth permanent
+     * for the life of the note, which is a page that only ever gets bigger and a thumbnail that
+     * shrinks the writing into a corner for good.
+     */
+    private var storedCanvas: PageCanvas = PageCanvas.fixed(PageSize.Letter)
 
     /** The paper under the ink. Changed through [loadPage] or [setPageMeta], never on its own. */
     public val pageBackground: Background get() = dryView.pageBackground
@@ -452,18 +586,74 @@ public class InkSurfaceView @JvmOverloads constructor(
     }
 
     /**
-     * Show a folded page.
+     * ⭐ True between [beginPageLoad] and [finishPageLoad] — the page's paper is up and its ink is
+     * still being built.
+     *
+     * ⚠️ **The pen is refused for this window, and that is not a nicety.** Until `install` runs the
+     * store is empty, so `StrokeStore.topZ` is null: a stroke drawn against it takes a base z key
+     * and the page's whole contents then install *above* it. That is M8a's `lastZ` bug — "the
+     * stroke I just drew went behind the picture" — recreated by a loading page, and
+     * docs/M8-PERF-RENDER-CACHE.md §5 names it as the trap that sank the earlier attempt at this.
+     *
+     * It costs the user nothing they had: the load used to block the UI thread outright, so input
+     * in this window was already going nowhere. What changes is that it is now a page visibly
+     * filling in rather than a frozen app.
+     */
+    public var pageLoading: Boolean = false
+        private set(value) {
+            if (field == value) return
+            field = value
+            onPageLoadingChanged?.invoke(value)
+        }
+
+    /** Told when [pageLoading] flips, so `:app` can say so rather than showing bare paper. */
+    public var onPageLoadingChanged: ((Boolean) -> Unit)? = null
+
+    /** Bumped per load, so a build that finishes after a newer one started is discarded. */
+    private var pageLoadGeneration: Int = 0
+
+    /**
+     * Show a folded page — **paper first, ink as soon as it is built.**
      *
      * The objects arrive already folded, so their absolute registers — including the erased
-     * region — are the winning values and nothing here replays a log. Decoding the geometry
-     * blobs is the cost, and it is a page-switch cost, not an ink-path one.
+     * region — are the winning values and nothing here replays a log. Decoding and tessellating
+     * the geometry blobs is the cost, and it is the largest single cost in the app: see
+     * [PreparedPage], which is where it now happens and why it is safe to happen there.
      *
      * ⭐ **M8c: every object, not `filterIsInstance<StrokeObject>()`.** That filter was the last
      * place a text box or an image was dropped between the log and the screen — and dropped from
      * the store's top z key with it, so the next stroke the user drew landed underneath one. See
      * [DryObject].
+     *
+     * @param dispatcher where the page is built. A parameter so a test can make it deterministic;
+     *   never the caller's own dispatcher, which is the whole point.
      */
-    public fun loadPage(page: FoldedPage) {
+    public suspend fun loadPage(page: FoldedPage, dispatcher: CoroutineDispatcher = Dispatchers.Default) {
+        val generation = beginPageLoad(page)
+        // ⭐ **The whole cost of opening a note, off the UI thread.** See [PreparedPage] — both for
+        // the measurement and for why building a `Stroke` here is safe rather than hopeful.
+        val prepared = withContext(dispatcher) { PreparedPage.of(page, brushFactory) }
+        // ⚠️ A newer load has started while this one was building, so this one's objects belong to
+        // a page that is no longer on screen. Installing them would put the previous page's ink on
+        // the current page's paper — and `NoteEditor.serial` does *not* rule it out: the editor
+        // holds that lock across this suspension, but `bindSurface` and `display` are separate
+        // coroutines and a fast page turn is two loads. A counter makes the stale install
+        // unrepresentable rather than argued about.
+        if (generation != pageLoadGeneration) return
+        finishPageLoad(prepared)
+    }
+
+    /**
+     * The main-thread frame of a load: everything about the *page* that is not its objects.
+     *
+     * Done first and on its own so the paper, the camera and the background are up immediately.
+     * The alternative — hold the old page on screen until the new one is built — shows the user
+     * the page they just left for as long as the build takes, which reads as the turn not having
+     * happened.
+     *
+     * @return the generation this load owns, for the staleness check in [loadPage].
+     */
+    private fun beginPageLoad(page: FoldedPage): Int {
         wetView.cancelUnfinishedStrokes()
         // Immediately, not left to fade: a mark made on the previous page would spend the next
         // second pointing at whatever now happens to be underneath it.
@@ -473,44 +663,41 @@ public class InkSurfaceView @JvmOverloads constructor(
         // offering "delete" for objects on a page the user has left.
         selectionController.clear()
         strokes.reset()
-        pageSize = page.size
+        adoptCanvas(page.canvas)
         // Explicit, because the setter above no longer does it. A page *switch* should fit the new
         // page — it is a different piece of paper and the old camera means nothing on it.
         resetCamera(FitMode.FIT_WIDTH)
         dryView.pageBackground = page.background
+        refreshSnapGrid()
         // Cleared, not kept: the next page's paper is not this one's, and leaving the
         // old bitmap up means an imported page briefly shows the previous page's scan.
         dryView.sourcePage = null
-        strokes.applyOps(ops = loadOps(page), brushes = brushFactory, record = false)
+        pageLoading = true
         dryView.onStoreChanged()
-        onStrokeCountChanged?.invoke(strokes.size)
+        return ++pageLoadGeneration
     }
 
-    /**
-     * A folded page as the ops that build it — synthetic, never journaled.
-     *
-     * `applyOps` is the one path into the render state, so loading goes through it rather than
-     * around it: one decoder, one erase model, one `(z, id)` order.
-     *
-     * ⚠️ **The two record registers are side tables on the fold, so they need their own ops.**
-     * `PageFolder.materialise` copies the winning transform, style, z and erased region onto each
-     * payload, and — for a text box — the winning text. It does **not** copy `SetFormat`, and it
-     * does not copy a *shape's* `SetTextContent` (SPEC §4.8.2's record lives there). Load the
-     * payloads alone and a text box comes back in the default font on every page turn while the
-     * log holds the right one: the fold is correct, the file is correct, and only the screen is
-     * wrong — which is the failure `NoteEditor.reconcile` was extended twice to close.
-     */
-    private fun loadOps(page: FoldedPage): List<PageOp> {
-        val ops = ArrayList<PageOp>(page.objects.size)
-        for (obj in page.objects) {
-            ops += PageOp.AddObject(opId = "", clock = LOAD_CLOCK, obj = obj)
-            // Only when the register has been written. A text box that has never been edited has
-            // its words on its payload and nothing in `texts`, and pushing an empty string here
-            // would wipe them.
-            page.textOf(obj.id)?.let { ops += PageOp.SetTextContent("", LOAD_CLOCK, obj.id, it) }
-            page.formatOf(obj.id)?.let { ops += PageOp.SetFormat("", LOAD_CLOCK, obj.id, it) }
-        }
-        return ops
+    private fun finishPageLoad(prepared: PreparedPage) {
+        strokes.install(prepared, brushFactory)
+        // ⚠️ **A stroke the user erased away comes back from disk, invisible and expensive.**
+        // `SetErasedRegion` is an absolute register (SPEC §3.5) and a fully erased stroke is not
+        // deleted — the op says its whole area is gone, which is the correct and lossless record.
+        // So the fold re-inserts it, `buildDryStroke` restores its region, and every frame after
+        // that it pays a `saveLayer`, a mesh draw and a `DST_OUT` `drawPath` to render *nothing*.
+        // The only other caller of this is `EraserController.end`, so before this line the cost
+        // was only ever reclaimed if the user happened to erase again in the same session — a
+        // page rubbed out and reopened carried it for the rest of its life.
+        strokes.pruneFullyErased()
+        // ⚠️ After the objects, not before: the canvas is derived from the ink, and until
+        // `install` runs the store is empty — so a page opened without this line would show an
+        // infinite note as a sheet of Letter with everything past the first page clipped away,
+        // until the user happened to draw. Same class as the fixture-more-generous-than-production
+        // note in CLAUDE.md: the load path is the one that has to re-derive what nobody watched
+        // happen.
+        recomputeCanvas()
+        pageLoading = false
+        dryView.onStoreChanged()
+        onStrokeCountChanged?.invoke(strokes.size)
     }
 
     /**
@@ -544,12 +731,29 @@ public class InkSurfaceView @JvmOverloads constructor(
      * throws. [resetCamera] and `onSizeChanged` both guard the same way; the old `pageSize` setter
      * was safe only because it went through [resetCamera].
      */
-    public fun setPageMeta(size: PageSize, background: Background) {
-        if (size == pageSize && background == dryView.pageBackground) return
-        pageSize = size
+    public fun setPageMeta(canvas: PageCanvas, background: Background) {
+        if (canvas == storedCanvas && background == dryView.pageBackground) return
+        adoptCanvas(canvas)
         dryView.pageBackground = background
+        refreshSnapGrid()
         dryView.sourcePage = null
         if (width > 0 && height > 0) camera = camera.leashed()
+    }
+
+    /**
+     * Put the lattice, the two controllers that snap to it and the chrome that draws it back in
+     * step — after the setting changed, or after the paper did.
+     *
+     * ⚠️ **Both, and that is the point of it being one function.** The grid is derived from the
+     * background, so a paper change is a grid change: leaving it to the setter alone would mean
+     * switching a page from grid to ruled kept snapping shapes to columns that were no longer
+     * drawn — a snap with no line, arrived at by a route nobody would look down.
+     */
+    private fun refreshSnapGrid() {
+        val grid = if (gridSnapEnabled) SnapGrid.forBackground(pageBackground) else SnapGrid.None
+        snap.grid = grid
+        selectionController.grid = grid
+        toolOverlay.snapGrid = grid
     }
 
     /**
@@ -602,6 +806,10 @@ public class InkSurfaceView @JvmOverloads constructor(
     public fun applyOps(ops: List<PageOp>, record: Boolean = true) {
         if (ops.isEmpty()) return
         strokes.applyOps(ops, brushFactory, record)
+        // ⭐ The door a peer's merged strokes, an undo and every object insert come through — so
+        // it is the one place an infinite page has to re-derive its paper for work it did not
+        // watch being made.
+        recomputeCanvas()
         // ⭐ Before the repaint: the selection caches ids and a box, and this is the door an
         // undo's DeleteObject or a peer's move comes through. Without it, "undo something
         // selected" left the outline and grips round objects that had just been deleted or
@@ -645,9 +853,70 @@ public class InkSurfaceView @JvmOverloads constructor(
             selectionController.marquee = value
         }
 
+    // -----------------------------------------------------------------------
+    // ⭐ The infinite canvas (SPEC §4.5)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Adopt a page's own canvas registers, then grow the paper to whatever is written on it.
+     *
+     * The single writer of [storedCanvas]; [pageCanvas] is derived from it and never set from
+     * outside. One door rather than two, because *"the paper the file says"* and *"the paper the
+     * ink needs"* being separately settable is exactly how they would come to disagree.
+     */
+    private fun adoptCanvas(canvas: PageCanvas) {
+        storedCanvas = canvas
+        recomputeCanvas()
+    }
+
+    /**
+     * ⭐ **The paper is derived from the ink, and nothing records it.**
+     *
+     * A fixed page is its registers and nothing else. An infinite one is those registers grown
+     * until everything on the page fits with a margin ([PageCanvas.grownToInclude]) — computed
+     * here, computed the same way by the thumbnail renderer, and computed the same way by the
+     * publisher before it writes the PDF's box.
+     *
+     * Deriving rather than journaling is the decision this feature turns on, and it buys three
+     * things at once. There is **no growth op**, so writing down a long page is not a
+     * `SetPageMeta` per stroke. There is **nothing to converge**, so SPEC §13.2's merges need no
+     * rule for it: a peer's strokes are simply in the store, so the page grows to hold them the
+     * moment they are folded — where a last-writer-wins size register could resolve the other way
+     * and leave their writing outside the box. And there is **nothing that can disagree with the
+     * ink**, which is the property that made this worth doing: the paper on screen and the box in
+     * the PDF are the same function of the same objects.
+     *
+     * It is not free of a trade. Erasing or undoing the outermost stroke takes the paper back
+     * down, because the derivation is honest in both directions. The slab quantisation is what
+     * keeps that from being twitchy — the edge moves half a page at a time or not at all.
+     */
+    private fun recomputeCanvas() {
+        val canvas = if (storedCanvas.infinite) storedCanvas.grownToInclude(strokes.contentBounds()) else storedCanvas
+        if (canvas == pageCanvas) return
+        pageCanvas = canvas
+        // The paper may have shrunk under a camera that was looking at the part that went away.
+        if (width > 0 && height > 0) camera = camera.leashed()
+    }
+
+    /**
+     * Make room for a point the pen is about to land on — the other half of *"write anywhere"*.
+     *
+     * [recomputeCanvas] derives from ink that exists, and at the ACTION_DOWN this stroke's does
+     * not yet. Without this the very first stroke past the edge would be refused by the same gate
+     * that protects a fixed page, on a page whose whole promise is that there is no edge.
+     *
+     * Nothing is lost by growing early: the stroke about to be drawn contains this point, so the
+     * derivation at the end of the gesture arrives at the same paper or a larger one.
+     */
+    private fun growCanvasForPen(x: Float, y: Float) {
+        if (!storedCanvas.infinite) return
+        val grown = pageCanvas.grownToInclude(x, y)
+        if (grown != pageCanvas) pageCanvas = grown
+    }
+
     /** Applies SPEC §4.5's leash: pan freely, but never lose the page. */
     private fun Camera.leashed(): Camera =
-        leashedTo(pageSize, Viewport(width.toFloat(), height.toFloat()), minVisiblePx)
+        leashedTo(pageCanvas, Viewport(width.toFloat(), height.toFloat()), minVisiblePx)
 
     /** Zoom as a percentage, for the toolbar readout. */
     public fun zoomPercent(): Float = camera.zoomPercent(pixelsPerPoint)
@@ -705,7 +974,7 @@ public class InkSurfaceView @JvmOverloads constructor(
 
     public fun resetCamera(mode: FitMode) {
         if (width == 0 || height == 0) return
-        camera = cameraFor(mode, pageSize, Viewport(width.toFloat(), height.toFloat()), pixelsPerPoint, zoomLimits)
+        camera = cameraFor(mode, pageCanvas, Viewport(width.toFloat(), height.toFloat()), pixelsPerPoint, zoomLimits)
     }
 
     /** Double-tap zoom: toggle between fit-width and 200% of it, around [focus]. */
@@ -735,6 +1004,9 @@ public class InkSurfaceView @JvmOverloads constructor(
                 // never reach a timeline either.
                 if (objectId != null && startedAt != 0L) onStrokeCaptured?.invoke(objectId, startedAt)
             }
+            // Before the repaint: the stroke may have gone past the paper's edge, and on an
+            // infinite page the paper follows it rather than cutting it off.
+            recomputeCanvas()
             dryView.onStoreChanged()
             // Hand off only after the dry layer has been told to redraw, so the
             // stroke is never absent from both layers for a frame.
@@ -785,6 +1057,11 @@ public class InkSurfaceView @JvmOverloads constructor(
 
     @SuppressLint("ClickableViewAccessibility") // A drawing surface has no click semantics.
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // ⚠️ Nothing is drawable, selectable or erasable on a page whose objects are still being
+        // built, and a stroke started here would land under all of them — see [pageLoading].
+        // Consumed rather than passed up: the surface fills the editor, so declining would hand
+        // the gesture to whatever is behind it.
+        if (pageLoading) return true
         predictor?.record(event)
 
         return when (event.actionMasked) {
@@ -836,7 +1113,9 @@ public class InkSurfaceView @JvmOverloads constructor(
      * exists to stop a palm *panning the page* or *drawing*; a tap moves nothing and writes
      * nothing, and the detector's own slop and timeout are what reject a palm (a palm slides
      * or lingers; two clean sub-slop sub-400 ms contacts are a person asking for undo).
-     * The camera, the ruler and finger drawing stay behind the guard, exactly as before.
+     *
+     * ⭐ **The ruler grab is now in front of it too**, for the same reason and at the same cost —
+     * see the comment on the call. The camera and finger drawing stay behind the guard.
      */
     private fun fingerPointerDown(event: MotionEvent, index: Int, pointerId: Int) {
         val gestureInFlight = activeStrokeId != null || eraser.isActive ||
@@ -845,17 +1124,31 @@ public class InkSurfaceView @JvmOverloads constructor(
 
         taps.onPointerDown(event)
 
-        if (!palmGuard.allowsFinger(event)) return
-
-        // ⭐ M8c — before the camera and before finger drawing. A finger that lands on the straight
-        // edge moves the edge; a finger anywhere else pans the page, exactly as before. Checked
-        // here and not in `beginDrawOrErase` because that is the *stylus* path: the pen draws along
-        // the ruler, so a pen that also moved it would make drawing and adjusting one gesture.
+        // ⭐ **The ruler is grabbed BEFORE the palm guard**, and this placement is the fix for
+        // *"the ruler does not work at all"*. It is the two-finger-undo bug one tool along, with
+        // the same cause: the S Pen reports hover from about a centimetre out and every hover event
+        // refreshes the guard, so with the pen anywhere near the page the guard swallowed the
+        // finger before [RulerController.begin] ever saw it — and *"pen in the other hand"* is the
+        // **only** posture a straight edge is ever used in. Behind the guard, the ruler could be
+        // moved exactly when nobody wanted to move it.
+        //
+        // The trade is deliberate and narrow. The guard exists to stop a palm *drawing* or
+        // *panning the page*; grabbing the ruler is neither. It writes no op, it requires landing
+        // within [RulerController]'s own reach of an edge the user placed themselves, it is visible
+        // the instant it happens, and it is undone by dragging the edge back. `gestureInFlight`
+        // above still refuses it outright while a stroke is live, so a resting palm cannot steal
+        // the edge out from under a line being ruled.
+        //
+        // Checked here and not in `beginDrawOrErase` because that is the *stylus* path: the pen
+        // draws along the ruler, so a pen that also moved it would make drawing and adjusting one
+        // gesture.
         if (rulerController.begin(event, index, pointerId, camera)) {
             taps.cancel()
             parent?.requestDisallowInterceptTouchEvent(true)
             return
         }
+
+        if (!palmGuard.allowsFinger(event)) return
 
         if (fingerDrawingEnabled) {
             requestUnbufferedDispatch(event)
@@ -904,17 +1197,42 @@ public class InkSurfaceView @JvmOverloads constructor(
     }
 
     /**
-     * ⚠️ **The ruler is applied here, as a transform, and that is the whole of the snap.**
+     * ⚠️ **The ruler is applied to the EVENT, not to ink's transform**, and the difference is
+     * the whole of *"the ruler does not work at all"*.
      *
-     * `motionEventToWorldTransform` is captured once per stroke and every sample — historical,
-     * live and predicted — is mapped through it by ink's own code. Composing the straight edge's
-     * orthogonal projection onto it therefore rules the stroke straight at no per-sample cost and
-     * without hand-building a single `StrokeInput`, which CLAUDE.md is explicit would silently drop
-     * pressure, tilt, orientation and tool type. [RulerController] has the full argument, including
-     * why a singular matrix is safe here and what would make it stop being safe.
+     * M8c composed the straight edge's orthogonal projection onto `motionEventToWorldTransform`,
+     * on the argument that ink maps every sample through it anyway. A projection is singular, and
+     * `InProgressShapesView` **inverts** that matrix to compute `strokeUnitLengthCm` — so
+     * `startStroke` threw `IllegalArgumentException: motionEventToWorldTransform must be
+     * invertible` on the ACTION_DOWN of every stroke drawn while the edge was out. Not a stroke
+     * that failed to snap: a stroke that never began. [RulerController]'s KDoc has the full
+     * account and why a near-singular matrix is not the answer either.
+     *
+     * So ink gets the camera's own `viewToPage`, and [ruled] hands it a copy of the event whose
+     * samples — including every historical one — have already been flattened onto the edge.
      */
     private fun beginStroke(event: MotionEvent, pointerIndex: Int, pointerId: Int) {
         if (activeStrokeId != null) return
+        // ⭐ **The paper is where the pen works.**
+        //
+        // Panning is free (SPEC §4.5), so the empty space beside the page is as easy to write in
+        // as the page — and a stroke there is captured at a page-space coordinate outside the
+        // CropBox, which **no PDF reader draws**. The app showed it; every other program dropped
+        // it; nothing said so. That is the silent-loss class CLAUDE.md rule 1 exists for, reached
+        // by drawing rather than by syncing.
+        //
+        // Refused at the ACTION_DOWN, before `strokes.beginEdit()`, so nothing is opened that
+        // would have to be unwound: no undo entry, no op, no half-stroke on the wet layer. A
+        // stroke that *starts* on the paper and runs off the edge is allowed and clipped where the
+        // paper ends ([PagePainter.clipToPaper]), which is what the PDF will do to it anyway.
+        //
+        // The slack is a stroke width or so: a hand aiming at the very edge of the page and
+        // landing a hair outside it meant the page, and the clip renders the overshoot away.
+        // On an infinite canvas this refuses nothing: the paper has already grown to hold the
+        // point by the time this runs.
+        toPageSpace(event.getX(pointerIndex), event.getY(pointerIndex), downPoint)
+        growCanvasForPen(downPoint.x, downPoint.y)
+        if (!pageCanvas.contains(downPoint.x, downPoint.y, slackPt = EDGE_SLACK_PT)) return
         // M12 — latched here, used when the stroke finishes. `elapsedRealtime` rather than
         // `event.eventTime`, which is `uptimeMillis` and stops during deep sleep: a recording holds
         // the CPU awake, so the two agree in practice, but only one of them is the clock the
@@ -937,18 +1255,56 @@ public class InkSurfaceView @JvmOverloads constructor(
             snap.begin(snapPoint.x, snapPoint.y, event.eventTime)
         }
         val viewToPage = cameraMatrix.viewToPage(camera)
+        // ⚠️ A copy, because `CameraMatrix` hands out a reused instance and every later sample of
+        // this stroke has to be projected through the camera the stroke *started* in — see
+        // `RulerController.eventProjection`.
+        activeStrokeIsRuled = ruled
+        if (ruled) strokeViewToPage.set(viewToPage)
+        val projected = ruled(event)
         activeStrokeId = wetView.startStroke(
-            event = event,
+            event = projected,
             pointerId = pointerId,
             brush = brushFactory.brushFor(pen),
-            // The camera in effect at stroke start, and only that camera — with the straight edge
-            // composed onto it when one is out.
-            motionEventToWorldTransform = if (ruled) rulerController.strokeTransform(viewToPage) else viewToPage,
-            // Stroke space *is* page space, so nothing needs converting later — and it is what
-            // makes the ruler's singular projection safe: nothing ever inverts it.
+            // The camera in effect at stroke start, and only that camera. Never the straight edge:
+            // ink inverts this matrix, and a projection has no inverse.
+            motionEventToWorldTransform = viewToPage,
+            // Stroke space *is* page space, so nothing needs converting later (SPEC §4.4 rule 1).
             strokeToWorldTransform = IDENTITY,
         )
+        release(event, projected)
     }
+
+    /**
+     * [event], with every sample flattened onto the straight edge — or [event] itself when no edge
+     * is out. **The caller must pass the result to [release].**
+     *
+     * `MotionEvent.transform` moves the coordinates of every pointer and every *historical* sample
+     * and leaves pressure, tilt, orientation and tool type alone, which is exactly the set
+     * CLAUDE.md says a hand-built `StrokeInput` silently drops. The copy is pooled and is recycled
+     * the moment ink has read it: `StrokeInputPool.obtainAllHistoryForMotionEvent` converts an
+     * event into a `MutableStrokeInputBatch` synchronously on the calling thread, so nothing
+     * downstream retains it (read off the 1.0.0 bytecode rather than assumed).
+     */
+    private fun ruled(event: MotionEvent): MotionEvent {
+        if (!activeStrokeIsRuled) return event
+        val projected = MotionEvent.obtain(event)
+        projected.transform(rulerController.eventProjection(strokeViewToPage))
+        return projected
+    }
+
+    /** [ruled], for the predicted tail — which is a whole event or nothing at all. */
+    private fun ruledOrNull(event: MotionEvent?): MotionEvent? = event?.let { ruled(it) }
+
+    /** Give back what [ruled] borrowed, and nothing else. */
+    private fun release(original: MotionEvent?, projected: MotionEvent?) {
+        if (projected !== original) projected?.recycle()
+    }
+
+    /** True while the live stroke is being ruled — see [ruled]. */
+    private var activeStrokeIsRuled = false
+
+    /** The camera this stroke started in, for [ruled]. A copy; `CameraMatrix` reuses its own. */
+    private val strokeViewToPage = Matrix()
 
     /**
      * ⭐ ROADMAP M8b — draw-and-hold. Two call sites: armed in [beginStroke], fed in [onMove].
@@ -966,9 +1322,14 @@ public class InkSurfaceView @JvmOverloads constructor(
             // release its own pointer bookkeeping and tolerates its absence.
             activeStrokeId?.let { wetView.cancelStroke(it, null) }
             activeStrokeId = null
+            // ⚠️ Remembered *before* it is cleared. The stroke's pointer is still on the glass — a
+            // snap fires mid-gesture, not on the lift — and `onSnapped` hands it to the selection so
+            // the same movement can go on adjusting the shape. Reading it after this line answers
+            // INVALID, which is how the hand-over silently did nothing.
+            handOverPointerId = strokePointerId
             strokePointerId = MotionEvent.INVALID_POINTER_ID
         },
-        onSnapped = { id, kind, attached ->
+        onSnapped = { id, result ->
             dryView.onStoreChanged()
             onStrokeCountChanged?.invoke(strokes.size)
             onHistoryChanged?.invoke()
@@ -985,11 +1346,38 @@ public class InkSurfaceView @JvmOverloads constructor(
             // the button was not, and the selection made above therefore had no gesture behind it
             // for anyone still holding the pen.
             selectionController.select(listOf(id))
-            onShapeSnapped?.invoke(kind, attached)
+            // ⭐ **Keep the gesture going.** The pen is still down, resting on the end of the line it
+            // just drew — which is where that line's endpoint handle now is — so the same unbroken
+            // movement can carry straight on into dragging that end. Without this the snap ended the
+            // gesture: to nudge the end you lifted, aimed at a 6 dp circle and pressed again, and
+            // the *reason* to nudge it is usually that the snap landed a few points off where you
+            // wanted.
+            //
+            // ⚠️ **Armed here, begun on the first real movement** — see [handOverFrom]. Starting the
+            // drag now would commit one on the lift even when the pen never moved, and a point drag
+            // commits an explicit vertex list: every snapped line would gain a `SetTextContent` it
+            // did not need, on the journal and on the wire, for a gesture the user had finished.
+            handOverFrom.set(snapPoint.x, snapPoint.y)
+            onShapeSnapped?.invoke(result)
         },
     )
 
     private val snapPoint = PagePointF()
+
+    /** Where the pen went down, in page space. Reused — the ink path must not allocate. */
+    private val downPoint = PagePointF()
+
+    /**
+     * The pointer that was drawing when a snap fired, so a later move can hand it to the selection.
+     *
+     * A field rather than an argument because the two halves are a callback apart: `cancelWetStroke`
+     * is where the drawing pointer is still known, and `onSnapped` is where the shape exists to be
+     * dragged. Cleared on the lift, and on any move that takes the hand-over.
+     */
+    private var handOverPointerId: Int = MotionEvent.INVALID_POINTER_ID
+
+    /** Where the pen was when the snap fired, so [handOverMove] can measure how far it has come. */
+    private val handOverFrom = PagePointF()
 
     /**
      * View coordinates -> page space.
@@ -1033,6 +1421,47 @@ public class InkSurfaceView @JvmOverloads constructor(
         if (snap.holdElapsed(SystemClock.uptimeMillis())) snapNow()
     }
 
+    /** Forget the pointer a snap was handed. See [handOverPointerId]. */
+    private fun clearHandOver() {
+        handOverPointerId = MotionEvent.INVALID_POINTER_ID
+    }
+
+    /**
+     * ⭐ The pen kept moving after a snap — give it the shape's endpoint.
+     *
+     * Draw a line, hold until it snaps, and *without lifting* carry on: the far end follows the pen.
+     * The handle is already under the tip, because a snapped line ends where the gesture did.
+     *
+     * ⚠️ **[HAND_OVER_SLOP_DP] of movement first.** Arming on the snap and dragging on the very next
+     * sample would take a hand's tremor as an adjustment — and a point drag commits an explicit
+     * vertex list, so every snapped line would gain a `SetTextContent` it did not need. Below the
+     * slop this returns false and the event falls through to the gestures that were live before.
+     *
+     * ⚠️ A **connector** has no point handles — its geometry is derived from what it is attached to
+     * (`SelectionController.soleShape`) — so `beginPointDrag` answers false for one and the pointer
+     * is released rather than half-claimed. A line drawn between two boxes *becomes* a connector, so
+     * this is the common case and not a corner.
+     */
+    private fun handOverMove(event: MotionEvent): Boolean {
+        if (handOverPointerId == MotionEvent.INVALID_POINTER_ID) return false
+        val index = event.findPointerIndex(handOverPointerId)
+        if (index < 0) {
+            clearHandOver()
+            return false
+        }
+        toPageSpace(event.getX(index), event.getY(index), snapPoint)
+        val slopPt = HAND_OVER_SLOP_DP * displayMetrics.density / camera.scale
+        if (hypot(snapPoint.x - handOverFrom.x, snapPoint.y - handOverFrom.y) < slopPt) return false
+
+        val pointerId = handOverPointerId
+        clearHandOver()
+        if (!selectionController.beginPointDrag(handOverFrom.x, handOverFrom.y, pointerId, camera, pageSize)) {
+            return false
+        }
+        selectionController.extend(event, camera)
+        return true
+    }
+
     /**
      * ⚠️ **Closes the gesture bracket [beginStroke] opened**, which `onStrokesFinished` normally
      * would — and it will never fire, because the stroke is cancelled rather than finished.
@@ -1055,18 +1484,25 @@ public class InkSurfaceView @JvmOverloads constructor(
         // *through* both boxes did. `SelectionController.snapTolerance` is the same conversion and
         // is the one to copy; its own KDoc records the identical bug in the alignment guides.
         val bindSlopPt = ENDPOINT_BIND_SLOP_DP * displayMetrics.density / camera.scale
-        if (snap.snap(pen.colorArgb, widthPt, bindSlopPt)) strokes.endEdit()
+        if (!snap.snap(pen.colorArgb, widthPt, bindSlopPt)) {
+            // Nothing was made, so there is nothing to hand the pointer to. Left set, the *next*
+            // snap would inherit a pointer that lifted long ago.
+            clearHandOver()
+            return
+        }
+        strokes.endEdit()
     }
 
     /**
      * Fired after a gesture snapped, so the toolbar can say what it became.
      *
-     * The boolean is whether both — or either — end **attached** to a shape. Worth surfacing
-     * because a line and a connector are pixel-identical the instant they are drawn and behave
-     * completely differently the moment anything moves; without it the user has no way to tell
-     * whether the binding took except by dragging a box and seeing what happens.
+     * ⚠️ **A type rather than the two booleans it replaced.** It carried `(kind, attached)` and was
+     * about to carry `(kind, attached, curved)` — three positional arguments, two of them booleans
+     * of the same type, which is the shape of call site that eventually gets them the wrong way
+     * round. `NoteSession.apply`'s deleted `undoable` flag is the same lesson: a wrong call that is
+     * representable is eventually made.
      */
-    public var onShapeSnapped: ((ShapeKind, Boolean) -> Unit)? = null
+    public var onShapeSnapped: ((ShapeSnapResult) -> Unit)? = null
 
     private fun onMove(event: MotionEvent): Boolean {
         // ⭐ Disqualification bookkeeping only — two subtractions per tracked pointer, no camera
@@ -1099,7 +1535,11 @@ public class InkSurfaceView @JvmOverloads constructor(
      *
      * @return true when one of them consumed the event.
      */
-    private fun stylusGestureMove(event: MotionEvent): Boolean {
+    private fun stylusGestureMove(event: MotionEvent): Boolean = handOverMove(event) || liveGestureMove(event)
+
+    /** The four that were already running. Split from [stylusGestureMove] only to keep each honest
+     *  about its own guard clauses — `ReturnCount` counts them, and the hand-over adds a fifth. */
+    private fun liveGestureMove(event: MotionEvent): Boolean {
         val strokeId = activeStrokeId
         if (strokeId != null) {
             // ⭐ Only when the stroke is really a stylus's. With finger drawing on, this branch is
@@ -1115,7 +1555,15 @@ public class InkSurfaceView @JvmOverloads constructor(
             // straight off the event. Synthesising StrokeInputs by hand here
             // would silently drop every one of those (SPEC §3.3).
             val prediction = if (predictionEnabled) predictor?.predict() else null
-            wetView.addToStroke(event, strokePointerId, strokeId, prediction)
+            // ⚠️ **The prediction is projected too.** It is a separate `MotionEvent` and travels
+            // through none of the event's own transforms, so a ruler that straightened the real
+            // samples and left the predicted tail alone would draw a hook at the nib that
+            // disappeared a frame later.
+            val projected = ruled(event)
+            val projectedPrediction = ruledOrNull(prediction)
+            wetView.addToStroke(projected, strokePointerId, strokeId, projectedPrediction)
+            release(event, projected)
+            release(prediction, projectedPrediction)
             // ⭐ M8b — after the ink, never before it. Two float writes and a distance compare
             // (see [ShapeSnapDetector]); putting it ahead of `addToStroke` would add its cost to
             // the pen-to-pixel path that SPEC §3.6 measures, for no benefit at all.
@@ -1190,8 +1638,17 @@ public class InkSurfaceView @JvmOverloads constructor(
     private fun endStroke(event: MotionEvent, pointerId: Int, cancelled: Boolean) {
         val strokeId = activeStrokeId
         if (strokeId != null) {
-            if (cancelled) wetView.cancelStroke(strokeId, event) else wetView.finishStroke(event, pointerId, strokeId)
+            if (cancelled) {
+                // A cancel throws the stroke away; the event is only read for latency accounting,
+                // so there is nothing here for the edge to straighten.
+                wetView.cancelStroke(strokeId, event)
+            } else {
+                val projected = ruled(event)
+                wetView.finishStroke(projected, pointerId, strokeId)
+                release(event, projected)
+            }
         }
+        activeStrokeIsRuled = false
         // A finished stroke closes its own bracket in `onStrokesFinished`; a cancelled one never
         // reaches that listener, so it has to be closed here or the next stroke joins this one's
         // undo entry.
@@ -1255,16 +1712,20 @@ public class InkSurfaceView @JvmOverloads constructor(
     private companion object {
         const val POINTS_PER_INCH = 72f
         const val MIN_PAGE_VISIBLE_DP = 64f
+
+        /**
+         * How far outside the paper a stroke may still begin, in page points.
+         *
+         * A person writing to the very edge of the page lands a little past it, and refusing that
+         * stroke would read as the last centimetre of the page not working. Half the widest brush
+         * is about right: what the slack lets in is ink whose visible body is on the paper anyway,
+         * and the clip takes off what is not.
+         */
+        const val EDGE_SLACK_PT = 6f
         const val UNDO_FINGERS = 2
         const val REDO_FINGERS = 3
         const val DOUBLE_TAP_ZOOM = 2f
 
-        /**
-         * The clock on the synthetic `AddObject`s a page load builds. Never journaled —
-         * `record` is false on that path — so its value is arbitrary, and it is a
-         * recognisable sentinel rather than a plausible counter in case one ever escapes.
-         */
-        val LOAD_CLOCK = LamportClock(0, "load")
         const val ZOOM_TOGGLE_THRESHOLD = 1.2f
 
         /**
@@ -1276,6 +1737,15 @@ public class InkSurfaceView @JvmOverloads constructor(
          * attaches to it. ⚠️ Not measured on a device, like the dwell constants (SPEC §4.8.7).
          */
         const val ENDPOINT_BIND_SLOP_DP = 20f
+
+        /**
+         * How far the pen must travel after a snap before it is adjusting rather than resting.
+         *
+         * A hand holding still to trigger the snap is not holding *perfectly* still, and the
+         * hand-over commits an explicit vertex list — so without a slop every snapped line would
+         * gain a `SetTextContent` from a tremor. See [handOverMove].
+         */
+        const val HAND_OVER_SLOP_DP = 6f
 
         val IDENTITY = Matrix()
     }

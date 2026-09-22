@@ -10,6 +10,9 @@ import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.SelectedObject
 import dev.inkstone.core.model.ShapeHit
+import dev.inkstone.core.model.SnapGrid
+import dev.inkstone.core.model.isAnchorable
+import dev.inkstone.core.model.unionOrNull
 
 /*
  * ⭐ M8a — asking a page of ink what a lasso or a tap just hit.
@@ -90,6 +93,10 @@ internal fun StrokeStore.objectAt(x: Float, y: Float, slopPageUnits: Float): Obj
  *   right for selecting and wrong here: dropping a line's end in the **middle** of a rectangle is
  *   the clearest way a person can say "attach to this box", and an outline test would answer no.
  *   [ShapeHit] with `filled = true` is that question, asked of the shape's own outline.
+ * - **Closed shapes only** ([isAnchorable]). A line or an arrow has no inside for
+ *   `filled = true` to test, so the question quietly became *"within slop of the segment"* — and a
+ *   snapped line that merely **started on** another line bound to it, collapsed to a stub on it,
+ *   and lost its point handles, because a connector has none.
  *
  * @param slopPageUnits how far outside the shape the endpoint may land and still bind. A drawn
  *   line usually stops just short of the box it points at, so zero slop would bind almost nothing.
@@ -103,6 +110,7 @@ internal fun StrokeStore.shapeAt(x: Float, y: Float, slopPageUnits: Float): Obje
         // the route would then depend on a route, and two connectors attached to each other have
         // no fixed point to resolve from — so it is refused here rather than left to converge.
         if (dry.isConnector) return@forEachInRenderOrder
+        if (!dry.obj.shape.isAnchorable) return@forEachInRenderOrder
         val bounds = dry.pageBounds
         if (bounds != null && !bounds.containsWithin(x, y, slopPageUnits)) return@forEachInRenderOrder
         if (!dry.toLocal(x, y, local)) return@forEachInRenderOrder
@@ -151,6 +159,45 @@ internal fun StrokeStore.pageBoundsOf(ids: Collection<ObjectId>): PageRect? {
         union = union?.union(rect) ?: rect
     }
     return union
+}
+
+/**
+ * ⭐ Everything on the page, as one page-space box — **what an infinite canvas grows to hold**
+ * (SPEC §4.5).
+ *
+ * Null for an empty page: *"nothing here"* rather than an empty box at the origin, because the
+ * two differ for a page whose only writing is a long way from `(0, 0)`.
+ *
+ * Derived rather than remembered, and that is the design. The canvas is
+ * `stored.grownToInclude(this)` everywhere it is asked for — the editor after a stroke, the
+ * thumbnail, the publisher before it writes the box — so no `SetPageMeta` records growth, nothing
+ * has to converge, and there is no state that can disagree with the ink. A merged page grows for a
+ * peer's writing the moment it is folded, because the peer's strokes are simply in here.
+ */
+internal fun StrokeStore.contentBounds(): PageRect? {
+    var bounds: PageRect? = null
+    forEachInRenderOrder(visibleBounds = null) { dry ->
+        dry.pageBounds?.let { bounds = bounds.unionOrNull(it.asRect()) }
+    }
+    return bounds
+}
+
+/**
+ * ⭐ [grid] when every object in [selection] is a shape, [SnapGrid.None] otherwise.
+ *
+ * ⚠️ **Shapes only, and that is a scope rather than an oversight.** A lattice is a diagram tool:
+ * quantising a drag of somebody's handwriting to 18 pt would move their writing away from the word
+ * it belongs beside, in steps they can see, for a setting they turned on to tidy boxes. A mixed
+ * selection keeps the alignment guides it has always had, which are about the objects on the page
+ * rather than about a lattice.
+ *
+ * A connector counts as a shape: its own transform is derived and re-derived every fold
+ * (SPEC §4.8.3), so a drag of one writes nothing the router honours and excluding it would be a
+ * condition with no observable effect.
+ */
+internal fun StrokeStore.gridFor(selection: Collection<ObjectId>, grid: SnapGrid): SnapGrid {
+    if (grid.isEmpty || selection.isEmpty()) return SnapGrid.None
+    return if (selection.all { shapeOf(it) != null }) grid else SnapGrid.None
 }
 
 /**

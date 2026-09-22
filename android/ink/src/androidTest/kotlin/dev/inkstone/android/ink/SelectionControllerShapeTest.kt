@@ -9,7 +9,10 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.inkstone.core.model.Camera
 import dev.inkstone.core.model.ConnectorEnd
+import dev.inkstone.core.model.EraseCapsule
+import dev.inkstone.core.model.ErasedArea
 import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.Offset
@@ -40,8 +43,8 @@ import org.junit.runner.RunWith
  * black; and `duplicate` silently dropped shapes from the copy. These tests fail on that build.
  *
  * Instrumented for the reason [StrokeStoreSelectionTest] is — the stroke half needs
- * `androidx.ink`'s native geometry — and the strokes carry no orientation and no tilt, so the
- * ten M1 x86_64 failures cannot leak in.
+ * `androidx.ink`'s native geometry — and the strokes carry no orientation and no tilt, which keeps
+ * every expected coordinate arithmetic a reader can check.
  */
 @RunWith(AndroidJUnit4::class)
 class SelectionControllerShapeTest {
@@ -100,21 +103,30 @@ class SelectionControllerShapeTest {
      * fixture through `ShapeEdit.placeSegment` is what keeps this test measuring the same geometry
      * `ShapeSnapController` creates rather than a convenient one of its own (CLAUDE.md: *"distrust
      * a fixture that is more generous than production"*).
+     *
+     * @param vertical the segment turned a quarter turn. Both orientations are axis-aligned, which
+     *   is the case [draggingAnAxisAlignedLineBetweenItsHandlesMovesIt] exists for.
+     * @param spanPt its length. The default keeps the original short horizontal fixture every test
+     *   above is calibrated to; the move test asks for a long one so that a quarter of the way
+     *   along is clear of all three point handles.
      */
-    private fun addLineShape(record: ShapeRecord = ShapeRecord.None): ObjectId {
+    private fun addLineShape(
+        record: ShapeRecord = ShapeRecord.None,
+        vertical: Boolean = false,
+        spanPt: Float = LINE_SPAN_PT,
+    ): ObjectId {
         val recorder = required(store.recorder, "the recorder")
         val id = recorder.newObjectId()
+        val far = LINE_START_X + spanPt
         store.beginEdit()
         store.applyOps(
             ShapeEdit.create(
                 id = id,
-                placement = ShapeEdit.placeSegment(
-                    LINE_START_X,
-                    LINE_SHAPE_Y,
-                    LINE_END_X,
-                    LINE_SHAPE_Y,
-                    bandPt = LINE_BAND_PT,
-                ),
+                placement = if (vertical) {
+                    ShapeEdit.placeSegment(LINE_SHAPE_Y, LINE_START_X, LINE_SHAPE_Y, far, bandPt = LINE_BAND_PT)
+                } else {
+                    ShapeEdit.placeSegment(LINE_START_X, LINE_SHAPE_Y, far, LINE_SHAPE_Y, bandPt = LINE_BAND_PT)
+                },
                 z = store.allocateTopZ(1).single(),
                 style = ObjectStyle(SHAPE_COLOR, SHAPE_WIDTH_PT),
                 record = record,
@@ -257,30 +269,38 @@ class SelectionControllerShapeTest {
     /**
      * ⭐ The check `ShapePointsTest` cannot make: that a press lands on a handle at all.
      *
-     * The arithmetic is settled in `:core:model`. What is only true here is that the handle is
-     * where the controller says it is, that a pen-down within reach of it starts a point drag
-     * rather than a lasso or a move, and that the drag writes **one** absolute `SetTransform` — the
-     * three joints where a correct solve still reaches nobody.
+     * The arithmetic is settled in `:core:model`. What is only true here is that the handle is where
+     * the controller says it is, and that a pen-down within reach of it starts a **point drag**
+     * rather than a lasso or a move — the joints where a correct solve still reaches nobody.
+     *
+     * What it asserts about the *result* is the third session's report: *"straight lines … have the
+     * stretching by size changing, i dont want any shape to do that no matter what"*. A segment's
+     * ends write geometry like every other shape's points, and the placement is not touched at all.
      */
     @Test
-    fun draggingALineEndpointMovesThatEndAndWritesOneTransform() {
+    fun draggingALineEndpointMovesThatEndAndLeavesThePlacementAlone() {
         val id = addLineShape()
         controller.select(listOf(id))
-        val before = required(store.objectOf(id), "the line").transform
+        val placement = required(store.objectOf(id), "the line").transform
+        val start = required(controller.points.firstOrNull(), "the start handle")
         val end = required(controller.points.lastOrNull(), "the end handle")
 
         drag(end.page.x, end.page.y, LINE_END_X, LINE_DRAGGED_Y)
 
-        val after = required(store.objectOf(id), "the line").transform
-        val ends = ShapePoints.of(ShapeKind.LINE, LINE_SPAN_PT, LINE_BAND_PT)
+        val shape = required(store.objectOf(id) as? DryShape, "the line")
+        val ends = required(shape.record.points, "the endpoints the drag should have written")
+        assertEquals(2, ends.size)
         // The dragged end is under the finger and the other one did not move.
-        assertPointEquals(PagePoint(LINE_END_X, LINE_DRAGGED_Y), after.map(ends[2].local))
-        assertPointEquals(before.map(ends[0].local), after.map(ends[0].local))
-        // One op, not one per frame — and absolute, which is what makes it merge (CLAUDE.md rule 8).
-        val transforms = required(store.recorder, "the recorder").drain()
-            .flatten().filterIsInstance<PageOp.SetTransform>().filter { it.target == id }
-        assertEquals("a point drag must write exactly one op", 1, transforms.size)
-        assertEquals(after, transforms.single().absolute)
+        assertPointEquals(PagePoint(LINE_END_X, LINE_DRAGGED_Y), placement.map(ends[1]))
+        assertPointEquals(start.page, placement.map(ends[0]))
+        // ⚠️ And **no** transform op: the placement is what a move or a rotate writes, and a point
+        // drag is neither. Under the old similarity this was one SetTransform that also scaled the
+        // shape's whole local frame.
+        val written = required(store.recorder, "the recorder").drain().flatten()
+        assertTrue(
+            "a point drag wrote a placement: $written",
+            written.none { it is PageOp.SetTransform && it.target == id },
+        )
     }
 
     /** The middle handle is the curve, and it writes the *other* register. */
@@ -310,6 +330,77 @@ class SelectionControllerShapeTest {
         assertEquals(bend, required(ShapeRecord.decode(gestures[1].single().text), "the bend record").bend)
     }
 
+    // -----------------------------------------------------------------------
+    // Moving a straight line — the axis-aligned case, which had no draggable area at all
+    // -----------------------------------------------------------------------
+
+    /**
+     * ⛔ A **vertical** line must move when it is dragged, and for four milestones it could not.
+     *
+     * `DryShape.boundsOf` measured the outline and nothing else. A straight segment's outline is
+     * two points, so an axis-aligned line's page box had one extent of exactly zero — and
+     * `SelectionController.begin` chose `Mode.MOVE` by asking `containsWithin(x, y, 0f)`, which no
+     * zero-width box can answer yes to. The press became a lasso instead: the line stayed put and
+     * the lasso cleared the selection on its way past.
+     *
+     * A **diagonal** line was fine, because the axis-aligned box of a rotated segment has area —
+     * which is exactly the asymmetry that was reported, *"if i draw a line vertically instead of
+     * diagonally or horizontally there seems to be problems"*, and why it survived every fixture
+     * in this file: they are all horizontal and none of them tries to move one.
+     *
+     * The grab is deliberately a quarter of the way along, clear of all three point handles —
+     * `pointAt` is tested before the mode, so a grab within [SelectionController.HANDLE_TOUCH_DP]
+     * of an end or the middle is a point drag and would prove nothing about MOVE.
+     */
+    @Test
+    fun draggingAnAxisAlignedLineBetweenItsHandlesMovesIt() {
+        for (vertical in listOf(true, false)) {
+            setUp()
+            val id = addLineShape(vertical = vertical, spanPt = LONG_LINE_SPAN_PT)
+            controller.select(listOf(id))
+            val before = required(store.objectOf(id), "the line").transform
+            required(store.recorder, "the recorder").drain()
+
+            // ⚠️ **Beside the centre line, not exactly on it**, and the first version of this test
+            // was on it — which made it pass against the broken build and prove nothing. A press
+            // landing on the exact float the segment runs along satisfies even a zero-width box
+            // (`xMin <= x && x <= xMax` with `xMin == xMax`), so the fixture was the one thing in
+            // the system that could hit a hairline. A finger cannot. Off by a quarter of the pen
+            // is still visibly on the ink and is outside the box the old code computed.
+            val quarter = LINE_START_X + LONG_LINE_SPAN_PT / 4f
+            val beside = LINE_SHAPE_Y + SHAPE_WIDTH_PT / 4f
+            val grabX = if (vertical) beside else quarter
+            val grabY = if (vertical) quarter else beside
+            drag(grabX, grabY, grabX + MOVE_BY_PT, grabY + MOVE_BY_PT)
+
+            val which = if (vertical) "vertical" else "horizontal"
+            val written = required(store.recorder, "the recorder").drain().flatten()
+            assertTrue(
+                "a drag on a $which line wrote no placement — it was treated as a lasso: $written",
+                written.any { it is PageOp.SetTransform && it.target == id },
+            )
+            val after = required(store.objectOf(id), "the line").transform
+            assertPointEquals(
+                PagePoint(before.map(ORIGIN).x + MOVE_BY_PT, before.map(ORIGIN).y + MOVE_BY_PT),
+                after.map(ORIGIN),
+            )
+        }
+    }
+
+    /**
+     * The other half of the same fix: a line's box is its ink, not its centre line.
+     *
+     * [DryShape] paints its outline with a paint of the style's width, and both hit tests already
+     * add half of it — this asserts the box agrees, so culling, the lasso and the grab all measure
+     * the ink the user can see rather than the hairline through the middle of it.
+     */
+    @Test
+    fun aStraightLinesBoxIsAsThickAsItsPen() {
+        val id = addLineShape(vertical = true)
+        val bounds = required(required(store.objectOf(id), "the line").pageBounds, "its page bounds")
+        assertEquals("the box is half a pen either side", SHAPE_WIDTH_PT, bounds.xMax - bounds.xMin, TOLERANCE)
+    }
+
     /** A press on a handle that goes nowhere must not put a record in the file. */
     @Test
     fun tappingTheMiddleHandleWithoutMovingWritesNothing() {
@@ -326,23 +417,37 @@ class SelectionControllerShapeTest {
     }
 
     /**
-     * ⚠️ The handles replace the frame's eight grips, so the press has to reach the shape's corner
-     * and not the box's — they are the same pixels for an axis-aligned rectangle, and the two
-     * gestures do different things.
+     * ⭐ **The complaint this milestone was rebuilt for**, asserted end to end through the real
+     * controller: *"editing the points is just resizeing the shape from those points rather then
+     * actually editing the shape"*.
+     *
+     * The press has to reach the shape's corner and not the frame's grip — the same pixels for an
+     * axis-aligned rectangle, and the two gestures do completely different things — and what comes
+     * out has to be a quadrilateral with **one** corner moved, not a scaled rectangle.
      */
     @Test
-    fun aRectangleCornerDragFollowsTheFingerRatherThanScalingAboutTheDiagonal() {
+    fun aRectangleCornerDragMovesThatCornerAndLeavesTheOthers() {
         val id = addRectangle(SHAPE_LEFT, SHAPE_TOP, SHAPE_RIGHT, SHAPE_BOTTOM)
         controller.select(listOf(id))
         assertEquals("a rectangle should offer four corners", 4, controller.points.size)
         val corner = controller.points[2]
+        val before = controller.points.map { it.page }
+        val placement = required(store.objectOf(id), "the rectangle").transform
 
         drag(corner.page.x, corner.page.y, CORNER_TARGET_X, CORNER_TARGET_Y)
 
-        val after = required(store.objectOf(id), "the rectangle").transform
-        val corners = ShapePoints.of(ShapeKind.RECTANGLE, SHAPE_RIGHT - SHAPE_LEFT, SHAPE_BOTTOM - SHAPE_TOP)
-        assertPointEquals(PagePoint(CORNER_TARGET_X, CORNER_TARGET_Y), after.map(corners[2].local))
-        assertPointEquals(PagePoint(SHAPE_LEFT, SHAPE_TOP), after.map(corners[0].local))
+        val shape = required(store.objectOf(id) as? DryShape, "the rectangle")
+        val points = required(shape.record.points, "the vertices the drag should have written")
+        assertEquals(4, points.size)
+        // The dragged corner is under the finger and the other three did not move at all. Under the
+        // old design every one of the last three assertions failed: the shape scaled about its pin.
+        assertPointEquals(PagePoint(CORNER_TARGET_X, CORNER_TARGET_Y), placement.map(points[2]))
+        assertPointEquals(before[0], placement.map(points[0]))
+        assertPointEquals(before[1], placement.map(points[1]))
+        assertPointEquals(before[3], placement.map(points[3]))
+        // ⚠️ And the *placement* is untouched, which is what keeps a later move or rotate to one
+        // absolute SetTransform.
+        assertEquals(placement, required(store.objectOf(id), "the rectangle").transform)
     }
 
     /** A connector's handles would be dead: its geometry is re-derived from what it is attached to. */
@@ -354,6 +459,59 @@ class SelectionControllerShapeTest {
         controller.select(listOf(id))
 
         assertTrue("a connector offered handles that cannot move it", controller.points.isEmpty())
+    }
+
+    // -----------------------------------------------------------------------
+    // ⭐ Erasure survives a reload — the one register a shape used to drop
+    // -----------------------------------------------------------------------
+
+    /**
+     * ⚠️ *"If you erase or delete a shape then leave the note and enter it again, the shape is
+     * back."*
+     *
+     * `SetErasedRegion` was journaled and applied to the screen correctly, so the bug was invisible
+     * until the note was re-opened: the fold collapses the register onto `ShapeObject.erased` and
+     * `DryShape` read everything off that payload **except** the erased region. A stroke and a text
+     * box both took it; a shape never had the line.
+     *
+     * This asserts the **load** path — an `AddObject` carrying an already-erased payload, which is
+     * exactly what a fold hands the store on open — rather than the live erase, which always worked
+     * and is why nothing caught it.
+     */
+    @Test
+    fun aShapeLoadedWithAnErasedRegionKeepsIt() {
+        val recorder = required(store.recorder, "the recorder")
+        val id = recorder.newObjectId()
+        val erased = ErasedArea(
+            listOf(EraseCapsule(fromX = 0f, fromY = 30f, toX = 100f, toY = 30f, radius = 12f)),
+        )
+
+        store.applyOps(
+            listOf(
+                PageOp.AddObject(
+                    recorder.newOpId(),
+                    recorder.newClock(),
+                    ShapeObject(
+                        id = id,
+                        shape = ShapeKind.RECTANGLE,
+                        widthPt = 100f,
+                        heightPt = 60f,
+                        transform = Matrix3.Identity,
+                        style = ObjectStyle(SHAPE_COLOR, SHAPE_WIDTH_PT),
+                        z = store.allocateTopZ(1).single(),
+                        erased = erased,
+                    ),
+                ),
+            ),
+            factory,
+            record = false,
+        )
+
+        val shape = required(store.objectOf(id) as? DryShape, "the loaded shape")
+        assertTrue("a reloaded shape came back with no erased region at all", shape.erased != null)
+        // And it is the region the payload carried, not an empty one — the eraser swept a band
+        // across the middle, so a point there must read as erased.
+        assertTrue("the erased band did not survive the load", shape.erased?.covers(50f, 30f) == true)
     }
 
     // -----------------------------------------------------------------------
@@ -417,7 +575,7 @@ class SelectionControllerShapeTest {
                     recorder.newOpId(),
                     recorder.newClock(),
                     id,
-                    dev.inkstone.core.model.Matrix3.translate(NUDGE_PT, 0f),
+                    Matrix3.translate(NUDGE_PT, 0f),
                 ),
             ),
             factory,
@@ -430,7 +588,16 @@ class SelectionControllerShapeTest {
         // shape's placement, so the box lands where the new matrix says — at the origin plus
         // the nudge — not at old-box-plus-delta. (The first version of this test expected the
         // delta reading and the store correctly failed it.)
-        assertEquals("the box did not follow the object", NUDGE_PT, after.left, TOLERANCE)
+        // ⚠️ Less half the pen: a shape's box is its **ink**, not the centre line of its outline
+        // (`DryShape.boundsOf`), so the left edge sits half a stroke width outside the geometry.
+        // That is what makes an axis-aligned straight line grabbable at all — see
+        // [draggingAnAxisAlignedLineBetweenItsHandlesMovesIt].
+        assertEquals(
+            "the box did not follow the object",
+            NUDGE_PT - SHAPE_WIDTH_PT / 2f,
+            after.left,
+            TOLERANCE,
+        )
         assertTrue("the box did not move at all", after.left != before.left)
     }
 
@@ -445,6 +612,20 @@ class SelectionControllerShapeTest {
         const val LINE_SHAPE_Y = 480f
         const val LINE_SPAN_PT = LINE_END_X - LINE_START_X
         const val LINE_BAND_PT = 4f
+
+        /**
+         * Long enough that a quarter of the way along clears every point handle.
+         *
+         * The handles reach [SelectionController.HANDLE_TOUCH_DP] (22 dp) scaled by the device's
+         * density, so on a 3× screen they are 66 pt; a quarter of 640 pt is 160 pt from the start
+         * handle and 160 pt from the bend, which leaves room on any density this runs on.
+         */
+        const val LONG_LINE_SPAN_PT = 640f
+
+        /** A plain diagonal nudge, comfortably past the tap/lasso slop. */
+        const val MOVE_BY_PT = 40f
+
+        val ORIGIN = PagePoint(0f, 0f)
 
         /** Straight down from the end handle: a rotation the frame's grips could not express. */
         const val LINE_DRAGGED_Y = 600f

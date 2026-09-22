@@ -72,6 +72,30 @@ public object SelectionEdit {
     }
 
     /**
+     * ⭐ One absolute `SetTransform` per object, each computed from **that** object.
+     *
+     * [transform]'s sibling, and [restyle]'s argument applies word for word: a gesture is one
+     * matrix for the whole selection because a drag moves everything together, while *"make each of
+     * these a perfect circle"* is a different matrix per shape — one shared value would resize them
+     * all to whichever one happened to be measured. Which is why this exists rather than a loop at
+     * the call site: the loop would have to build the ops, and op-building is what this object is.
+     *
+     * @param matrixOf null for an object with nothing to do — already regular, already on the
+     *   lattice, or not a kind this action applies to — and no op is written for it. A degenerate
+     *   matrix is refused for [transform]'s reason: a shape that arrives singular can never be
+     *   moved, erased or attached to again.
+     */
+    public fun transformEach(
+        objects: List<SelectedObject>,
+        matrixOf: (SelectedObject) -> Matrix3?,
+        nextOpId: () -> String,
+        nextClock: () -> LamportClock,
+    ): List<PageOp> = objects.mapNotNull { obj ->
+        val matrix = matrixOf(obj)?.takeIf { !it.isDegenerate() } ?: return@mapNotNull null
+        PageOp.SetTransform(nextOpId(), nextClock(), obj.id, matrix)
+    }
+
+    /**
      * Recolour, rewidth or fade a selection.
      *
      * The style is absolute and complete (see [ObjectStyle]). A stroke's capture-time colour

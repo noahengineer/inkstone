@@ -213,9 +213,9 @@ Added in M5, which found three bugs this way that no JVM test could have.
 
 ```bash
 adb devices                                               # emulator-5554
-./gradlew :core:database:connectedDebugAndroidTest        # 47 tests, incl. the schema migration
-./gradlew :app:connectedDebugAndroidTest                  # 6: crash safety + row 10's wet half
-./gradlew :android:ink:connectedDebugAndroidTest           # 15, of which 10 are red on x86_64
+./gradlew :core:database:connectedDebugAndroidTest        # 67 tests, incl. the schema migration
+./gradlew :app:connectedDebugAndroidTest                  # 19: crash safety + row 10's wet half
+./gradlew :android:ink:connectedDebugAndroidTest          # 110 — all green since `SyntheticInk.turn`
 adb install -r app/build/outputs/apk/debug/app-debug.apk  # …then drive the app
 ```
 
@@ -397,6 +397,51 @@ point it at a Nextcloud you care about:
 Rows 15 and 12b need a shell on the instance (`occ maintenance:data-fingerprint`, and a quota that
 can be filled) and skip their live half loudly. Set `occ=` in the properties file — or
 `INKSTONE_NC_OCC` — to a command that reaches it, and row 15 runs too.
+
+---
+
+## Reading your notes and lectures from a desktop
+
+First time only — sign in to Nextcloud in your browser:
+
+```bash
+tools\web\run-reader.cmd -Login
+```
+
+You type your server's address; your browser opens; you log in as you normally would, second
+factor and all. Nextcloud hands the tool its own credential and stores it in
+`watcher.local.properties`, which the M12 watcher reads too. **You are never asked for a password
+here and this tool never sees one** — there is no app password to mint by hand. Then:
+
+```bash
+tools\web\run-reader.cmd -Open
+```
+
+⚠️ Use the **`.cmd`**, not the `.ps1`. Windows defaults the `CurrentUser` execution policy to
+Restricted, so `run-reader.ps1` fails with *"running scripts is disabled on this system"* on a
+machine where nobody has changed it — and a `.cmd` is not subject to execution policy at all. It
+also picks an interpreter that works: with the Microsoft Store aliases enabled, `python` and
+`python3` resolve to stubs that fail, while `py` does not. `py tools\web\server.py --open` is the
+same thing by hand.
+
+A local, **read-only** website for everything in your Nextcloud: the notes, and every recorded
+lesson with its transcript and a scrubbable picture of when you were writing. It uses
+the same `watcher.local.properties` the transcript watcher does, so if `run-watcher.ps1` works this
+does too.
+
+`-Mirror "C:\path\to\a\sync\folder"` reads a local folder instead, with no credentials and no
+network — useful on a train, and what the tests run against.
+
+The same index is exposed to Claude over MCP (`.mcp.json`, approve it once with `claude`), so
+asking *"what did she say while I was writing this?"* is one call rather than a WebDAV crawl.
+`docs/WEB-READER.md` has the design, §6 the per-claim evidence, and §7 what is still unproven.
+
+There is no `PUT`, `DELETE` or `MKCOL` anywhere in `tools/web` — it cannot change or lose anything.
+
+To run it on a server instead, `tools/web/compose.yaml` puts it in a container behind your reverse
+proxy, with a passphrase for the website and a bearer token for Claude, and exposes the MCP tools
+over HTTP so Claude on any machine can use them. `docs/WEB-READER.md` §9 is the setup and the
+reasoning; §9.6 is the two bugs that only appeared once it was actually running.
 
 ---
 

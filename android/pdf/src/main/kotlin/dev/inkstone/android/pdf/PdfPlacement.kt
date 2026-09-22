@@ -52,12 +52,19 @@ internal object PdfPlacement {
      */
     fun pageToUser(geometry: PdfPageGeometry): Matrix3 {
         val box = geometry.cropBox
-        return when (normalizeRotate(geometry.rotate)) {
+        val rigid = when (normalizeRotate(geometry.rotate)) {
             0 -> Matrix3(1f, 0f, box.x0, 0f, -1f, box.y1)
             QUARTER_TURN -> Matrix3(0f, 1f, box.x0, 1f, 0f, box.y0)
             HALF_TURN -> Matrix3(-1f, 0f, box.x1, 0f, 1f, box.y0)
             else -> Matrix3(0f, -1f, box.x1, -1f, 0f, box.y1)
         }
+        // ⭐ SPEC §4.5 — the canvas origin, folded in here so that a text box and an image get the
+        // same treatment as a stroke does through [PdfPageGeometry.toPdfUser]. Composed on the
+        // right, because it is a translation in *page* space and everything to its left is the
+        // page→user rigid motion. `PdfPlacementTest` asserts the two agree point for point, which
+        // is what stops this becoming a second copy of the rule instead of a second form of it.
+        val origin = geometry.origin
+        return if (origin.x == 0f && origin.y == 0f) rigid else rigid * Matrix3.translate(-origin.x, -origin.y)
     }
 
     /** The object's own space → PDF user space: [pageToUser] after the object's absolute matrix. */

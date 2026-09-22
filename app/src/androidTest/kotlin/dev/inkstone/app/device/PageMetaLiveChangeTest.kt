@@ -4,9 +4,11 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.Offset
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
+import kotlinx.coroutines.runBlocking
 import org.junit.runner.RunWith
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -63,7 +65,7 @@ class PageMetaLiveChangeTest {
         val cameraMidStroke = host.onSurface { it.camera }
         val paperBefore = host.onSurface { it.pageBackground }
 
-        host.onSurface { it.setPageMeta(PageSize.Letter, Background.Template(PageTemplate.CORNELL)) }
+        host.onSurface { it.setPageMeta(PageCanvas.fixed(PageSize.Letter), Background.Template(PageTemplate.CORNELL)) }
 
         assertNotEquals(paperBefore, host.onSurface { it.pageBackground }, "the paper did not change")
         assertEquals(
@@ -110,7 +112,7 @@ class PageMetaLiveChangeTest {
         // A4 is *narrower* than Letter, which is the direction that matters: the leash tightens, so a
         // re-leash may legitimately clamp the pan. Scale must survive either way — that is the whole
         // difference between clamping and refitting.
-        host.onSurface { it.setPageMeta(PageSize.A4, Background.Template(PageTemplate.RULED)) }
+        host.onSurface { it.setPageMeta(PageCanvas.fixed(PageSize.A4), Background.Template(PageTemplate.RULED)) }
 
         assertEquals(PageSize.A4, host.onSurface { it.pageSize }, "the extent did not change")
         assertEquals(
@@ -124,14 +126,14 @@ class PageMetaLiveChangeTest {
     @Test
     fun `an unchanged paper and extent is not a repaint`() {
         host.launch(pageSize = PageSize.Letter)
-        host.onSurface { it.setPageMeta(PageSize.Letter, Background.Template(PageTemplate.RULED)) }
+        host.onSurface { it.setPageMeta(PageCanvas.fixed(PageSize.Letter), Background.Template(PageTemplate.RULED)) }
         val camera = host.onSurface { it.camera }
 
         // The common case on the pull side: a poll re-delivers a peer's whole log, the folds come out
         // identical, and reaching the surface with nothing to say would redraw the page once per poll
         // on every open note. `NoteEditor.reconcile` guards this too; the surface guards it as well
         // because the guard here is the one that protects the camera.
-        host.onSurface { it.setPageMeta(PageSize.Letter, Background.Template(PageTemplate.RULED)) }
+        host.onSurface { it.setPageMeta(PageCanvas.fixed(PageSize.Letter), Background.Template(PageTemplate.RULED)) }
 
         assertEquals(camera, host.onSurface { it.camera })
         assertEquals(PageSize.Letter, host.onSurface { it.pageSize })
@@ -151,7 +153,10 @@ class PageMetaLiveChangeTest {
             surface.camera
         }
 
-        host.onSurface { it.loadPage(FoldedPage.empty(PAGE, size = PageSize.A4)) }
+        // ⚠️ `runBlocking` because `loadPage` builds the page off the main thread now
+        // (`PreparedPage`). The block itself already runs on the main thread, so the install
+        // half still touches the views from where it must.
+        host.onSurface { runBlocking { it.loadPage(FoldedPage.empty(PAGE, PageCanvas.fixed(PageSize.A4))) } }
 
         assertNotEquals(fitted, host.onSurface { it.camera }, "loadPage stopped refitting the camera")
         assertEquals(0, host.onSurface { it.strokeCount }, "loadPage stopped clearing the page")

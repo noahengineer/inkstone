@@ -90,12 +90,57 @@ public fun pdfUserToPage(p: PdfPoint, box: PdfBox, rotate: Int): PagePoint = whe
  * in the bundle would be a second source of truth for the one value the whole
  * "annotations are 3mm off" bug class comes from.
  */
-public data class PdfPageGeometry(val cropBox: PdfBox, val rotate: Int) {
+public data class PdfPageGeometry(
+    val cropBox: PdfBox,
+    val rotate: Int,
+    /**
+     * ⭐ **Where the paper's top-left sits in page space** — [PageCanvas.origin], and `(0, 0)` for
+     * every fixed page and every page being *read* (SPEC §4.5).
+     *
+     * The conversions above put page-space `(0, 0)` at the box's displayed top-left. That is
+     * exactly right until a canvas grows *upwards*, at which point the paper's corner is at a
+     * negative page coordinate and the box has to be enlarged to reach it — and enlarging a box
+     * moves the corner the conversion is anchored to, which would slide every existing annotation
+     * on the page by however much it grew.
+     *
+     * Subtracting the origin first is what cancels that, exactly: enlarge the box by the same
+     * amount the origin went negative, and every page point maps to the PDF coordinate it mapped
+     * to before. So an imported PDF's ink stays where it was drawn while its page grows around it,
+     * without a single annotation being rewritten. `PdfCoordinatesTest` asserts that identity for
+     * all four rotations, because it is the whole argument and it is not obvious by inspection.
+     */
+    val origin: PagePoint = PagePoint(0f, 0f),
+) {
 
     /** SPEC §4.4 rule 3 — CropBox **with `/Rotate` applied**. */
     public val pageSize: PageSize get() = pageSizeOf(cropBox, rotate)
 
-    public fun toPdfUser(p: PagePoint): PdfPoint = pageToPdfUser(p, cropBox, rotate)
+    public fun toPdfUser(p: PagePoint): PdfPoint =
+        pageToPdfUser(PagePoint(p.x - origin.x, p.y - origin.y), cropBox, rotate)
 
-    public fun toPage(p: PdfPoint): PagePoint = pdfUserToPage(p, cropBox, rotate)
+    public fun toPage(p: PdfPoint): PagePoint = pdfUserToPage(p, cropBox, rotate).let {
+        PagePoint(it.x + origin.x, it.y + origin.y)
+    }
+
+    /**
+     * The box a published page must carry so that all of [canvas] is inside it: this page's own
+     * box, enlarged to reach the paper's corners.
+     *
+     * Computed by mapping the canvas through *this* geometry rather than by arithmetic on the
+     * edges, so a `/Rotate 90` page grows along the right axis without a second case to get wrong.
+     */
+    public fun boxFor(canvas: PageCanvas): PdfBox {
+        val corners = listOf(
+            toPdfUser(PagePoint(canvas.left, canvas.top)),
+            toPdfUser(PagePoint(canvas.right, canvas.top)),
+            toPdfUser(PagePoint(canvas.right, canvas.bottom)),
+            toPdfUser(PagePoint(canvas.left, canvas.bottom)),
+        )
+        return PdfBox(
+            x0 = minOf(cropBox.x0, corners.minOf { it.x }),
+            y0 = minOf(cropBox.y0, corners.minOf { it.y }),
+            x1 = maxOf(cropBox.x1, corners.maxOf { it.x }),
+            y1 = maxOf(cropBox.y1, corners.maxOf { it.y }),
+        )
+    }
 }

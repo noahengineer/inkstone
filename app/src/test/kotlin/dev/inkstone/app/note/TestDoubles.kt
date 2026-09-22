@@ -1,13 +1,19 @@
 package dev.inkstone.app.note
 
 import dev.inkstone.core.model.Background
+import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
+import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.PageSize
+import dev.inkstone.core.model.PageText
+import dev.inkstone.core.search.SearchHit
+import dev.inkstone.core.search.SearchIndex
 
 /**
  * Shared doubles for the editor's JVM tests.
@@ -26,6 +32,10 @@ internal class FakeSurface : NoteEditor.NoteSurface {
     var loadedPage: FoldedPage? = null
         private set
 
+    /** How many times the editor asked for a page — the readout docs/M8-PERF-RENDER-CACHE.md §5 wanted. */
+    var loadCount: Int = 0
+        private set
+
     val applied = ArrayList<Applied>()
 
     class Applied(val ops: List<PageOp>, val record: Boolean)
@@ -40,8 +50,9 @@ internal class FakeSurface : NoteEditor.NoteSurface {
         bindCount++
     }
 
-    override fun loadPage(page: FoldedPage) {
+    override suspend fun loadPage(page: FoldedPage) {
         loadedPage = page
+        loadCount++
     }
 
     override fun drainOps(): List<List<PageOp>> {
@@ -89,11 +100,11 @@ internal class FakeSurface : NoteEditor.NoteSurface {
      * and the wet stroke survived. Read a green tick here as *"the editor asked"*, never as *"the
      * screen changed"*.
      */
-    var pageMeta: Pair<PageSize, Background>? = null
+    var pageMeta: Pair<PageCanvas, Background>? = null
         private set
 
-    override fun setPageMeta(size: PageSize, background: Background) {
-        pageMeta = size to background
+    override fun setPageMeta(canvas: PageCanvas, background: Background) {
+        pageMeta = canvas to background
     }
 }
 
@@ -198,4 +209,108 @@ internal class GatedFileSystem(private val delegate: InMemoryFileSystem = InMemo
         writes += "append:$path"
         delegate.appendBytes(path, bytes)
     }
+}
+
+/**
+ * ⭐ A [FileSystem] that remembers **which thread** each call ran on.
+ *
+ * The only way to assert that opening a note does its reading and decoding off the thread the
+ * editor was started from. `NoteEditor.work` is `Dispatchers.Main.immediate` in the app and the
+ * test scope's dispatcher here, and before `openOrCreate` was given a `withContext` the whole open
+ * — the journal read and CRC, the full op decode, `NoteStore.loadUndo` — ran there. That is not
+ * visible from any result: the note opens correctly either way, and the only difference is a
+ * blocked UI thread (docs/M8-PERF-RENDER-CACHE.md §5).
+ *
+ * ⚠️ **A test using this must give the editor a real dispatcher**, not an
+ * `UnconfinedTestDispatcher`: unconfined does not dispatch, so every hop stays on the calling
+ * thread and the assertion passes against code that never moved.
+ */
+internal class ThreadRecordingFileSystem(private val delegate: FileSystem) : FileSystem {
+
+    private val seen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    /**
+     * Every thread name that has run a call on this file system.
+     *
+     * ⚠️ **Match these by prefix, never by equality.** `kotlinx-coroutines-debug` — which the
+     * test runtime turns on — appends ` @coroutine#N` to the running thread's name, so an exact
+     * comparison against a `ThreadFactory` name never matches and every assertion built on one
+     * passes vacuously. That is what [ranOn] is for; it cost a revert-and-check-red to find, which
+     * is the only reason it was found at all.
+     */
+    val threads: Set<String> get() = seen.toSet()
+
+    /** Whether any call ran on the thread named [name] — see [threads] on why this is a prefix test. */
+    fun ranOn(name: String): Boolean = seen.any { it == name || it.startsWith("$name ") }
+
+    /**
+     * ⚠️ **On entry, before the call.** Recording the thread the delegate *returned* on measures
+     * where the work resumed rather than where it ran, which is a different thread the moment any
+     * implementation hops internally.
+     */
+    private fun entered() {
+        seen += Thread.currentThread().name
+    }
+
+    override suspend fun exists(path: String): Boolean {
+        entered()
+        return delegate.exists(path)
+    }
+
+    override suspend fun size(path: String): Long {
+        entered()
+        return delegate.size(path)
+    }
+
+    override suspend fun readBytes(path: String): ByteArray {
+        entered()
+        return delegate.readBytes(path)
+    }
+
+    override suspend fun readRange(path: String, offset: Long, length: Int): ByteArray {
+        entered()
+        return delegate.readRange(path, offset, length)
+    }
+
+    override suspend fun writeBytesAtomically(path: String, bytes: ByteArray) {
+        entered()
+        delegate.writeBytesAtomically(path, bytes)
+    }
+
+    override suspend fun appendBytes(path: String, bytes: ByteArray) {
+        entered()
+        delegate.appendBytes(path, bytes)
+    }
+
+    override suspend fun createDirectories(path: String) {
+        entered()
+        delegate.createDirectories(path)
+    }
+
+    override suspend fun move(from: String, to: String) {
+        entered()
+        delegate.move(from, to)
+    }
+
+    override suspend fun delete(path: String) {
+        entered()
+        delegate.delete(path)
+    }
+
+    override suspend fun list(path: String): List<String> {
+        entered()
+        return delegate.list(path)
+    }
+}
+
+/** A [SearchIndex] that does nothing, for a test whose subject is not the index. */
+internal class NoOpSearchIndex : SearchIndex {
+
+    override suspend fun indexPage(noteId: DocumentId, text: PageText) = Unit
+
+    override suspend fun forgetPage(noteId: DocumentId, pageId: PageId) = Unit
+
+    override suspend fun forgetNote(noteId: DocumentId) = Unit
+
+    override suspend fun search(query: String, limit: Int): List<SearchHit> = emptyList()
 }

@@ -1,6 +1,5 @@
 package dev.inkstone.core.model
 
-import kotlin.math.PI
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
@@ -8,17 +7,16 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * ⭐ Editing a shape by its points, and the curve that gave it a third handle.
+ * ⭐ Editing a shape by its points, and the curve that gave a segment a third handle.
  *
  * Unlike its neighbour [ShapesTest], **these tests can settle their subject**. Draw-and-hold's
- * classifier is a heuristic about a hand and a fixture is the worst possible witness for one
- * (M7); a handle drag is arithmetic with a right answer. *"The dragged vertex ends up under the
- * finger and the other two do not move"* is a fact about a matrix, and if it holds here it holds
- * on the tablet.
+ * classifier is a heuristic about a hand and a fixture is the worst possible witness for one (M7);
+ * a handle drag is arithmetic with a right answer. *"The dragged point ends up under the finger and
+ * the others do not move"* is a fact about a list, and if it holds here it holds on the tablet.
  *
- * What is **not** settled here is whether the handles can be hit, whether they are drawn where
- * they are computed, and whether the ops reach the log — that is `SelectionControllerPointTest`
- * on a device, and CLAUDE.md's definition-of-done #6 is why it exists at all.
+ * What is **not** settled here is whether the handles can be hit, whether they are drawn where they
+ * are computed, and whether the ops reach the log — that is `SelectionControllerShapeTest` on a
+ * device, and CLAUDE.md's definition-of-done #6 is why it exists.
  */
 class ShapePointsTest {
 
@@ -77,174 +75,144 @@ class ShapePointsTest {
     }
 
     // -----------------------------------------------------------------------
-    // A segment's ends — the similarity solve
+    // ⭐ One rule: a drag moves one point, and nothing else moves
     // -----------------------------------------------------------------------
 
     @Test
-    fun `dragging one end of a line moves that end and leaves the other where it was`() {
-        val line = ShapeEdit.placeSegment(100f, 200f, 300f, 200f, bandPt = 4f)
-        val end = handle(line, index = 2)
-        val target = PagePoint(300f, 400f)
+    fun `moving a rectangle corner moves that corner and nothing else`() {
+        val before = ShapePoints.of(ShapeKind.RECTANGLE, 100f, 60f).map { it.local }
+        val target = PagePoint(180f, -40f)
 
-        val placed = placementAfter(line, end, target)
+        val after = assertNotNull(ShapePoints.moved(ShapeKind.RECTANGLE, 100f, 60f, null, index = 2, toLocal = target))
 
-        assertPoint(target, placed.map(end.local))
-        assertPoint(PagePoint(100f, 200f), placed.map(handle(line, index = 0).local))
+        // ⭐ *"editing the points is just resizeing the shape from those points rather then actually
+        // editing the shape"*. The first design solved this as a placement, which for a rectangle
+        // can only scale: every one of these four assertions failed except the first.
+        assertEquals(4, after.size)
+        assertPoint(target, after[2])
+        assertPoint(before[0], after[0])
+        assertPoint(before[1], after[1])
+        assertPoint(before[3], after[3])
     }
 
     @Test
-    fun `dragging the end of a rotated line still pins the other end`() {
-        // A line drawn at 40 degrees, which is the case a page-space box cannot express at all —
-        // its axis-aligned frame has corners nowhere near the ink.
-        val line = ShapeEdit.placeSegment(120f, 500f, 320f, 100f, bandPt = 3f)
-        val start = handle(line, index = 0)
-        val target = PagePoint(60f, 620f)
+    fun `moving one end of a line moves that end and nothing else`() {
+        val target = PagePoint(140f, -60f)
 
-        val placed = placementAfter(line, start, target)
+        val after = assertNotNull(ShapePoints.moved(ShapeKind.LINE, 200f, 4f, null, index = 2, toLocal = target))
 
-        assertPoint(target, placed.map(start.local))
-        assertPoint(PagePoint(320f, 100f), placed.map(handle(line, index = 2).local))
+        // ⭐ *"straight lines … have the stretching by size changing, i dont want any shape to do
+        // that no matter what"*. This used to be a similarity about the far end, which scaled the
+        // whole local frame — the far end stayed put, but everything else in that frame moved.
+        assertEquals(2, after.size)
+        assertPoint(PagePoint(0f, 2f), after[0])
+        assertPoint(target, after[1])
     }
 
     @Test
-    fun `a line keeps its band proportions so a bend on it scales with the chord`() {
-        val line = ShapeEdit.placeSegment(0f, 0f, 100f, 0f, bandPt = 4f)
-        val bend = PagePoint(50f, -20f)
-        val middle = handle(line, index = 1).local
-        val end = handle(line, index = 2)
+    fun `dragging an end of a curved line leaves the curve where it is`() {
+        val bend = PagePoint(100f, -40f)
+        val moved =
+            assertNotNull(ShapePoints.moved(ShapeKind.LINE, 200f, 4f, null, index = 2, toLocal = PagePoint(400f, 2f)))
 
-        val placed = placementAfter(line, end, PagePoint(200f, 0f))
-
-        // Twice as long, so the bulge is twice as deep: the bend is a point in the shape's own
-        // frame and a similarity carries it. A non-uniform scale would stretch the curve along the
-        // chord and leave its depth behind, which reads as a curve flattening as it grows.
-        val before = line.transform.map(middle).y - line.transform.map(bend).y
-        val after = placed.map(middle).y - placed.map(bend).y
-        assertEquals(2f * before, after, TOLERANCE)
+        // The bend is its own register in the shape's own space, so stretching the chord does not
+        // touch it. Under the old similarity the bulge doubled with the line — the visible half of
+        // "stretching by size changing".
+        val curve = ShapeGeometry.outline(ShapeKind.LINE, 200f, 4f, bendLocal = bend, points = moved)
+        assertPoint(bend, curve.flattened(samplesPerCurve = 2)[1])
     }
 
     @Test
-    fun `a line cannot be dragged onto its own far end`() {
-        val line = ShapeEdit.placeSegment(100f, 200f, 300f, 200f, bandPt = 4f)
+    fun `a second drag edits the list it was given rather than re-seeding`() {
+        val once = assertNotNull(
+            ShapePoints.moved(ShapeKind.TRIANGLE, 100f, 60f, null, index = 0, toLocal = PagePoint(10f, -30f)),
+        )
 
-        val refused = gestureFor(line, handle(line, index = 2), PagePoint(100f, 200f))
+        val twice = assertNotNull(
+            ShapePoints.moved(ShapeKind.TRIANGLE, 100f, 60f, once, index = 1, toLocal = PagePoint(140f, 90f)),
+        )
 
-        // Refused rather than clamped: a drag onto the pivot has no direction to rotate toward, so
-        // any answer would be an invented one. SelectionEdit.transform would refuse the resulting
-        // matrix anyway — this refuses it a step earlier, where the reason is visible.
-        assertNull(refused)
+        assertPoint(PagePoint(10f, -30f), twice[0])
+        assertPoint(PagePoint(140f, 90f), twice[1])
+        assertPoint(once[2], twice[2])
     }
 
     @Test
-    fun `a line dragged almost onto its far end keeps a length that can be grabbed again`() {
-        val line = ShapeEdit.placeSegment(100f, 200f, 300f, 200f, bandPt = 4f)
-        val end = handle(line, index = 2)
+    fun `a line's second drag edits the ends it was given`() {
+        val once =
+            assertNotNull(ShapePoints.moved(ShapeKind.LINE, 200f, 4f, null, index = 0, toLocal = PagePoint(-50f, 30f)))
 
-        val placed = placementAfter(line, end, PagePoint(100.5f, 200f))
+        val twice =
+            assertNotNull(ShapePoints.moved(ShapeKind.LINE, 200f, 4f, once, index = 2, toLocal = PagePoint(300f, 90f)))
 
-        val landed = placed.map(end.local)
-        assertTrue(landed.x - 100f > 1f, "the line collapsed onto its own start: $landed")
-    }
-
-    // -----------------------------------------------------------------------
-    // A triangle's vertices — the exact affine
-    // -----------------------------------------------------------------------
-
-    @Test
-    fun `dragging a triangle vertex lands it exactly and pins the other two`() {
-        val triangle = ShapePlacement(ShapeKind.TRIANGLE, 100f, 60f, Matrix3.Identity)
-        val apex = handle(triangle, index = 0)
-        val target = PagePoint(10f, -30f)
-
-        val placed = placementAfter(triangle, apex, target)
-
-        assertPoint(target, placed.map(apex.local))
-        assertPoint(PagePoint(100f, 60f), placed.map(handle(triangle, index = 1).local))
-        assertPoint(PagePoint(0f, 60f), placed.map(handle(triangle, index = 2).local))
+        assertPoint(PagePoint(-50f, 30f), twice[0])
+        assertPoint(PagePoint(300f, 90f), twice[1])
     }
 
     @Test
-    fun `a triangle vertex drag shears the placement because a different triangle is a shear`() {
-        val triangle = ShapePlacement(ShapeKind.TRIANGLE, 100f, 60f, Matrix3.Identity)
-
-        val placed = placementAfter(triangle, handle(triangle, index = 0), PagePoint(10f, -30f))
-
-        // Matrix3.isSkewed is a *diagnostic* — the signature of a delta-composition bug (SPEC §4.2)
-        // — and not a guard, which is what makes this legal. There is no other way to reach an
-        // arbitrary triangle from the one the user drew, and the write is still one absolute matrix.
-        assertTrue(placed.isSkewed(), "an off-axis vertex should have sheared the placement")
-        assertTrue(!placed.isDegenerate())
+    fun `the bend handle writes no vertex list`() {
+        // Its index is between the two ends, and it belongs to the other register entirely.
+        assertNull(ShapePoints.moved(ShapeKind.LINE, 200f, 4f, null, index = 1, toLocal = PagePoint(50f, 50f)))
     }
 
     @Test
-    fun `flattening a triangle onto a line is refused rather than written`() {
-        val triangle = ShapePlacement(ShapeKind.TRIANGLE, 100f, 60f, Matrix3.Identity)
+    fun `a vertex may be dragged anywhere including onto its neighbours line`() {
+        // A degenerate *polygon* is recoverable — drag the point back — where the first design's
+        // degenerate *matrix* was not: an uninvertible placement cannot map an eraser into the
+        // object's own space, so the shape became uneraseable as well as invisible.
+        val flattened = ShapePoints.moved(ShapeKind.TRIANGLE, 100f, 60f, null, index = 0, toLocal = PagePoint(50f, 60f))
 
-        // Straight onto the line through the other two vertices: the resulting affine is singular,
-        // and a singular one cannot be inverted — which is what maps an eraser into the object's
-        // own space, so the shape would become uneraseable as well as invisible.
-        val refused = gestureFor(triangle, handle(triangle, index = 0), PagePoint(50f, 60f))
+        assertNotNull(flattened)
+        assertPoint(PagePoint(50f, 60f), flattened[0])
+    }
 
-        assertNull(refused)
+    @Test
+    fun `an edited line offers its handles where its stored ends are`() {
+        val ends = listOf(PagePoint(-20f, 10f), PagePoint(260f, 90f))
+
+        val handles = ShapePoints.of(ShapeKind.LINE, 200f, 4f, points = ends)
+
+        assertPoint(ends[0], handles[0].local)
+        assertPoint(ends[1], handles[2].local)
+        // …and the bend handle sits at the middle of the *edited* chord, not the payload's.
+        assertPoint(PagePoint(120f, 50f), handles[1].local)
     }
 
     // -----------------------------------------------------------------------
-    // A box's corners — the shape's own axes, which is what rotation-invariance means
+    // ⭐ Seeding is invisible — the property that makes the first drag safe
     // -----------------------------------------------------------------------
 
     @Test
-    fun `dragging a rectangle corner lands it exactly and pins the opposite corner`() {
-        val rectangle = ShapePlacement(ShapeKind.RECTANGLE, 100f, 60f, Matrix3.translate(200f, 300f))
-        val corner = handle(rectangle, index = 2)
-        val target = PagePoint(400f, 420f)
+    fun `seeded vertices reproduce the parametric outline for every closed kind`() {
+        for (kind in listOf(ShapeKind.RECTANGLE, ShapeKind.TRIANGLE, ShapeKind.ELLIPSE)) {
+            val seeded = ShapePoints.of(kind, 200f, 120f).map { it.local }
+            val parametric = ShapeGeometry.outline(kind, 200f, 120f).flattened(samplesPerCurve = 16)
+            val fromPoints = ShapeGeometry.outline(kind, 200f, 120f, points = seeded).flattened(samplesPerCurve = 16)
 
-        val placed = placementAfter(rectangle, corner, target)
-
-        assertPoint(target, placed.map(corner.local))
-        assertPoint(PagePoint(200f, 300f), placed.map(handle(rectangle, index = 0).local))
+            // ⚠️ The ellipse is the one that had to be *made* true: its smoothing constant is
+            // KAPPA/2 rather than Catmull-Rom's 1/6 precisely so that four quadrant points redraw
+            // the same ellipse. Any other constant and the first drag would visibly re-draw the
+            // whole shape — which is the complaint this feature answers, arriving backwards.
+            assertEquals(parametric.size, fromPoints.size, "$kind changed shape on seeding")
+            for (index in parametric.indices) assertPoint(parametric[index], fromPoints[index])
+        }
     }
 
     @Test
-    fun `a rotated rectangle stays a rectangle when a corner is dragged`() {
-        val turned = Matrix3.translate(200f, 300f) * Matrix3.rotate((PI / 6).toFloat())
-        val rectangle = ShapePlacement(ShapeKind.RECTANGLE, 100f, 60f, turned)
-        val corner = handle(rectangle, index = 2)
-        // Somewhere the shape's own axes can reach — 1.6× along its width, 1.5× along its height.
-        val target = turned.map(PagePoint(160f, 90f))
+    fun `a seeded segment reproduces its own payload geometry`() {
+        val seeded = ShapePoints.of(ShapeKind.LINE, 200f, 4f).filter { it.role == ShapePointRole.VERTEX }
 
-        val placed = placementAfter(rectangle, corner, target)
-
-        assertPoint(target, placed.map(corner.local))
-        assertPoint(turned.map(PagePoint(0f, 0f)), placed.map(handle(rectangle, index = 0).local))
-        // ⭐ The whole point of solving in the shape's own basis. A page-space solve would have put
-        // the corner under the finger too — by shearing the rectangle into a parallelogram.
-        assertTrue(!placed.isSkewed(), "a corner drag sheared a rectangle")
+        assertEquals(
+            ShapeGeometry.outline(ShapeKind.LINE, 200f, 4f).flattened(),
+            ShapeGeometry.outline(ShapeKind.LINE, 200f, 4f, points = seeded.map { it.local }).flattened(),
+        )
     }
 
     @Test
-    fun `dragging a corner past its pin refuses to mirror the rectangle`() {
-        val rectangle = ShapePlacement(ShapeKind.RECTANGLE, 100f, 60f, Matrix3.Identity)
-
-        val placed = placementAfter(rectangle, handle(rectangle, index = 2), PagePoint(-50f, -30f))
-
-        // A flip is a second gesture nobody asked this one to perform, and it is indistinguishable
-        // from a shape that has simply vanished behind its own pin.
-        assertTrue(placed.determinant > 0f, "the corner drag mirrored the shape: $placed")
-        assertTrue(!placed.isDegenerate())
-    }
-
-    @Test
-    fun `an ellipse quadrant point travels along its own diameter and no further`() {
-        val ellipse = ShapePlacement(ShapeKind.ELLIPSE, 200f, 100f, Matrix3.Identity)
-        val right = handle(ellipse, index = 1)
-
-        // Dragged diagonally: the sideways half of the drag has nowhere to go on a diameter, and
-        // shearing it in would turn the ellipse into a tilted one nobody asked for.
-        val placed = placementAfter(ellipse, right, PagePoint(260f, 90f))
-
-        assertPoint(PagePoint(260f, 50f), placed.map(right.local))
-        assertPoint(PagePoint(0f, 50f), placed.map(handle(ellipse, index = 3).local))
-        assertPoint(PagePoint(130f, 0f), placed.map(handle(ellipse, index = 0).local))
+    fun `an unedited shape stores no points at all`() {
+        assertTrue(ShapeRecord.None.points == null)
+        assertTrue(ShapeRecord.None.isDefault)
+        assertTrue(!ShapeRecord(points = listOf(PagePoint(0f, 0f), PagePoint(1f, 0f), PagePoint(0f, 1f))).isDefault)
     }
 
     // -----------------------------------------------------------------------
@@ -255,33 +223,65 @@ class ShapePointsTest {
     fun `the bend is the point under the finger in the shape own space`() {
         val line = ShapeEdit.placeSegment(100f, 200f, 300f, 200f, bandPt = 4f)
 
-        val bend = ShapePoints.bend(line.heightPt, line.transform, PagePoint(200f, 120f), 8f)
+        val drag = assertNotNull(bendAt(line, PagePoint(200f, 120f)))
 
-        assertNotNull(bend)
-        assertPoint(PagePoint(200f, 120f), line.transform.map(bend))
+        assertNotNull(drag.stored)
+        assertPoint(PagePoint(200f, 120f), line.transform.map(drag.stored))
+        assertEquals(drag.stored, drag.preview, "a real bend previews exactly what it stores")
     }
 
     @Test
-    fun `a bend within the straighten tolerance is no bend at all`() {
+    fun `a bend within the straighten tolerance stores nothing and previews straight`() {
         val line = ShapeEdit.placeSegment(100f, 200f, 300f, 200f, bandPt = 4f)
 
-        val bend = ShapePoints.bend(line.heightPt, line.transform, PagePoint(180f, 204f), 8f)
+        val drag = assertNotNull(bendAt(line, PagePoint(180f, 204f)))
 
-        // Null, not "a bend that happens to be flat". The record stores null as "straight", so the
-        // line goes back to a plain segment and — because ShapeRecord.isDefault then holds again —
-        // stops costing a string in the file.
-        assertNull(bend)
+        // ⭐ The two halves, which used to be one nullable and therefore one bug. `stored` is null
+        // because straight is *no bend* in the record — that is what restores isDefault and stops
+        // the line costing a string in the file.
+        assertNull(drag.stored)
+        // …and `preview` is the foot of the perpendicular, so the drag *draws* straight instead of
+        // meaning "nothing to preview". Reading null as the latter is what sprang a flattened curve
+        // back to its stored arc with the finger still down.
+        assertPoint(PagePoint(80f, 2f), drag.preview)
+        assertTrue(
+            ShapeGeometry.outline(ShapeKind.LINE, line.widthPt, line.heightPt, bendLocal = drag.preview)
+                .segments.none { it is ShapeSegment.CubicTo },
+            "a straightened preview must draw as a line",
+        )
+    }
+
+    @Test
+    fun `a bend dragged onto the chord keeps the handle under the finger`() {
+        val line = ShapeEdit.placeSegment(0f, 0f, 200f, 0f, bandPt = 4f)
+
+        // A quarter of the way along, not the middle: the preview must not jump to the chord's
+        // centre just because the line went straight, which is a visible snap under the finger.
+        val drag = assertNotNull(bendAt(line, PagePoint(50f, 1f)))
+
+        assertNull(drag.stored)
+        assertEquals(50f, line.transform.map(drag.preview).x, TOLERANCE)
+    }
+
+    @Test
+    fun `straightness is measured against the edited chord and not the payload's`() {
+        // ⚠️ Once an end has been dragged the segment is no longer (0, h/2) → (w, h/2). Measuring
+        // against the payload's chord would call a genuine curve straight, or the reverse.
+        val line = ShapeEdit.placeSegment(0f, 0f, 200f, 0f, bandPt = 4f)
+        val tilted = listOf(PagePoint(0f, 2f), PagePoint(200f, 102f))
+
+        // Dead on the tilted chord's midpoint: straight by the edited chord, 50 pt off the old one.
+        val drag = assertNotNull(bendAt(line, PagePoint(100f, 50f), points = tilted))
+
+        assertNull(drag.stored, "a point on the edited chord must count as straight")
     }
 
     @Test
     fun `the straighten tolerance is measured on the page and not in the shape own units`() {
-        // A line placed at 4x: 6 page points off the chord is 1.5 in its own space, and measuring
-        // the tolerance in the wrong space is the conversion bug M8b shipped twice (the connector
-        // bind radius, and the alignment guides before it).
         val scaled = ShapePlacement(ShapeKind.LINE, 100f, 4f, Matrix3.scale(4f, 4f))
 
-        assertNull(ShapePoints.bend(4f, scaled.transform, PagePoint(200f, 14f), 8f))
-        assertNotNull(ShapePoints.bend(4f, scaled.transform, PagePoint(200f, 28f), 8f))
+        assertNull(assertNotNull(bendAt(scaled, PagePoint(200f, 14f))).stored)
+        assertNotNull(assertNotNull(bendAt(scaled, PagePoint(200f, 28f))).stored)
     }
 
     @Test
@@ -304,8 +304,6 @@ class ShapePointsTest {
         val straight = ShapeGeometry.outline(ShapeKind.ARROW, 200f, 4f).flattened()
         val bent = ShapeGeometry.outline(ShapeKind.ARROW, 200f, 4f, bendLocal = PagePoint(100f, -40f)).flattened()
 
-        // A connector falls back to `(0, h/2) → (w, h/2)` under its transform when an end does not
-        // resolve, and an older build draws exactly that. Both readings stay true of a bent line.
         assertEquals(straight.first(), bent.first())
         assertEquals(straight.last(), bent.last())
         assertTrue(!ShapeGeometry.outline(ShapeKind.LINE, 200f, 4f, bendLocal = PagePoint(100f, -40f)).closed)
@@ -323,6 +321,9 @@ class ShapePointsTest {
 
     @Test
     fun `only a segment bends`() {
+        // ⚠️ There is no `vertices(kind)` to assert against any more: *every* kind edits its points,
+        // so a predicate answering a constant was a question with no information in it — detekt said
+        // so, and deleting it is the honest form of the rule. `bends` is the one that still varies.
         assertTrue(ShapeGeometry.bends(ShapeKind.LINE))
         assertTrue(ShapeGeometry.bends(ShapeKind.ARROW))
         assertTrue(!ShapeGeometry.bends(ShapeKind.RECTANGLE))
@@ -349,10 +350,36 @@ class ShapePointsTest {
     }
 
     @Test
+    fun `vertices round trip through the record and re-encode byte for byte`() {
+        val record = ShapeRecord(points = listOf(PagePoint(0f, 0f), PagePoint(180f, -40.5f), PagePoint(0f, 60f)))
+
+        val wire = record.encode()
+        val back = assertNotNull(ShapeRecord.decode(wire))
+
+        assertEquals(record.points, back.points)
+        assertEquals(wire, back.encode())
+    }
+
+    @Test
+    fun `a segment's two ends round trip because two is a legal list now`() {
+        // ⚠️ MIN_POINTS was 3 until a segment's ends moved into this register, which would have made
+        // the decoder refuse a list the encoder had just written.
+        val record = ShapeRecord(points = listOf(PagePoint(-20f, 10f), PagePoint(260f, 90f)))
+
+        assertEquals(record.points, assertNotNull(ShapeRecord.decode(record.encode())).points)
+    }
+
+    @Test
+    fun `one unreadable vertex abandons the whole list rather than shortening it`() {
+        // ⚠️ Every other key here degrades to its default. This one cannot: dropping a vertex from a
+        // quadrilateral yields a triangle, which is defined, non-crashing and a different shape.
+        assertNull(assertNotNull(ShapeRecord.decode("is1;pts=0:0,180:oops,0:60")).points)
+        assertNull(assertNotNull(ShapeRecord.decode("is1;pts=0:0,180:20:9,0:60")).points)
+        assertNull(assertNotNull(ShapeRecord.decode("is1;pts=0:0")).points, "one point is not geometry")
+    }
+
+    @Test
     fun `a curved line is not a default record`() {
-        // ⚠️ ShapeEdit.create omits a default record entirely and editRecords writes its undo
-        // baseline only for a default one. A curve reading as "default" would be published with no
-        // record by one path and given a baseline that straightens it by the other.
         assertTrue(!ShapeRecord(bend = PagePoint(10f, 10f)).isDefault)
         assertTrue(ShapeRecord(bend = null).isDefault)
     }
@@ -361,8 +388,6 @@ class ShapePointsTest {
     fun `an unreadable bend leaves the line straight and keeps the rest of the record`() {
         val record = assertNotNull(ShapeRecord.decode("is1;f=-16777216;bd=oops"))
 
-        // Fail closed, per key: a record is several independent properties and one unreadable bend
-        // is no reason to forget a fill.
         assertNull(record.bend)
         assertEquals(-16777216, record.fillArgb)
     }
@@ -396,24 +421,19 @@ class ShapePointsTest {
 
     // -----------------------------------------------------------------------
 
-    private fun handle(placement: ShapePlacement, index: Int): ShapePoint =
-        ShapePoints.of(placement.kind, placement.widthPt, placement.heightPt)[index]
-
-    private fun gestureFor(placement: ShapePlacement, point: ShapePoint, to: PagePoint): Matrix3? =
-        ShapePoints.gesture(placement.kind, placement.widthPt, placement.heightPt, placement.transform, point, to)
-
-    /**
-     * Where the shape ends up: the gesture composed onto its own matrix, exactly as
-     * [SelectionEdit.transform] composes it before writing the op.
-     *
-     * Going through that composition rather than asserting on the gesture is deliberate — the
-     * gesture alone is meaningless, and a test that checked it would pass for a matrix the real
-     * caller then applies to the wrong side.
-     */
-    private fun placementAfter(placement: ShapePlacement, point: ShapePoint, to: PagePoint): Matrix3 {
-        val gesture = assertNotNull(gestureFor(placement, point, to), "the drag was refused")
-        return gesture * placement.transform
-    }
+    private fun bendAt(
+        placement: ShapePlacement,
+        toPage: PagePoint,
+        points: List<PagePoint>? = null,
+        tolerance: Float = 8f,
+    ): BendDrag? = ShapePoints.bend(
+        widthPt = placement.widthPt,
+        heightPt = placement.heightPt,
+        transform = placement.transform,
+        points = points,
+        toPage = toPage,
+        straightenTolerancePt = tolerance,
+    )
 
     private fun assertPoint(expected: PagePoint, actual: PagePoint) {
         assertEquals(expected.x, actual.x, TOLERANCE, "x")

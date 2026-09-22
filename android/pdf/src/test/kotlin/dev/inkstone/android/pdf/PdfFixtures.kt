@@ -15,8 +15,10 @@ import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageAnnotationMode
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PagePoint
+import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.StrokeGeometry
 import dev.inkstone.core.model.StrokeOutline
 import dev.inkstone.core.model.StrokeRebuilder
@@ -211,10 +213,15 @@ internal object PdfFixtures {
         mode: PageAnnotationMode = PageAnnotationMode.PER_STROKE,
         words: List<InvisibleWord> = emptyList(),
         objects: List<PdfPageObject> = emptyList(),
+        // A fixed sheet at the page-space origin, which is what every fixture here is: the
+        // published box is then the source page's own and the writer changes nothing about it.
+        // `PdfCanvasTest` is where a grown one is passed instead.
+        canvas: PageCanvas = PageCanvas.fixed(PageSize.Letter),
     ) = PdfPagePlan(
         source = PageSource.Existing(sourceIndex),
         pageId = PageId(pageId),
         sortKey = FractionalKey.Initial,
+        canvas = canvas,
         mode = mode,
         outlines = outlines,
         words = words,

@@ -36,8 +36,8 @@ import org.junit.runner.RunWith
  * than behavioural on purpose; a test could only ever confirm that a thing with no phone did not
  * make a call.
  *
- * Geometry here is arithmetic and `MotionEvent`s, with no `androidx.ink` stroke anywhere, so this
- * file is independent of the ten M1 failures on x86_64.
+ * Geometry here is arithmetic and `MotionEvent`s, with no `androidx.ink` stroke anywhere, so no
+ * fixture of ink's can affect it.
  */
 @RunWith(AndroidJUnit4::class)
 class RulerAndLaserTest {
@@ -97,30 +97,63 @@ class RulerAndLaserTest {
     }
 
     /**
-     * ⭐ **The matrix and the arithmetic agree**, which is the claim the whole snap rests on.
+     * ⭐ **The event projection and the arithmetic agree**, which is the claim the whole snap
+     * rests on.
      *
-     * The snap is applied by composing a projection onto `startStroke`'s
-     * `motionEventToWorldTransform`, so ink maps every sample — historical, live and predicted —
-     * through it in native code at no per-sample cost. [RulerController.project] is the same
-     * projection expressed for anything on this side of the boundary. If the two ever disagree, the
-     * ink lands somewhere the app's own idea of the edge says it should not, and nothing would
-     * report it.
+     * The snap flattens a copy of the `MotionEvent` with `MotionEvent.transform`, so what ink reads
+     * has already landed on the edge. [RulerController.project] is the same projection expressed
+     * for anything on this side of the boundary. If the two ever disagree, the ink lands somewhere
+     * the app's own idea of the edge says it should not, and nothing would report it.
      *
      * The camera matrix here is the identity, so view space *is* page space and what is left is the
      * projection alone.
      */
     @Test
-    fun theStrokeTransformProjectsExactlyWhereTheArithmeticSays() {
+    fun theEventProjectionLandsExactlyWhereTheArithmeticSays() {
         val ruler = ruler()
         ruler.angleDegrees = EIGHTH_TURN
         val expected = PagePointF()
         ruler.project(CENTRE_X + OFFSET, CENTRE_Y + HALF_OFFSET, expected)
 
         val mapped = floatArrayOf(CENTRE_X + OFFSET, CENTRE_Y + HALF_OFFSET)
-        ruler.strokeTransform(Matrix()).mapPoints(mapped)
+        ruler.eventProjection(Matrix()).mapPoints(mapped)
 
         assertEquals(expected.x, mapped[0], TOLERANCE)
         assertEquals(expected.y, mapped[1], TOLERANCE)
+    }
+
+    /**
+     * ⭐ **It projects in view space and comes back**, which is what makes it safe to apply to a
+     * `MotionEvent`.
+     *
+     * A camera with a scale and a translation, so the identity above cannot hide a missing hop.
+     * The point is projected onto the edge in *page* space and returned to *view* space, which is
+     * the only reading under which `MotionEvent.transform` produces samples ink can then map with
+     * the camera's own — invertible — matrix.
+     */
+    @Test
+    fun theEventProjectionRoundTripsThroughTheCamera() {
+        val ruler = ruler()
+        val camera = Matrix().apply {
+            setScale(CAMERA_SCALE, CAMERA_SCALE)
+            postTranslate(PAN_X, PAN_Y)
+        }
+        val viewToPage = Matrix()
+        assertTrue("the fixture camera must be invertible", camera.invert(viewToPage))
+
+        // A view point, mapped to page space by hand, projected by hand, and mapped back.
+        val viewPoint = floatArrayOf(VIEW_X, VIEW_Y)
+        val inPage = viewPoint.copyOf()
+        viewToPage.mapPoints(inPage)
+        val onEdge = PagePointF()
+        ruler.project(inPage[0], inPage[1], onEdge)
+        val expected = floatArrayOf(onEdge.x, onEdge.y)
+        camera.mapPoints(expected)
+
+        ruler.eventProjection(viewToPage).mapPoints(viewPoint)
+
+        assertEquals(expected[0], viewPoint[0], TOLERANCE)
+        assertEquals(expected[1], viewPoint[1], TOLERANCE)
     }
 
     /**
@@ -194,6 +227,56 @@ class RulerAndLaserTest {
         assertEquals(QUARTER_TURN, ruler.angleDegrees, ANGLE_TOLERANCE)
         assertEquals("the centre moved while rotating", CENTRE_X, ruler.centreXPt, TOLERANCE)
         assertEquals("the centre moved while rotating", CENTRE_Y, ruler.centreYPt, TOLERANCE)
+    }
+
+    /**
+     * ⭐ **The body is on one side of the guide, and the grab is on the same side.**
+     *
+     * The report was *"the ruler does not work at all and it should not use the centre because
+     * otherwise it covers it"*. The body used to be drawn centred on the line, so a ruled stroke
+     * landed down the middle of the slab and the ruler covered it. It hangs off one side now, and
+     * this is the assertion that the *grab* moved with the chrome: a chrome side and a grab side
+     * that disagree is a ruler you can see and cannot pick up, which at 12 % alpha nobody would
+     * ever diagnose.
+     *
+     * `bodyNormal` is the side, and page space has y growing downwards (SPEC 4.4), so for a
+     * horizontal edge the body hangs below.
+     */
+    @Test
+    fun theGrabCoversTheBodyAndNotThePaperTheEdgeIsDrawnAgainst() {
+        val ruler = ruler()
+        assertEquals("the body of a horizontal edge is not below it", 1f, ruler.bodyNormalY, TOLERANCE)
+
+        val onTheBody = CENTRE_Y + BODY_INSET
+        assertTrue(
+            "a finger on the body did not grab the edge",
+            ruler.begin(event(MotionEvent.ACTION_DOWN, CENTRE_X, onTheBody), 0, 0, Camera.Identity),
+        )
+        ruler.end()
+
+        // The same distance on the pen's side is paper, and must fall through to the camera.
+        assertFalse(
+            "the ruler claimed the paper its edge is drawn against",
+            ruler.begin(event(MotionEvent.ACTION_DOWN, CENTRE_X, CENTRE_Y - BODY_INSET), 0, 0, Camera.Identity),
+        )
+    }
+
+    /**
+     * Turning the edge past a half turn carries the body — and the grab — with it.
+     *
+     * A normal computed once and cached, or a hard-coded "below", would leave a ruler whose body is
+     * drawn on one side and grabbed on the other for half of all angles.
+     */
+    @Test
+    fun turningTheEdgeCarriesTheBodyWithIt() {
+        val ruler = ruler()
+        ruler.angleDegrees = HALF_TURN
+
+        assertEquals("the body did not follow the edge past a half turn", -1f, ruler.bodyNormalY, TOLERANCE)
+        assertTrue(
+            "the body moved but the grab did not",
+            ruler.begin(event(MotionEvent.ACTION_DOWN, CENTRE_X, CENTRE_Y - BODY_INSET), 0, 0, Camera.Identity),
+        )
     }
 
     /** Switched off, it claims nothing and snaps nothing. */
@@ -308,14 +391,29 @@ class RulerAndLaserTest {
         const val QUARTER_TURN = 90f
         const val EIGHTH_TURN = 45f
         const val FULL_TURN = 360f
+        const val HALF_TURN = 180f
         const val THIRTY = 30f
         const val HALF = 0.5f
 
-        /** Well outside the grab reach of 24 dp at density 1 and camera scale 1. */
+        // A camera that is neither the identity nor square with the page, so a missing hop shows.
+        const val CAMERA_SCALE = 2.5f
+        const val PAN_X = 40f
+        const val PAN_Y = -15f
+        const val VIEW_X = 900f
+        const val VIEW_Y = 1180f
+
+        /** Well outside the grab region on either side, at density 1 and camera scale 1. */
         const val FAR = 200f
 
-        /** Inside it. */
+        /** Inside it, on the body's side. */
         const val NEAR = 8f
+
+        /**
+         * On the body and past the pen side's reach, at density 1 and camera scale 1: more than
+         * `GRAB_REACH_DP` and less than `SLAB_WIDTH_DP`. That gap is the whole point of the
+         * asymmetry, so the constant is chosen to fall inside it rather than beside it.
+         */
+        const val BODY_INSET = 24f
         const val DRAG = 25f
 
         const val TRAIL_X = 120f

@@ -77,7 +77,7 @@ public suspend fun NoteStore.duplicateNote(
 
     sourcePages.forEachIndexed { index, ref ->
         val loaded = loadPage(source, ref.id)
-        val folded = foldPage(ref.id, loaded.ops, defaultSize = loaded.size, defaultBackground = loaded.background)
+        val folded = foldPage(ref.id, loaded.ops, defaultCanvas = loaded.canvas, defaultBackground = loaded.background)
         val target = targetPages[index].id
 
         val ops = ArrayList<PageOp>(folded.objects.size + 1)

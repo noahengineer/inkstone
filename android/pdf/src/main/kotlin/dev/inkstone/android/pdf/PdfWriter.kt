@@ -9,6 +9,7 @@ import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageAnnotationMode
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PdfPageGeometry
@@ -64,7 +65,7 @@ internal interface PdfWriter {
 }
 
 /** One generated page for a from-scratch note. Templates are drawn as vectors, not raster. */
-internal data class BasePage(val size: PageSize, val background: Background)
+internal data class BasePage(val canvas: PageCanvas, val background: Background)
 
 /**
  * Everything one materialization writes into the update section.
@@ -89,6 +90,15 @@ internal data class PdfPagePlan(
     val source: PageSource,
     val pageId: PageId,
     val sortKey: FractionalKey,
+    /**
+     * ⭐ The paper this page is published on — grown, if the page is infinite, to hold everything
+     * written on it (SPEC §4.5).
+     *
+     * The publisher derives this the same way the editor does, from the same objects, which is
+     * what makes the box in the file and the paper on screen the same function rather than two
+     * values that have to be kept in step.
+     */
+    val canvas: PageCanvas,
     val mode: PageAnnotationMode,
     val outlines: List<StrokeOutline>,
     val words: List<InvisibleWord> = emptyList(),
@@ -255,7 +265,7 @@ internal sealed interface PageSource {
     data class Existing(val index: Int) : PageSource
 
     /** A page the note added after import, or the whole of a from-scratch note. */
-    data class Generated(val size: PageSize, val background: Background) : PageSource
+    data class Generated(val canvas: PageCanvas, val background: Background) : PageSource
 }
 
 /**

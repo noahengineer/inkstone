@@ -615,6 +615,61 @@ data class Camera(val translate: Offset, val scale: Float)   // page space → v
 - **Ink is captured in view space and converted at the camera in effect when the stroke started.** A camera change mid-stroke does not retroactively alter the stroke.
 - Dry-layer re-render is debounced on scale change; the front buffer is not scaled, it is re-created
 
+#### The paper, and the infinite canvas
+
+⚠️ **Free panning had a consequence nobody wrote down: you could write beside the page.** The empty
+space next to the paper is one finger-drag away and takes ink exactly like the paper does — the
+stroke is captured, converted at a **negative page-space coordinate**, journaled, put on the undo
+stack and synced like any other. It draws on screen, because the dry layer clips to the viewport
+and not to the page. And **no PDF reader draws it**, because an annotation outside the CropBox is
+not rendered. Ink this app showed you and every other program dropped, with nothing anywhere saying
+so — the silent-loss class CLAUDE.md rule 1 exists for, reached by drawing rather than by syncing.
+Confirmed on an emulator by drawing beside the paper and reading the resulting `add` op straight out
+of `journal.ops`.
+
+So **where the paper is** is a value now, `PageCanvas`, and it is what both halves of this are made
+of:
+
+```kotlin
+data class PageCanvas(val size: PageSize, val origin: PagePoint, val infinite: Boolean)
+```
+
+- **A fixed page refuses ink outside its paper.** The gate is at the pen's ACTION_DOWN, before any
+  gesture is opened, so a refused stroke leaves no op and no undo entry. A stroke that *starts* on
+  the paper and runs off the edge is **kept whole in the log and clipped where the paper ends** —
+  which is what the PDF does to it anyway, so what is on screen is what a reader will see. Nothing
+  is destroyed: widen the page, or make the canvas endless, and all of it is back.
+- **An infinite page grows to hold whatever is written on it**, in all four directions. Growing
+  upwards or to the left moves `origin` negative and **moves no object**: every stroke, capsule and
+  transform keeps the coordinates its author gave it. That is what makes growth cheap and what keeps
+  a peer's concurrent stroke where they drew it — the alternative, re-anchoring page space and
+  translating everything, is a rewrite of the page that a concurrent `AddObject` would miss.
+- ⭐ **The paper is *derived*, not journaled.** `SetPageMeta` carries only the switch (`infinite`);
+  how big an endless page *is* is `stored.grownToInclude(contentBounds)`, computed by the editor
+  after a stroke, by the thumbnail renderer, and by the publisher before it writes the box. Three
+  consequences, all of them the reason: there is no growth op, so writing down a long page is not a
+  `SetPageMeta` per stroke; there is nothing to converge, so §13.2's merges need no rule for it,
+  because a peer's strokes are simply *in* the fold and the page grows to hold them the moment it is
+  folded; and there is nothing that can disagree with the ink, since the paper on screen and the box
+  in the PDF are the same function of the same objects. Growth is quantised to half a page and
+  keeps a 72 pt margin beyond the furthest ink.
+- **It is per page**, offered in the paper menu beside the templates, and **off by default**. An
+  imported PDF stays the size it was imported at unless somebody asks otherwise.
+
+The one trade: the derivation is honest in both directions, so erasing or undoing the outermost
+stroke takes the paper back down. The quantisation is what keeps that from being twitchy.
+
+⚠️ **Growing a published page must not move what is already on it.** Page space is measured from
+the box's *displayed* top-left (§4.4), so enlarging the box to reach a canvas that has grown upwards
+moves the very corner every conversion is anchored to — and every annotation already on an imported
+lecture would slide by however far it grew. `PdfPageGeometry.origin` cancels that exactly, and
+`PageCanvasPdfTest` asserts the identity for all four `/Rotate` values because it is the whole
+argument and is not obvious by inspection. A *generated* page needs no enlarging at all — it is
+created at the canvas's own extent — and conflating the two published a 1008 pt canvas as a 1404 pt
+page with a slab of blank paper down one side. That was caught by reading the published `/MediaBox`
+back with something that is **not** PDFBox; every assertion made with the writing library agreed
+with itself.
+
 ### 4.6 Undo/redo
 
 Undo is a **new op appended to the log**, never a pop:
@@ -886,20 +941,106 @@ ovels/circles"*, and it was exact. Against the minimum-area box (convex hull + r
 Two thresholds travel with that. The closure test is `endGap / pathLength ≤ 0.12`; at M8b's 0.22 an
 open **300° arc** passed it and became an ellipse at confidence 0.84, so every large open curve held
 still was eaten — a second, independent mechanism behind the same complaint. And the dwell's own
-samples are **not** appended to the gesture: half a second of tremor at 240 Hz piles ~130 points onto
-one spot, inflating `pathLength`, which both sank a line's straightness below its bar and pulled a
+samples are **not** part of the gesture: half a second of tremor at 240 Hz piles ~130 points onto
+one spot, inflating `pathLength`, which both sank a line's straightness below its bar and pulled an
 *open* gesture's end-gap ratio under the closure threshold. Both got worse the longer the user held.
+
+⚠️ **The gesture is sampled at its own spacing, and that spacing is not the dwell radius.** Keeping
+the dwell out of the gesture was originally done by recording a point *only* when the pen left the
+dwell window — which made the hold radius double as the sampling resolution, so the classifier saw a
+polyline whose vertices were 6 pt apart however small the shape was. `MIN_POINTS` needs five of
+those, i.e. 30 pt of path, so **a line under about 36 pt could not be recognised at all** while a
+circle worked down to 18 pt across (what gets sampled for a closed shape is its *perimeter*). The
+report was *"if you try make a shape like a line or circle or whatever it just does not work"*. The
+two jobs are separate now: points are recorded every 3 pt, and the ones taken since the pen last
+left the window are a scratch tail that classification discards. The dwell contributes nothing
+either way.
+
+The spacing is **3 pt and not finer**, and that is the other half of the same trap. A line is scored
+by `chord / pathLength`, and a summed path length grows with the digitiser's own jitter as the
+spacing shrinks: at 1.5 pt a hand with ±1 pt of jitter scores 0.44 against a bar of 0.93, so making
+the sampling finer stops a shaky line being a line. 3 pt keeps a factor of two of headroom over any
+jitter a stylus plausibly has. **Both directions are the same bug** — a geometric threshold measured
+against the instrument rather than against the gesture.
+
+⚠️ **How small a shape may be is one pair of constants, and nothing else here has a size in it.**
+`ShapeSnapDetector.DEFAULT_MIN_TRAVEL_PT` refuses the *gesture* and `ShapeSnap.MIN_PATH_LENGTH_PT`
+refuses the *classification*; they are kept equal, because a gap between them is a size at which
+the feature half-works. Every other test is a ratio and so has no opinion about size — including
+`MIN_POINTS`, which **was** acting as a hidden one: sampling is uniform in arc length, so
+`MIN_POINTS × spacing` is a length, expressed in a unit nobody would look for it in.
+
+Three things had to be true before that pair could come down to 9 pt, and only the first was
+visible from a fixture. `travel` only grows when the pen **leaves** the dwell window, so it was a
+multiple of the hold radius and never counted the last leg — a 15 pt line exits at 6 and 12,
+finishes 3 pt later, and was measured as 12. Everything from about 12 to 21 pt was therefore
+refused *by the dwell*, before the classifier was asked, which looks like the hold not being
+detected rather than like a size limit. Adding the anchor-to-pen distance is exact for the missing
+leg and cannot be reached by tremor, since it is bounded by the hold radius and a resting pen never
+moves the anchor.
+
+It also has to be summed **per sample rather than per recorded point**, or it loses whatever the
+pen covered after the last point worth recording; and the classified run must not stop at the last
+window *exit*, which excluded up to a whole dwell window of genuine drawing — half of a 12 pt
+gesture. Excluding it is unnecessary once sampling is by distance: a held hand never covers a whole
+spacing in one step, so the ~130 tremor points that exclusion existed to keep out do not exist to
+begin with. Both were found by drawing through the app over `adb` and neither by any fixture,
+because a fixture chooses its own sample positions.
+
+The floor is now about **12 pt** — roughly 4 mm at fit width — for all three kinds. Below about
+10 pt the mechanism runs out rather than a threshold biting: a gesture smaller than the hold radius
+never leaves the dwell window and can never accumulate travel at all. ⚠️ **The cost is stated
+rather than designed away**: draw-and-hold cannot tell a deliberate 12 pt dash from the downstroke
+of a letter somebody paused in the middle of, and only the half-second of stillness separates them.
+That pair of constants is what to raise if ordinary marks start snapping — never the sampling
+spacing, which decides how well a gesture is measured rather than how small one may be.
+
+⚠️ **A snapped segment's endpoints are the gesture's, including where the pen finally stopped.** A
+`LINE` is placed by its two endpoints and not by its box (§4.8.9), and the last recorded sample is
+by construction up to a sampling spacing behind the tip. So the line came out visibly shorter than
+the one drawn, which at 30 pt is a fifth of it. The pen's resting position is appended once, at
+classification.
+
+⚠️ **Every candidate's confidence ramps down to the shared bar, never to zero.** `recognise` drops
+anything under `DEFAULT_CONFIDENCE`, so a candidate that ramps `0 → 1` across its own tolerance is
+really being held to a fraction of it — a line's stated floor of 0.93 was an effective 0.9465, and
+this file has now been bitten by the same shape four times (`FILL_WINDOW`, `LINE_CERTAIN`,
+`ARC_MAX_RESIDUAL`, and the line's own ramp). Ramping to the bar makes everything a check accepts
+clear it by construction, and keeps two candidates' confidences comparable rather than being two
+differently-normalised numbers that happen to share a name.
 
 What *is* tuned is the confidence bar and the window around each target, and M7's rule applies —
 a synthetic fixture is the worst possible witness for a geometric heuristic, so *"no fighting it
 to draw a freehand curve"* is settled on the tablet and nowhere else. A gesture that matches
 nothing well leaves the ink alone, which is the default.
 
-A snapped shape is **selected the moment it is made**, so the handles that edit it (§4.8.9) are
-already there. The tool is deliberately not changed — a flowchart is five boxes in a row, and
-stealing the pen after each would cost five taps to give back; the toolbar offers **Adjust**, one
-tap, which switches to Select without dropping the selection. ⚠️ That sentence was in this spec and
-in `InkSurfaceView`'s KDoc for two milestones before the button existed.
+A snapped shape is **selected the moment it is made**, and the editor **switches to Select**, so the
+handles that edit it (§4.8.9) are both on screen and live.
+
+⚠️ **Which means a small shape is drawn under its own handles, and they shrink to fit.** Two 13 dp
+squares and a 12 dp ring is about 18 pt of chrome at fit width, so a 30 pt line was three-fifths
+covered by the handles describing it and a 24 pt one had nothing visible between them — a filled
+square, a ring and a filled square, reported as *"a line that does not have the proper points … this
+weird image like thing"*. The drawn handle is scaled down so the closest pair never fills more than
+a third of the gap between them. The **touch** target is untouched: a handle you can see is a
+drawing question and a handle you can hit is a finger question, and tying them together is what
+would make a small shape unusable rather than merely unreadable.
+
+⚠️ **This reverses the original rule, and the reversal was reported rather than reasoned.** The rule
+was *"the tool is deliberately not changed — a flowchart is five boxes in a row, and stealing the
+pen after each would cost five taps to give back"*, with an **Adjust** button as the way back in.
+Two things were wrong with it. The button did not exist for two milestones (nothing in `:app`
+contained the word), and once it did, the default was still backwards: *"it makes it so that you
+draw immediately after, so you end up drawing on the shape rather then editing it"*. Drawing on
+your own new shape and undoing it costs more than a tap on a pen chip, so the toolbar now offers
+**Draw again** and the tool hands over.
+
+**An open gesture that is one clean arc snaps to a curve** — a `LINE` with a `ShapeRecord.bend`
+(§4.8.9). This too reverses an earlier reading: arcs were refused outright on the strength of *"no
+fighting it to draw a freehand curve"*, which protects a curve drawn and **lifted** and says nothing
+about one the user deliberately held still on. A hold is a request. What is still refused is
+anything a single quadratic cannot draw — an S, a corner, a scribble, or an arc past about 180° —
+measured as the distance from the ink to the curve it would become, never as a corner detector.
 
 `ARROW` is never recognised. An arrowhead is a few samples at one end of a gesture,
 indistinguishable from a hooked pen-lift; it is a tool the user picks.
@@ -919,28 +1060,70 @@ for a shape whose points are the thing being drawn, and for two kinds it is not 
 incapable: no scale turns one triangle into another, and an axis-aligned line's frame has no height
 to grab. This section is what a point drag writes.*
 
-**Three points are an affine map, so a point drag is a placement and not new geometry.** A
-`ShapeObject` is a kind, a local box, and the matrix that places it (§4.8.6). A 2-D affine map is
-determined by exactly three point correspondences — so *"put this vertex there and leave the other
-two"* has one answer, and that answer is a matrix. Every vertex drag therefore emits the ordinary
-absolute `SetTransform` §4.2 froze in M2. No new op, no new object kind, no geometry stored beside
-the payload, and undo, the merge matrix, the PDF and a peer's copy keep working because none of
-them can tell a point drag from a drag of the whole shape.
+**Every shape edits its points. A drag moves one point, and nothing else moves.**
 
-| Kind | Handles | A drag solves |
+| Kind | Handles | A drag writes |
 |---|---|---|
-| `TRIANGLE` | 3 vertices | the exact affine; the other two vertices are pinned |
-| `LINE` / `ARROW` | 2 ends + 1 bend | a **similarity** about the far end; the bend writes the record |
-| `RECTANGLE` | 4 corners | a scale on **both** local axes about the opposite corner |
-| `ELLIPSE` | 4 quadrant points | a scale on **one** local axis about the opposite point |
+| `RECTANGLE` / `ELLIPSE` / `TRIANGLE` | its vertices | `ShapeRecord.points` |
+| `LINE` / `ARROW` | 2 ends + 1 bend | `ShapeRecord.points` for an end; `ShapeRecord.bend` for the middle |
 
-⚠️ **Only the triangle gets the free affine, and the restriction is the feature.** A rectangle has
-four corners and an affine has three degrees of freedom, so *"drag one corner, pin the other
-three"* has **no** solution — the fourth is `B + D − A` by construction. Solving it as a free
-affine anyway would silently turn every rectangle into a parallelogram the moment a corner was
-touched. Scaling the shape's **own** axes keeps the right angles, and because they are the shape's
-and not the page's, the dragged corner still lands exactly under the finger at any rotation. A
-corner drag past its own pin is clamped rather than allowed to mirror the shape.
+No handle writes a `SetTransform`. The placement is what a **move, a resize or a rotation of the
+whole shape** writes, and points are local so they ride along with it for free (§4.8.3).
+
+⚠️ **A segment was the last exception and it was also wrong.** The defence was that a similarity
+expresses a segment *exactly* — map one end anywhere, pin the other, no residue — which is true and
+beside the point: a similarity scales the whole local frame, so a curve's bulge grew as its chord
+was dragged out. *"Straight lines … have the stretching by size changing, i dont want any shape to
+do that no matter what."* "Expressible as a placement" is not "should be a placement".
+
+⚠️ **The first version of this section said the opposite, and shipped.** It solved every drag as a
+new **placement**, on the observation that three point correspondences determine an affine map.
+That is true, and for a triangle it even gives the right answer — but a rectangle has **four**
+corners and an affine has three degrees of freedom, so *"move this corner and leave the other
+three"* has no solution as a matrix; the nearest a matrix can do is scale the shape about the
+opposite corner. The report was immediate and exact: *"editing the points is just resizeing the
+shape from those points rather then actually editing the shape, which is not what i want at all"*.
+
+So a closed shape's vertices are now **stored geometry**, seeded from the kind's own outline on the
+first drag and overriding it from then on. Three properties make that safe:
+
+- **Seeding is invisible.** `ShapeGeometry.outline` reproduces the parametric shape from its own
+  seeds bit for bit — including the ellipse, whose smoothing constant is `KAPPA / 2` for exactly
+  that reason. The shape does not change when it becomes editable, only when a finger moves it.
+- **The kind is unchanged**, so a build that predates the key draws the parametric shape and
+  re-encodes the bytes untouched — the same degrade `bend` gets, and why neither needed a sixth
+  `ShapeKind` (§4.8.8).
+- **The placement is untouched**, so a move, a resize and a rotation are still one absolute
+  `SetTransform` (§4.8.3), and a vertex edit and a drag of the whole shape stay independent
+  registers.
+
+A **segment** stores exactly two points, and its bend stays a separate register: the bend is an
+*on-curve* value that is **absent** when the line is straight, and folding it into the vertex list
+would make "straight" and "the middle vertex happens to sit on the chord" the same state. The
+triangle moved to vertices with the other closed kinds even though the affine solved it correctly,
+because a sheared **space** and a moved **point** differ once anything else lives in that space — an
+erase region shears with the first and not with the second.
+
+⚠️ **Straightness is measured against the *edited* chord.** Once an end has been dragged the segment
+is no longer `(0, h/2) → (w, h/2)`, and measuring the bend's offset against the payload's original
+chord would call a real curve straight, or the reverse.
+
+The cost is the one §4.8.2 already states: the vertex list is one LWW register written whole, so two
+devices dragging different corners of the same shape concurrently keep one edit intact and lose the
+other. A delta would instead produce a shape neither of them drew.
+
+**Leaving the Select tool clears the selection, and a tap on bare paper leaves the tool.** The first
+is the toolbar's own stated rule — *"a box round objects the toolbar no longer offers actions for is
+chrome that lies"* — applied to every route out rather than only to the Select chip, and it lives in
+`InkSurfaceView.tool`'s setter because that is the one place which sees them all. The second is
+reported separately from the selection emptying, because a selection empties for half a dozen
+reasons (an undo, a peer's delete, an erase) and only one of them is a person saying *"I am done"*.
+
+**The selection frame is not drawn for a shape that has its own points** — *"i dont like how it
+gives a box around the shapes, it can make it quite confusing"*. The box stopped being the thing you
+act on the moment the handles arrived: it described a resize gesture the points had replaced, and
+for a curve or a diagonal line it is mostly empty paper. It is still the **move** target and is
+still hit-tested; only the rotate grip and the points are drawn.
 
 **The curve is the one thing a placement cannot express**, because a straight segment and a bent
 one are different paths and no affine map turns one into the other. It is therefore the one point
@@ -970,6 +1153,14 @@ and re-derived on every fold (§4.8.3), so a vertex drag would write a correct `
 the reroute paints straight over — an honest-looking dead grip. Dragging an endpoint onto a
 *different* shape is the gesture a connector actually wants, and it is still owed
 (`docs/M8-CONNECTORS.md` §7.7).
+
+**Only a closed shape can be attached to** (`ShapeKind.isAnchorable`). Draw-and-hold binds a
+line's end to whatever shape it lands on, and that lookup used to accept a line or an arrow too —
+so a line drawn starting *on* another snapped line became a connector bound to it, routed from the
+boundary of a box one pen-width tall, collapsed to a stub on the line it touched, and offered the
+frame's grips instead of its points. The refusal is at **binding** time only: a connector already
+attached to a line in an existing note still routes as before, because changing what the fold
+resolves would change how every synced copy of that note draws.
 
 ### 4.9 Text boxes, images, and the format register ⭐
 
@@ -1008,7 +1199,7 @@ prohibition that forces every future property into whichever existing register i
 | Register | Op | Holds | Per object kind |
 |---|---|---|---|
 | **content** | `SetTextContent` (M2) | what the user authored | text box → **the words**; shape → `ShapeRecord` (§4.8.2, unchanged) |
-| **format** | `SetFormat` (**new in M8c**) | how it is presented | text box → font, size, alignment, list level; image → crop |
+| **format** | `SetFormat` (**new in M8c**) | how it is presented | text box → font, size, alignment, list level, **frame**; image → crop |
 
 `SetFormat(target, record)` is an absolute, object-keyed LWW register carrying a short ASCII
 record, encoded exactly like `ShapeRecord` and with the same unknown-key preservation (§4.8.2's
@@ -1036,6 +1227,20 @@ undo"* silently eats the press (§4.2's own trap, in the register next door).
 
 **Rotate and flip are not in the record either.** Both are `SetTransform`, absolute, already in the
 vocabulary — a flip is a matrix negation. ROADMAP M8c says as much and it is right.
+
+⚠️ **A text box's *size* is in the record, and that reverses what M8c assumed.** Keys `w` and `h`
+(`ObjectFormat.boxWidthPt` / `boxHeightPt`), absolute, null meaning *the extents the object was
+created with*. M8c left a text box with no size register at all on the reasoning that a resize is a
+`SetTransform` like any other object's — which is right for a photo, where scaling **is** resizing,
+and wrong for a paragraph, where resizing means a different **wrap width**. Dragging a corner
+magnified every glyph and re-wrapped nothing, so "widen this label to fit one more word" returned the
+same words, larger, on the same number of lines. Moving a box is still `SetTransform`; sizing one is
+this. The two are separate registers on purpose: the top-left corner is the object's origin, which is
+why the frame handles grow only right and down and never write both at once.
+
+The read side has to follow it everywhere the payload's extents were read — the wrap width, the
+silhouette a lasso is tested against, the rectangle a tap is tested against, and the layout the
+published PDF uses. A layer left on `widthPt` draws the box at one size and measures it at another.
 
 **Crop is not `SetErasedRegion`.** An erased area is a union of eraser capsules and grows
 monotonically with the gesture; a crop is a single absolute region the user can widen again. They
@@ -1844,6 +2049,16 @@ The core user-facing feature:
 3. Creates `remote_binding`, enqueues `MKCOL` (if needed) then `UPLOAD`, sets `PENDING_UPLOAD`
 4. **The note is fully editable throughout.** Binding never blocks editing.
 5. A default folder per account makes step 2 one tap
+6. ⭐ **Step 2 works offline.** Every successful listing is remembered in `browsedFolder`, and a
+   PROPFIND that cannot reach the server is answered from it — marked as remembered, with how
+   long ago it was seen. Steps 3–5 never touched the network in the first place (the `MKCOL` is
+   unconditional precisely so the folder need not exist yet), so the *only* part of binding that
+   ever required a connection was seeing the names. A folder created with no network is kept as
+   a marked, not-yet-on-the-server destination and is created by the binding's own `MKCOL`.
+   Adopting a remote **PDF** is the one thing here that genuinely needs the network, because it
+   is a `GET` of the bytes; the browser says so rather than listing files it cannot open.
+   ⚠️ `browsedFolder` is **not** the reconciler's `remoteDirectory` (§7.4 rule 1) and nothing
+   that decides what syncs may read it — see `docs/OFFLINE-FOLDERS.md`.
 
 **Deleting a bound note:** local trash immediately + enqueue remote `DELETE` (which lands in Nextcloud's trash). Restoring from local trash within 30 days re-enqueues an `UPLOAD` — note that a Nextcloud trash-restore **changes the fileid**, so re-bind by path and repair `remote_oc_id` from the PUT response.
 
@@ -2017,6 +2232,38 @@ binding has no ETag and no `oc:id`, so *"was this ever uploaded"* is false, so t
 the note flagged `CONFLICTED`. A note that has just arrived byte-identical to the server's copy
 reads as a conflict, and because a park is inherited, the next real edit to it never uploads
 either.
+
+#### Adopting a file that is already on the server
+
+*Added after M12, when the third way to bind a note turned out to be needed.*
+
+The user browses their Nextcloud, picks a **PDF that is already there**, and writes on it; the note
+binds to that file, so the ink uploads back onto the document where they keep it. Two facts make
+this safe and one makes it different from both bindings above.
+
+- **Bind at the version the GET reported** — its ETag *and* its `oc:id` — so the first PUT carries
+  `If-Match:` and a file that changed since it was picked 412s instead of being overwritten. The
+  `oc:id` is what a later move is matched on (§7.4 rule 2).
+- **`lastSyncedRev` is 0**, because the server holds none of *this note's* revisions. What it holds
+  is the PDF the note was made from, which is what the ETag remembers.
+- ⚠️ **One upload is owed immediately**, unlike a pulled note. §5.6 puts identity in the file, so a
+  bound path whose bytes carry **no marker** is read as §7.7 layer 3 — *keep both* — by anything
+  that makes the pass download it: a weak ETag, a proxy rewriting validators, or somebody touching
+  the file. Stamping the file as this note's is what makes the binding honest, and waiting for the
+  user's first stroke to do it leaves a window in which an ordinary poll manufactures a conflicted
+  copy of a note nothing is wrong with.
+
+The upload still waits out §7.6's 30 s floor, which is measured from the download — so the marker
+and the first strokes land in one PUT, and unbinding inside that window leaves the document
+untouched.
+
+A file the account may not **write** (`oc:permissions` without `W`) cannot be adopted: it is
+imported as an ordinary local note instead, and said so. Binding it would 403 on every PUT and park
+for a day, which presents as a note that quietly never syncs.
+
+⚠️ **Trashing an adopted note DELETEs the file it was adopted from** — to Nextcloud's trash, per
+§7.7's contract, but *"delete the note"* then also means *"remove the document from where I keep
+it"*. Unbind first to keep the file. See `docs/REMOTE-PDF.md` §6.
 
 #### Polling and push
 
@@ -2389,7 +2636,7 @@ Toolchain is ready: Kotlin 2.3.20, Compose Multiplatform iOS stable since 1.8.0,
 |---|---|
 | Real-time collaboration | The op-log supports it; transport and presence UI are their own project |
 | AI features | ML Kit GenAI can't do handwriting; cloud AI contradicts offline-first |
-| Infinite canvas | Different rendering and viewport model |
+| ~~Infinite canvas~~ | ~~Different rendering and viewport model~~ — **built**, §4.5. The reason given here was right about *where* the cost would be and wrong about how much: the viewport model needed one value (`PageCanvas`) rather than a new one, and the rendering needed the paper's rectangle to stop being assumed. What made it affordable is that the canvas is **derived from the ink** rather than journaled, so it added no op, no merge rule and no format version — and the same rectangle it introduced is what stopped ink being written beside a *fixed* page, which was a live data-visibility bug the whole time this row said "not now". Off by default, per page. |
 | Audio + stroke sync | Large surface, and a data-loss risk area. **Designed for M12 — `docs/M12-AUDIO.md`. The capture half is now built (§15); alignment and transcription are not.** Still out of scope for v1, which ends at M11; the reason above turned out to be exactly right, and the design is mostly the answer to it — the one thing it under-rated is the outbox's coalescing key, which would have eaten a lecture in silence |
 | Tags / backlinks | Worth doing properly later |
 | Handwriting→text replace-in-place | Recognition exists in M7; the editing UX is its own design problem |

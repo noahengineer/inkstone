@@ -179,12 +179,40 @@ public fun Camera.zoomedAround(focusView: Offset, factor: Float, limits: ZoomLim
  * If the page is smaller than [minVisiblePx] on an axis, the whole of it is the
  * bound, otherwise the leash would be unsatisfiable.
  */
-public fun Camera.leashedTo(page: PageSize, viewport: Viewport, minVisiblePx: Float): Camera = copy(
-    translate = Offset(
-        x = leashAxis(translate.x, page.widthPt * scale, viewport.widthPx, minVisiblePx),
-        y = leashAxis(translate.y, page.heightPt * scale, viewport.heightPx, minVisiblePx),
-    ),
-)
+public fun Camera.leashedTo(page: PageCanvas, viewport: Viewport, minVisiblePx: Float): Camera {
+    // ⚠️ The leash is about the **paper**, not about page space, and on a grown canvas the two
+    // start in different places. The paper's top-left is at `translate + origin·scale` in view
+    // space; clamping `translate` directly would leash the page-space origin instead, which on an
+    // infinite page that has grown upwards is a point somewhere in the middle of the writing.
+    return copy(
+        translate = Offset(
+            x = leashEdge(translate.x, page.left * scale, page.size.widthPt * scale, viewport.widthPx, minVisiblePx),
+            y = leashEdge(translate.y, page.top * scale, page.size.heightPt * scale, viewport.heightPx, minVisiblePx),
+        ),
+    )
+}
+
+/**
+ * [leashAxis] about the paper's edge rather than about the page-space origin.
+ *
+ * ⚠️ **The zero case is a short circuit and not an optimisation.** Adding an offset and taking it
+ * away again is exact in floating point for every value except one: `-0.0 + 0.0` is `+0.0`, so a
+ * camera resting at exactly `-0.0` came back as `+0.0` — numerically the same pan, and a *different
+ * value* to `equals`. Found on a device by `PageMetaLiveChangeTest`, whose whole subject is that
+ * the camera must not move under the pen and which therefore compares cameras for equality. Every
+ * fixed page takes this branch, so nothing that worked before this existed goes near the
+ * arithmetic below it.
+ */
+private fun leashEdge(
+    translate: Float,
+    origin: Float,
+    scaledExtent: Float,
+    viewportExtent: Float,
+    minVisible: Float,
+): Float {
+    if (origin == 0f) return leashAxis(translate, scaledExtent, viewportExtent, minVisible)
+    return leashAxis(translate + origin, scaledExtent, viewportExtent, minVisible) - origin
+}
 
 private fun leashAxis(translate: Float, scaledExtent: Float, viewportExtent: Float, minVisible: Float): Float {
     val keep = min(minVisible, scaledExtent)
@@ -195,10 +223,12 @@ private fun leashAxis(translate: Float, scaledExtent: Float, viewportExtent: Flo
 }
 
 /** Centres [page] in [viewport]. Used by the fit modes, and by nothing else. */
-private fun Camera.centredIn(page: PageSize, viewport: Viewport): Camera = copy(
+private fun Camera.centredIn(page: PageCanvas, viewport: Viewport): Camera = copy(
     translate = Offset(
-        x = (viewport.widthPx - page.widthPt * scale) / 2f,
-        y = (viewport.heightPx - page.heightPt * scale) / 2f,
+        // Minus the origin, for the same reason the leash adds it: what is being centred is the
+        // paper, and on a grown canvas the paper does not start at the page-space origin.
+        x = (viewport.widthPx - page.size.widthPt * scale) / 2f - page.left * scale,
+        y = (viewport.heightPx - page.size.heightPt * scale) / 2f - page.top * scale,
     ),
 )
 
@@ -217,23 +247,28 @@ public enum class FitMode { FIT_WIDTH, FIT_PAGE, ACTUAL_SIZE }
  */
 public fun cameraFor(
     mode: FitMode,
-    page: PageSize,
+    page: PageCanvas,
     viewport: Viewport,
     pixelsPerPoint: Float,
     limits: ZoomLimits,
 ): Camera {
+    val size = page.size
     val scale = when (mode) {
-        FitMode.FIT_WIDTH -> viewport.widthPx / page.widthPt
-        FitMode.FIT_PAGE -> min(viewport.widthPx / page.widthPt, viewport.heightPx / page.heightPt)
+        FitMode.FIT_WIDTH -> viewport.widthPx / size.widthPt
+        FitMode.FIT_PAGE -> min(viewport.widthPx / size.widthPt, viewport.heightPx / size.heightPt)
         FitMode.ACTUAL_SIZE -> pixelsPerPoint
     }
     val clamped = limits.clamp(scale)
     val centred = Camera(Offset.Zero, clamped).centredIn(page, viewport)
     // Fit-width means "show the full width and start at the top", so a page
     // taller than the viewport keeps its top edge rather than being centred
-    // vertically on a page the user has not scrolled yet.
-    return if (mode == FitMode.FIT_WIDTH && page.heightPt * clamped > viewport.heightPx) {
-        centred.copy(translate = Offset(centred.translate.x, 0f))
+    // vertically on a page the user has not scrolled yet. The top is the *paper's*
+    // top, which on a grown canvas is above the page-space origin.
+    return if (mode == FitMode.FIT_WIDTH && size.heightPt * clamped > viewport.heightPx) {
+        // `-page.top * clamped`, except that for a paper at the origin that expression is `-0.0`
+        // rather than `0.0` — the same place, and a different value to `equals`. See [leashEdge].
+        val top = if (page.top == 0f) 0f else -page.top * clamped
+        centred.copy(translate = Offset(centred.translate.x, top))
     } else {
         centred
     }

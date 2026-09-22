@@ -3,7 +3,10 @@ package dev.inkstone.app.sync
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dev.inkstone.android.pdf.PdfOpenResult
 import dev.inkstone.app.library.LibraryRepository
+import dev.inkstone.app.library.RemotePdfAdoption
+import dev.inkstone.app.library.RemotePdfPick
 import dev.inkstone.core.database.recording.RecordingIndex
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FolderId
@@ -13,6 +16,7 @@ import dev.inkstone.core.sync.DavResource
 import dev.inkstone.core.sync.LoginFlowResult
 import dev.inkstone.core.sync.LoginFlowStart
 import dev.inkstone.core.sync.OutboxStore
+import dev.inkstone.core.sync.RemoteVersion
 import dev.inkstone.core.sync.SyncAccount
 import dev.inkstone.core.sync.SyncEngine
 import dev.inkstone.core.sync.SyncNowReport
@@ -36,6 +40,10 @@ import javax.inject.Inject
  * `viewModelScope`, so backing out of the screen ends it rather than leaving a coroutine
  * polling somebody's server for twenty minutes.
  */
+// TooManyFunctions: this screen is the app's whole Nextcloud surface — sign in, sign out, browse,
+// bind, pin, move, adopt a file, sync now — and each of those is one press with one method behind
+// it. Splitting it by count rather than by meaning would put half a flow in another class.
+@Suppress("TooManyFunctions")
 @HiltViewModel
 class SyncViewModel @Inject constructor(
     private val accounts: NextcloudAccounts,
@@ -125,6 +133,24 @@ class SyncViewModel @Inject constructor(
     }
 
     /**
+     * ⭐ **Opened by *"Import → From Nextcloud"* — pick a PDF that is already on the server and
+     * write on it.**
+     *
+     * The same browser as every other flow, with the files drawn as well as the folders. The
+     * listing always carried them (one PROPFIND, SPEC §7.3); [RemoteBrowser.pickingPdf] is what
+     * decides whether they are shown, so a user choosing where to save a note is not offered a
+     * file to save it into.
+     *
+     * There is no confirm button. Tapping a folder navigates and tapping a PDF *is* the action —
+     * a "choose here" chip would have nothing to mean, since what is being chosen is the file
+     * under the finger and not the folder in the breadcrumb.
+     */
+    fun openForPdfImport(intoFolder: FolderId? = null) {
+        mutable.update { SyncUiState(pickingPdf = true, pickingInto = intoFolder) }
+        refresh()
+    }
+
+    /**
      * Opened by *"Change sync folder…"* on a note that is already synced.
      *
      * The same browser as binding, confirming into a `MOVE` rather than a new binding — which is
@@ -180,7 +206,11 @@ class SyncViewModel @Inject constructor(
             val single = mutable.value.usable.singleOrNull()
             val wants = mutable.value.bindingNote != null ||
                 mutable.value.pinningFolder != null ||
-                mutable.value.movingNote != null
+                mutable.value.movingNote != null ||
+                // Picking a PDF to write on wants it most of all: with one account, "From
+                // Nextcloud" should land on the user's files. Without this it lands on an
+                // account list, which is a settings screen and reads as the wrong button.
+                mutable.value.pickingPdf
             if (wants && mutable.value.browser == null && single != null) {
                 chooseAccount(single.id)
             }
@@ -335,7 +365,21 @@ class SyncViewModel @Inject constructor(
             mutable.update { it.copy(busy = true) }
             when (val result = accounts.browse(accountId, path)) {
                 is NextcloudAccounts.BrowseResult.Listing -> mutable.update {
-                    it.copy(busy = false, browser = RemoteBrowser(accountId, path, result.folders), message = null)
+                    it.copy(
+                        busy = false,
+                        browser = RemoteBrowser(
+                            accountId = accountId,
+                            path = result.path,
+                            folders = result.folders,
+                            pdfs = result.pdfs,
+                            pickingPdf = it.pickingPdf,
+                            remembered = result.remembered,
+                        ),
+                        // ⭐ Not an error line. A remembered listing is a working browser, and
+                        // saying so twice — once as chrome and once as a red line — reads as a
+                        // failure the user has to do something about. The chrome says it.
+                        message = null,
+                    )
                 }
 
                 is NextcloudAccounts.BrowseResult.Failed -> mutable.update {
@@ -344,7 +388,7 @@ class SyncViewModel @Inject constructor(
                     // and useful answer; the note still binds there.
                     it.copy(
                         busy = false,
-                        browser = RemoteBrowser(accountId, path, emptyList()),
+                        browser = RemoteBrowser(accountId, path, emptyList(), pickingPdf = it.pickingPdf),
                         message = result.reason,
                     )
                 }
@@ -390,10 +434,25 @@ class SyncViewModel @Inject constructor(
         val legal = RemoteName.sanitise(name)
         val path = if (browser.path.isEmpty()) legal else "${browser.path}/$legal"
         viewModelScope.launch {
-            if (accounts.createRemoteFolder(browser.accountId, path)) {
-                browseTo(browser.accountId, path)
-            } else {
-                mutable.update { it.copy(message = "Could not create “$legal” on the server.") }
+            when (val result = accounts.createRemoteFolder(browser.accountId, path)) {
+                NextcloudAccounts.FolderCreateResult.Created -> browseTo(browser.accountId, path)
+
+                // ⭐ No network is not a refusal. The folder is remembered, the browser walks
+                // into it, and the MKCOL that creates it for real is the one the binding
+                // enqueues — so the whole *"new folder, save it there"* flow works offline.
+                NextcloudAccounts.FolderCreateResult.Deferred -> {
+                    browseTo(browser.accountId, path)
+                    mutable.update {
+                        it.copy(
+                            message = "“$legal” will be created on the server the first time " +
+                                "something is saved into it.",
+                        )
+                    }
+                }
+
+                is NextcloudAccounts.FolderCreateResult.Failed -> mutable.update {
+                    it.copy(message = "Could not create “$legal” on the server. ${result.reason}")
+                }
             }
         }
     }
@@ -427,7 +486,127 @@ class SyncViewModel @Inject constructor(
 
     /** Leave the folder browser without binding anything. Changes nothing, remotely or locally. */
     fun cancelBrowse() {
-        mutable.update { it.copy(browser = null, bindingNote = null, movingNote = null, pinningFolder = null) }
+        mutable.update {
+            it.copy(browser = null, bindingNote = null, movingNote = null, pinningFolder = null, pickingPdf = false)
+        }
+    }
+
+    /**
+     * ⭐ **Download the PDF the user tapped, import it, and bind the note to that same file.**
+     *
+     * The one place in the app that makes a *foreground* request and asks the user to wait for it.
+     * Everything else is the outbox, deliberately (CLAUDE.md rule 4) — but the outbox exists so
+     * that **writes** survive a dead network and a dead process, and this is a read whose whole
+     * point is that the note opens now. Nothing remote is mutated here; the write that follows it
+     * goes through the outbox like every other.
+     *
+     * ⚠️ **A read-only file is imported, not refused.** [RemotePdfPick] decides that off
+     * `oc:permissions` before a byte moves: a shared handout the user may read and not write cannot
+     * be annotated *in place*, and binding it anyway would 403 on every PUT, park for a day, and
+     * present as a note that quietly never syncs. They get the note, and a sentence saying why it
+     * will not write back.
+     */
+    fun pickPdf(file: DavResource) {
+        val browser = mutable.value.browser ?: return
+        if (mutable.value.busy) return
+        when (val decision = RemotePdfPick.decide(file)) {
+            RemotePdfPick.Decision.NotAFile -> browseTo(browser.accountId, file.path)
+
+            RemotePdfPick.Decision.NotAPdf ->
+                mutable.update { it.copy(message = "Only PDFs can be opened as notes.") }
+
+            else -> downloadAndImport(
+                accountId = browser.accountId,
+                file = file,
+                inPlace = decision == RemotePdfPick.Decision.AdoptInPlace,
+            )
+        }
+    }
+
+    private fun downloadAndImport(accountId: String, file: DavResource, inPlace: Boolean) {
+        viewModelScope.launch {
+            mutable.update { it.copy(busy = true, message = "Getting ${file.name}…") }
+            val fetched = when (val outcome = accounts.fetchPdf(accountId, file.path)) {
+                is NextcloudAccounts.FetchResult.Downloaded -> outcome.file
+
+                is NextcloudAccounts.FetchResult.Failed ->
+                    return@launch fail("Could not download that file. ${outcome.reason}")
+
+                NextcloudAccounts.FetchResult.Unavailable ->
+                    return@launch fail("That account needs signing in again.")
+            }
+            val title = RemotePdfPick.titleOf(file)
+            // ⚠️ The version off the **GET**, not off the listing — see `SyncEngine.bindAdopted`.
+            val observed = RemoteVersion(
+                etag = fetched.etag,
+                ocId = fetched.ocId ?: file.ocId,
+                checksum = null,
+                syncedRev = null,
+            )
+            val outcome = if (inPlace) {
+                library.adoptRemotePdf(
+                    bytes = fetched.bytes,
+                    title = title,
+                    accountId = accountId,
+                    remotePath = file.path,
+                    observed = observed,
+                    folderId = mutable.value.pickingInto,
+                )
+            } else {
+                // Bound to nothing. The note is the user's; the file on the server is not theirs
+                // to write to, and this app does not queue a PUT it knows will 403.
+                when (val result = library.importPdf(fetched.bytes, title, mutable.value.pickingInto)) {
+                    is PdfOpenResult.Opened -> RemotePdfAdoption.Unbound(result.documentId, result)
+                    else -> RemotePdfAdoption.Refused(result)
+                }
+            }
+            report(outcome, file, inPlace)
+        }
+    }
+
+    /**
+     * One sentence per outcome, and **an opened note only when there is nothing to read first**.
+     *
+     * The same rule `LibraryViewModel.importPdf` follows for a local file: a recovery report that
+     * is dismissed by the editor opening over it has not been read (SPEC §5.6 point 4).
+     */
+    private fun report(outcome: RemotePdfAdoption, file: DavResource, inPlace: Boolean) {
+        val message = when (outcome) {
+            is RemotePdfAdoption.Adopted ->
+                "Writing on ${file.name}. Your ink uploads back to /${outcome.remotePath}."
+
+            is RemotePdfAdoption.AlreadySynced ->
+                "That note is already in your library, and already syncing where it was."
+
+            is RemotePdfAdoption.Recovered ->
+                "That was an Inkstone note whose data did not survive. It has been recovered as far " +
+                    "as possible and is not syncing — check it before you save it back."
+
+            is RemotePdfAdoption.Unbound -> if (inPlace) {
+                "Added ${file.name}, but it is not syncing — that account is unavailable."
+            } else {
+                "Added ${file.name} as a note. You may not write to that file on the server, so your " +
+                    "ink stays here until you save the note to Nextcloud yourself."
+            }
+
+            is RemotePdfAdoption.Refused -> "That PDF could not be opened as a note."
+        }
+        val opens = outcome !is RemotePdfAdoption.Recovered
+        mutable.update {
+            it.copy(
+                busy = false,
+                browser = null,
+                pickingPdf = false,
+                message = message,
+                openNote = outcome.noteId.takeIf { _ -> opens },
+            )
+        }
+        refresh()
+    }
+
+    /** Consumed by the Activity, which owns navigation — the same handshake as [openInBrowser]. */
+    fun noteOpened() {
+        mutable.update { it.copy(openNote = null) }
     }
 
     fun unbind(noteId: DocumentId) {
@@ -524,6 +703,18 @@ data class SyncUiState(
     val movingNote: DocumentId? = null,
     /** Non-null while a *folder* is being pinned to a remote path (M6). */
     val pinningFolder: FolderId? = null,
+    /** True while the browser is being used to pick a PDF to write on, which is what shows files. */
+    val pickingPdf: Boolean = false,
+    /**
+     * Which library folder an adopted PDF is filed into — the one the user was looking at.
+     *
+     * Null is the root, and null is also what every other flow leaves it as. It says nothing about
+     * where the file lives on the server: an adopted note is bound to a path the user chose long
+     * before, and SPEC §9's mirror does not reach backwards into it.
+     */
+    val pickingInto: FolderId? = null,
+    /** Set once by an import, consumed by the Activity, which owns opening a note. */
+    val openNote: DocumentId? = null,
     val outboxCount: Int = 0,
     /**
      * ⭐ M12 §11 — *"Five lectures a day and a week offline is ~275 MB of audio waiting on the
@@ -549,5 +740,26 @@ data class SyncUiState(
     val usable: List<SyncAccount> get() = accounts.filter { it.isUsable }
 }
 
-/** One level of the remote tree (PROPFIND `Depth: 1`). */
-data class RemoteBrowser(val accountId: String, val path: String, val folders: List<DavResource>)
+/**
+ * One level of the remote tree (PROPFIND `Depth: 1`).
+ *
+ * [pdfs] is always populated — the listing carried it either way — and [pickingPdf] is what says
+ * whether this browser is *for* them.
+ */
+data class RemoteBrowser(
+    val accountId: String,
+    val path: String,
+    val folders: List<NextcloudAccounts.RemoteFolderEntry>,
+    val pdfs: List<DavResource> = emptyList(),
+    val pickingPdf: Boolean = false,
+    /**
+     * ⭐ Non-null when the server could not be reached and these folder names came out of the
+     * cache instead.
+     *
+     * Everything the browser is *for* still works in this state — binding a note, pinning a
+     * folder, setting the default — because none of those touch the network: they write rows and
+     * enqueue MKCOL + UPLOAD. The one thing that does not is adopting a PDF, which is a GET, and
+     * [pdfs] is empty here for exactly that reason.
+     */
+    val remembered: NextcloudAccounts.Remembered? = null,
+)

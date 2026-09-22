@@ -573,6 +573,11 @@ Automated and green:
         `pressureAndTiltSurviveTheRoundTrip` fails an arm64-tuned float tolerance
         (`y at 1 expected:<415.70966> but was:<415.7085>`). Pre-existing, documented in CLAUDE.md
         since M5, **not** an M6 regression and deliberately not "fixed" by loosening M1's tolerances.
+
+        ⚠️ **Both diagnoses above were wrong**, found when the tablet finally ran this suite:
+        13 of 108 failed there too, with the same numbers. The orientation escape is
+        seed-dependent arithmetic, not x86_64 rounding, and the tolerance was never
+        arm64-tuned — it had never passed anywhere. Fixed; 110/110 on the tablet. See CLAUDE.md.
 - [x] **SPEC §13.3 crash safety — four instrumented process kills, written for the first time.**
       `app/src/androidTest/…/CrashSafetyTest.kt` kills a real second process
       (`dev.inkstone:crashpoint`) at four named instants and asserts a **bound** at each: an
@@ -596,7 +601,7 @@ Automated and green:
       the camera does not move and the in-progress stroke still lands when the pen lifts. Its
       control drives the forbidden path — `loadPage` — and asserts the damage, so the first test
       cannot pass by accident. The peer's geometry is harvested from a stroke the test itself drew,
-      so `SyntheticInk`'s x86_64 orientation bug cannot leak into it
+      so what it merges is geometry the real capture path produced
 - [x] **The M6 app driven end-to-end over `adb` on the emulator**, which is the check that catches
       "correct in every test, inert in the app": a folder created through the UI, *"Always sync to…"*
       reachable from its overflow menu, the folder's cloud badge appearing, a note created inside the
@@ -1297,10 +1302,12 @@ Four things that will bite:
    quietly disagreeing rather than any error.
 
 3. A FRAME BENCHMARK ON THE EMULATOR MEASURES NEITHER THING SPEC §10 ASKS
-   ABOUT — and the stress fixtures do not even build there. Both the
-   5,000-stroke ink fill and the 500-note library fixture are built by
-   SyntheticInk, whose orientations are a thousandth outside [0, 2π) under
-   x86_64 rounding, which androidx.ink rejects. The frame-rate row is
+   ABOUT. (The stress fixtures used to fail to build anywhere, on any CPU:
+   SyntheticInk emitted orientations outside [0, 2π) for ~6% of strokes and
+   androidx.ink rejects those. Fixed — SyntheticInk.turn — so both the
+   5,000-stroke fill and the 500-note library fixture now build on an
+   emulator; what an emulator still cannot tell you is how any of it
+   *feels*.) The frame-rate row is
    `dumpsys gfxinfo` on the physical Galaxy Tab; the latency row is a 240 fps
    camera against Samsung Notes. Pass bars are in docs/M1-INK.md §4.1–4.2
    (janky ≤ 5 %, 99th ≤ 16.67 ms) and docs/M3-LIBRARY.md §10.

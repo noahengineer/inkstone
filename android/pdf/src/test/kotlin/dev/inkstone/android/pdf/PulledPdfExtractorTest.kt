@@ -7,6 +7,7 @@ import dev.inkstone.core.model.Document
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FractionalKey
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageRef
 import dev.inkstone.core.model.PageSize
@@ -195,7 +196,9 @@ class PulledPdfExtractorTest {
         return BundleWriter.write(
             BundleContents(
                 document = document,
-                pages = mapOf(pageId to PageContents(PageSize.Letter, Background.Blank, ops = emptyList())),
+                pages = mapOf(
+                    pageId to PageContents(PageCanvas.fixed(PageSize.Letter), Background.Blank, ops = emptyList()),
+                ),
                 highestClockCounter = 7L,
             ),
         )

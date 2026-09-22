@@ -8,6 +8,7 @@ import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageRef
@@ -64,7 +65,7 @@ class BundleAssetsTest {
     private fun webp(seed: Int) = ByteArray(ASSET_BYTES) { (it * seed % 256 - 128).toByte() }
 
     private fun imagePage(asset: String) = PageContents(
-        size = PageSize.Letter,
+        canvas = PageCanvas.fixed(PageSize.Letter),
         background = Background.Blank,
         ops = listOf(
             PageOp.AddObject(
@@ -231,7 +232,7 @@ class BundleAssetsTest {
 
     private suspend fun pagesOf(note: OpenNote): Map<PageId, PageContents> = note.document.livePages.associate { ref ->
         val loaded = store.loadPage(note, ref.id)
-        ref.id to PageContents(loaded.size, loaded.background, loaded.ops)
+        ref.id to PageContents(PageCanvas.fixed(loaded.size), loaded.background, loaded.ops)
     }
 
     /**

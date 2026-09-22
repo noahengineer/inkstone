@@ -28,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import dagger.hilt.android.AndroidEntryPoint
 import dev.inkstone.app.audio.RecordingController
+import dev.inkstone.app.ink.EditorPreferences
 import dev.inkstone.app.library.FolderCoverImage
 import dev.inkstone.app.library.LibraryActions
 import dev.inkstone.app.library.LibraryScreen
@@ -43,6 +44,7 @@ import dev.inkstone.app.sync.SyncActions
 import dev.inkstone.app.sync.SyncScreen
 import dev.inkstone.app.sync.SyncUiState
 import dev.inkstone.app.sync.SyncViewModel
+import dev.inkstone.app.ui.DarkBars
 import dev.inkstone.app.ui.InkstoneTheme
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
@@ -96,6 +98,18 @@ class MainActivity : ComponentActivity() {
     lateinit var clock: Clock
 
     /**
+     * M10 — the editor's remembered toolbar (docs/M10-DESIGN.md §10).
+     *
+     * WARNING: warmed in `onCreate` **before `setContent`**, so a deep link straight into a note
+     * starts the read before the first composition rather than after it, and flushed in `onStop`
+     * because that is the last callback Android guarantees before the process can be killed. It is
+     * deliberately **not** warmed from `InkstoneApplication.onCreate`, which runs in every process
+     * — including `:crashpoint`, which has no business touching settings.
+     */
+    @Inject
+    lateinit var editorPreferences: EditorPreferences
+
+    /**
      * M12 §9 — *"a process killed mid-lecture leaves an orphaned recording. The next launch
      * finalises it and offers to process it rather than discarding it."*
      *
@@ -135,7 +149,7 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge()
+        enableEdgeToEdge(statusBarStyle = DarkBars, navigationBarStyle = DarkBars)
         super.onCreate(savedInstanceState)
         pickingCoverFor = savedInstanceState?.getString(STATE_PICKING_COVER_FOR)?.let(::FolderId)
         // Only on a genuinely fresh start, not after a rotation: a saved instance state means this
@@ -158,6 +172,9 @@ class MainActivity : ComponentActivity() {
         // Paired with `retain`, and counted rather than a plain stop: opening a note runs
         // `NoteActivity.onStart` *before* this, so a boolean would leave the editor unpolled.
         poll.release()
+        // The palette is only editable from the editor today. Flushed here anyway, because a flush
+        // that exists on one screen is a flush somebody has to remember to add to the next one.
+        editorPreferences.flush()
         super.onStop()
     }
 
@@ -205,6 +222,17 @@ class MainActivity : ComponentActivity() {
             syncState.openInBrowser?.let { pending ->
                 sync.browserOpened()
                 openLoginPage(pending.browserUrl)
+            }
+        }
+
+        // A PDF adopted off the server opens straight away — and the Sync screen is left standing
+        // behind it holding the sentence that says where the ink will go, because the editor
+        // arriving over a snackbar is how that sentence gets dismissed unread (SPEC §5.6 point 4,
+        // the same reason a *recovery* does not open at all).
+        LaunchedEffect(syncState.openNote) {
+            syncState.openNote?.let { noteId ->
+                sync.noteOpened()
+                openNote(noteId)
             }
         }
 
@@ -303,6 +331,13 @@ class MainActivity : ComponentActivity() {
                         onShow(Showing.SYNC)
                     },
                     onOpenAttention = { onShow(Showing.ATTENTION) },
+                    onImportFromNextcloud = {
+                        // The folder on screen, so an adopted PDF is filed where the user is
+                        // standing rather than at the root. It does not follow the file's remote
+                        // path — see `LibraryRepository.adoptRemotePdf`.
+                        sync.openForPdfImport(libraryState.folderId)
+                        onShow(Showing.SYNC)
+                    },
                 ),
             )
         }
@@ -323,6 +358,7 @@ class MainActivity : ComponentActivity() {
         onBindHere = sync::bindHere,
         onMoveHere = sync::moveHere,
         onPinFolderHere = sync::pinFolderHere,
+        onPickPdf = sync::pickPdf,
         onCancelBrowse = sync::cancelBrowse,
         onSyncNow = sync::syncNow,
     )
@@ -351,6 +387,7 @@ class MainActivity : ComponentActivity() {
         onOpenSyncForFolder: (FolderId) -> Unit,
         onMoveSyncedNote: (DocumentId) -> Unit,
         onOpenAttention: () -> Unit,
+        onImportFromNextcloud: () -> Unit,
     ) = LibraryActions(
         onOpenAttention = onOpenAttention,
         onOpenNote = ::openNote,
@@ -363,6 +400,7 @@ class MainActivity : ComponentActivity() {
         // (SPEC §5.6 point 4), and jumping into the editor is how that gets dismissed
         // unread — `importPdf` decides, not this.
         onImportPdf = { uri -> library.importPdf(uri, ::openNote) },
+        onImportFromNextcloud = onImportFromNextcloud,
         onNewFolder = library::createFolder,
         onQueryChange = library::setQuery,
         onSort = library::setSort,

@@ -26,10 +26,12 @@ import dev.inkstone.core.storage.DeviceIdentity
 import dev.inkstone.core.storage.NoteLayout
 import dev.inkstone.core.storage.NoteStore
 import dev.inkstone.core.storage.NoteTrash
+import dev.inkstone.core.storage.PdfOpenMode
 import dev.inkstone.core.storage.ThumbnailCache
 import dev.inkstone.core.storage.duplicateNote
 import dev.inkstone.core.sync.FolderBinding
 import dev.inkstone.core.sync.RemoteBinding
+import dev.inkstone.core.sync.RemoteVersion
 import dev.inkstone.core.sync.SyncAccount
 import dev.inkstone.core.sync.SyncEngine
 import kotlinx.coroutines.flow.Flow
@@ -278,9 +280,36 @@ class LibraryRepository @Inject constructor(
      * than inserting a second one, because the note is the same note; it is the
      * `documentId` that says so, not the file it arrived in.
      *
+     * The note lands in [folderId] — the library folder the user is standing in — and a note
+     * that *arrives* in a pinned folder binds there without being asked, exactly as a created
+     * or moved one does ([autoBindIfPinned]). ⚠️ The folder that governs the pin is the one the
+     * note **ends up in**, which for a re-import of a note the library already knows is where it
+     * already lives and not the folder that was picked: nothing here moves an existing note.
+     *
+     * ⚠️ [adoptRemotePdf] deliberately does **not** come through here — it calls [openAndIndex]
+     * and binds the note to the file it came from instead. A pin binding there would point the
+     * note's uploads at the pinned folder rather than at the handout the user asked to write on,
+     * and would then report it as *"already syncing where it was"*.
+     *
      * @return what the gateway decided, so the UI can warn if it has to.
      */
     suspend fun importPdf(bytes: ByteArray, title: String, folderId: FolderId? = null): PdfOpenResult {
+        val result = openAndIndex(bytes, title, folderId)
+        if (result is PdfOpenResult.Opened) {
+            autoBindIfPinned(result.documentId, index.note(result.documentId)?.folderId)
+        }
+        return result
+    }
+
+    /**
+     * [importPdf] without the pin binding: open the bytes, and make the library index agree
+     * with whatever the gateway decided.
+     *
+     * Separate from [importPdf] rather than a flag on it, because the one caller that must not
+     * pin-bind ([adoptRemotePdf]) does its own binding immediately afterwards — and a boolean
+     * default here is the shape CLAUDE.md keeps finding at the bottom of a silent bug.
+     */
+    private suspend fun openAndIndex(bytes: ByteArray, title: String, folderId: FolderId?): PdfOpenResult {
         val result = gateway.open(bytes = bytes, title = title.trim().ifEmpty { UNTITLED }, deviceId = deviceId())
         if (result !is PdfOpenResult.Opened) return result
 
@@ -307,6 +336,89 @@ class LibraryRepository @Inject constructor(
             thumbnails.invalidate(document.id)
         }
         return result
+    }
+
+    /**
+     * ⭐ **Write on a PDF that is already on the user's Nextcloud, in place.**
+     *
+     * The user browsed their server, picked a handout, and asked to annotate it. The note is
+     * imported exactly as a local file would be — [openAndIndex] and therefore SPEC §5.6's
+     * three-way identity decision, unchanged — and then bound to **the file it came from**, so
+     * their ink goes back onto that path and Nextcloud Files, their phone and every other reader
+     * see it.
+     *
+     * The whole of the care here is in *which* binding, because the two that already existed both
+     * fail in ways that are silent for a day:
+     *
+     * | what the file turned out to be | binding | why |
+     * |---|---|---|
+     * | a stranger's PDF ([PdfOpenMode.Foreign]) | [SyncEngine.bindAdopted] | the server's copy carries no marker, so one upload is owed *immediately* — see that method |
+     * | one of our own published notes ([PdfOpenMode.Normal]) | [SyncEngine.bindPulled] | the bytes came **from** the server and are already ours, marker and bundle and all; owing an upload here re-uploads a file the server already has |
+     * | a recovery, or refused | neither | nothing is bound and nothing is uploaded |
+     *
+     * ⚠️ **A recovery is deliberately not bound.** SPEC §5.6 says a recovered note is reported
+     * before anything else happens to it, and binding one would publish this build's
+     * reconstruction back over the file it was reconstructed from — stamped past every clock the
+     * document has seen, so it would win every later merge and take the lost fidelity with it.
+     * The note is still imported; the user is told, and can bind it by hand.
+     *
+     * ⚠️ **A note this device already syncs is left alone.** Browsing to a file whose note is
+     * already bound must not re-point that binding: the existing one may name a different path
+     * (the file was moved on the server, or this is a second copy of it), and overwriting it is
+     * how a note starts uploading over a stranger's file.
+     *
+     * The note lands in [folderId] — the library folder the user is standing in when they ask,
+     * like a new note, because *"add it to my notes"* means the notes they were looking at.
+     *
+     * ⚠️ **The library folder and the remote path are deliberately unrelated here**, and this is
+     * the one place in the app where that is true. Everywhere else a note's remote path is derived
+     * from where it sits in the library (SPEC §9's mirror); an adopted note is bound to a file that
+     * already exists somewhere the user chose long ago. So filing it under *Chemistry* must **not**
+     * move their handout on the server, and it does not: nothing here consults a pin, and a pin set
+     * *later* leaves already-bound notes where they are ([pinFolderToRemote]).
+     *
+     * The exception, and it is the user's own explicit action: *"Always sync here"* on a folder
+     * ([syncFolderToRemote]) does MOVE the notes already in it. Pinning a folder that contains an
+     * adopted document will relocate that document on the server.
+     *
+     * @param observed the ETag and `oc:id` off the **GET**, not off the listing.
+     */
+    suspend fun adoptRemotePdf(
+        bytes: ByteArray,
+        title: String,
+        accountId: String,
+        remotePath: String,
+        observed: RemoteVersion,
+        folderId: FolderId? = null,
+    ): RemotePdfAdoption {
+        val result = openAndIndex(bytes, title, folderId)
+        if (result !is PdfOpenResult.Opened) return RemotePdfAdoption.Refused(result)
+
+        val noteId = result.documentId
+        if (result.mode is PdfOpenMode.Recovered) return RemotePdfAdoption.Recovered(noteId, result)
+        if (sync.bindingOf(noteId) != null) return RemotePdfAdoption.AlreadySynced(noteId, result)
+
+        val binding = when (result.mode) {
+            is PdfOpenMode.Normal -> sync.bindPulled(
+                noteId = noteId,
+                accountId = accountId,
+                remotePath = remotePath,
+                observed = observed,
+                localRev = index.note(noteId)?.localRev ?: 0L,
+            )
+
+            else -> sync.bindAdopted(
+                noteId = noteId,
+                accountId = accountId,
+                remotePath = remotePath,
+                observed = observed,
+            )
+        }
+        return if (binding == null) {
+            RemotePdfAdoption.Unbound(noteId, result)
+        } else {
+            RemotePdfAdoption.Adopted(noteId, binding.remotePath, result)
+        }
     }
 
     /**
@@ -641,10 +753,18 @@ class LibraryRepository @Inject constructor(
      * autosave timer, which is the kind of thing CLAUDE.md rule 7 is about even when it
      * runs off the ink thread. The picture is regenerated when the note closes, and on
      * demand before that.
+     *
+     * ⚠️ **Nor a `thumbnails.invalidate`, which is what this used to call.** That deletes the
+     * cover *and recursively deletes the note's whole page-thumbnail directory* — every two
+     * seconds, for the whole time the user is writing, against the one note whose page overview
+     * they are most likely to open. It was also redundant: `recordSave` above clears
+     * `thumbnailRev` in the same statement that bumps `localRev`, which is already what makes
+     * a stale cover a miss (SPEC §5.7). [Thumbnails.forgetDecodedCover] does the one part the
+     * revision cannot do — the decoded image in memory — and opens no file.
      */
     suspend fun noteSaved(id: DocumentId, localRev: Long, pageCount: Int) {
         index.recordSave(id, localRev, pageCount, clock.nowEpochMillis())
-        thumbnails.invalidate(id)
+        thumbnails.forgetDecodedCover(id)
         // Safe on every two-second autosave tick: the outbox UPSERTs on
         // `(note_id, UPLOAD)`, so 500 offline edits leave exactly one row, and the
         // drainer's 30-second floor turns "upload immediately" into "at most once per
@@ -666,7 +786,10 @@ class LibraryRepository @Inject constructor(
     suspend fun noteMaterialized(id: DocumentId, localRev: Long, pageCount: Int, cover: FoldedPage) {
         index.recordSave(id, localRev, pageCount, clock.nowEpochMillis())
         thumbnails.invalidate(id)
-        if (thumbnails.refreshCover(id, cover)) index.recordThumbnail(id, localRev)
+        // `recordThumbnail` used to be this method's business, which is how the *other* path that
+        // writes a cover came to write one it could never read back. It is [Thumbnails]' now, and
+        // inseparable from the write (see `Thumbnails.storeCover`).
+        thumbnails.refreshCover(id, localRev, cover)
         sync.noteChanged(id)
     }
 
@@ -690,9 +813,21 @@ class LibraryRepository @Inject constructor(
      * repository is already the library's whole surface *including* thumbnails (see the file
      * header), and the note editor having a second, direct route to the cache is one more
      * place for SPEC §5.7's invalidation rules to be applied inconsistently.
+     *
+     * ⚠️ **The revision is looked up here rather than asked of the caller, and it is the index's
+     * rather than the session's.** A page thumbnail used to have no freshness rule at all — it was
+     * kept honest by deleting the whole directory on every autosave tick — and the row's `localRev`
+     * is the same signal that deletion was driven by, so freshness is unchanged and the two-second
+     * churn is gone. It is also the *conservative* one: `recordSave` runs after the journal is on
+     * disk, so this can only ever be a lower bound on what [fold] returns, and a lower bound is a
+     * re-render rather than a wrong picture.
+     *
+     * Null when the index has no row for the note — which is not an error (a reconcile can be
+     * mid-flight) and means *"cannot date this picture"*, so [Thumbnails.page] neither reads nor
+     * records a cache entry for it.
      */
     suspend fun pageThumbnail(id: DocumentId, pageId: PageId, fold: suspend () -> FoldedPage?) =
-        thumbnails.page(id, pageId, fold)
+        thumbnails.page(id, pageId, index.note(id)?.localRev, fold)
 
     /**
      * Every note SPEC §8.3's batch pass should look at — the whole live library.
@@ -1083,7 +1218,7 @@ class LibraryRepository @Inject constructor(
         val note = store.open(id) ?: return null
         val first = note.document.livePages.firstOrNull() ?: return null
         val loaded = store.loadPage(note, first.id)
-        return foldPage(first.id, loaded.ops, defaultSize = loaded.size, defaultBackground = loaded.background)
+        return foldPage(first.id, loaded.ops, defaultCanvas = loaded.canvas, defaultBackground = loaded.background)
     }
 
     // There is deliberately no `foldPageOf(id, pageId)` here. A *page* thumbnail is only ever

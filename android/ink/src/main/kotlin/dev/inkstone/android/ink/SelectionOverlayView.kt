@@ -11,6 +11,7 @@ import dev.inkstone.core.model.GuideAxis
 import dev.inkstone.core.model.GuideKind
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.ShapePointRole
+import kotlin.math.hypot
 
 /**
  * ⭐ M8a — the selection chrome: the lasso being drawn, the box round what is selected, the
@@ -156,13 +157,25 @@ internal class SelectionOverlayView(context: Context) : View(context) {
      */
     private fun drawBoxAndGrips(canvas: Canvas, selection: SelectionController) {
         val box = selection.bounds ?: return
-        val left = toViewX(box.left)
-        val top = toViewY(box.top)
-        val right = toViewX(box.right)
-        val bottom = toViewY(box.bottom)
-        canvas.drawRect(left, top, right, bottom, boxPaint)
-
         val points = selection.points
+
+        // ⭐ **No frame when the shape has its own points**, in the user's words: *"i dont like how
+        // it gives a box around the shapes, it can make it quite confusing"*. Right, and the reason
+        // is that the box stopped being the thing you act on the moment the handles arrived — it
+        // was chrome describing a gesture (drag any edge to resize) that the points had replaced,
+        // and for a curve or a diagonal line it is mostly empty paper. It is still the **move**
+        // target and is still hit-tested; it is simply not drawn, so what is on screen is the shape
+        // and its points.
+        if (points.isEmpty()) {
+            canvas.drawRect(
+                toViewX(box.left),
+                toViewY(box.top),
+                toViewX(box.right),
+                toViewY(box.bottom),
+                boxPaint,
+            )
+        }
+
         val grips = if (points.isEmpty()) SelectionHandle.entries else listOf(SelectionHandle.ROTATE)
         val radius = GRIP_RADIUS_DP * density
         for (handle in grips) {
@@ -185,8 +198,19 @@ internal class SelectionOverlayView(context: Context) : View(context) {
      * nobody would otherwise discover: a straight line's bend handle is what turns it into a curve.
      */
     private fun drawPoints(canvas: Canvas, points: List<PointHandle>) {
-        val half = VERTEX_HALF_DP * density
-        val ring = BEND_RADIUS_DP * density
+        // ⭐ **Shrunk when the shape is smaller than its own handles**, which for a segment it very
+        // often is: two 13 dp squares and a 12 dp ring is about 18 pt of chrome at fit width, so a
+        // 30 pt line was three-fifths covered by the handles that describe it and a 24 pt one
+        // disappeared under them entirely — a filled square, a ring and a filled square with no
+        // visible line between. *"A line that does not have the proper points … this weird image
+        // like thing."*
+        //
+        // The **touch** target is untouched (`SelectionController.HANDLE_TOUCH_DP`): a handle you
+        // can see is a drawing question and a handle you can hit is a finger question, and tying
+        // them together is what would make a small shape unusable rather than merely unreadable.
+        val scale = handleScale(points)
+        val half = VERTEX_HALF_DP * density * scale
+        val ring = BEND_RADIUS_DP * density * scale
         for (handle in points) {
             val x = toViewX(handle.page.x)
             val y = toViewY(handle.page.y)
@@ -203,6 +227,33 @@ internal class SelectionOverlayView(context: Context) : View(context) {
                 }
             }
         }
+    }
+
+    /**
+     * How far to shrink the point handles so that neighbours do not merge, in `[HANDLE_MIN_SCALE, 1]`.
+     *
+     * The closest pair decides it, not the box: a rectangle can be wide and short, and it is the
+     * short side that would collide. [HANDLE_GAP] of the spacing is the target diameter, which
+     * leaves clear paper between two handles at every size.
+     *
+     * Floored rather than allowed to vanish — a handle too small to see is worse than one that
+     * still overlaps, because the second at least says *"there is something here to drag"*. Below
+     * the floor a shape is a few points across and there is nothing to draw between the handles
+     * anyway.
+     */
+    private fun handleScale(points: List<PointHandle>): Float {
+        if (points.size < 2) return 1f
+        var closest = Float.MAX_VALUE
+        for (i in points.indices) {
+            for (j in i + 1 until points.size) {
+                val dx = toViewX(points[i].page.x) - toViewX(points[j].page.x)
+                val dy = toViewY(points[i].page.y) - toViewY(points[j].page.y)
+                val distance = hypot(dx, dy)
+                if (distance < closest) closest = distance
+            }
+        }
+        val room = closest * HANDLE_GAP / (VERTEX_HALF_DP * 2f * density)
+        return room.coerceIn(HANDLE_MIN_SCALE, 1f)
     }
 
     /**
@@ -235,14 +286,37 @@ internal class SelectionOverlayView(context: Context) : View(context) {
     private fun toViewY(pageY: Float): Float = pageY * camera.scale + camera.translate.y
 
     private companion object {
-        const val ACCENT = 0xFF2563EB.toInt()
-        const val ACCENT_FILL = 0x142563EB
+        /**
+         * ⭐ ROADMAP M10 — sky-500, the redesign's selection hue.
+         *
+         * ⚠️ Sky-**500** and not the sky-400 `Ink.Focus` the chrome uses, and the difference is the
+         * surface. Chrome sits on a near-black canvas, where a lighter blue is what reads; these
+         * handles are drawn on **white paper**, where sky-400 is a pale line on a bright field. The
+         * design's own mock makes the same distinction — its canvas objects are outlined
+         * `border-sky-500` while the chrome's focus ring is `#38bdf8`.
+         */
+        const val ACCENT = 0xFF0EA5E9.toInt()
+        const val ACCENT_FILL = 0x140EA5E9
+
+        /**
+         * Alignment guides, and deliberately a *different* hue from [ACCENT].
+         *
+         * ROADMAP M8a — *"dashed = centre, solid = edge"*. A guide says where the thing you are
+         * dragging lines up with something else; a handle says where you may grab it. Painting both
+         * in the selection colour would make a guide look like a handle you cannot grip.
+         */
         const val GUIDE = 0xFFEC4899.toInt()
         const val GRIP_RADIUS_DP = 6f
 
         /** Half a vertex square's side. A shade larger than a grip, because it is the precise one. */
         const val VERTEX_HALF_DP = 6.5f
         const val BEND_RADIUS_DP = 6f
+
+        /** How much of the gap between two neighbouring handles one of them may fill. */
+        const val HANDLE_GAP = 0.34f
+
+        /** Below this a handle stops shrinking — see [handleScale]. */
+        const val HANDLE_MIN_SCALE = 0.3f
 
         /** The ring's inner circle, as a fraction of its radius. */
         const val BEND_HOLE = 0.45f

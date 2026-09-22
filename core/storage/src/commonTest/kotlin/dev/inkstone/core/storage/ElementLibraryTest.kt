@@ -12,6 +12,7 @@ import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.ShapeKind
@@ -298,7 +299,7 @@ class ElementLibraryTest {
         )
         return FoldedPage(
             pageId = PAGE,
-            size = PageSize.Letter,
+            canvas = PageCanvas.fixed(PageSize.Letter),
             background = Background.Blank,
             objects = objects,
             deleted = emptySet(),

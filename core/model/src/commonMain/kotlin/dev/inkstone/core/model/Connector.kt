@@ -105,6 +105,60 @@ public data class ShapeRecord(
      * them — the register ROADMAP M8b forbids, arrived at from a third direction.
      */
     val bend: PagePoint? = null,
+    /**
+     * ⭐ **The shape's own vertices**, in its local space — null until a point is dragged, and from
+     * then on the outline itself rather than a modifier of it.
+     *
+     * ## Why this exists, in the user's words
+     *
+     * > *"editing the points is just resizeing the shape from those points rather then actually
+     * > editing the shape, which is not what i want at all"*
+     *
+     * Exactly right, and it was a design decision rather than a bug: a drag used to be solved as a
+     * new **placement** (see [ShapePoints]), which for a rectangle can only ever scale — an affine
+     * has three degrees of freedom and a rectangle has four corners, so *"move this corner and
+     * leave the other three"* has no solution as a matrix. It has an obvious solution as
+     * **geometry**, and this is that geometry.
+     *
+     * The kind stays [ShapeKind.RECTANGLE]; these points override its outline. So a build that
+     * predates this key draws the parametric rectangle it always drew and re-encodes these bytes
+     * untouched — the same degrade [bend] gets, and the reason neither needed a new [ShapeKind]
+     * (§4.8.8: a sixth constant is a note an older build cannot open).
+     *
+     * ⚠️ **Seeded from the kind's own outline on the first edit, so nothing moves that the user did
+     * not move.** The seeds are exactly [ShapeGeometry]'s corners and quadrant points, and
+     * [ShapeGeometry.outline] reproduces the parametric shape from them bit for bit — including the
+     * ellipse, whose smoothing constant is chosen for precisely that (`KAPPA / 2`). Without that
+     * property the first drag would visibly re-draw the *whole* shape, which is the thing being
+     * complained about, arriving from the other direction.
+     *
+     * Local space, like everything else here: a move, a resize and a rotation are still the
+     * object's absolute matrix and still write one `SetTransform` (§4.8.3).
+     */
+    val points: List<PagePoint>? = null,
+    /**
+     * ⭐ **Whether this segment shows an arrowhead**, overriding the kind it was created as — null
+     * means *"whatever [ShapeKind] says"*, which is what every shape starts at.
+     *
+     * ## Why an override register and not a change of kind
+     *
+     * The user's ask was *"should be able to say if its an arrow or not if its a line"*, and the
+     * obvious reading — rewrite `ShapeObject.shape` — is not available: the kind is **payload**, so
+     * changing it means deleting the object and adding a new one, which mints a fresh [ObjectId] and
+     * takes the shape's erased bites, its fill and every connector attached to it along with it. A
+     * register is what this vocabulary has for *"a property of an object that changes"* (SPEC §4.2),
+     * and this record is where a shape's are.
+     *
+     * The pattern is `SetStyle`'s exactly, and so is the reason it starts null: a stroke's colour
+     * lives in its geometry blob and the style register is the **override**, because duplicating the
+     * capture-time value into a register would give two sources that drift. Here the payload says
+     * what was drawn and this says what the user has since asked for.
+     *
+     * The degrade for a build that predates this key is [bend]'s and [points]': it keeps the bytes,
+     * re-encodes them verbatim, and draws the head the *kind* implies — the picture the payload has
+     * always described.
+     */
+    val arrow: Boolean? = null,
     /** Null for a plain shape. Non-null at *either* end makes this object a connector. */
     val endA: ConnectorEnd? = null,
     val endB: ConnectorEnd? = null,
@@ -126,7 +180,8 @@ public data class ShapeRecord(
      * the other.
      */
     public val isDefault: Boolean
-        get() = fillArgb == null && cornerRadiusPt == 0f && bend == null && !isConnector && extras.isEmpty()
+        get() = fillArgb == null && cornerRadiusPt == 0f && bend == null && points == null &&
+            arrow == null && !isConnector && extras.isEmpty()
 
     /**
      * Every object this record names, for the id remap a note or page duplicate needs.
@@ -254,6 +309,25 @@ public data class ConnectorPath(val path: ShapePath, val a: ResolvedEnd, val b: 
 public data class AnchorTarget(val kind: ShapeKind, val widthPt: Float, val heightPt: Float, val transform: Matrix3)
 
 public fun ShapeObject.asAnchorTarget(): AnchorTarget = AnchorTarget(shape, widthPt, heightPt, transform)
+
+/**
+ * Whether a connector end may **attach** to a shape of this kind — only one with an inside.
+ *
+ * ⚠️ A line answered yes by omission, so a snapped line that merely *started on* another line
+ * became a connector bound to it. Its route left from the boundary of a box one pen-width tall and
+ * collapsed to a stub on the line it touched, and being a connector it offered the frame's grips
+ * instead of its own two points. An `Auto` anchor is the boundary point facing the other end
+ * (SPEC §4.8.3), and a segment has no boundary worth the name.
+ *
+ * Asked when a binding is **made**, not when one is routed: a note that already holds a connector
+ * attached to a line keeps drawing it as before, on every device, because the fold is unchanged.
+ * An exhaustive `when` rather than a reuse of [ShapeGeometry.isFillable], so a new kind has to decide.
+ */
+public val ShapeKind.isAnchorable: Boolean
+    get() = when (this) {
+        ShapeKind.LINE, ShapeKind.ARROW -> false
+        ShapeKind.RECTANGLE, ShapeKind.ELLIPSE, ShapeKind.TRIANGLE -> true
+    }
 
 /**
  * Whatever can answer *"where is object X and is it still here"* — a fold, or the ink surface's
@@ -545,7 +619,30 @@ internal object ShapeRecordCodec {
     private const val K_BEND = "bd"
 
     /** `x:y`, and nothing else — an arity that is not two is a value from a build that meant more. */
-    private const val BEND_PARTS = 2
+    private const val POINT_PARTS = 2
+
+    /** `pts=x:y,x:y,…` — the shape's own vertices, in its local space. */
+    private const val K_POINTS = "pts"
+
+    /** ⭐ The arrowhead override — `1` or `0`. See [ShapeRecord.arrow]. */
+    private const val K_ARROW = "ah"
+
+    private const val TRUE = "1"
+    private const val FALSE = "0"
+
+    /** The list separator. The third and last: `;` divides pairs, `:` divides a value's parts. */
+    private const val POINT = ','
+
+    /**
+     * A segment stores **two** points and a closed shape at least three; more than [MAX_POINTS] is
+     * not a hand-edited shape.
+     *
+     * ⚠️ Was 3. A segment's endpoints moved into this register when *"i dont want any shape to do
+     * that no matter what"* took the last transform-based edit away, and a two-entry list would
+     * otherwise have been refused by the decoder it had just been written by.
+     */
+    private const val MIN_POINTS = 2
+    private const val MAX_POINTS = 64
 
     private const val TAG_FREE = "p"
     private const val TAG_OBJECT = "o"
@@ -557,7 +654,8 @@ internal object ShapeRecordCodec {
     private const val PINNED_U = 2
     private const val PINNED_V = 3
 
-    private val knownKeys = setOf(K_FILL, K_FILL_OPACITY, K_RADIUS, K_END_A, K_END_B, K_ROUTE, K_BEND)
+    private val knownKeys =
+        setOf(K_FILL, K_FILL_OPACITY, K_RADIUS, K_END_A, K_END_B, K_ROUTE, K_BEND, K_POINTS, K_ARROW)
 
     fun encode(record: ShapeRecord): String {
         val parts = ArrayList<String>()
@@ -569,6 +667,11 @@ internal object ShapeRecordCodec {
         record.endB?.let { parts += "$K_END_B$EQUALS${encodeEnd(it)}" }
         if (record.route != ConnectorRoute.STRAIGHT) parts += "$K_ROUTE$EQUALS${encodeRoute(record.route)}"
         record.bend?.let { parts += "$K_BEND$EQUALS${format(it.x)}$PART${format(it.y)}" }
+        record.arrow?.let { parts += "$K_ARROW$EQUALS${if (it) TRUE else FALSE}" }
+        record.points?.takeIf { it.isNotEmpty() }?.let { points ->
+            parts += K_POINTS + EQUALS +
+                points.joinToString(POINT.toString()) { "${format(it.x)}$PART${format(it.y)}" }
+        }
         // Sorted, so identical content produces identical bytes whatever order a future build
         // happened to read them in — the same discipline `BundleReader` applies to unknown
         // manifest members (SPEC §5.8).
@@ -607,13 +710,45 @@ internal object ShapeRecordCodec {
      */
     private fun applyKnown(record: ShapeRecord, key: String, value: String): ShapeRecord = when (key) {
         K_FILL -> record.withFill(value)
+
         K_FILL_OPACITY -> record.withFillOpacity(value)
+
         K_RADIUS -> record.withRadius(value)
+
         K_END_A -> record.withEnd(value, isA = true)
+
         K_END_B -> record.withEnd(value, isA = false)
+
         K_ROUTE -> record.copy(route = decodeRoute(value))
+
         K_BEND -> record.withBend(value)
+
+        K_POINTS -> record.withPoints(value)
+
+        // Fail-closed like every branch here: an unreadable flag leaves the head to the kind.
+        K_ARROW -> when (value) {
+            TRUE -> record.copy(arrow = true)
+            FALSE -> record.copy(arrow = false)
+            else -> record
+        }
+
         else -> record
+    }
+
+    /**
+     * Fail-closed, and **all or nothing**.
+     *
+     * ⚠️ Unlike every other key here, a half-read value would not degrade — it would be a *different
+     * shape*. Dropping one unreadable vertex from a quadrilateral silently yields a triangle, which
+     * is defined, non-crashing and wrong, so a single bad number abandons the whole list and the
+     * shape falls back to the parametric outline its kind has always had.
+     */
+    private fun ShapeRecord.withPoints(value: String): ShapeRecord {
+        val parts = value.split(POINT)
+        if (parts.size !in MIN_POINTS..MAX_POINTS) return this
+        val points = ArrayList<PagePoint>(parts.size)
+        for (part in parts) points += decodePoint(part) ?: return this
+        return copy(points = points)
     }
 
     private fun ShapeRecord.withEnd(value: String, isA: Boolean): ShapeRecord {
@@ -622,15 +757,21 @@ internal object ShapeRecordCodec {
     }
 
     /** Fail-closed like every branch above: an unreadable bend leaves the line straight. */
-    private fun ShapeRecord.withBend(value: String): ShapeRecord {
+    private fun ShapeRecord.withBend(value: String): ShapeRecord = decodePoint(value)?.let { copy(bend = it) } ?: this
+
+    /**
+     * `x:y`, or null.
+     *
+     * ⚠️ **Non-finite is null.** A NaN would reach [ShapeGeometry.outline] and put NaN into a path,
+     * which propagates into the object's bounds, the culling test and the published PDF — none of
+     * which report it. `toFloatOrNull` parses `NaN` and `Infinity` perfectly happily.
+     */
+    private fun decodePoint(value: String): PagePoint? {
         val parts = value.split(PART)
-        if (parts.size != BEND_PARTS) return this
-        val x = parts[0].toFloatOrNull() ?: return this
-        val y = parts[1].toFloatOrNull() ?: return this
-        // A non-finite bend would reach `ShapeGeometry.outline` and put NaN into a path — which
-        // propagates into the object's bounds, the culling test and the PDF, none of which report it.
-        if (!x.isFinite() || !y.isFinite()) return this
-        return copy(bend = PagePoint(x, y))
+        if (parts.size != POINT_PARTS) return null
+        val x = parts[0].toFloatOrNull() ?: return null
+        val y = parts[1].toFloatOrNull() ?: return null
+        return if (x.isFinite() && y.isFinite()) PagePoint(x, y) else null
     }
 
     private fun ShapeRecord.withFill(value: String) = value.toIntOrNull()?.let { copy(fillArgb = it) } ?: this

@@ -13,6 +13,7 @@ import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.LamportClockGenerator
 import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageLog
 import dev.inkstone.core.model.PageOp
@@ -106,7 +107,91 @@ public class NoteSession(
     /** True between a [flush] and the next re-read — see [pageLog]. */
     private var journalHasUnreadFlushes = false
 
+    /** The journal's size, as far as this session knows it. Half of [foldableBytes]. */
     private var journalBytes: Long = note.journalBytes
+
+    /**
+     * The **bundle's** op count — the other half, and the half that was missing.
+     *
+     * ⚠️ SPEC §4.7's threshold is *"≈2 MB of journal"*, and since M2 the journal has not been
+     * the material that gets folded. It is only the delta since the last materialization; the
+     * log a page re-folds at every open lives in the bundle, and [NoteStore.materialize]
+     * resets the journal to its 8-byte header. Every production caller of [compactIfDue]
+     * materializes on the line before it, so the gate was asked whether 8 bytes exceeded 2 MB
+     * — every time, on every note, forever. See [compactIfDue].
+     *
+     * Set by [materialize], which already holds every page's ops in order to write them, so
+     * the measurement is free. Zero until then, which is the conservative direction: a session
+     * that has not materialized has not read the bundle's log, and under-measuring refuses a
+     * compaction rather than allowing one.
+     *
+     * A **count** rather than the bundle's size on disk, converted by [ESTIMATED_OP_BYTES].
+     * That is not laziness about reading a file size: the cost a snapshot removes is one fold
+     * step per op, and a stroke's geometry is opaque bytes the fold never looks at (SPEC §5.4)
+     * — so a note of few enormous strokes is cheap to open and a note of many small ones is
+     * not, which is the opposite of what its byte size says. SPEC §4.7 states the threshold in
+     * bytes because in M2's design the journal *was* the whole log; the quantity it is reaching
+     * for is the work, and the work is per op.
+     */
+    private var bundleOpCount: Int = 0
+
+    /**
+     * SPEC §4.7's size gate: everything a snapshot would save re-folding.
+     *
+     * The two terms never overlap — [materialize] moves the journal's ops into the bundle and
+     * resets the journal in the same step — so this is a sum and not a maximum.
+     */
+    private val foldableBytes: Long get() = journalBytes + bundleOpCount * ESTIMATED_OP_BYTES
+
+    /**
+     * ⭐ **When this note's ops last changed, as far as this session can honestly tell —
+     * SPEC §4.7's causal-stability horizon, read from something [materialize] does not reset.**
+     *
+     * The horizon keeps an op out of a snapshot until every peer has plausibly seen it. SPEC
+     * §4.7 asks that *"all ops being folded are older than the causal-stability horizon"* and
+     * [Compaction.isAllowed] tests one number for it, so the number has to bound **the newest
+     * op a snapshot would contain** — and it has to survive the materialize that runs
+     * immediately before the gate.
+     *
+     * ⚠️ `document.modifiedEpochMillis` is neither of those. [NoteStore.materialize] stamps it
+     * with `now`, so the gate was being asked *"is a note that was written to this instant more
+     * than thirty days old?"*. It answered no every time. This is the same shape as the two
+     * corrections SPEC §4.7 already records from M6 — a gate tested against a value the step
+     * before it had just overwritten — and it is why nothing in this app has ever compacted.
+     *
+     * Two sources:
+     *
+     * - **At open**, the `modifiedEpochMillis` the note carried *in* — the instant the bundle
+     *   holding its log was written, so every op inside it was created no later than that.
+     * - **After that**, [flush], which is the only path an op takes to disk. A flush carrying
+     *   only document metadata — a rename, a page move — moves this too, although nothing it
+     *   wrote can end up in a snapshot. That is the conservative direction and it is not worth
+     *   a second field to avoid.
+     *
+     * ⚠️ And `modifiedEpochMillis` **0 means unknown, not 1970** — it is the field's default, so
+     * it is what a manifest written before the field existed reads back as (`LibraryRepository`
+     * spells the same sentinel out with `takeIf { it > 0 }`). Taken literally it is an age of
+     * fifty-six years, which clears every horizon there could ever be: the one input the gate
+     * cannot verify would become the one input that always says yes.
+     *
+     * ## The one gap left, stated rather than hidden
+     *
+     * A **journal left behind by a crashed session** holds ops written *after* the materialize
+     * that stamped `modifiedEpochMillis`, so for those ops this is not a bound at all. The next
+     * session inherits the old stamp and can compact ops that are minutes old.
+     *
+     * That is a known imprecision and not a data risk, because of what a snapshot is: the raw
+     * log is kept (SPEC §4.7), a peer op that sorts before the snapshot sets `snapshotStale`
+     * and re-folds from the log (CLAUDE.md rule 9), and the whole cost is a cache thrown away.
+     * Closing it would need a wall clock per journal record, which is a format change — and
+     * `MergeFoundationTest` and SPEC §13.2 row 8 both compact from exactly this shape of
+     * session, deliberately, because a materialize is what empties a journal. Do not "fix" it
+     * by treating an open journal as recent without changing those two first.
+     *
+     * Erring recent refuses a compaction, which costs disk and never data.
+     */
+    private var contentChangedEpochMillis: Long =
+        note.document.modifiedEpochMillis.takeIf { it > 0L } ?: clock.nowEpochMillis()
 
     init {
         // The `max + 1` rule (SPEC §4.1) is only as good as what the generator was seeded
@@ -377,7 +462,7 @@ public class NoteSession(
             pageId = pageId,
             ops = loaded.ops + unflushed,
             snapshot = store.readSnapshot(document.id, pageId),
-            defaultSize = loaded.size,
+            defaultCanvas = loaded.canvas,
             defaultBackground = loaded.background,
         )
         clocks.observeAll(log.ops)
@@ -406,7 +491,7 @@ public class NoteSession(
         documentDirty = true
         // The page's own metadata is a page op, so it lands in the journal like any other
         // edit and survives a crash before the next materialization.
-        cache[id] = PageLog(id, defaultSize = size, defaultBackground = background)
+        cache[id] = PageLog(id, defaultCanvas = PageCanvas.fixed(size), defaultBackground = background)
         pending += PendingOp(
             PageOp.SetPageMeta(nextOpId(), nextClock(), background = background, size = size),
             id,
@@ -585,12 +670,22 @@ public class NoteSession(
         document = document.copy(localRev = revision)
         note = note.copy(document = document)
         journalBytes += ops.size.toLong() * ESTIMATED_OP_BYTES
+        // The one place an op becomes durable, and therefore the one place that can say the
+        // note's content has moved. SPEC §4.7's horizon is read off this — see the field.
+        contentChangedEpochMillis = clock.nowEpochMillis()
         pending.clear()
         documentDirty = false
         journalHasUnreadFlushes = true
         // Undo state is local and follows the same rhythm — it must survive the same
         // crash the journal survives (ROADMAP M2: undo across an app restart).
-        store.saveUndo(document.id, undoStack.undoEntries, undoStack.redoEntries)
+        //
+        // ⚠️ **Snapshotted, because the encode may not run on this thread.** `undoEntries` and
+        // `redoEntries` are `get()`s onto `UndoStack`'s own mutable lists, and `NoteStore` is
+        // given a `saveContext` by the editor so this write does not block the UI thread. Handing
+        // the live lists across that boundary would let a stack the user is still pressing undo on
+        // be read while it is being serialised. Copying 200 references is not a cost worth
+        // reasoning about; a torn undo file is.
+        store.saveUndo(document.id, undoStack.undoEntries.toList(), undoStack.redoEntries.toList())
         return revision
     }
 
@@ -616,6 +711,7 @@ public class NoteSession(
         journalHasUnreadFlushes = false
 
         val pages = LinkedHashMap<PageId, PageContents>()
+        var foldable = 0
         for (ref in document.pages) {
             val cached = cache[ref.id]
             // SPEC §5.5 — text this session recognised wins over what is in the bundle;
@@ -623,14 +719,21 @@ public class NoteSession(
             // reader rather than through the fold, so a page nobody looked at keeps its
             // text without being folded to find that out.
             val text = pendingText[ref.id] ?: note.reader?.pageText(ref.id).takeIf { ref.id !in clearedText }
-            pages[ref.id] = if (cached != null) {
-                PageContents(cached.state.size, cached.state.background, cached.ops, text)
+            val contents = if (cached != null) {
+                PageContents(cached.state.canvas, cached.state.background, cached.ops, text)
             } else {
                 val loaded = store.loadPage(note, ref.id)
-                PageContents(loaded.size, loaded.background, loaded.ops, text)
+                PageContents(loaded.canvas, loaded.background, loaded.ops, text)
             }
+            pages[ref.id] = contents
+            // SPEC §4.7's size gate, measured here because this is the only moment the whole
+            // log is in hand anyway. Live pages only: a tombstoned page's ops stay in the
+            // bundle (CLAUDE.md rule 1) but nothing folds them, so they are not a cost a
+            // snapshot could remove. See [bundleOpCount].
+            if (!ref.deleted) foldable += contents.ops.size
         }
         note = store.materialize(note.copy(document = document), pages, extraCarried, extraCarriedManifest)
+        bundleOpCount = foldable
         pendingText.clear()
         clearedText.clear()
         document = note.document
@@ -674,6 +777,55 @@ public class NoteSession(
      * causal-stability half of SPEC §4.7's gate was thirty days of wall clock and nothing
      * else. Null remains the right *value* wherever no peer clock is known — it is only
      * the silence about it that was wrong.
+     *
+     * ## ⚠️ A fifth correction to SPEC §4.7: both halves of the gate were measured off values
+     * the line above had just reset, so **compaction had never fired in this app at all**
+     *
+     * `close()` and `NoteEditor.materializeLocked` both materialize and then test the gate.
+     * [NoteStore.materialize] writes an empty journal (`journalBytes` → 8) and stamps
+     * `document.modifiedEpochMillis` with `now`; this method read the gate's size from the
+     * first and its age from the second. So the question actually asked was *"is this
+     * 8-byte journal bigger than 2 MB, and is a note written to this instant older than
+     * thirty days?"* — no and no, on every note, at every close, since M2. Every page has
+     * re-folded its **entire lifetime log** at every open ever since, and the cost grows
+     * monotonically with everything the user writes. It is the same failure the section's
+     * existing three corrections describe, which is worth saying out loud: a gate whose
+     * inputs are produced by the step immediately before it is a gate that tests the step,
+     * not the note.
+     *
+     * ⚠️ It survived four milestones of tests because **every test that made it fire reached it
+     * from a session that had never materialized** — `MergeFoundationTest`'s peer-ack pair and
+     * SPEC §13.2 row 8 both flush a large journal, reopen, and call this directly, and both say
+     * so in a comment. That is a legitimate path and it still works. It is also the one path on
+     * which the two resets do not happen, so the suite could show compaction working while no
+     * user had ever had a note compacted. CLAUDE.md's *"a feature can be correct in every test
+     * and inert in the app"*, in the shape where the fixture is not more generous than
+     * production but merely differently ordered.
+     *
+     * The inputs now come from state materialize does not erase — [foldableBytes], which counts
+     * the bundle's log as well as the journal's, and [contentChangedEpochMillis], which is the
+     * stamp the note was *opened* with rather than the one it was just given. Each field's KDoc
+     * carries its own argument.
+     *
+     * ## The invariant this preserves
+     *
+     * > **No op younger than the causal-stability horizon may enter a snapshot.**
+     *
+     * That is what the 30-day check is for, and it is *not* an arbitrary age: SPEC §4.7's
+     * snapshot is a base a page re-folds from, so an op that a peer is still holding offline
+     * has to sort *after* it to be absorbed rather than to invalidate it (CLAUDE.md rule 9 —
+     * re-fold, never patch). Nothing is lost when that goes wrong, because the raw log is
+     * kept and [PageLog] reports `snapshotStale`; what is lost is the snapshot, and with it
+     * the whole point of having written one.
+     *
+     * [contentChangedEpochMillis] preserves the invariant because it is an **upper bound on
+     * the creation time of the newest op the snapshot would contain**, never an estimate of
+     * it: it is the time of this session's last [flush] if there was one, and otherwise the
+     * instant at which the bundle holding every one of those ops was written. `now - bound ≥
+     * 30 days` therefore implies *every* op being folded is at least 30 days old, which is
+     * SPEC §4.7's *"all ops being folded are older than the causal-stability horizon"* read
+     * literally. The horizon is only ever crossed later than the truth, and crossing it later
+     * refuses a compaction — disk, never data.
      */
     public suspend fun compactIfDue(syncState: NoteSyncState, oldestAckedCounter: Long?) {
         // ⚠️ A snapshot is a cache **of the log** (SPEC §4.7: *"keep the raw log"*). Folding
@@ -688,7 +840,11 @@ public class NoteSession(
         if (hasUnflushedWork) return
         val allowed = Compaction.isAllowed(
             syncState = syncState,
-            journalBytes = journalBytes,
+            // `Compaction.isAllowed` names this `journalBytes` and documents it as *"the size
+            // of the material that would be folded"*. Since M2 those two have been different
+            // things, and only the name was being honoured: after a materialize the journal is
+            // 8 bytes and the material is the whole bundle. [foldableBytes] is both terms.
+            journalBytes = foldableBytes,
             nowEpochMillis = clock.nowEpochMillis(),
             // ⚠️ The oldest op *being folded*, not the document's creation date. Passing
             // `createdEpochMillis` meant that on any note older than 30 days the
@@ -696,16 +852,26 @@ public class NoteSession(
             // whole guard SPEC §4.7 describes, inverted, on precisely the long-lived
             // notebooks it exists to protect.
             //
-            // The last materialization is the honest floor: every op in the journal was
-            // written after it, and it is the only timestamp this session actually knows.
-            // Erring later means refusing to compact, which costs disk and never data.
-            oldestOpEpochMillis = document.modifiedEpochMillis,
+            // ⚠️ And *not* `document.modifiedEpochMillis`, which was M6's fix for that and
+            // is reset to `now` by the materialize on the line above every caller. See the
+            // KDoc: this is a bound the newest op cannot be younger than, which is the
+            // reading of SPEC §4.7 that makes the check mean anything.
+            oldestOpEpochMillis = contentChangedEpochMillis,
             oldestAckedCounter = oldestAckedCounter,
             highestFoldedCounter = clocks.highestSeen,
         )
         if (!allowed) return
         for (ref in document.livePages) {
-            store.writeSnapshot(document.id, page(ref.id), document.deviceId)
+            val folded = page(ref.id)
+            // Nothing has been added to this page since its snapshot, so rewriting it would
+            // re-serialise every object on it to produce a byte-identical file. Worth a read
+            // to avoid, now that the gate can pass: it passes for a note *nothing is changing*,
+            // which is precisely the note that would otherwise be re-snapshotted in full on
+            // every close and every idle-while-charging pass for the rest of its life. A
+            // snapshot's own log is one op per live object, so reading one back is a fraction
+            // of the fold that produced it.
+            if (store.readSnapshot(document.id, ref.id)?.throughClock == folded.throughClock) continue
+            store.writeSnapshot(document.id, folded, document.deviceId)
         }
     }
 
@@ -749,12 +915,16 @@ public class NoteSession(
         public const val DEFAULT_MAX_CACHED_PAGES: Int = 6
 
         /**
-         * A rough per-op journal cost, for the compaction threshold only.
+         * A rough per-op cost, for the compaction threshold only.
          *
          * The real size is known after the append, but reading the file back to find it
          * would defeat the point of an append-only journal. Compaction's trigger is a
          * heuristic about when work is worth doing, so an estimate is the right precision
          * — and it errs high, which delays compaction rather than triggering it early.
+         *
+         * It converts [bundleOpCount] as well, so SPEC §4.7's 2 MB threshold reads as ~4,000
+         * ops of accumulated log — deliberately more than the *"2,000 ops is about one page of
+         * dense handwriting"* the section rejects as too small a trigger.
          */
         private const val ESTIMATED_OP_BYTES = 512L
     }

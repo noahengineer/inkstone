@@ -5,6 +5,7 @@ import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.model.StrokeGeometry
@@ -149,7 +150,7 @@ class NoteDuplicateTest {
         val note = assertNotNull(store.open(id))
         val pages = note.document.livePages.associate { ref ->
             val loaded = store.loadPage(note, ref.id)
-            ref.id to PageContents(loaded.size, loaded.background, loaded.ops)
+            ref.id to PageContents(PageCanvas.fixed(loaded.size), loaded.background, loaded.ops)
         }
         store.materialize(note, pages, extraCarried = mapOf(asset to bytes))
     }
@@ -167,6 +168,11 @@ class NoteDuplicateTest {
 
     private suspend fun fold(note: OpenNote, pageId: dev.inkstone.core.model.PageId) =
         store.loadPage(note, pageId).let { loaded ->
-            foldPage(pageId, loaded.ops, defaultSize = loaded.size, defaultBackground = loaded.background)
+            foldPage(
+                pageId,
+                loaded.ops,
+                defaultCanvas = PageCanvas.fixed(loaded.size),
+                defaultBackground = loaded.background,
+            )
         }
 }

@@ -11,10 +11,12 @@ import dev.inkstone.core.model.Camera
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.StrokeObject
+import kotlinx.coroutines.runBlocking
 import org.junit.runner.RunWith
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -50,9 +52,8 @@ import kotlin.test.assertTrue
  *
  * The peer's op is harvested from a stroke this test actually draws, through `MotionEvent` →
  * `InProgressStrokesView` → `drainOps()`, and then re-stamped with a fresh [ObjectId]. Nothing is
- * synthesised: `SyntheticInk` is avoided deliberately, because M1's fixture does not clamp
- * orientation to `[0, 2π)` and x86_64 rounding puts it outside — the known reason ten of
- * `:android:ink`'s instrumented tests are red on an emulator. A test of M6 must not inherit that.
+ * synthesised: a peer's op has to be one the real capture path produced, or this proves nothing
+ * about what actually arrives over sync.
  *
  * ⚠️ Only a stylus draws. `PalmGuard` accepts `TOOL_TYPE_STYLUS` and `TOOL_TYPE_ERASER` and
  * nothing else (SPEC §3.3), so a finger-shaped event lands on the canvas and marks nothing —
@@ -115,7 +116,8 @@ class WetInkRemoteMergeTest {
         val cameraMidStroke = onSurface(surface) { it.camera }
 
         // What `display()` does, and what a remote op must never be routed through.
-        onSurface(surface) { it.loadPage(FoldedPage.empty(PAGE, size = PageSize.A4)) }
+        // ⚠️ `runBlocking`: see `PreparedPage` — the build half is off the main thread now.
+        onSurface(surface) { runBlocking { it.loadPage(FoldedPage.empty(PAGE, PageCanvas.fixed(PageSize.A4))) } }
 
         assertEquals(
             0,

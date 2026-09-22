@@ -291,6 +291,13 @@ class LibraryViewModel @Inject constructor(
      * down: `:android:pdf` must not learn what a `ContentResolver` is, and a `Uri` is
      * only readable while this process holds the grant the picker just made.
      *
+     * The note lands in **the folder on screen**, exactly as [createNote] does — importing a
+     * handout while standing in *Chemistry* means a handout in *Chemistry*. This took the
+     * repository's `folderId = null` default from M4 until M12, so every import landed at the
+     * root and the user moved it by hand — the repository has taken the folder the whole time
+     * and only this caller withheld it. The Nextcloud import beside it
+     * (`MainActivity.onImportFromNextcloud`) passes it, and says in a comment why.
+     *
      * @param onOpened invoked with the note so the caller can open it — but only for a
      *   clean import. A **recovery** is deliberately not opened: SPEC §5.6 requires the
      *   user to be told what was lost first, and dropping them into the editor is how
@@ -305,7 +312,7 @@ class LibraryViewModel @Inject constructor(
             return@launch
         }
 
-        when (val result = repository.importPdf(bytes, titleFor(uri))) {
+        when (val result = repository.importPdf(bytes, titleFor(uri), controls.value.folderId)) {
             is PdfOpenResult.Opened -> when (val mode = result.mode) {
                 is PdfOpenMode.Recovered -> message.value = recoveryMessage(mode, result)
                 else -> onOpened(result.documentId)

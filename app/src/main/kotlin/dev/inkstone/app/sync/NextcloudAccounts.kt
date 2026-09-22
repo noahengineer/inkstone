@@ -1,5 +1,6 @@
 package dev.inkstone.app.sync
 
+import dev.inkstone.app.library.RemotePdfPick
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.CredentialStore
 import dev.inkstone.core.model.IdFactory
@@ -7,18 +8,22 @@ import dev.inkstone.core.model.NextcloudCredential
 import dev.inkstone.core.sync.AccountState
 import dev.inkstone.core.sync.AccountStore
 import dev.inkstone.core.sync.BindingStore
+import dev.inkstone.core.sync.CachedFolder
 import dev.inkstone.core.sync.DavFailure
 import dev.inkstone.core.sync.DavOutcome
 import dev.inkstone.core.sync.DavResource
+import dev.inkstone.core.sync.DownloadedFile
 import dev.inkstone.core.sync.LoginFlowResult
 import dev.inkstone.core.sync.LoginFlowStart
 import dev.inkstone.core.sync.LoginFlowV2
 import dev.inkstone.core.sync.NextcloudSession
 import dev.inkstone.core.sync.NextcloudTransport
 import dev.inkstone.core.sync.OcsClient
+import dev.inkstone.core.sync.RemoteFolderCache
 import dev.inkstone.core.sync.SyncAccount
 import dev.inkstone.core.sync.SyncEngine
 import dev.inkstone.core.sync.WebDavClient
+import dev.inkstone.core.sync.isRetryable
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -38,6 +43,13 @@ class NextcloudAccounts @Inject constructor(
     private val bindings: BindingStore,
     private val sync: SyncEngine,
     private val clock: Clock,
+    /**
+     * ⭐ What the folder browser remembers, so a path can be chosen with no network.
+     *
+     * ⚠️ Not the reconciler's `DirectoryCache`, and it must never become it — see
+     * [RemoteFolderCache]. Nothing written here decides what syncs.
+     */
+    private val folderCache: RemoteFolderCache,
 ) {
 
     private val loginFlow = LoginFlowV2(transport)
@@ -237,6 +249,10 @@ class NextcloudAccounts @Inject constructor(
         for (binding in bindings.forAccount(accountId)) sync.unbind(binding.noteId)
         credentials.remove(accountId)
         accounts.remove(accountId)
+        // The remembered folder names go with it. They are one account's private directory
+        // structure, and an account the user has asked to be forgotten should not leave its
+        // filing system on the device.
+        folderCache.clearFor(accountId)
     }
 
     /**
@@ -279,26 +295,132 @@ class NextcloudAccounts @Inject constructor(
      * [WebDavClient.Depth] makes unrepresentable.
      */
     suspend fun browse(accountId: String, remotePath: String): BrowseResult {
+        val here = remotePath.trim('/')
         val session = session(accountId) ?: return BrowseResult.Unavailable
         return when (val outcome = session.dav.propfind(remotePath, WebDavClient.Depth.One)) {
-            is DavOutcome.Ok -> BrowseResult.Listing(
-                path = remotePath,
-                folders = outcome.value
-                    .filter { it.isCollection && it.path.trim('/') != remotePath.trim('/') }
-                    .sortedBy { it.name.lowercase() },
-            )
+            is DavOutcome.Ok -> {
+                val folders = outcome.value
+                    .filter { it.isCollection && it.path.trim('/') != here }
+                    .sortedBy { it.name.lowercase() }
+                folderCache.remember(
+                    accountId = accountId,
+                    path = here,
+                    folders = folders.map {
+                        CachedFolder(
+                            accountId = accountId,
+                            path = it.path.trim('/'),
+                            parentPath = here,
+                            name = it.name,
+                            ocId = it.ocId,
+                        )
+                    },
+                    nowEpochMillis = clock.nowEpochMillis(),
+                )
+                BrowseResult.Listing(
+                    path = here,
+                    folders = folders.map { RemoteFolderEntry(path = it.path.trim('/'), name = it.name) },
+                    // The same listing already carried these; only the filter was throwing them
+                    // away. A browser that shows them costs no extra request (SPEC §7.3's one
+                    // PROPFIND), and the screen decides whether to draw them — see
+                    // `RemoteBrowser.pickingPdf`.
+                    pdfs = RemotePdfPick.pdfsIn(outcome.value),
+                )
+            }
 
             is DavOutcome.Failed -> {
                 if (outcome.error is DavFailure.Unauthorized) haltOn401(accountId, session)
-                BrowseResult.Failed(outcome.error.describe)
+                remembered(accountId, here, outcome.error) ?: BrowseResult.Failed(outcome.error.describe)
             }
         }
     }
 
-    /** Create a folder the user typed a name for, straight away — this is a UI action, not an outbox op. */
-    suspend fun createRemoteFolder(accountId: String, remotePath: String): Boolean {
-        val session = session(accountId) ?: return false
-        return session.dav.mkcolRecursive(remotePath) is DavOutcome.Ok
+    /**
+     * ⭐ The server cannot be reached — answer from what the browser saw last time.
+     *
+     * Choosing where a note goes needs no network: [SyncEngine.bind] writes three rows and
+     * enqueues MKCOL then UPLOAD without opening a socket, and that MKCOL is unconditional
+     * precisely so the folder need not exist yet. The only part that ever needed a connection
+     * was *seeing the names*, and this is that part, remembered.
+     *
+     * ⚠️ **Only for a failure that means "cannot see the server".** A 401 is halted above and
+     * must not then be dressed up as a working browser (CLAUDE.md rule 5 — the user has to be
+     * sent to sign in, not left choosing folders nothing will ever be written to); a 403 or a 404
+     * is the server answering, and answering *about this path*, so serving the cache would be
+     * contradicting something we have just been told. [isRetryable] is already this codebase's
+     * name for the "could not be told" set, minus [DavFailure.Locked], which is a fact about the
+     * folder rather than about the connection.
+     *
+     * Returns null when the failure is not of that kind, so the caller reports it as before.
+     */
+    private suspend fun remembered(accountId: String, path: String, error: DavFailure): BrowseResult? {
+        val cannotSeeServer = error.isRetryable && error !is DavFailure.Locked
+        if (!cannotSeeServer) return null
+        val cached = folderCache.childrenOf(accountId, path)
+        return BrowseResult.Listing(
+            path = path,
+            folders = cached.folders.map { RemoteFolderEntry(path = it.path, name = it.name, pending = it.pending) },
+            // Deliberately empty. A remembered *file* list would be a list of documents that
+            // cannot be opened — adopting one is a GET — so it would be the one dishonest row on
+            // this screen.
+            pdfs = emptyList(),
+            remembered = Remembered(listedAtEpochMillis = cached.listedAtEpochMillis, reason = error.describe),
+        )
+    }
+
+    /**
+     * Download one remote PDF so it can be imported and written on.
+     *
+     * ⭐ **A UI action, not an outbox op**, for the same reason [createRemoteFolder] is one: the
+     * outbox exists so that *writes* survive a dead network and a dead process (CLAUDE.md rule 4),
+     * and this is a read the user is standing in front of waiting for. Nothing is mutated remotely.
+     *
+     * ⚠️ The [DownloadedFile] carries the ETag and `oc:id` **off the GET**, and those are what the
+     * binding must record — not the PROPFIND's, which the listing may have been holding for a
+     * while. `SyncEngine.bindAdopted` turns them into the `If-Match` that guards the first write
+     * back onto this file.
+     *
+     * A 401 halts the account exactly as a walk would (SPEC §7.1 rule 5): one failure, no retry.
+     */
+    suspend fun fetchPdf(accountId: String, remotePath: String): FetchResult {
+        val session = session(accountId) ?: return FetchResult.Unavailable
+        return when (val outcome = session.dav.download(remotePath)) {
+            is DavOutcome.Ok -> FetchResult.Downloaded(outcome.value)
+
+            is DavOutcome.Failed -> {
+                if (outcome.error is DavFailure.Unauthorized) haltOn401(accountId, session)
+                FetchResult.Failed(outcome.error.describe)
+            }
+        }
+    }
+
+    /**
+     * Create a folder the user typed a name for, straight away — a UI action, not an outbox op.
+     *
+     * ⭐ With no network this is [FolderCreateResult.Deferred] rather than a failure: the folder
+     * is remembered locally, marked as not-yet-on-the-server, and the MKCOL that really creates
+     * it is the one [SyncEngine.bind] already enqueues unconditionally for every binding. So
+     * *"new folder, save the note there"* works on a train, which is the whole point of the cache
+     * beside it.
+     *
+     * ⚠️ Nothing is enqueued **here**. The outbox is keyed by note (SPEC §7.6), so a queued
+     * MKCOL with no note behind it would be a row no binding owns — and a folder nobody saves
+     * anything into never needs to exist.
+     */
+    suspend fun createRemoteFolder(accountId: String, remotePath: String): FolderCreateResult {
+        val session = session(accountId) ?: return FolderCreateResult.Failed("That account needs signing in again.")
+        return when (val outcome = session.dav.mkcolRecursive(remotePath)) {
+            is DavOutcome.Ok -> FolderCreateResult.Created
+
+            is DavOutcome.Failed -> {
+                if (outcome.error is DavFailure.Unauthorized) haltOn401(accountId, session)
+                if (outcome.error is DavFailure.Transport) {
+                    folderCache.rememberPending(accountId, remotePath.trim('/'), clock.nowEpochMillis())
+                    FolderCreateResult.Deferred
+                } else {
+                    FolderCreateResult.Failed(outcome.error.describe)
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -358,11 +480,58 @@ class NextcloudAccounts @Inject constructor(
     }
 
     sealed interface BrowseResult {
-        data class Listing(val path: String, val folders: List<DavResource>) : BrowseResult
+        data class Listing(
+            val path: String,
+            val folders: List<RemoteFolderEntry>,
+            val pdfs: List<DavResource> = emptyList(),
+            /** Null when this listing came off the server just now. */
+            val remembered: Remembered? = null,
+        ) : BrowseResult
 
         data class Failed(val reason: String) : BrowseResult
 
         /** The account is gone, halted, or has no uid — nothing to browse. */
         data object Unavailable : BrowseResult
+    }
+
+    /**
+     * One folder in the browser — from the server, or from what the browser remembers.
+     *
+     * A type of its own rather than [DavResource], because half of these rows never came off a
+     * PROPFIND and giving them an ETag, a permission string and a content length would be
+     * inventing every one of them.
+     *
+     * @property pending true for a folder the user created with no network. It is a real
+     *   destination — the binding's MKCOL creates it — and it is **not on the server yet**, so
+     *   the screen marks it rather than drawing it like the others.
+     */
+    data class RemoteFolderEntry(val path: String, val name: String, val pending: Boolean = false)
+
+    /**
+     * Why a listing is being answered from memory, and how old that memory is.
+     *
+     * @property listedAtEpochMillis when this folder was last listed successfully. **0 means
+     *   never**, which is not "empty" — the screen must not draw the two the same way: one is
+     *   *"there are no folders in here"* and the other is *"I have never seen inside here"*.
+     */
+    data class Remembered(val listedAtEpochMillis: Long, val reason: String)
+
+    /** What [createRemoteFolder] did. */
+    sealed interface FolderCreateResult {
+        data object Created : FolderCreateResult
+
+        /** No network. Remembered locally; the binding's MKCOL is what creates it. */
+        data object Deferred : FolderCreateResult
+
+        data class Failed(val reason: String) : FolderCreateResult
+    }
+
+    /** What [fetchPdf] came back with. */
+    sealed interface FetchResult {
+        data class Downloaded(val file: DownloadedFile) : FetchResult
+
+        data class Failed(val reason: String) : FetchResult
+
+        data object Unavailable : FetchResult
     }
 }

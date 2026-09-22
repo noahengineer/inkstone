@@ -18,6 +18,7 @@ import com.tom_roush.pdfbox.pdmodel.common.filespecification.PDComplexFileSpecif
 import com.tom_roush.pdfbox.pdmodel.common.filespecification.PDEmbeddedFile
 import dev.inkstone.core.model.AnnotationName
 import dev.inkstone.core.model.PageAnnotationMode
+import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PdfBox
 import dev.inkstone.core.model.PdfPageGeometry
 import dev.inkstone.core.model.StrokeOutline
@@ -70,9 +71,9 @@ internal class PdfBoxWriter(faces: PdfFontFaces = PdfFontFaces.None, decoder: Pd
         require(pages.isNotEmpty()) { "a base PDF needs at least one page" }
         PDDocument().use { doc ->
             for (spec in pages) {
-                val page = PDPage(PDRectangle(spec.size.widthPt, spec.size.heightPt))
+                val page = PDPage(PDRectangle(spec.canvas.size.widthPt, spec.canvas.size.heightPt))
                 doc.addPage(page)
-                val template = PdfTemplateContent.forPage(spec.background, spec.size)
+                val template = PdfTemplateContent.forPage(spec.background, spec.canvas.size)
                 if (template.isNotEmpty()) {
                     val stream = PDStream(doc, ByteArrayInputStream(template), COSName.FLATE_DECODE)
                     page.cosObject.setItem(COSName.CONTENTS, stream)
@@ -114,8 +115,12 @@ internal class PdfBoxWriter(faces: PdfFontFaces = PdfFontFaces.None, decoder: Pd
                 doc.getPage(source.index)
             }
 
-            is PageSource.Generated -> PDPage(PDRectangle(source.size.widthPt, source.size.heightPt)).also { page ->
-                val template = PdfTemplateContent.forPage(source.background, source.size)
+            // ⭐ The box is the **paper**, which on an infinite page is the canvas grown to hold
+            // the ink (SPEC §4.5) — and it starts at the PDF origin whatever the canvas's own
+            // page-space origin is. The two are reconciled by [PdfPageGeometry.origin], which
+            // `writePage` puts on the geometry every conversion goes through.
+            is PageSource.Generated -> PDPage(box(source.canvas.size)).also { page ->
+                val template = PdfTemplateContent.forPage(source.background, source.canvas.size)
                 if (template.isNotEmpty()) {
                     val stream = PDStream(doc, ByteArrayInputStream(template), COSName.FLATE_DECODE).cosObject
                     markUpdated(stream)
@@ -189,7 +194,40 @@ internal class PdfBoxWriter(faces: PdfFontFaces = PdfFontFaces.None, decoder: Pd
         // Read from the page rather than taken from the caller. SPEC §4.4's whole
         // failure mode is a CropBox and a rotation that came from somewhere other
         // than the page being written on; there is no way to pass the wrong one here.
-        val geometry = geometryOf(page)
+        val anchor = geometryOf(page)
+        // ⭐ SPEC §4.5 — an infinite page's paper may reach past the box the page was imported or
+        // created with, so the box grows to meet it.
+        //
+        // ⚠️ **Only an infinite page's**, and the guard is not a shortcut. A fixed page publishes
+        // into the box it already had, exactly as it did before this existed, so nothing about an
+        // ordinary note's output changes — and an imported page whose stored extent has drifted
+        // from its source page's box (a replaced PDF, SPEC §6.2) is not silently resized by a
+        // number that came from the note rather than from the page.
+        //
+        // ⚠️ **Computed from the anchor and applied afterwards, in that order.** The enlarged box
+        // has a different top-left corner, and the top-left corner is what page space is measured
+        // from — so a geometry read back off the enlarged page would place every annotation on it
+        // by however far the box grew. [PdfPageGeometry.origin] is what cancels that, and it only
+        // cancels the growth that `boxFor` was asked for.
+        //
+        // ⚠️ **Only a page that already had content gets its box enlarged**, and getting that wrong
+        // is not a crash but a page of the wrong size. A *generated* page was created a few lines
+        // ago at exactly the canvas's extent ([resolvePage]) and has nothing on it to preserve, so
+        // enlarging it as well adds the growth twice: a canvas 1008 pt wide came out as a 1404 pt
+        // page with 396 pt of blank paper down one side. Caught by reading the published
+        // `/MediaBox` back with something that is not PDFBox, which is the only kind of check that
+        // could have caught it — every assertion made with the writing library agreed with itself.
+        val geometry = when {
+            plan.source is PageSource.Existing && plan.canvas.infinite -> {
+                val grown = anchor.boxFor(plan.canvas)
+                if (grown != anchor.cropBox) setBox(dict, grown)
+                PdfPageGeometry(grown, anchor.rotate, origin = plan.canvas.origin)
+            }
+
+            // A generated page *is* the paper, so its box needs no adjusting — only the mapping
+            // from page space into it, which is what the origin carries.
+            else -> PdfPageGeometry(anchor.cropBox, anchor.rotate, origin = plan.canvas.origin)
+        }
 
         // Page identity (SPEC §5.6 as amended in M4 — see PdfPageKeys).
         dict.setString(COSName.getPDFName(PdfPageKeys.PAGE_ID), plan.pageId.value)
@@ -275,6 +313,31 @@ internal class PdfBoxWriter(faces: PdfFontFaces = PdfFontFaces.None, decoder: Pd
             node = node.getDictionaryObject(COSName.PARENT) as? COSDictionary
             depth++
         }
+    }
+
+    /** A page rectangle at the PDF origin. */
+    private fun box(size: PageSize) = PDRectangle(size.widthPt, size.heightPt)
+
+    /**
+     * Write a page's box, both boxes, and mark it.
+     *
+     * ⚠️ **`/MediaBox` as well as `/CropBox`.** A CropBox larger than the MediaBox is clipped back
+     * to it by every reader — the PDF specification says a CropBox is an *intersection* with the
+     * media — so growing only the one a viewer displays (SPEC §4.4 rule 2) would leave a grown
+     * page looking exactly like an ungrown one, with the extra ink cut off at the old edge and
+     * nothing in the file to say why.
+     */
+    private fun setBox(dict: COSDictionary, box: PdfBox) {
+        val array = COSArray().apply {
+            add(COSFloat(box.x0))
+            add(COSFloat(box.y0))
+            add(COSFloat(box.x1))
+            add(COSFloat(box.y1))
+        }
+        markUpdated(array)
+        dict.setItem(COSName.CROP_BOX, array)
+        dict.setItem(COSName.MEDIA_BOX, array)
+        markUpdated(dict)
     }
 
     private fun geometryOf(page: PDPage): PdfPageGeometry {

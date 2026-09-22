@@ -1,8 +1,14 @@
 package dev.inkstone.app.ink
 
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -22,6 +28,7 @@ import dev.inkstone.app.note.topmostAt
 import dev.inkstone.core.model.Camera
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.ImageObject
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.PageSize
@@ -57,7 +64,11 @@ fun ObjectLayers(
     // Loaded when the panel opens rather than held for the note's lifetime: the library is a file
     // on disk that another note may have written, so a list captured at open would go stale the
     // moment an element was saved from anywhere else.
-    LaunchedEffect(objects.elementsOpen, objects.capturedArea) {
+    //
+    // ⚠️ Re-read on [ObjectToolState.libraryRevision], which is bumped when a write **finishes** —
+    // see its KDoc for the version of this that keyed on `capturedArea` and re-read the index a
+    // moment before the save wrote it.
+    LaunchedEffect(objects.libraryReloadKey) {
         if (objects.elementsOpen) elements = editor.elements()
     }
 
@@ -84,7 +95,10 @@ fun ObjectLayers(
                 onDelete = { id ->
                     scope.launch {
                         editor.deleteElement(id)
-                        elements = editor.elements()
+                        // A removed element must not stay armed: the next tap would stamp
+                        // something the panel no longer offers.
+                        if (objects.pendingElement?.id == id) objects.pendingElement = null
+                        objects.libraryChanged()
                     }
                 },
                 onClose = { objects.elementsOpen = false },
@@ -92,6 +106,38 @@ fun ObjectLayers(
             )
         }
     }
+
+    // ⭐ M8c — the captured area's name and collection. A dialog rather than a bar, because it is a
+    // question with an answer and the page underneath is exactly what the answer is about.
+    //
+    // ⚠️ It lives here rather than in the Elements toolbar row, and that move is load-bearing: the
+    // redesign collapses row two whenever a contextual toolbar is up, so a dialog hung off that row
+    // would be *un-summonable* the moment anything on the page was selected — a capture gesture that
+    // does nothing, which is CLAUDE.md's definition-of-done #6 caused by a layout decision.
+    if (objects.capturedArea != null) NameElementDialog(objects, actions)
+}
+
+/** Name and file the captured area. Two fields, because a library with one collection is a list. */
+@Composable
+private fun NameElementDialog(state: ObjectToolState, actions: ObjectActions) {
+    var name by remember { mutableStateOf("") }
+    var collection by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = { state.capturedArea = null },
+        title = { Text("Save as Element") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("Name") })
+                OutlinedTextField(
+                    value = collection,
+                    onValueChange = { collection = it },
+                    label = { Text("Collection") },
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = { actions.onSaveElement(name, collection) }) { Text("Save") } },
+        dismissButton = { TextButton(onClick = { state.capturedArea = null }) { Text("Cancel") } },
+    )
 }
 
 /**
@@ -126,10 +172,15 @@ private suspend fun tapText(
     // Whatever is being typed reaches the register before the field moves, or the tail of it is in
     // no journal at all — the same reason the field commits on focus loss.
     objects.editing?.id?.let { editor.updateText(it, objects.draft) }
-    val hit = fold.objects.topmostAt(point) { it is TextBoxObject } as? TextBoxObject
+    // ⚠️ Hit-tested against the **frame**, not the payload. A text box is resized by
+    // `SetFormat` (`ObjectFormat.boxWidthPt`), so measuring one at its placed extents means a box the
+    // user has widened cannot be tapped in the part they widened it into - and tapping there places
+    // a second box on top of the first instead.
+    val hit = fold.objects.topmostAt(point, { fold.formatting(it.id) }) { it is TextBoxObject } as? TextBoxObject
     if (hit != null) {
-        val bounds = hit.pageBounds() ?: return
-        objects.edit(hit, bounds, fold.textOf(hit.id) ?: hit.text, fold.formatting(hit.id))
+        val format = fold.formatting(hit.id)
+        val bounds = hit.pageBounds(format) ?: return
+        objects.edit(hit, bounds, fold.textOf(hit.id) ?: hit.text, format)
     } else {
         objects.place(
             PageRect(point.x, point.y, point.x + NEW_BOX_WIDTH_PT, point.y + NEW_BOX_HEIGHT_PT),
@@ -164,14 +215,18 @@ private fun onDragBox(box: PageRect, ui: InkUiState, objects: ObjectToolState) {
  * anybody zoomed into a corner, which is indistinguishable from nothing having happened —
  * definition-of-done #6 in its mildest form.
  */
-fun visiblePage(camera: Camera, widthPx: Int, heightPx: Int, page: PageSize): PageRect {
+fun visiblePage(camera: Camera, widthPx: Int, heightPx: Int, page: PageCanvas): PageRect {
     val topLeft = viewToPage(ViewOffset(0f, 0f), camera)
     val bottomRight = viewToPage(ViewOffset(widthPx.toFloat(), heightPx.toFloat()), camera)
+    // ⚠️ Clamped to the **paper**, which on a grown canvas does not start at the page-space origin
+    // (SPEC §4.5). Clamping to `0..size` instead would drop a picture at the top-left of a canvas
+    // the user had scrolled a long way from — placed where they were not looking, in the one
+    // gesture whose whole meaning is *"put it here"*.
     return PageRect(
-        left = topLeft.x.coerceIn(0f, page.widthPt),
-        top = topLeft.y.coerceIn(0f, page.heightPt),
-        right = bottomRight.x.coerceIn(0f, page.widthPt),
-        bottom = bottomRight.y.coerceIn(0f, page.heightPt),
+        left = topLeft.x.coerceIn(page.left, page.right),
+        top = topLeft.y.coerceIn(page.top, page.bottom),
+        right = bottomRight.x.coerceIn(page.left, page.right),
+        bottom = bottomRight.y.coerceIn(page.top, page.bottom),
     )
 }
 
@@ -180,4 +235,4 @@ private const val NEW_BOX_WIDTH_PT = 220f
 private const val NEW_BOX_HEIGHT_PT = 44f
 
 /** Clear of the toolbar card, which is anchored to the same corner region. */
-private const val PANEL_TOP_DP = 120
+private const val PANEL_TOP_DP = 76

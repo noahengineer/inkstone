@@ -5,6 +5,7 @@ import dev.inkstone.core.model.Document
 import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageRef
@@ -125,7 +126,7 @@ public object RecoveredImport {
                     ),
                 )
             }
-            contents[pageId] = PageContents(page.size, page.background, ops)
+            contents[pageId] = PageContents(PageCanvas.fixed(page.size), page.background, ops)
         }
 
         val document = Document(

@@ -49,33 +49,87 @@ public interface InkRuler {
 
     /** Move the edge without turning it. */
     public fun placeAt(xPt: Float, yPt: Float)
+
+    /**
+     * How wide the body is **on the glass**, in dp, and which side of the guide it hangs off.
+     *
+     * On this interface for [lengthPt]'s reason — the chrome is drawn by a different class from the
+     * one that owns the geometry, and the grab is decided by a third concern again. One value
+     * everybody reads is what keeps the drawn ruler and the grabbable ruler the same rectangle; two
+     * copies of it drift the first time anybody adjusts the look, leaving an edge you can see and
+     * cannot pick up.
+     *
+     * The normal is a unit vector in page space pointing at the body. For a horizontal edge it is
+     * `(0, 1)`: page space has y growing downwards (SPEC 4.4), so the body hangs below the line and
+     * the pen runs along its top, the way a set square sits on paper.
+     */
+    public val bodyWidthDp: Float
+
+    public val bodyNormalX: Float
+
+    public val bodyNormalY: Float
 }
 
 /**
  * ⭐ ROADMAP M8c — a draggable, rotatable straight edge that strokes snap to.
  *
- * ## ⚠️ How the snap actually happens, and why it is not a per-sample callback
+ * ## ⚠️ How the snap happens, and the assumption that made the ruler unusable
  *
- * The snap is an **orthogonal projection onto a line**, which is an affine map — so it is applied
- * by handing `InProgressStrokesView.startStroke` a `motionEventToWorldTransform` of
- * `projection ∘ viewToPage` instead of `viewToPage`. Three things follow, and all three are the
- * reason it is done this way:
+ * The snap is an **orthogonal projection onto a line**, which is an affine map. M8c therefore
+ * applied it by handing `InProgressStrokesView.startStroke` a `motionEventToWorldTransform` of
+ * `projection ∘ viewToPage`, on the reasoning that it costs nothing per sample and keeps ink's own
+ * path — and closed with:
  *
- * - **It costs nothing per sample.** The matrix is composed once, at `ACTION_DOWN`. Ink then maps
- *   every sample through it in native code, which it was going to do anyway. There is no allocation
- *   and no arithmetic added to the pen-to-pixel path at all (CLAUDE.md rule 7).
+ * > *"The composed matrix is **singular** — that is what a projection is — and that is safe here
+ * > only because `strokeToWorldTransform` is the identity, so nothing ever inverts it."*
+ *
+ * **It is inverted, and the ruler has therefore never worked.** `InProgressShapesView` inverts
+ * `motionEventToWorldTransform` in `strokeUnitLengthCm` to work out how many centimetres a stroke
+ * unit is — which the fountain pen's `INPUT_SPEED_IN_CENTIMETERS_PER_SECOND` behaviour needs — and
+ * throws `IllegalArgumentException: motionEventToWorldTransform must be invertible` from inside
+ * `startStroke`. So **every** stylus stroke drawn while the edge was out threw at ACTION_DOWN.
+ * Not "did not snap": did not draw. That is `RulerReachTest` in `:app`, and it is the one thing
+ * `RulerAndLaserTest`'s KDoc already listed as unverified — *"the emulator walk is what closes
+ * it"*, and the walk never happened.
+ *
+ * ### What it does instead
+ *
+ * The transform ink is given is the plain `viewToPage` again, and the **event** is projected
+ * before it is handed over ([eventProjection]) — in view space, so ink's own matrix is untouched
+ * and `strokeUnitLengthCm` is measured against a well-conditioned camera. Three properties of the
+ * old design survive, and they are why this is a copy of the event rather than hand-built inputs:
+ *
  * - **The whole `MotionEvent` still goes to `addToStroke`.** CLAUDE.md is explicit that hand-built
  *   `StrokeInput`s *"compile, draw, and silently drop"* pressure, tilt, orientation, tool type and
- *   every historical point. Projecting the event ourselves would mean either rebuilding those
- *   inputs or copying and re-transforming the event per move; the matrix keeps ink's own path.
- * - **Historical samples and the predicted tail are projected too**, because they travel through
- *   the same transform. A ruler that snapped the samples the app happened to see and not the ones
- *   ink interpolated between them would produce a line with a wobble at every frame boundary.
+ *   every historical point. `MotionEvent.transform` moves the coordinates of every pointer **and
+ *   every historical sample** and leaves the rest alone.
+ * - **The predicted tail is projected too**, by projecting the predictor's event as well. A ruler
+ *   that straightened the real samples and not the predicted ones would show a hook at the nib.
+ * - **The cost is bounded and only paid while the edge is out.** One pooled `MotionEvent.obtain`
+ *   and one native `transform` per event, recycled immediately — `StrokeInputPool` converts an
+ *   event into a `MutableStrokeInputBatch` synchronously on the calling thread, so nothing retains
+ *   it (checked against the 1.0.0 bytecode, not assumed).
  *
- * The composed matrix is **singular** — that is what a projection is — and that is safe here only
- * because `strokeToWorldTransform` is the identity (SPEC §4.4 rule 1: stroke space *is* page
- * space), so nothing ever inverts it. If that ever stops being true this stops working, which is
- * why it is stated here rather than discovered.
+ * A near-singular matrix — `εI + (1−ε)P` — was the other candidate and is worse than it looks:
+ * its condition number is `1/ε`, and `strokeUnitLengthCm` averages the row norms of the inverse,
+ * so any ε small enough to straighten a line is large enough to report a stroke unit tens of times
+ * too long. The fountain pen would then size itself off a speed it never travelled.
+ *
+ * ## ⚠️ The body sits BESIDE the guide, never on top of it
+ *
+ * For two milestones the translucent slab was drawn centred on the line strokes snap to, and
+ * `ToolOverlayView` argued the case: chrome that disagreed with the geometry by half the slab's
+ * width would land every ruled stroke visibly beside the guide. The conclusion was right and the
+ * premise had a third option nobody took — **move the body, keep the line**. As drawn, the ink
+ * landed down the middle of a 44 dp band, so the ruler covered the line you had just ruled and
+ * whatever you were ruling it against. The user's words: *"otherwise it covers it."*
+ *
+ * So the guide is unchanged — [project] and [eventProjection] are exactly what they were — and the
+ * slab is drawn from the line along [bodyNormalX] / [bodyNormalY], which is the page-space
+ * "downhill" side of the edge. That is also what a real straight edge is: a body you hold with one
+ * hand and an edge the pen runs along, with nothing of the ruler between the nib and the paper.
+ *
+ * The grab follows the body ([begin]), because the body is the part a finger aims at.
  *
  * ## The guide is a line; the drawn edge is a segment
  *
@@ -157,6 +211,22 @@ internal class RulerController(
     private var dirX = 1f
     private var dirY = 0f
 
+    override val bodyWidthDp: Float get() = SLAB_WIDTH_DP
+
+    /**
+     * The unit normal pointing at the body — see [InkRuler.bodyWidthDp].
+     *
+     * Turning the edge past 180° swaps the body to the other side, exactly as flipping a real ruler
+     * over does, because it is derived from the live direction rather than cached.
+     *
+     * ⚠️ It is the negation of the sign [begin] measures `across` in — see the note there. The
+     * two are derived from one another rather than written twice, because a chrome side and a grab
+     * side that disagree is a ruler you can see but not pick up.
+     */
+    override val bodyNormalX: Float get() = -dirY
+
+    override val bodyNormalY: Float get() = dirX
+
     private fun setAngleRadians(radians: Float) {
         angleRadians = radians
         dirX = cos(radians)
@@ -180,7 +250,7 @@ internal class RulerController(
      *
      * Two multiplies, an add, and two more — exactly what the class KDoc claims, and allocation-free
      * because [into] is the caller's. Not used by the wet stroke, which goes through
-     * [strokeTransform]; this is for anything on this side of the boundary that has to agree with
+     * [eventProjection]; this is for anything on this side of the boundary that has to agree with
      * where the ink will land.
      */
     fun project(x: Float, y: Float, into: PagePointF) {
@@ -189,13 +259,37 @@ internal class RulerController(
     }
 
     /**
-     * [viewToPage] followed by the projection — what `startStroke` is given instead of the camera's
-     * own matrix. See the class KDoc for why this is a matrix and not a per-sample hook.
+     * The projection expressed in **view** coordinates — `pageToView ∘ project ∘ viewToPage` — for
+     * `MotionEvent.transform` to apply to a copy of the event.
      *
-     * Returns a reused instance, like [CameraMatrix] does and for the same reason: this runs once
-     * per stroke and the alternative is a `Matrix` allocated at every `ACTION_DOWN`.
+     * View space in and view space out, because that is what a `MotionEvent` holds. Everything
+     * downstream then runs exactly as it does with no ruler: ink is given the camera's own
+     * `viewToPage`, which is invertible, and the samples it reads have already been flattened onto
+     * the edge.
+     *
+     * ⚠️ [viewToPage] must be the camera in effect **at stroke start**, not the live one. Ink
+     * captures its transform at `startStroke`; projecting later samples through a camera that has
+     * since moved would put them on the edge as it is now and then map them with the camera as it
+     * was, which is a straight line in the wrong place.
+     *
+     * Returns a reused instance, like [CameraMatrix] does and for the same reason: this runs per
+     * event on the ink path and the alternative is a `Matrix` allocated there (CLAUDE.md rule 7).
      */
-    fun strokeTransform(viewToPage: Matrix): Matrix {
+    fun eventProjection(viewToPage: Matrix): Matrix {
+        buildProjection()
+        // The camera is a scale and a translation, so it always inverts; the guard is for the
+        // frame before layout, where the scale can still be zero. Answering the identity there
+        // means one unsnapped sample, not a crash.
+        if (!viewToPage.invert(pageToView)) return IDENTITY
+        composed.set(viewToPage)
+        // `post`, not `pre`: the event's coordinates go through the camera first and land in page
+        // space, are projected onto a line that is defined in page space, and come back.
+        composed.postConcat(projection)
+        composed.postConcat(pageToView)
+        return composed
+    }
+
+    private fun buildProjection() {
         // q = c + ((p - c) · u) u, written out. The linear part is the outer product `u ⊗ u`, whose
         // determinant is zero — see the class KDoc on why a singular matrix is safe here.
         projectionValues[Matrix.MSCALE_X] = dirX * dirX
@@ -208,15 +302,11 @@ internal class RulerController(
         projectionValues[Matrix.MPERSP_1] = 0f
         projectionValues[Matrix.MPERSP_2] = 1f
         projection.setValues(projectionValues)
-        composed.set(viewToPage)
-        // `post`, not `pre`: the event's coordinates go through the camera first and land in page
-        // space, and only then are they projected onto a line that is defined in page space.
-        composed.postConcat(projection)
-        return composed
     }
 
     private val projection = Matrix()
     private val composed = Matrix()
+    private val pageToView = Matrix()
     private val projectionValues = FloatArray(MATRIX_VALUES)
 
     // --- The finger that moves it -------------------------------------------
@@ -244,12 +334,21 @@ internal class RulerController(
         val along = (point.x - centreXPt) * dirX + (point.y - centreYPt) * dirY
         // The perpendicular offset is the 2D cross product with the unit direction — signed
         // distance from the line, no square root.
+        //
+        // ⚠️ **Negative is the body's side.** `(dirY, -dirX)` is the normal this measures against
+        // and [bodyNormalX] is its negation, so a point on the slab has `across < 0`. Written once,
+        // here, because a grab region on the opposite side from the drawn body is a ruler you can
+        // see and cannot pick up — and at 12 % alpha nobody would work out why.
         val across = (point.x - centreXPt) * dirY - (point.y - centreYPt) * dirX
         // A constant reach on the glass, like every other grab in this module: `dp × density ÷
         // camera.scale`. ⚠️ Not `÷ pixelsPerPoint` — that is the conversion for a *width authored in
         // page points*, and confusing the two shrank M8b's endpoint binding by the density factor.
         val reach = GRAB_REACH_DP * displayDensity / camera.scale
-        if (abs(across) > reach || abs(along) > LENGTH_PT / 2f + reach) return false
+        val body = SLAB_WIDTH_DP * displayDensity / camera.scale
+        // Asymmetric on purpose: the whole body on one side, a hairline's grace on the drawing
+        // side. A finger reaching for the ruler aims at the slab it can see; the paper above the
+        // edge is where the *pen* goes, and claiming it would be claiming the page.
+        if (across > reach || across < -body || abs(along) > LENGTH_PT / 2f + reach) return false
 
         this.pointerId = pointerId
         grip = if (abs(along) > LENGTH_PT / 2f * ROTATE_ZONE) Grip.ROTATE else Grip.MOVE
@@ -302,6 +401,8 @@ internal class RulerController(
     }
 
     private companion object {
+        val IDENTITY = Matrix()
+
         const val MATRIX_VALUES = 9
         const val PI_F = Math.PI.toFloat()
         const val FULL_TURN = 360f
@@ -315,8 +416,20 @@ internal class RulerController(
          */
         const val LENGTH_PT = 400f
 
-        /** How far off the edge a finger may land and still grab it. About 8 mm on the glass. */
-        const val GRAB_REACH_DP = 24f
+        /** How far past the edge, on the **pen's** side, a finger may land and still grab it. */
+        const val GRAB_REACH_DP = 12f
+
+        /**
+         * How wide the body is, on the glass — read by `ToolOverlayView` to draw it and by [begin]
+         * to decide what a finger has grabbed.
+         *
+         * ⚠️ **One constant, not one each.** The chrome and the grab region are the same
+         * rectangle described twice, and two copies of it drift the first time anybody adjusts the
+         * look — leaving a ruler that is grabbable somewhere it is not drawn, which is
+         * `DryBox`'s *"selectable with a lasso but not with a tap"* in a tool made of nothing but
+         * chrome.
+         */
+        const val SLAB_WIDTH_DP = 44f
 
         /** The outer fraction of each half that rotates rather than moves. */
         const val ROTATE_ZONE = 0.7f

@@ -4,6 +4,7 @@ import dev.inkstone.app.elements.Element
 import dev.inkstone.app.elements.ElementLibrary
 import dev.inkstone.app.search.NoteRecogniser
 import dev.inkstone.app.search.RecognitionReport
+import dev.inkstone.app.search.SessionGate
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
@@ -22,6 +23,7 @@ import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PagePoint
@@ -191,13 +193,52 @@ class NoteEditor(
     private val serial = Mutex(locked = true)
 
     private val ids = IdFactory(clock)
-    private val store = NoteStore(fs, clock, ids)
+
+    /**
+     * ⚠️ **The undo write does not run on [work], and this editor is why the parameter exists.**
+     * [work] is `Dispatchers.Main.immediate` deliberately — see its KDoc — and the 2-second
+     * [autosaveLoop] reaches `NoteSession.flush`, which re-serialises both undo stacks with every
+     * stroke's geometry blob in them and fsyncs the result. On the UI thread that was a measured
+     * 62 ms stall every two seconds while the user was writing.
+     *
+     * It reuses [drainDispatcher] rather than naming `Dispatchers.IO` for two reasons. The work is
+     * **CPU-bound** — the cost is `kotlinx.serialization` encoding, not the write — so the default
+     * pool is the right one. And the tests already inject an `UnconfinedTestDispatcher` here: a
+     * hard-coded `Dispatchers.IO` escapes `runTest`'s scheduler, which is not a style question but
+     * six tests that fail depending on how a real thread pool is scheduled. Found by running them.
+     *
+     * Only this store gets a context; the library's and the host's keep the default, because
+     * neither is on a path a finger is waiting on.
+     */
+    private val store = NoteStore(fs, clock, ids, saveContext = drainDispatcher)
 
     /** SPEC §4.1's Lamport tiebreak — one id per install, persisted. See [DeviceIdentity]. */
     private val deviceIdentity = DeviceIdentity(fs, ids)
 
     private val _state = MutableStateFlow(NoteEditorState())
     val state: StateFlow<NoteEditorState> = _state.asStateFlow()
+
+    /**
+     * ⛔ **Which note is open — available from the moment [session] exists, which is *before* the
+     * first page is loaded. [NoteEditorState.documentId] is not, and that cost an imported PDF its
+     * paper.**
+     *
+     * `openOrCreate` ends `bindSurface()` → `display()` → `publish()`, and only `publish` writes
+     * the id into [state]. `display` calls `NoteSurface.loadPage`, whose `:app` adapter *launches*
+     * the request for the page's source PDF — so that request read `state.value.documentId` while
+     * it was still **null**, answered null, and painted white paper. It is a race and it was
+     * always losable; a note imported from Nextcloud lost it every time, because the open follows
+     * a burst of index, binding and outbox writes that changes which coroutine runs first.
+     *
+     * What made it expensive to see is that nothing retries: the source page is fetched once per
+     * `loadPage`, so the note stayed blank until something loaded a page again. *"If I add a page
+     * and go back to the first page I can see it properly"* — the second load happens long after
+     * `publish`, and works.
+     *
+     * ⚠️ So do not read a note's identity out of the state flow to answer a question asked *during*
+     * the open. The flow is what the **screen** has been told; this is what the editor **is**.
+     */
+    val openDocumentId: DocumentId? get() = session?.document?.id
 
     private var session: NoteSession? = null
     private var surface: NoteSurface? = null
@@ -208,6 +249,14 @@ class NoteEditor(
 
     /** The current page's template, for the picker. Set wherever the page or its background changes. */
     private var currentTemplate: PageTemplate = PageTemplate.BLANK
+
+    /**
+     * Whether the current page's canvas is endless (SPEC §4.5) — for the same picker.
+     *
+     * The **stored** register, not the paper the ink has grown the page to. What the menu offers
+     * is the switch, and a page that has grown is still the same answer to "is this endless".
+     */
+    private var currentInfinite: Boolean = false
 
     /**
      * The device's identity for the Lamport tiebreak (SPEC §4.1).
@@ -306,7 +355,15 @@ class NoteEditor(
     interface NoteSurface {
         fun bindPage(nextObjectId: () -> ObjectId, nextOpId: () -> String, nextClock: () -> LamportClock)
 
-        fun loadPage(page: FoldedPage)
+        /**
+         * ⭐ **Suspending, because building a page is the most expensive thing this app does.**
+         *
+         * The implementation puts its paper up immediately and decodes and tessellates the page's
+         * objects off the main thread — see `PreparedPage`. Awaiting it is what keeps [display]
+         * honest: `saveViewState` below records the page as shown, and the operations that create
+         * a page finish by displaying it, so both need the load to have actually happened.
+         */
+        suspend fun loadPage(page: FoldedPage)
 
         fun drainOps(): List<List<PageOp>>
 
@@ -336,7 +393,7 @@ class NoteEditor(
          * camera, which are both of SPEC §13.2 row 10's forbidden outcomes. A page whose paper just
          * changed under the user is still the page they are writing on.
          */
-        fun setPageMeta(size: PageSize, background: Background)
+        fun setPageMeta(canvas: PageCanvas, background: Background)
     }
 
     init {
@@ -376,30 +433,61 @@ class NoteEditor(
      * uses to adopt an orphaned directory — the files are the truth in both.
      */
     private suspend fun openOrCreate() {
-        deviceId = deviceIdentity.get()
-        val requested = documentId ?: fs.list(NoteLayout.NOTES_DIR).firstOrNull()?.let(::DocumentId)
-        val note = requested?.let { store.open(it) }
-            ?: store.create(
-                title = DEFAULT_TITLE,
-                deviceId = deviceId,
-                background = Background.Template(PageTemplate.RULED),
-            )
-
-        val opened = NoteSession.open(store, ids, clock, note, deviceId)
-        session = opened
-        // Where this device left off, falling back to the first page. Checked against the live
-        // pages rather than trusted: the remembered page may have been deleted here, or deleted
-        // on the other tablet and merged in since, and `view.json` is not part of that merge.
-        val live = opened.document.livePages
-        val remembered = store.loadViewState(opened.document.id)?.takeIf { saved -> live.any { it.id == saved } }
+        // ⭐ **Every byte of this is read and decoded off the UI thread.**
+        //
+        // [work] is `Dispatchers.Main.immediate`, so before this hop the whole open ran there: the
+        // journal read and CRC, the full op decode, and `NoteStore.loadUndo` — which was measured
+        // at 597,640 B and 1,898 ops on one real note (docs/M8-PERF-RENDER-CACHE.md §5). None of
+        // it touches a view or an Android type; it was on the main thread only because that is
+        // where the editor's scope runs. `serial` is held throughout either way, so this changes
+        // no ordering, only which thread pays.
+        val opened = withContext(drainDispatcher) {
+            val device = deviceIdentity.get()
+            val requested = documentId ?: fs.list(NoteLayout.NOTES_DIR).firstOrNull()?.let(::DocumentId)
+            val note = requested?.let { store.open(it) }
+                ?: store.create(
+                    title = DEFAULT_TITLE,
+                    deviceId = device,
+                    background = Background.Template(PageTemplate.RULED),
+                )
+            val session = NoteSession.open(store, ids, clock, note, device)
+            // Where this device left off, falling back to the first page. Checked against the live
+            // pages rather than trusted: the remembered page may have been deleted here, or deleted
+            // on the other tablet and merged in since, and `view.json` is not part of that merge.
+            val live = session.document.livePages
+            val remembered = store.loadViewState(session.document.id)
+                ?.takeIf { saved -> live.any { it.id == saved } }
+            OpenedNote(device, session, remembered ?: live.first().id)
+        }
+        deviceId = opened.deviceId
+        session = opened.session
+        // ⚠️ **Bind before displaying, and the order is the whole of a 2× open cost.**
+        //
+        // Both of these can load the page, and with `display` first they *both did*: it sets
+        // `currentPage` and calls `loadPage`, and `bindSurface` then finds `currentPage` non-null
+        // and launches `loadPage` again. Every stroke on the page was therefore decoded and
+        // **natively tessellated twice** on the UI thread — and tessellation is the dominant term
+        // in opening a note, not the reading or the folding (docs/M8-PERF-RENDER-CACHE.md §5).
+        // Measured on a 1,187-object note: `Skipped 190 frames!` and `Displayed +3s632ms`.
+        //
+        // Binding first makes the duplicate unreachable rather than merely unlikely:
+        // `bindSurface`'s load is guarded on `currentPage`, which `display` has not set yet, so it
+        // installs the recorder and nothing else. The other ordering is unchanged and still loads
+        // exactly once — a surface attaching *later* finds `currentPage` set and is the only
+        // loader. Both paths end at one load, which is why this is a reorder and not a new guard.
+        //
+        // Safe because `bindSurface` needs only `session` (set above) and because
+        // `StrokeStore.reset()` inside `loadPage` does not clear `recorder` — so the recorder
+        // installed here survives the load that follows it.
+        bindSurface()
         // Directly, not through `showPage`: that launches a coroutine, and publishing before it
         // ran would show a note with no page.
-        display(opened, remembered ?: live.first().id)
-        // The other half of the binding race — see `bindSurface`. On a real device this is the
-        // side that runs second, and if it did not bind, nothing the user drew would be recorded.
-        bindSurface()
-        publish(recovered = opened.recoveredFromTornJournal)
+        display(opened.session, opened.pageId)
+        publish(recovered = opened.session.recoveredFromTornJournal)
     }
+
+    /** [openOrCreate]'s result, so nothing is assigned to a field from the worker that built it. */
+    private class OpenedNote(val deviceId: String, val session: NoteSession, val pageId: PageId)
 
     fun onSurfaceAttached(surface: NoteSurface) {
         this.surface = surface
@@ -467,13 +555,40 @@ class NoteEditor(
     private suspend fun saveLocked() {
         val session = this.session ?: return
         val page = currentPage ?: return
+        val drained = drainLocked(session, page)
+        if (drained || session.hasUnflushedWork) {
+            flushAndReport(session)
+            publish()
+        }
+    }
+
+    /**
+     * The half of [saveLocked] that gets the surface's finished gestures into the session, and
+     * **writes nothing**.
+     *
+     * ⚠️ Split out for [drainHistory], and the split is the point. Undo used to open with a full
+     * [saveLocked], which is a journal append plus `NoteStore.saveUndo` — a rewrite of *both*
+     * whole undo stacks, every stroke's geometry blob included — plus a library row, a
+     * `SyncEngine.noteChanged` and a WorkManager enqueue. All of it inside [serial], and
+     * `session.undo` leaves its inverse ops in `pending`, so `hasUnflushedWork` was true on the
+     * *next* press and the cost never amortised: every two-finger tap paid the lot. Meanwhile the
+     * taps kept arriving and [withPage] kept launching coroutines to wait for the lock, so the
+     * presses looked dead and then landed all at once, several undos past where the user wanted
+     * to stop. Erasing made it worse in exactly the way `UndoStack.DEFAULT_MAX_DEPTH` warns about
+     * — an undone erase carries a whole absolute region, a scribble-erase region is thousands of
+     * capsules, and `saveUndo` re-encodes the whole stack every time.
+     *
+     * What undo actually needs from a save is that queued ink has **reached the session**, so that
+     * an inverse is computed against a page containing it. It does not need it on disk: the ops
+     * undo appends go into `pending` like any others and the two-second [autosaveLoop] flushes
+     * them, which is the same window every stroke already lives in (SPEC §5.1).
+     *
+     * @return whether any gesture landed.
+     */
+    private suspend fun drainLocked(session: NoteSession, page: PageId): Boolean {
         val gestures = surface?.let { withContext(drainDispatcher) { it.drainOps() } }.orEmpty()
         for (gesture in gestures) {
             session.apply(page, gesture)
-        }
-        if (gestures.isNotEmpty() || session.hasUnflushedWork) {
-            flushAndReport(session)
-            publish()
         }
         // SPEC §8.3 — "debounced ~3 s after the last stroke on a page". This is the one place
         // that knows a gesture actually landed *and* is off the ink thread; hanging it off the
@@ -483,6 +598,7 @@ class NoteEditor(
             unreadPages += page
             lastStrokeAtMs = clock.nowEpochMillis()
         }
+        return gestures.isNotEmpty()
     }
 
     // -----------------------------------------------------------------------
@@ -512,10 +628,30 @@ class NoteEditor(
     }
 
     /**
-     * Read the pages the pen has touched. Takes [serial], so it queues behind a merge or a
-     * save rather than folding a page one of them is rewriting.
+     * ⭐ **The lock this takes and gives back, rather than holding.** See [SessionGate].
+     *
+     * `NoteEditor.serial` is held for the fold and for the write, and **not** for the ML Kit pass
+     * between them — which is the slow part, one recogniser call per line of handwriting.
+     *
+     * ⛔ Wrapping the whole pass in `serial.withLock` is what made undo stop responding. SPEC
+     * §8.3 fires this three seconds after the pen stops, which is exactly the moment a user stops
+     * drawing and reaches for undo: every press queued behind the lock and the whole batch landed
+     * at once when ML Kit finished. `NoteSession.recognised` was already written for a concurrent
+     * pass — *"the ink can and does change while it runs"*, and it returns false when the digest
+     * moved — so the old locking was strictly more than the design asked for, and the guard that
+     * makes it safe was unreachable.
      */
-    suspend fun recogniseNow(): RecognitionReport = serial.withLock { recogniseLocked() }
+    suspend fun recogniseNow(): RecognitionReport = recogniseThrough { session, recogniser ->
+        // Taken before the pass, not after: a stroke landing while ML Kit is working must
+        // leave that page queued for the next round rather than being marked read. The
+        // session's ink digest would catch it anyway (SPEC §5.5), but catching it here saves
+        // publishing a page with no text at all until the next stroke.
+        //
+        // ⭐ And this is now reachable rather than theoretical: the pen really can write during
+        // the pass, because the lock is not held while it runs.
+        val pages = serial.withLock { unreadPages.toList().also { unreadPages.clear() } }
+        if (pages.isEmpty()) RecognitionReport.NOTHING else recogniser.recognise(session, pages, gate)
+    }
 
     /**
      * SPEC §8.3's background pass reaching a note this editor holds — `NoteSessionHost.recognise`
@@ -529,30 +665,40 @@ class NoteEditor(
         if (!work.isActive) return null
         // Every live page, not just the unread ones: the batch pass exists to catch up a note
         // the debounce never got to — a note opened, written in and closed inside three seconds.
-        return work.async { serial.withLock { recogniseAllLocked() } }.await()
+        //
+        // ⚠️ Through [gate] like the debounced pass, and for the same reason: this arrives from
+        // WorkManager at a moment of its own choosing, so it can perfectly well land while the
+        // user is writing in the note. It is the *more* likely of the two to be inconvenient.
+        return work.async {
+            recogniseThrough { session, recogniser ->
+                serial.withLock { unreadPages.clear() }
+                recogniser.recognise(session, gate = gate)
+            }
+        }.await()
     }
 
-    private suspend fun recogniseAllLocked(): RecognitionReport {
+    /**
+     * The half both passes share: check there is anything to recognise with, run [pass] **outside**
+     * [serial], and flush what it recorded.
+     *
+     * ⚠️ [pass] must not be called from inside `serial.withLock`. A [Mutex] is not re-entrant
+     * (see [serial]), so a pass that took [gate] while its caller already held the lock would
+     * deadlock the editor for good — which is why this function exists rather than the two callers
+     * each remembering.
+     */
+    private suspend fun recogniseThrough(
+        pass: suspend (NoteSession, NoteRecogniser) -> RecognitionReport,
+    ): RecognitionReport {
         val session = this.session ?: return RecognitionReport.NOTHING
         val recogniser = this.recogniser ?: return RecognitionReport.NOTHING
-        unreadPages.clear()
-        val report = recogniser.recognise(session)
-        if (report.changedAnything) flushAndReport(session)
+        val report = pass(session, recogniser)
+        if (report.changedAnything) serial.withLock { flushAndReport(session) }
         return report
     }
 
-    private suspend fun recogniseLocked(): RecognitionReport {
-        val session = this.session ?: return RecognitionReport.NOTHING
-        val recogniser = this.recogniser ?: return RecognitionReport.NOTHING
-        // Taken before the pass, not after: a stroke landing while ML Kit is working must
-        // leave that page queued for the next round rather than being marked read. The
-        // session's ink digest would catch it anyway (SPEC §5.5), but catching it here saves
-        // publishing a page with no text at all until the next stroke.
-        val pages = unreadPages.toList()
-        unreadPages.clear()
-        val report = recogniser.recognise(session, pages)
-        if (report.changedAnything) flushAndReport(session)
-        return report
+    /** [serial], handed to a long pass so it can borrow the session rather than hold it. */
+    private val gate = object : SessionGate {
+        override suspend fun <T> locked(block: suspend () -> T): T = serial.withLock { block() }
     }
 
     /**
@@ -732,29 +878,77 @@ class NoteEditor(
     // -----------------------------------------------------------------------
 
     /**
-     * Undo appends the inverse ops and then shows the result.
+     * Undo and redo presses waiting to be applied — true for an undo.
      *
-     * Everything queued has to be flushed first: an undo of a stroke that has not reached the
-     * session yet would compute its inverse against a page that does not contain it.
+     * ⭐ **A queue rather than a coroutine each, and this is what stopped the presses stacking
+     * up.** Every press used to be its own [withPage], i.e. its own `work.launch` waiting on
+     * [serial], and nothing on screen moved until each one reached its `reconcile` at the very
+     * end of its turn. So a burst of taps looked like nothing happening, then happened all at
+     * once — and the user overshot by however many presses they had made in the meantime, which
+     * is precisely the complaint. Now the first press starts one drain that takes the lock once
+     * and keeps consuming this deque while it holds it, so late presses join the batch that is
+     * already running instead of queueing another whole operation behind it.
+     *
+     * ⚠️ **Not a signed counter.** Collapsing "five undos then two redos" to a net three is
+     * tempting and is wrong at the one moment it would matter: with only two entries on the
+     * stack, five undos exhaust it and two redos come back to where you started, while a net
+     * three leaves you two gestures in the past. Recovering from an overshoot is exactly this
+     * bug's aftermath, so the order presses arrived in is kept.
+     *
+     * ⚠️ Every entry belongs to whatever page was current when it was queued, which is why
+     * [display] empties it: an entry's inverse is only meaningful on its own page (`UndoEntry`).
+     *
+     * UI thread only — see [work], which is `Dispatchers.Main.immediate`.
      */
-    fun undo() {
+    private val historyRequests = ArrayDeque<Boolean>()
+
+    /** Whether [drainHistory] is already running, so a press joins it rather than starting another. */
+    private var historyDraining = false
+
+    /** SPEC §4.6 — appends the inverse ops of the last gesture on this page and shows the result. */
+    fun undo(): Unit = requestHistory(undo = true)
+
+    fun redo(): Unit = requestHistory(undo = false)
+
+    private fun requestHistory(undo: Boolean) {
+        if (session == null || currentPage == null) return
+        historyRequests += undo
+        if (historyDraining) return
+        historyDraining = true
         withPage { session, page ->
-            saveLocked()
-            val before = session.page(page)
-            if (!session.undo(page)) return@withPage
-            reconcile(before, session.page(page))
-            publish()
+            try {
+                drainHistory(session, page)
+            } finally {
+                historyDraining = false
+            }
         }
     }
 
-    fun redo() {
-        withPage { session, page ->
-            saveLocked()
-            val before = session.page(page)
-            if (!session.redo(page)) return@withPage
-            reconcile(before, session.page(page))
-            publish()
+    /**
+     * Apply every queued press, then repaint **once**.
+     *
+     * The fold before the batch is taken once and diffed against the fold after it, so five
+     * undos cost one [reconcile] and one [publish] rather than five of each — and, more to the
+     * point, the surface is never shown a state the user was only passing through.
+     *
+     * [drainLocked] and not [saveLocked]: the ink queued on the surface has to reach the session
+     * before an inverse is computed against the page, but nothing here has to reach *disk* — see
+     * [drainLocked] on why the flush that used to be here is what made the presses queue.
+     */
+    private suspend fun drainHistory(session: NoteSession, page: PageId) {
+        drainLocked(session, page)
+        val before = session.page(page)
+        var moved = false
+        // `isNotEmpty` each time round rather than a snapshot: `undo` suspends, and a press that
+        // lands while it does belongs to this batch. That is the whole of the coalescing.
+        while (historyRequests.isNotEmpty()) {
+            val undo = historyRequests.removeFirst()
+            if (if (undo) session.undo(page) else session.redo(page)) moved = true
         }
+        // Still published when nothing moved: the stack may have run out, and `canUndo` is what
+        // the button reads.
+        if (moved) reconcile(before, session.page(page))
+        publish()
     }
 
     // -----------------------------------------------------------------------
@@ -886,12 +1080,16 @@ class NoteEditor(
         // The picker's own label is updated *before* the `surface ?: return` below, because the
         // label is state and the surface is a view: a fold that changed the paper has changed what
         // the picker should say whether or not anything is currently on screen to draw it.
-        val metaChanged = after.size != before.size || after.background != before.background
+        // ⚠️ The whole canvas, not the extent: a peer turning the page infinite changes neither
+        // `size` nor `background`, and comparing those alone would fold the change, journal it,
+        // upload it and draw nothing (SPEC §13.2 row 10's failure, one register along).
+        val metaChanged = after.canvas != before.canvas || after.background != before.background
         if (metaChanged) {
             currentTemplate = (after.background as? Background.Template)?.template ?: PageTemplate.BLANK
+            currentInfinite = after.canvas.infinite
         }
         val surface = this.surface ?: return
-        if (metaChanged) surface.setPageMeta(after.size, after.background)
+        if (metaChanged) surface.setPageMeta(after.canvas, after.background)
         val beforeIds = before.objects.map { it.id }.toSet()
         val afterIds = after.objects.map { it.id }.toSet()
 
@@ -1006,12 +1204,21 @@ class NoteEditor(
      */
     private suspend fun display(session: NoteSession, page: PageId) {
         currentPage = page
-        val folded = session.page(page)
+        // An undo press belongs to the page it was made on (`UndoEntry`), and one still queued
+        // when the page turns is a press for a page that is no longer on screen. Dropped rather
+        // than redirected — see [historyRequests].
+        historyRequests.clear()
+        // ⚠️ Off the UI thread. [work] is `Dispatchers.Main.immediate` deliberately — it is what
+        // serialises the session — so a fold is main-thread work by default, and a page turn folds
+        // the whole page. `serial` is still held across the hop, so nothing else reaches the
+        // session while it runs; what moves is only which thread does the arithmetic.
+        val folded = withContext(drainDispatcher) { session.page(page) }
         currentTemplate = (folded.background as? Background.Template)?.template ?: PageTemplate.BLANK
+        currentInfinite = folded.canvas.infinite
         surface?.loadPage(folded)
         // Convenience, not data: a note that cannot record where it was still opens, on page
         // one. So this must never be able to fail an edit that has already happened.
-        runCatching { store.saveViewState(session.document.id, page) }
+        runCatching { withContext(drainDispatcher) { store.saveViewState(session.document.id, page) } }
     }
 
     fun goToPage(index: Int) {
@@ -1099,6 +1306,40 @@ class NoteEditor(
                         background = Background.Template(template),
                     ),
                 ),
+            )
+            flushAndReport(session)
+            reconcile(before, session.page(page))
+            publish()
+        }
+    }
+
+    /**
+     * ⭐ SPEC §4.5 — turn this page's canvas endless, or put it back to a fixed sheet.
+     *
+     * Written exactly the way the paper beside it is ([setTemplate]): one absolute `SetPageMeta`,
+     * folded, then [reconcile] pushes the difference at the screen. Both directions go through the
+     * same three lines, so "make it endless" and "put it back" cannot disagree about anything —
+     * which is the failure the template picker had before M6 and the reason that method reads the
+     * way it does.
+     *
+     * ⚠️ **Only the flag is written; the paper's extent is not.** How big an infinite page *is* is
+     * derived from what is on it, everywhere and by everybody (`InkSurfaceView.recomputeCanvas`,
+     * `InkstonePdfMaterializer`), so recording a size here would create a second answer to a
+     * question that already has one — and a last-writer-wins one, which after a merge is the
+     * answer that can leave a peer's writing off the paper.
+     *
+     * Putting a page back to fixed is therefore not lossy in the log and *is* lossy on the page:
+     * ink outside the sheet stops being drawn and stops being published, and comes back in full
+     * the moment the canvas is endless again. Nothing is deleted (CLAUDE.md rule 1).
+     */
+    fun setInfiniteCanvas(infinite: Boolean) {
+        withPage { session, page ->
+            saveLocked()
+            val before = session.page(page)
+            if (before.canvas.infinite == infinite) return@withPage
+            session.apply(
+                page,
+                listOf(PageOp.SetPageMeta(session.nextOpId(), session.nextClock(), infinite = infinite)),
             )
             flushAndReport(session)
             reconcile(before, session.page(page))
@@ -1527,6 +1768,7 @@ class NoteEditor(
             canRedo = currentPage?.let { session.canRedo(it) } ?: false,
             localRev = session.document.localRev,
             template = currentTemplate,
+            infiniteCanvas = currentInfinite,
             recoveredFromCrash = recovered,
             message = message,
         )
@@ -1609,6 +1851,8 @@ data class NoteEditorState(
     val canRedo: Boolean = false,
     val localRev: Long = 0,
     val template: PageTemplate = PageTemplate.BLANK,
+    /** SPEC §4.5 — whether this page grows to hold whatever is written on it. */
+    val infiniteCanvas: Boolean = false,
     /**
      * True when the journal ended in a torn record — a crash mid-stroke.
      *

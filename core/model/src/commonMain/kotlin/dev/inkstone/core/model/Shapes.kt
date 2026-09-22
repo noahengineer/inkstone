@@ -6,9 +6,12 @@
 package dev.inkstone.core.model
 
 import kotlin.math.abs
+import kotlin.math.acos
+import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sqrt
+import kotlin.math.tan
 
 /**
  * ROADMAP M8b — a [ShapeKind]'s outline, as plain arithmetic in the shape's **own** space.
@@ -46,6 +49,11 @@ public object ShapeGeometry {
     /** Below this a box is treated as collapsed — see [ShapeKind.LINE]'s note in the class KDoc. */
     public const val MIN_EXTENT_PT: Float = 0.5f
 
+    /** `4/3`, the cubic approximation constant for a circular arc. See [roundedPolygon]. */
+    private const val ARC_CUBIC = 4f / 3f
+
+    private const val PI_F = kotlin.math.PI.toFloat()
+
     /** A filled shape needs an interior. A line has none, whatever colour you ask for. */
     public fun isFillable(kind: ShapeKind): Boolean = when (kind) {
         ShapeKind.LINE, ShapeKind.ARROW -> false
@@ -53,13 +61,25 @@ public object ShapeGeometry {
     }
 
     /**
-     * ⚠️ **Only a rectangle rounds.** An ellipse has no corners, and a triangle's corners meet at
-     * angles a single radius cannot round consistently — an equilateral apex and a 15° sliver want
-     * visibly different radii to look equally rounded, and picking one makes the sliver disappear.
-     * ROADMAP's *"rounded corners"* is therefore a rectangle feature, and asking for one anywhere
-     * else is ignored rather than approximated.
+     * Every closed shape with corners — which is every one except the ellipse.
+     *
+     * ⚠️ **This said "only a rectangle" and the reasoning was wrong.** It ran: *"a triangle's corners
+     * meet at angles a single radius cannot round consistently — an equilateral apex and a 15° sliver
+     * want visibly different radii to look equally rounded, and picking one makes the sliver
+     * disappear."* The first half is true and the conclusion does not follow. A fillet is not
+     * "a radius applied at a corner", it is *the largest circle up to that radius which fits between
+     * the two edges*, and clamping it per corner is what every vector editor does: the 90° corner
+     * takes the full radius, the 15° sliver takes what it has room for, and nothing disappears
+     * because a corner that cannot round simply does not. See [roundedPolygon].
+     *
+     * An ellipse still answers false — it has no corners at all, which is a different statement
+     * from having awkward ones — so the toolbar hides the control for one rather than offering a
+     * button that does nothing.
      */
-    public fun roundsCorners(kind: ShapeKind): Boolean = kind == ShapeKind.RECTANGLE
+    public fun roundsCorners(kind: ShapeKind): Boolean = when (kind) {
+        ShapeKind.LINE, ShapeKind.ARROW, ShapeKind.ELLIPSE -> false
+        ShapeKind.RECTANGLE, ShapeKind.TRIANGLE -> true
+    }
 
     /** Only a segment bends. A box with a bend is a box — see [outline]'s [bendLocal]. */
     public fun bends(kind: ShapeKind): Boolean = kind == ShapeKind.LINE || kind == ShapeKind.ARROW
@@ -86,15 +106,83 @@ public object ShapeGeometry {
         heightPt: Float,
         cornerRadiusPt: Float = 0f,
         bendLocal: PagePoint? = null,
+        points: List<PagePoint>? = null,
     ): ShapePath {
         val w = max(widthPt, 0f)
         val h = max(heightPt, 0f)
-        return when (kind) {
-            ShapeKind.LINE, ShapeKind.ARROW -> segment(w, h, bendLocal)
-            ShapeKind.RECTANGLE -> rectangle(w, h, cornerRadiusPt)
-            ShapeKind.ELLIPSE -> ellipse(w, h)
-            ShapeKind.TRIANGLE -> triangle(w, h)
+        // ⭐ Edited vertices are the outline, not a modifier of one — see [ShapeRecord.points]. The
+        // radius now survives them: [roundedPolygon] clamps per corner, so an arbitrary quadrilateral
+        // rounds each of its four by as much as that corner has room for. This used to drop the
+        // radius, on the same reasoning [roundsCorners] used to give for a triangle, and it was wrong
+        // in the same way.
+        if (bends(kind)) {
+            val ends = endpointsOf(w, h, points)
+            return segment(ends.first, ends.second, bendLocal)
         }
+        points?.takeIf { it.size >= MIN_VERTICES }?.let { return polygon(kind, it, cornerRadiusPt) }
+        return when (kind) {
+            ShapeKind.LINE, ShapeKind.ARROW -> error("handled above")
+
+            ShapeKind.RECTANGLE -> rectangle(w, h, cornerRadiusPt)
+
+            ShapeKind.ELLIPSE -> ellipse(w, h)
+
+            // Apex at the top edge's midpoint, base along the bottom — the orientation a drag implies.
+            ShapeKind.TRIANGLE ->
+                roundedPolygon(listOf(PagePoint(w / 2f, 0f), PagePoint(w, h), PagePoint(0f, h)), cornerRadiusPt)
+        }
+    }
+
+    /**
+     * A segment's two ends in its own space — the record's, or the payload's `(0, h/2) → (w, h/2)`.
+     *
+     * ⚠️ **Two, not three.** The bend is not one of these: it is a separate register with its own
+     * meaning (an *on-curve* point, absent when the line is straight), and folding it into the list
+     * would make "straight" and "the middle vertex happens to be on the chord" the same state — the
+     * collision [BendDrag] exists to keep apart.
+     */
+    public fun endpointsOf(widthPt: Float, heightPt: Float, points: List<PagePoint>?): Pair<PagePoint, PagePoint> {
+        val stored = points?.takeIf { it.size == SEGMENT_ENDS }
+        if (stored != null) return stored[0] to stored[1]
+        val y = heightPt / 2f
+        return PagePoint(0f, y) to PagePoint(widthPt, y)
+    }
+
+    /**
+     * [kind]'s outline through explicit [points] — straight edges, except an ellipse, which stays
+     * smooth.
+     *
+     * ⭐ **An ellipse's four seeded quadrant points reproduce [ellipse] exactly**, because the
+     * smoothing constant is `KAPPA / 2` rather than the Catmull-Rom ⅙. That is not a detail: the
+     * points are seeded on the *first drag*, so any other constant would re-draw the whole shape at
+     * the moment the user moved one point of it — which is the complaint this feature exists to
+     * answer, arriving from the other direction.
+     */
+    private fun polygon(kind: ShapeKind, points: List<PagePoint>, cornerRadiusPt: Float = 0f): ShapePath {
+        // An ellipse stays smooth; everything else is straight edges, and straight edges round.
+        if (kind != ShapeKind.ELLIPSE && cornerRadiusPt > 0f) return roundedPolygon(points, cornerRadiusPt)
+        val segments = ArrayList<ShapeSegment>(points.size + 2)
+        segments += ShapeSegment.MoveTo(points[0].x, points[0].y)
+        if (kind == ShapeKind.ELLIPSE) {
+            for (index in points.indices) {
+                val previous = points[(index - 1 + points.size) % points.size]
+                val start = points[index]
+                val end = points[(index + 1) % points.size]
+                val after = points[(index + 2) % points.size]
+                segments += ShapeSegment.CubicTo(
+                    start.x + (end.x - previous.x) * SMOOTHING,
+                    start.y + (end.y - previous.y) * SMOOTHING,
+                    end.x - (after.x - start.x) * SMOOTHING,
+                    end.y - (after.y - start.y) * SMOOTHING,
+                    end.x,
+                    end.y,
+                )
+            }
+        } else {
+            for (index in 1 until points.size) segments += ShapeSegment.LineTo(points[index].x, points[index].y)
+        }
+        segments += ShapeSegment.Close
+        return ShapePath(segments, closed = true)
     }
 
     /** The centre of [kind]'s local box — where an auto anchor measures its direction from. */
@@ -163,25 +251,31 @@ public object ShapeGeometry {
      * A bend on the chord is not a bend: the curve degenerates to the straight segment anyway, and
      * emitting a cubic for it would make *"is this line straight"* a question about float noise.
      */
-    private fun segment(w: Float, h: Float, bend: PagePoint?): ShapePath {
-        val y = h / 2f
-        val start = ShapeSegment.MoveTo(0f, y)
-        val straight = ShapePath(listOf(start, ShapeSegment.LineTo(w, y)), closed = false)
-        if (bend == null || abs(bend.y - y) < STRAIGHT_EPSILON_PT) return straight
+    private fun segment(a: PagePoint, b: PagePoint, bend: PagePoint?): ShapePath {
+        val start = ShapeSegment.MoveTo(a.x, a.y)
+        val straight = ShapePath(listOf(start, ShapeSegment.LineTo(b.x, b.y)), closed = false)
+        if (bend == null) return straight
+        // Perpendicular distance from the chord — the chord is no longer horizontal now that both
+        // ends are editable, so this is a cross product rather than a subtraction of `y`.
+        val dx = b.x - a.x
+        val dy = b.y - a.y
+        val chord = sqrt(dx * dx + dy * dy)
+        if (chord < EPSILON) return straight
+        if (abs((bend.x - a.x) * dy - (bend.y - a.y) * dx) / chord < STRAIGHT_EPSILON_PT) return straight
         // The quadratic control point that puts the curve's midpoint exactly on the handle.
-        val cx = 2f * bend.x - w / 2f
-        val cy = 2f * bend.y - y
+        val cx = 2f * bend.x - (a.x + b.x) / 2f
+        val cy = 2f * bend.y - (a.y + b.y) / 2f
         // Degree-raise: a quadratic (A, C, B) is the cubic (A, A + ⅔(C−A), B + ⅔(C−B), B).
         return ShapePath(
             listOf(
                 start,
                 ShapeSegment.CubicTo(
-                    THIRDS * cx,
-                    y + THIRDS * (cy - y),
-                    w + THIRDS * (cx - w),
-                    y + THIRDS * (cy - y),
-                    w,
-                    y,
+                    a.x + THIRDS * (cx - a.x),
+                    a.y + THIRDS * (cy - a.y),
+                    b.x + THIRDS * (cx - b.x),
+                    b.y + THIRDS * (cy - b.y),
+                    b.x,
+                    b.y,
                 ),
             ),
             closed = false,
@@ -240,16 +334,84 @@ public object ShapeGeometry {
         )
     }
 
-    /** Apex at the top edge's midpoint, base along the bottom — the orientation a drag implies. */
-    private fun triangle(w: Float, h: Float): ShapePath = ShapePath(
-        listOf(
-            ShapeSegment.MoveTo(w / 2f, 0f),
-            ShapeSegment.LineTo(w, h),
-            ShapeSegment.LineTo(0f, h),
-            ShapeSegment.Close,
-        ),
-        closed = true,
-    )
+    /**
+     * ⭐ A closed polygon with each corner filleted by as much as that corner can take.
+     *
+     * ## Why the radius is clamped per corner and not once for the shape
+     *
+     * A fillet at a corner is the arc of the largest circle, up to [cornerRadiusPt], that fits
+     * between the two edges meeting there. How far along each edge it has to start —
+     * `t = r / tan(θ/2)` for interior angle θ — grows without bound as θ closes up, so a single
+     * radius applied blindly makes a sharp corner's tangent points run past the ends of its own
+     * edges and the outline folds through itself. Clamping `t` to half of the shorter adjacent edge
+     * and solving back for `r` is what makes *"round this triangle"* mean something for an
+     * equilateral apex and a 15° sliver at the same time: each rounds as much as it has room for.
+     *
+     * This is the argument [roundsCorners] used to get wrong, and it is why a triangle rounds now.
+     *
+     * ## The arc
+     *
+     * One cubic per corner, with control points along the two edges at `(4/3)·tan(φ/4)·r` from the
+     * tangent points, where `φ = π − θ` is the arc's sweep. ⚠️ At θ = 90° that factor is exactly
+     * [KAPPA] and `t = r`, so this reduces to [rectangle]'s hand-written form — which is why the two
+     * agree and why the rectangle is allowed to keep its own exact version.
+     */
+    private fun roundedPolygon(points: List<PagePoint>, cornerRadiusPt: Float): ShapePath {
+        val n = points.size
+        // The straight case is exactly what [polygon] already draws; a radius of zero there cannot
+        // come back here, so this is a delegation and not a recursion.
+        if (n < MIN_VERTICES || cornerRadiusPt <= 0f) return polygon(ShapeKind.RECTANGLE, points)
+
+        // ⚠️ Every corner emits a `LineTo`, and the **first one is rewritten to a `MoveTo`** at the
+        // end. Deciding it inside the loop needs a flag and a branch at two different emit sites —
+        // and the branch is what made this fall foul of "one break or continue per loop".
+        val segments = ArrayList<ShapeSegment>(n * 2 + 2)
+        for (index in 0 until n) {
+            val corner = points[index]
+            val previous = points[(index - 1 + n) % n]
+            val next = points[(index + 1) % n]
+
+            val toPreviousLength = hypot(previous.x - corner.x, previous.y - corner.y)
+            val toNextLength = hypot(next.x - corner.x, next.y - corner.y)
+            val degenerate = toPreviousLength <= EPSILON || toNextLength <= EPSILON
+            val px = if (degenerate) 0f else (previous.x - corner.x) / toPreviousLength
+            val py = if (degenerate) 0f else (previous.y - corner.y) / toPreviousLength
+            val nx = if (degenerate) 0f else (next.x - corner.x) / toNextLength
+            val ny = if (degenerate) 0f else (next.y - corner.y) / toNextLength
+
+            // The interior half-angle. A degenerate corner, or one folded flat back on itself, has
+            // no fillet and is emitted as the sharp corner it is.
+            val halfTheta = if (degenerate) 0f else acos((px * nx + py * ny).coerceIn(-1f, 1f)) / 2f
+            val tanHalf = tan(halfTheta)
+
+            if (tanHalf <= EPSILON) {
+                segments += ShapeSegment.LineTo(corner.x, corner.y)
+                continue
+            }
+            // How far along each edge the arc must start, clamped so two fillets on one edge cannot
+            // overlap — then the radius solved back from what actually fitted.
+            val t = min(cornerRadiusPt / tanHalf, min(toPreviousLength, toNextLength) / 2f)
+            val handle = ARC_CUBIC * tan((PI_F - 2f * halfTheta) / 4f) * (t * tanHalf)
+            val startX = corner.x + px * t
+            val startY = corner.y + py * t
+            val endX = corner.x + nx * t
+            val endY = corner.y + ny * t
+
+            segments += ShapeSegment.LineTo(startX, startY)
+            segments += ShapeSegment.CubicTo(
+                startX - px * handle,
+                startY - py * handle,
+                endX - nx * handle,
+                endY - ny * handle,
+                endX,
+                endY,
+            )
+        }
+        val head = segments.firstOrNull()
+        if (head is ShapeSegment.LineTo) segments[0] = ShapeSegment.MoveTo(head.x, head.y)
+        segments += ShapeSegment.Close
+        return ShapePath(segments, closed = true)
+    }
 
     // -----------------------------------------------------------------------
     // Boundaries
@@ -318,6 +480,19 @@ public object ShapeGeometry {
 
     /** Quadratic-to-cubic control fraction — the ⅔ in `A + ⅔(C − A)`. */
     private const val THIRDS = 2f / 3f
+
+    /**
+     * How far along the neighbour-to-neighbour chord an edited ellipse's control points sit.
+     *
+     * `KAPPA / 2` and not Catmull-Rom's ⅙: against four points on a circle the chord `Pᵢ₊₁ − Pᵢ₋₁`
+     * is twice the tangent, so halving `KAPPA` puts the control point exactly where [ellipse] puts
+     * it. See [polygon].
+     */
+    private const val SMOOTHING = KAPPA / 2f
+
+    /** A closed outline needs three vertices; a segment has exactly two. */
+    private const val MIN_VERTICES = 3
+    private const val SEGMENT_ENDS = 2
 
     /**
      * A bend nearer the chord than this is straight.

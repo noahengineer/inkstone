@@ -12,6 +12,7 @@ import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.OpExtras
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageRef
@@ -61,7 +62,7 @@ class BundleRoundTripTest {
         val strokeId = ObjectId("obj-stroke")
         val textId = ObjectId("obj-text")
         return PageContents(
-            size = PageSize.A4,
+            canvas = PageCanvas.fixed(PageSize.A4),
             background = Background.Template(PageTemplate.CORNELL),
             ops = listOf(
                 PageOp.AddObject(
@@ -168,7 +169,7 @@ class BundleRoundTripTest {
         // it. The test for "never interprets" is that arbitrary bytes survive.
         val geometry = StrokeGeometry(ByteArray(GEOMETRY_BYTES) { (it % 251).toByte() })
         val page = PageContents(
-            PageSize.Letter,
+            PageCanvas.fixed(PageSize.Letter),
             Background.Blank,
             listOf(PageOp.AddObject(opId(), clock(), StrokeObject(ObjectId("obj-1"), geometry))),
         )
@@ -186,7 +187,7 @@ class BundleRoundTripTest {
         // re-saving must not destroy it.
         val fromTheFuture = """{"i":"op-future","c":99,"d":"device-z","t":"SetHologram","depth":3.5}"""
         val page = PageContents(
-            PageSize.Letter,
+            PageCanvas.fixed(PageSize.Letter),
             Background.Blank,
             listOf(
                 PageOp.AddObject(opId(), clock(), StrokeObject(ObjectId("obj-1"), StrokeGeometry(byteArrayOf(1)))),
@@ -221,7 +222,7 @@ class BundleRoundTripTest {
         // already exists. Dropping it degrades the newer device's data on every save.
         val extras = OpExtras("""{"pressureCurve":"v2","tiltCompensated":true}""")
         val page = PageContents(
-            PageSize.Letter,
+            PageCanvas.fixed(PageSize.Letter),
             Background.Blank,
             listOf(
                 PageOp.SetTransform(

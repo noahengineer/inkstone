@@ -86,7 +86,9 @@ public object SyntheticInk {
                     // width and the mesh has the vertex count real ink has.
                     pressure = MIN_PRESSURE + (1f - MIN_PRESSURE) * sin(t * PI_F),
                     tiltRadians = TILT_RADIANS,
-                    orientationRadians = angle,
+                    // Wrapped, and only here — x and y above keep the *unwrapped* [angle].
+                    // See [turn].
+                    orientationRadians = turn(angle),
                 )
             }
 
@@ -133,6 +135,39 @@ public object SyntheticInk {
                 ),
             )
         }
+    }
+
+    /**
+     * [radians] reduced to `[0, TAU)` — the only range `StrokeInput::orientation` accepts.
+     *
+     * ⛔ **Without this, roughly one stroke in sixteen could not be built at all**, and it had
+     * nothing to do with the architecture. [generate] draws `direction` uniformly from
+     * `[0, TAU)` and bends it by `curl` in `[-0.8, +0.8]`; `angle` is monotonic in `t` and
+     * starts at `direction`, so a stroke escapes exactly when `direction + curl` leaves the
+     * range — `E|curl| / TAU` = **6.4%**, independent of `pointsPerStroke` and of the CPU.
+     * `MutableStrokeInputBatch.add` then throws `IllegalArgumentException` and the whole
+     * generation dies. That is why all twelve `StrokeStoreEraseTest` cases failed on the
+     * Galaxy Tab and not only on an emulator, and why both production callers
+     * (`InkScreen.loadSyntheticPage`, `LibraryFixture`) threw where a user pressed a button.
+     *
+     * ⚠️ **Wrap the orientation, never the angle.** `cos`/`sin` of the wrapped value differ in
+     * the last bit for almost every slightly-negative input, so wrapping before the
+     * trigonometry would move every generated point and make this fix change the fixture's
+     * output. Wrapping here leaves x and y bit-identical, which is what keeps *"deterministic
+     * by seed"* true: no seed that works today produces different bytes tomorrow. Nothing
+     * reads the field back either — `InkstoneBrushFamilies` sources only pressure, speed and
+     * tilt — so orientation is carried for fidelity and tessellates to nothing.
+     *
+     * ⚠️ **The `>= TAU` line is load-bearing, not defensive.** `TAU` is the nearest Float to
+     * 2π and sits just *above* it, and flooring-mod rounds every input in roughly
+     * `[-2.4e-7, 0)` up to exactly `TAU` — which the exclusive upper bound still rejects.
+     * The next Float down is safely below 2π, so `< TAU` is exactly the right test.
+     * For anything already in range the whole function is the identity, bit for bit.
+     */
+    internal fun turn(radians: Float): Float {
+        val remainder = radians % TAU
+        val wrapped = if (remainder < 0f) remainder + TAU else remainder
+        return if (wrapped >= TAU) 0f else wrapped
     }
 
     private const val DEFAULT_SEED = 20260805

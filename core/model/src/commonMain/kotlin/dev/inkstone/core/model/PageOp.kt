@@ -202,21 +202,41 @@ public sealed interface PageOp {
     ) : PageOp
 
     /**
-     * Page-level registers: background and size. Null means "leave that one alone",
-     * which is not a delta — each field is its own LWW register, and this op writes
-     * whichever ones it names with an absolute value.
+     * Page-level registers: the paper's background, extent, position and whether it grows. Null
+     * means "leave that one alone", which is not a delta — each field is its own LWW register,
+     * and this op writes whichever ones it names with an absolute value.
+     *
+     * ⭐ **[origin] and [infinite] are the infinite canvas** (SPEC §4.5). [origin] is the paper's
+     * top-left **in page space**, `(0, 0)` on every fixed page and negative on one that has grown
+     * up or to the left; [infinite] is whether the page grows to hold what is written on it.
+     *
+     * ⚠️ **Growing the canvas must never move an object**, which is the whole reason the origin is
+     * a page register rather than a re-anchoring of page space. Extending the paper upwards writes
+     * a negative [origin] and nothing else — every stroke, capsule and transform keeps the
+     * coordinates its author gave it, so growth is one absolute op (CLAUDE.md rule 8) rather than
+     * a `SetTransform` per object, and a peer's concurrent stroke still lands where they drew it.
+     * The alternative — shifting page space and translating everything — is a rewrite of the page
+     * that a concurrent `AddObject` from a peer would silently miss.
+     *
+     * Both are omitted from the encoding when null, so a build that never sets them writes exactly
+     * the bytes it wrote before they existed, and an older build reading them ignores two unknown
+     * fields (SPEC §5.8) and sees the page at the extent it has grown to.
      */
     public data class SetPageMeta(
         override val opId: String,
         override val clock: LamportClock,
         val background: Background? = null,
         val size: PageSize? = null,
+        val origin: PagePoint? = null,
+        val infinite: Boolean? = null,
         override val extras: OpExtras = OpExtras.None,
     ) : PageOp {
         override val target: ObjectId? get() = null
 
         init {
-            require(background != null || size != null) { "SetPageMeta must set at least one field" }
+            require(background != null || size != null || origin != null || infinite != null) {
+                "SetPageMeta must set at least one field"
+            }
         }
     }
 

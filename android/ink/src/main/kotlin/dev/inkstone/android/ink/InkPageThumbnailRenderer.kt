@@ -74,7 +74,11 @@ public class InkPageThumbnailRenderer(
     override suspend fun render(noteId: DocumentId, page: FoldedPage, widthPx: Int): ByteArray? =
         withContext(dispatcher) {
             if (widthPx <= 0) return@withContext null
-            val size = page.size
+            // The whole paper, wherever it sits in page space — a grown canvas has a negative
+            // origin, and a thumbnail scaled from the extent alone would show the wrong corner of
+            // it (SPEC §4.5, [PageCanvas]).
+            val paper = page.canvas
+            val size = paper.size
             val heightPx = (widthPx * size.heightPt / size.widthPt).roundToInt().coerceAtLeast(1)
 
             // Before the bitmap is allocated, because this is the one step that can be slow
@@ -86,16 +90,23 @@ public class InkPageThumbnailRenderer(
                 val canvas = Canvas(bitmap)
                 // Page points to thumbnail pixels. Uniform, taken from the width, so the aspect
                 // ratio is the page's and a thumbnail is never letterboxed or squashed.
-                val pageToThumbnail = Matrix().apply { setScale(widthPx / size.widthPt, widthPx / size.widthPt) }
+                // Page points to thumbnail pixels, with the paper's own top-left brought to the
+                // bitmap's. The translation is part of the same matrix so that everything below
+                // this line draws in plain page space, exactly as the editor does.
+                val scale = widthPx / size.widthPt
+                val pageToThumbnail = Matrix().apply {
+                    setScale(scale, scale)
+                    preTranslate(-paper.left, -paper.top)
+                }
                 canvas.concat(pageToThumbnail)
 
                 val painter = PagePainter()
                 painter.assets = assets
-                painter.paintBackground(canvas, size, page.background, sourcePage)
+                painter.paintBackground(canvas, paper, page.background, sourcePage)
                 // No culling: the whole page is "on screen" in a thumbnail by definition, and a
                 // cull rect would only add a compare per stroke.
-                painter.paintObjects(canvas, toStrokeStore(page), pageToThumbnail, visibleBounds = null)
-                painter.paintBorder(canvas, size)
+                painter.paintObjects(canvas, toStrokeStore(page), pageToThumbnail, visibleBounds = null, paper = paper)
+                painter.paintBorder(canvas, paper)
 
                 val out = ByteArrayOutputStream(ESTIMATED_BYTES)
                 @Suppress("DEPRECATION") // WEBP_LOSSY is API 30+; WEBP itself is what's deprecated.

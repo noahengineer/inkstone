@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- ⚠️ `same-origin`, NOT `no-referrer`.
+     Chrome serialises the `Origin` header as **null** for a form-submission navigation under a
+     `no-referrer` policy — so this page's own sign-in POST arrived with an opaque origin and was
+     refused by the server's own cross-origin check. Every sign-in failed, in real Chrome, with an
+     error blaming the caller.
+     Diagnosed by experiment rather than by reading: removing the meta made the identical
+     submission succeed. `same-origin` keeps the whole privacy intent — nothing is sent to another
+     site — while leaving this site's own requests attributable, which is what the check needs. -->
+<meta name="referrer" content="same-origin">
+<title>Sign in · Inkstone reader</title>
+<link rel="stylesheet" href="/static/app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%2309090B'/><path d='M8 22 L16 9 L24 22' stroke='%23E4E4E7' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+</head>
+<body class="signin-body">
+
+<main class="signin">
+  <div class="brand signin-brand">
+    <span class="mark" aria-hidden="true"></span>
+    <span class="brand-name">Inkstone</span>
+    <span class="brand-sub">reader</span>
+  </div>
+
+  <h1>Your notes and lessons.</h1>
+
+  <!-- POST, not GET: a passphrase in a query string lands in browser history, in the Referer of
+       every outbound link, and in the reverse proxy's access log. -->
+  <form class="signin-form" method="POST" action="/signin" autocomplete="on">
+    <label class="micro" for="password">Passphrase</label>
+    <input id="password" name="password" type="password" autocomplete="current-password"
+           autofocus required aria-describedby="signin-note">
+    <input type="hidden" name="next" id="next" value="/">
+    <button class="chip signin-go" type="submit">Sign in</button>
+  </form>
+
+  <p class="signin-error" id="signin-error" hidden role="alert"></p>
+
+  <p class="signin-note" id="signin-note">
+    One passphrase, set as <code>INKSTONE_WEB_PASSWORD</code> on the server. There are no accounts
+    to create and nothing to reset — if you lose it, change the variable and restart.
+  </p>
+</main>
+
+<script>
+  // The server redirects here with ?error=… rather than rendering a template: this file is static,
+  // and keeping it that way means there is no place for a server-side string to become markup.
+  const params = new URLSearchParams(location.search);
+  const error = params.get('error');
+  if (error) {
+    const box = document.getElementById('signin-error');
+    box.textContent = error === 'rate'
+      ? (params.get('wait')
+          ? `Too many attempts. Try again in ${Math.ceil(Number(params.get('wait')))} seconds.`
+          : 'Too many attempts. Wait a moment and try again.')
+      : 'That passphrase was not right.';
+    box.hidden = false;
+  }
+  const next = params.get('next');
+  // Only ever a path on this site. An absolute URL here would make the sign-in page an open
+  // redirect — somewhere to send a person after they have just proved they trust this site.
+  if (next && next.startsWith('/') && !next.startsWith('//')) {
+    document.getElementById('next').value = next;
+  }
+</script>
+</body>
+</html>

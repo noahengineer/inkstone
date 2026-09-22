@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "inkstone": {
+      "type": "stdio",
+      "command": "py",
+      "args": ["tools/web/mcp_server.py"]
+    }
+  }
+}

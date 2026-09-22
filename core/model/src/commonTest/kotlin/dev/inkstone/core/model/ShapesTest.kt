@@ -3,6 +3,7 @@ package dev.inkstone.core.model
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.hypot
 import kotlin.math.sin
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -65,11 +66,67 @@ class ShapesTest {
     }
 
     @Test
-    fun `only a rectangle rounds and only a closed shape fills`() {
+    fun `everything with corners rounds and only a closed shape fills`() {
+        // ⚠️ The triangle is the point of this one. It answered false for six milestones, on the
+        // reasoning that a single radius cannot suit both a wide corner and a sharp one — see
+        // ShapeGeometry.roundsCorners for why clamping per corner makes that a non-problem. An
+        // ellipse still refuses, because it has no corners at all.
         assertTrue(ShapeGeometry.roundsCorners(ShapeKind.RECTANGLE))
+        assertTrue(ShapeGeometry.roundsCorners(ShapeKind.TRIANGLE))
         assertTrue(!ShapeGeometry.roundsCorners(ShapeKind.ELLIPSE))
+        assertTrue(!ShapeGeometry.roundsCorners(ShapeKind.LINE))
         assertTrue(ShapeGeometry.isFillable(ShapeKind.TRIANGLE))
         assertTrue(!ShapeGeometry.isFillable(ShapeKind.ARROW))
+    }
+
+    @Test
+    fun `a connector can attach only to a shape with an inside`() {
+        // A line answered yes by omission, and a line drawn starting on another line became a
+        // connector bound to it. See ShapeKind.isAnchorable.
+        assertTrue(ShapeKind.RECTANGLE.isAnchorable)
+        assertTrue(ShapeKind.ELLIPSE.isAnchorable)
+        assertTrue(ShapeKind.TRIANGLE.isAnchorable)
+        assertTrue(!ShapeKind.LINE.isAnchorable)
+        assertTrue(!ShapeKind.ARROW.isAnchorable)
+    }
+
+    @Test
+    fun `a rounded triangle keeps its box and pulls its outline in at the corners`() {
+        val sharp = ShapeGeometry.outline(ShapeKind.TRIANGLE, 120f, 100f)
+        val round = ShapeGeometry.outline(ShapeKind.TRIANGLE, 120f, 100f, cornerRadiusPt = 12f)
+        assertTrue(round.closed)
+        assertTrue(round.segments.any { it is ShapeSegment.CubicTo })
+
+        // Still inside the box it was drawn in — a fillet only ever removes area.
+        val points = round.flattened(samplesPerCurve = 16)
+        assertTrue(points.all { it.x in -TOLERANCE..(120f + TOLERANCE) })
+        assertTrue(points.all { it.y in -TOLERANCE..(100f + TOLERANCE) })
+
+        // And it is genuinely rounder: the apex is the sharpest corner, so it is the one that
+        // visibly retreats from the top edge.
+        assertTrue(points.minOf { it.y } > sharp.flattened().minOf { it.y } + TOLERANCE)
+    }
+
+    @Test
+    fun `a radius far larger than the shape rounds each corner by as much as it has room for`() {
+        // The clamp is what makes "round this" mean something for a 15-degree sliver and a right
+        // angle at once. Unclamped, the tangent points run past the ends of their own edges and the
+        // outline folds through itself — which shows up as points outside the box.
+        val path = ShapeGeometry.outline(ShapeKind.TRIANGLE, 60f, 200f, cornerRadiusPt = 400f)
+        val points = path.flattened(samplesPerCurve = 16)
+        assertTrue(points.all { it.x in -TOLERANCE..(60f + TOLERANCE) })
+        assertTrue(points.all { it.y in -TOLERANCE..(200f + TOLERANCE) })
+    }
+
+    @Test
+    fun `edited vertices round too rather than dropping the radius`() {
+        // ⚠️ An explicit vertex list used to discard the corner radius outright. A quadrilateral a
+        // user has dragged into shape is exactly the thing they then want rounded.
+        val quad = listOf(PagePoint(0f, 0f), PagePoint(90f, 10f), PagePoint(80f, 70f), PagePoint(5f, 60f))
+        val sharp = ShapeGeometry.outline(ShapeKind.RECTANGLE, 90f, 70f, points = quad)
+        val round = ShapeGeometry.outline(ShapeKind.RECTANGLE, 90f, 70f, cornerRadiusPt = 10f, points = quad)
+        assertTrue(sharp.segments.none { it is ShapeSegment.CubicTo })
+        assertEquals(4, round.segments.count { it is ShapeSegment.CubicTo })
     }
 
     // -----------------------------------------------------------------------
@@ -287,10 +344,149 @@ class ShapesTest {
         // a bracket or any large open curve held still was eaten and turned into an oval. This is
         // a completely separate mechanism from the fill ratio and the second half of the complaint.
         for (sweep in listOf(180, 240, 270, 300)) {
-            assertNull(ShapeSnap.recognise(arc(200f, 120f, sweep)), "a $sweep° arc must stay ink")
+            val kind = ShapeSnap.recognise(arc(200f, 120f, sweep))?.kind
+            assertTrue(kind != ShapeKind.ELLIPSE, "a $sweep° arc came back as an ellipse")
         }
         // …while a circle the user closed properly still snaps.
         assertEquals(ShapeKind.ELLIPSE, assertNotNull(ShapeSnap.recognise(arc(200f, 120f, 355))).kind)
+    }
+
+    // -----------------------------------------------------------------------
+    // ⭐ Curves — "when not drawing a straight line it should create a curve out of that"
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `a drawn arc becomes a curve through the ink`() {
+        val drawn = arc(200f, 200f, 140)
+
+        val candidate = assertNotNull(ShapeSnap.recognise(drawn), "a 140° arc should snap")
+
+        // A curve *is* a line plus a bend — there is no CURVE kind, because a sixth ShapeKind is a
+        // note an older build cannot open (SPEC 4.8.8).
+        assertEquals(ShapeKind.LINE, candidate.kind)
+        val bend = assertNotNull(candidate.bend, "the arc lost its apex")
+        // The apex is on the ink the user drew, not somewhere off it: a control point would be.
+        assertTrue(
+            drawn.any { hypot(it.x - bend.x, it.y - bend.y) < 1f },
+            "the bend at $bend is not one of the drawn points",
+        )
+    }
+
+    @Test
+    fun `the curve a snapped arc draws follows the arc that was drawn`() {
+        val drawn = arc(200f, 200f, 140)
+        val candidate = assertNotNull(ShapeSnap.recognise(drawn))
+        val placement = candidate.placement(bandPt = 2f)
+
+        val curve = ShapeGeometry
+            .outline(ShapeKind.LINE, placement.widthPt, placement.heightPt, bendLocal = candidate.bendLocal(placement))
+            .under(placement.transform)
+            .flattened(samplesPerCurve = 24)
+
+        // Every drawn point is near the curve that replaces it — the only assertion that says the
+        // snap kept the user's gesture rather than merely producing *a* curve between its ends.
+        val worst = drawn.maxOf { point -> curve.minOf { hypot(it.x - point.x, it.y - point.y) } }
+        val chord = hypot(drawn.last().x - drawn.first().x, drawn.last().y - drawn.first().y)
+        assertTrue(worst < chord * 0.08f, "the snapped curve strays ${worst}pt from the ink")
+    }
+
+    // -----------------------------------------------------------------------
+    // ⭐ "it is far too easy to make a circle" — the rectangle's one-sided window
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `an imperfect square is a rectangle and not an ellipse`() {
+        // A hand's square loses fill to rounded corners, bowed edges and overshoot past a corner
+        // (which widens the hull and therefore the box). Every one of those moves it *toward* the
+        // ellipse, because 1.0 is the top of the range — so a square that is 8% short used to be
+        // refused as a rectangle and accepted as an oval.
+        for (rounding in listOf(0.06f, 0.12f, 0.18f)) {
+            assertEquals(
+                ShapeKind.RECTANGLE,
+                assertNotNull(ShapeSnap.recognise(roundedSquare(200f, rounding)), "r=$rounding").kind,
+                "a square with corners rounded by $rounding of its side came back as something else",
+            )
+        }
+    }
+
+    @Test
+    fun `a circle is still a circle and keeps a wide margin over the rectangle`() {
+        // The other half of the trade, asserted so the allowance cannot grow until it eats ellipses.
+        val candidate = assertNotNull(ShapeSnap.recognise(ellipse(200f, 200f)))
+        assertEquals(ShapeKind.ELLIPSE, candidate.kind)
+        assertTrue(candidate.confidence > 0.9f, "a perfect circle scored only ${candidate.confidence}")
+        assertEquals(ShapeKind.ELLIPSE, assertNotNull(ShapeSnap.recognise(ellipse(240f, 140f))).kind)
+    }
+
+    @Test
+    fun `a corner stays ink and the boundary is where the measurements put it`() {
+        // ⚠️ The gesture that sets ARC_MAX_RESIDUAL. A rounded corner and a deep arc are genuinely
+        // similar shapes, and no threshold separates them cleanly — so the limit sits below the
+        // corner rather than above the deepest arc, because turning someone's elbow into a smooth
+        // curve is a drawing that changed under them, where a refused half-circle is only a feature
+        // that did not fire.
+        for (radius in listOf(0.5f, 10f, 20f)) {
+            assertNull(ShapeSnap.recognise(roundedCorner(radius)), "a corner rounded by $radius snapped")
+        }
+        // ⭐ …and the far side of the boundary, asserted rather than left to drift: a corner rounded
+        // by 30 of a 100 pt arm is a quarter circle with two stubs on it, and it *does* snap. If a
+        // future change moves this line, it has moved the boundary — which is the thing to argue
+        // about, not the constant.
+        assertEquals(ShapeKind.LINE, assertNotNull(ShapeSnap.recognise(roundedCorner(30f))).kind)
+    }
+
+    @Test
+    fun `an S is not one arc and stays ink`() {
+        // Two humps cannot lie on one quadratic, and a quadratic is what a curve is drawn as. This
+        // is the guard that keeps "snap my curve" from becoming "snap anything I hold still on".
+        val s = (0..40).map { step ->
+            val t = step / 40f
+            PagePoint(t * 300f, 40f * sin(t * 2f * PI.toFloat()))
+        }
+        assertNull(ShapeSnap.recognise(s))
+    }
+
+    @Test
+    fun `a straight line is still a line and not a shallow curve`() {
+        val candidate = assertNotNull(ShapeSnap.recognise(line(0f, 0f, 300f, 120f)))
+
+        assertEquals(ShapeKind.LINE, candidate.kind)
+        assertNull(candidate.bend, "a straight line must not acquire a bend")
+    }
+
+    @Test
+    fun `nothing straight enough to be a line ever comes back as a curve`() {
+        // ⭐ **The property, not the constant.** The line and the arc are separated by their
+        // *features* and not by comparing two confidence ramps — a line's is 0.03 wide and falls off
+        // a cliff, an arc's is nearly flat, and at a 60° bow the line was winning by 0.03, which is
+        // noise on a real gesture. *"Straight lines dont create properly"* was the result.
+        //
+        // ⚠️ This is what pins ARC_MIN_SAGITTA to LINE_MIN_STRAIGHTNESS. Move either constant
+        // without the other and this fails, which is the whole point of asserting it this way.
+        for (sweep in 2..80 step 2) {
+            val drawn = arc(200f, 200f, sweep)
+            val chord = hypot(drawn.last().x - drawn.first().x, drawn.last().y - drawn.first().y)
+            val path = drawn.zipWithNext().sumOf { (a, b) -> hypot(b.x - a.x, b.y - a.y).toDouble() }.toFloat()
+            if (chord / path < ShapeSnap.LINE_MIN_STRAIGHTNESS) continue
+            val candidate = ShapeSnap.recognise(drawn)
+            assertNull(candidate?.bend, "a $sweep° bow is straight enough to be a line but became a curve")
+        }
+    }
+
+    @Test
+    fun `a bow deep enough to have been refused as a line is still a curve`() {
+        // The other side of the same boundary: making the two disjoint must not cost the feature.
+        //
+        // ⚠️ 140° is the top of the range, and the ceiling is ARC_MAX_RESIDUAL rather than the
+        // sagitta — a 150° arc's sagitta (0.384) is well inside the window, but one quadratic
+        // strays 5.2% of the chord from it and the residual bar is 5%. That is the *deliberate*
+        // limit (a quadratic is a parabola), not a side effect of separating the line from the arc.
+        for (sweep in listOf(80, 90, 120, 140)) {
+            assertNotNull(
+                assertNotNull(ShapeSnap.recognise(arc(200f, 200f, sweep)), "a $sweep° arc snapped to nothing").bend,
+                "a $sweep° arc came back without a bend",
+            )
+        }
     }
 
     @Test
@@ -454,6 +650,66 @@ class ShapesTest {
         PagePoint(w / 2f + w / 2f * cos(angle), h / 2f + h / 2f * sin(angle))
     }
 
+    /**
+     * A square of side [side] whose corners are rounded by [rounding] of that side — the nearest a
+     * fixture gets to a square drawn by a hand, and the gesture the fill ratio punishes.
+     */
+    private fun roundedSquare(side: Float, rounding: Float): List<PagePoint> {
+        val r = side * rounding
+        val points = ArrayList<PagePoint>()
+        // Corner centres, in drawing order: top-left, top-right, bottom-right, bottom-left.
+        val centres = listOf(
+            PagePoint(r, r) to PI.toFloat(),
+            PagePoint(side - r, r) to -PI.toFloat() / 2f,
+            PagePoint(side - r, side - r) to 0f,
+            PagePoint(r, side - r) to PI.toFloat() / 2f,
+        )
+        for ((index, corner) in centres.withIndex()) {
+            val (centre, start) = corner
+            for (step in 0..CORNER_STEPS) {
+                val angle = start + PI.toFloat() / 2f * step / CORNER_STEPS
+                points += PagePoint(centre.x + r * cos(angle), centre.y + r * sin(angle))
+            }
+            // ⚠️ **The straight edges are sampled too**, and leaving them out is not a harmless
+            // simplification: a fixture with points only on its corner arcs is 37 points that are
+            // *all* corner, which flatters any turning-based measure and — because it is under 48 —
+            // used to trip a resampling guard and be classified round. A drawn square has samples
+            // along its sides.
+            // ⚠️ Toward the next arc's **start point**, not the next corner's centre. Aiming at the
+            // centre pulls the edges inward and cuts the corners off: this fixture's fill read 0.799
+            // at an 18% rounding — an *oval's* number — and a threshold was very nearly moved to
+            // accommodate a shape the fixture had deformed. The real figure is 0.972.
+            val (nextCentre, nextStart) = centres[(index + 1) % centres.size]
+            val next = PagePoint(
+                nextCentre.x + r * cos(nextStart),
+                nextCentre.y + r * sin(nextStart),
+            )
+            val from = points.last()
+            for (step in 1..EDGE_STEPS) {
+                val fraction = step.toFloat() / (EDGE_STEPS + 1)
+                points += PagePoint(
+                    from.x + (next.x - from.x) * fraction,
+                    from.y + (next.y - from.y) * fraction,
+                )
+            }
+        }
+        points += points.first()
+        return points
+    }
+
+    /** Two 100 pt arms meeting at a right angle, joined by a quarter circle of [radius]. */
+    private fun roundedCorner(radius: Float, arm: Float = 100f): List<PagePoint> {
+        val steps = 12
+        val points = ArrayList<PagePoint>(steps * 3 + 1)
+        for (step in 0..steps) points += PagePoint(-arm + (arm - radius) * step / steps, 0f)
+        for (step in 1..steps) {
+            val angle = PI.toFloat() / 2f * step / steps
+            points += PagePoint(-radius + radius * sin(angle), radius - radius * cos(angle))
+        }
+        for (step in 1..steps) points += PagePoint(0f, radius + (arm - radius) * step / steps)
+        return points
+    }
+
     /** [sweepDegrees] of an ellipse, left open — the gesture `CLOSED_MAX_GAP` has to refuse. */
     private fun arc(w: Float, h: Float, sweepDegrees: Int): List<PagePoint> {
         val steps = STEPS * 2
@@ -493,6 +749,10 @@ class ShapesTest {
 
     private companion object {
         const val STEPS = 24
+
+        /** Samples along each rounded corner, and along each straight edge — see [roundedSquare]. */
+        const val CORNER_STEPS = 8
+        const val EDGE_STEPS = 3
         const val TOLERANCE = 0.05f
     }
 }

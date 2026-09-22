@@ -1,18 +1,26 @@
 package dev.inkstone.app.note
 
+import dev.inkstone.app.search.NoteRecogniser
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.HandwritingRecogniser
 import dev.inkstone.core.model.IdFactory
+import dev.inkstone.core.model.InkSample
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.MaterializedFile
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PdfPublisher
+import dev.inkstone.core.model.RecognitionOutcome
+import dev.inkstone.core.model.SampledStroke
 import dev.inkstone.core.model.StrokeGeometry
 import dev.inkstone.core.model.StrokeObject
+import dev.inkstone.core.model.StrokeSampler
 import dev.inkstone.core.storage.BundleContents
 import dev.inkstone.core.storage.BundleReader
 import dev.inkstone.core.storage.BundleWriter
@@ -80,7 +88,13 @@ class NoteEditorConcurrencyTest {
             BundleWriter.write(
                 BundleContents(
                     document = note.document,
-                    pages = mapOf(page to PageContents(PageSize.Letter, Background.Blank, listOf(peerStroke()))),
+                    pages = mapOf(
+                        page to PageContents(
+                            PageCanvas.fixed(PageSize.Letter),
+                            Background.Blank,
+                            listOf(peerStroke()),
+                        ),
+                    ),
                     highestClockCounter = PEER_COUNTER,
                 ),
             ),
@@ -88,7 +102,11 @@ class NoteEditorConcurrencyTest {
         return Fixture(fs, note.document.id, page, peerBundle)
     }
 
-    private fun TestScope.editorOver(fixture: Fixture, publisher: PdfPublisher? = null) = NoteEditor(
+    private fun TestScope.editorOver(
+        fixture: Fixture,
+        publisher: PdfPublisher? = null,
+        recogniser: NoteRecogniser? = null,
+    ) = NoteEditor(
         fs = fixture.fs,
         clock = clock,
         scope = this,
@@ -98,6 +116,7 @@ class NoteEditorConcurrencyTest {
         autosaveIntervalMs = Long.MAX_VALUE,
         documentId = fixture.id,
         publisher = publisher,
+        recogniser = recogniser,
     )
 
     /**
@@ -266,6 +285,187 @@ class NoteEditorConcurrencyTest {
     }
 
     /**
+     * ⭐ **Undo presses made while the editor is busy become one batch, not one operation each.**
+     *
+     * Every press used to be its own `work.launch { serial.withLock { … } }`, and nothing reached
+     * the screen until a press got the lock and ran all the way to its `reconcile`. So a burst of
+     * two-finger taps against a busy editor did nothing visible, then landed together — several
+     * undos past wherever the user meant to stop. In their words: *"it seems to lag, like not
+     * register properly, and then after a few seconds it updates and all the undos that seem to do
+     * nothing happen and you undo a lot more than you want."*
+     *
+     * The gate is what makes this a test rather than a coincidence: the presses are made while a
+     * real operation holds [NoteEditor.serial], which is the only state the bug is reachable from.
+     * Called in sequence — which is what the rest of this package does — the old code and the new
+     * one are indistinguishable.
+     */
+    @Test
+    fun `undo presses made while the editor is busy become one batch`() = runTest {
+        val fixture = fixture()
+        val editor = editorOver(fixture)
+        val surface = FakeSurface()
+        editor.onSurfaceAttached(surface)
+        runCurrent()
+        // Three gestures, so three undo entries — SPEC §4.6's grain is the gesture, not the op.
+        repeat(3) { n -> surface.queueGesture(listOf(localStroke(n))) }
+        editor.save()
+        runCurrent()
+        assertEquals(3, assertNotNull(editor.foldedPage(fixture.page)).objects.size, "the fixture never drew")
+        surface.applied.clear()
+
+        // The editor is busy. In production this is the two-second autosave, a reconciler pull, or
+        // simply the press before this one still writing.
+        val parked = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        fixture.parkAtBundleWrite(parked, release)
+        val busy = async { editor.materializeNow() }
+        parked.await()
+
+        repeat(3) { editor.undo() }
+        runCurrent()
+        assertTrue(surface.applied.isEmpty(), "an undo ran inside the materialize, which is what serial forbids")
+        release.complete(Unit)
+        busy.await()
+        runCurrent()
+
+        assertEquals(
+            emptySet(),
+            assertNotNull(editor.foldedPage(fixture.page)).objects.mapTo(HashSet()) { it.id },
+            "three presses did not undo three gestures",
+        )
+        // The assertion the fix is actually about: **one** call, carrying all three deletions.
+        // Three calls would mean three operations ran, which is the queue this bug was.
+        assertEquals(1, surface.applied.size, "the presses repainted the surface once each")
+        assertEquals(3, surface.applied.single().ops.size, "the batch did not carry all three gestures")
+        editor.close()
+    }
+
+    /**
+     * ⚠️ **A redo in the same burst is not a cancelled undo.**
+     *
+     * Coalescing five undos and two redos into a net three is cheaper and is wrong exactly where it
+     * matters: with two entries on the stack, five presses exhaust it and the two redos come back
+     * to the start, while a net three leaves the user two gestures in the past. Recovering from an
+     * overshoot is this bug's own aftermath, so arrival order is kept rather than netted.
+     *
+     * ⚠️ **This one passes against the pre-fix code too, and that is what it is for.** The old
+     * shape ran a whole operation per press, so it could not net anything; this is a guard against
+     * the netting being added later as an optimisation, not a reproduction of the bug. The test
+     * above is the reproduction — it fails at `expected:<1> but was:<3>`.
+     */
+    @Test
+    fun `an over-pressed undo burst is put right by redos in the same burst`() = runTest {
+        val fixture = fixture()
+        val editor = editorOver(fixture)
+        val surface = FakeSurface()
+        editor.onSurfaceAttached(surface)
+        runCurrent()
+        repeat(2) { n -> surface.queueGesture(listOf(localStroke(n))) }
+        editor.save()
+        runCurrent()
+        surface.applied.clear()
+
+        val parked = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        fixture.parkAtBundleWrite(parked, release)
+        val busy = async { editor.materializeNow() }
+        parked.await()
+
+        // Five taps at a screen that looked dead, then two to put it back.
+        repeat(5) { editor.undo() }
+        repeat(2) { editor.redo() }
+        runCurrent()
+        release.complete(Unit)
+        busy.await()
+        runCurrent()
+
+        assertEquals(
+            setOf(ObjectId(localStrokeId(0)), ObjectId(localStrokeId(1))),
+            assertNotNull(editor.foldedPage(fixture.page)).objects.mapTo(HashSet()) { it.id },
+            "the presses were netted rather than replayed in order",
+        )
+        editor.close()
+    }
+
+    /**
+     * ⛔ **Undo must not wait for a recognition pass, and for three milestones it did.**
+     *
+     * SPEC §8.3 fires recognition three seconds after the pen stops — which is exactly the moment
+     * a user stops drawing and reaches for undo — and `NoteEditor.recogniseNow` wrapped the whole
+     * pass in `serial.withLock`. ML Kit is one recogniser call per line of handwriting, so a dense
+     * page is **seconds**, and every undo press in that window queued behind the lock. In the
+     * user's words: *"at some point the undo does not seem to work anymore and then I press undo a
+     * couple of times to see if it just did not register, when everything suddenly gets undone in
+     * an instant."*
+     *
+     * ⭐ **The storage layer was already written for a concurrent pass.**
+     * `NoteSession.recognised`'s own KDoc says *"the ink can and does change while it runs"* and it
+     * returns false when the digest moved. Under the old locking that could not happen, so the
+     * guard was unreachable — the lock was strictly more than the design asked for, and the cost
+     * was the editor.
+     *
+     * ⚠️ The recogniser is parked **inside** the ML Kit call, which is the only place the split
+     * can be observed: park it anywhere else and both the old code and the new one look identical.
+     */
+    @Test
+    fun `an undo pressed during a recognition pass does not wait for it`() = runTest {
+        val fixture = fixture()
+        val parked = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val editor = editorOver(fixture, recogniser = parkingRecogniser(parked, release))
+        val surface = FakeSurface()
+        editor.onSurfaceAttached(surface)
+        runCurrent()
+        surface.queueGesture(listOf(localStroke(0)))
+        editor.save()
+        runCurrent()
+        surface.applied.clear()
+
+        // Three seconds after the pen stopped. In the app this is `recognitionLoop`'s own timer.
+        val reading = async { editor.recogniseNow() }
+        parked.await()
+
+        editor.undo()
+        runCurrent()
+
+        // ⚠️ Asserted on the **surface**, not on `foldedPage`. Reading the fold takes `serial`
+        // too, so against the pre-fix code the assertion itself would block and the test would
+        // hang out on `runTest`'s timeout — which reproduces the bug but reports it as
+        // *"the test body did not run to completion"*. A test whose assertion needs the very lock
+        // it is about can only ever hang; `surface.applied` is a plain field the reconcile writes.
+        assertEquals(1, surface.applied.size, "the undo was still waiting for ML Kit to finish")
+        assertEquals(1, surface.applied.single().ops.size, "the undo reached the screen carrying nothing")
+
+        release.complete(Unit)
+        reading.await()
+        assertEquals(
+            emptySet(),
+            assertNotNull(editor.foldedPage(fixture.page)).objects.mapTo(HashSet()) { it.id },
+            "the stroke came back after the pass finished",
+        )
+        editor.close()
+    }
+
+    /**
+     * A recogniser that parks in the middle of the ML Kit call, once.
+     *
+     * Only the first call parks ([CompletableDeferred.complete] answers false afterwards), so a
+     * second page cannot deadlock the test; and it answers [RecognitionOutcome.NothingToRead] so
+     * nothing is written back and the assertions above are about the lock and nothing else.
+     */
+    private fun parkingRecogniser(parked: CompletableDeferred<Unit>, release: CompletableDeferred<Unit>) =
+        NoteRecogniser(
+            sampler = StrokeSampler { page ->
+                page.objects.map { SampledStroke(it.id, listOf(InkSample(0f, 0f, 0L)), SAMPLE_BOX) }
+            },
+            recogniser = HandwritingRecogniser {
+                if (parked.complete(Unit)) release.await()
+                RecognitionOutcome.NothingToRead
+            },
+            index = NoOpSearchIndex(),
+        )
+
+    /**
      * A materializer that records what was in `note.inkstone` **at the moment it ran** — which is
      * exactly what `InkstonePdfMaterializer` embeds and hashes.
      */
@@ -289,6 +489,9 @@ class NoteEditorConcurrencyTest {
         /** Above anything the local note has issued, so the peer's op is genuinely novel. */
         const val PEER_COUNTER = 9L
 
+        /** Any box at all — the parking recogniser never reads it. */
+        val SAMPLE_BOX = PageRect(0f, 0f, 1f, 1f)
+
         fun peerStroke() = PageOp.AddObject(
             opId = "peer-op-1",
             clock = LamportClock(PEER_COUNTER, "device-b"),
@@ -300,6 +503,15 @@ class NoteEditorConcurrencyTest {
             opId = "local-op-1",
             clock = LamportClock(PEER_COUNTER + 3, "device-a"),
             obj = StrokeObject(ObjectId(LOCAL_STROKE), StrokeGeometry(byteArrayOf(1, 2, 3))),
+        )
+
+        fun localStrokeId(n: Int) = "$LOCAL_STROKE-$n"
+
+        /** One distinct stroke per gesture, so an undo of one is visible as the loss of that id. */
+        fun localStroke(n: Int) = PageOp.AddObject(
+            opId = "local-op-$n",
+            clock = LamportClock(PEER_COUNTER + 3 + n, "device-a"),
+            obj = StrokeObject(ObjectId(localStrokeId(n)), StrokeGeometry(byteArrayOf(1, 2, 3))),
         )
     }
 }

@@ -17,10 +17,7 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -30,10 +27,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
+import dev.inkstone.app.ui.ChipKind
+import dev.inkstone.app.ui.Ink
+import dev.inkstone.app.ui.InkDims
+import dev.inkstone.app.ui.MicroLabel
+import dev.inkstone.app.ui.Readout
+import dev.inkstone.app.ui.TextChip
 import dev.inkstone.core.model.PageId
 
 /**
@@ -57,6 +60,12 @@ import dev.inkstone.core.model.PageId
  * not, so a page drawn on two seconds ago would otherwise show its previous contents.
  * Loading is one `LaunchedEffect` per cell, keyed on the page id and the note's revision, so
  * an edit invalidates exactly the pages it should and a scrolled-away cell cancels its load.
+ *
+ * ## ⭐ ROADMAP M10 — still a `ModalBottomSheet`
+ *
+ * The redesign replaces *chrome*, and a sheet full of page thumbnails is content: it inherits the
+ * palette from `InkstoneTheme` and needs nothing bespoke. What changed is inside the cells, and one
+ * of those changes is not cosmetic — see [PageCell] on the border.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -70,16 +79,12 @@ fun PageOverviewSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = sheetState) {
-        Text(
-            text = "Pages",
-            style = MaterialTheme.typography.titleMedium,
-            modifier = Modifier.padding(horizontal = 16.dp),
-        )
+        MicroLabel(text = "Pages", modifier = Modifier.padding(horizontal = SheetPadding))
         LazyVerticalGrid(
-            columns = GridCells.Adaptive(minSize = CELL_MIN_WIDTH.dp),
-            contentPadding = PaddingValues(16.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            columns = GridCells.Adaptive(minSize = CellMinWidth),
+            contentPadding = PaddingValues(SheetPadding),
+            horizontalArrangement = Arrangement.spacedBy(CellGap),
+            verticalArrangement = Arrangement.spacedBy(CellGap),
             modifier = Modifier.fillMaxWidth(),
         ) {
             itemsIndexed(note.pageIds, key = { _, id -> id.value }) { index, pageId ->
@@ -109,6 +114,18 @@ private data class PageCellState(
     val localRev: Long,
 )
 
+/**
+ * One page.
+ *
+ * ⚠️ **The current page's ring is [Ink.Focus] and not `colorScheme.primary`** — which happen to be
+ * the same colour today, because `InkstoneTheme` maps one onto the other, and that is exactly why it
+ * is written out. The mapping exists so *Material's* chrome inherits the palette; a bespoke ring
+ * drawn on the app's one white surface is a design decision of its own, and reading it through
+ * Material's role would silently re-point it at whatever a future scheme puts in `primary`.
+ *
+ * The paper stays [Ink.Paper]. A note is a PDF and the page is the document, not the chrome
+ * (`InkstoneTheme`), so a thumbnail is the one thing on this screen that must not go dark.
+ */
 @Composable
 private fun PageCell(
     page: PageCellState,
@@ -122,43 +139,64 @@ private fun PageCell(
     LaunchedEffect(pageId.value, page.localRev) { image = thumbnail(pageId) }
 
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .aspectRatio(PAGE_ASPECT)
-                .background(Color.White)
-                .then(
-                    if (page.isCurrent) {
-                        Modifier.border(2.dp, MaterialTheme.colorScheme.primary)
-                    } else {
-                        Modifier
-                    },
-                )
-                .clickable { onGoToPage(index) },
-            contentAlignment = Alignment.Center,
-        ) {
-            val bitmap = image
-            if (bitmap != null) {
-                Image(
-                    bitmap = bitmap,
-                    contentDescription = null,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize(),
-                )
-            } else {
-                Text("…")
-            }
-        }
+        PageThumbnail(image = image, isCurrent = page.isCurrent, onClick = { onGoToPage(index) })
         Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { onMovePage(index, index - 1) }, enabled = index > 0) { Text("‹") }
-            Text("${index + 1}", style = MaterialTheme.typography.labelMedium)
-            TextButton(
-                onClick = { onMovePage(index, index + 1) },
+            TextChip(
+                label = "‹",
+                kind = ChipKind.GLYPH,
+                enabled = index > 0,
+                onClick = { onMovePage(index, index - 1) },
+            )
+            Readout("${index + 1}", color = if (page.isCurrent) Ink.Focus else Ink.TextNormal)
+            TextChip(
+                label = "›",
+                kind = ChipKind.GLYPH,
                 enabled = index < page.lastIndex,
-            ) { Text("›") }
+                onClick = { onMovePage(index, index + 1) },
+            )
         }
     }
 }
 
-private const val CELL_MIN_WIDTH = 120
+/** The paper itself, once its bitmap has arrived. See [PageCell] for why the ring is not `primary`. */
+@Composable
+private fun PageThumbnail(image: ImageBitmap?, isCurrent: Boolean, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .aspectRatio(PAGE_ASPECT)
+            .clip(InkDims.SegmentInnerCorner)
+            .background(Ink.Paper)
+            .then(
+                if (isCurrent) {
+                    Modifier.border(CurrentRing, Ink.Focus, InkDims.SegmentInnerCorner)
+                } else {
+                    Modifier
+                },
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (image != null) {
+            Image(
+                bitmap = image,
+                contentDescription = null,
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            // Muted rather than the readout's usual grey: this one sits on white paper, where the
+            // palette's normal text colour is very nearly invisible.
+            Readout("…", color = Ink.TextMuted)
+        }
+    }
+}
+
+private val CellMinWidth = 120.dp
+private val CellGap = 12.dp
+private val SheetPadding = 16.dp
+
+/** Thick enough to survive being drawn inside a 120 dp cell's rounded corner. */
+private val CurrentRing = 2.dp
+
 private const val PAGE_ASPECT = 612f / 792f

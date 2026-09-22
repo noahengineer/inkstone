@@ -6,6 +6,7 @@ import dev.inkstone.core.model.Document
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
@@ -154,7 +155,7 @@ private suspend fun NoteSession.copyPage(remote: BundleReader, source: PageId, t
     val folded = foldPage(
         source,
         contents?.ops.orEmpty(),
-        defaultSize = contents?.size ?: PageSize.Letter,
+        defaultCanvas = contents?.canvas ?: PageCanvas.fixed(PageSize.Letter),
         defaultBackground = contents?.background ?: Background.Blank,
     )
 

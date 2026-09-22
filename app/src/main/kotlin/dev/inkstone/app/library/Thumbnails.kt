@@ -4,6 +4,7 @@ import android.graphics.BitmapFactory
 import android.util.LruCache
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
+import dev.inkstone.core.database.library.LibraryIndex
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.NoteSummary
@@ -14,6 +15,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -30,10 +32,23 @@ import javax.inject.Singleton
  *
  * ## Freshness
  *
- * A cached image is fresh when [NoteSummary.hasFreshThumbnail] — the note's `localRev`
- * equals the `thumbnailRev` the index recorded. That check is why tier 2 is safe to trust:
- * every save clears `thumbnailRev` in the same statement that bumps `localRev`, so a stale
- * image is a miss rather than a wrong picture.
+ * A cover is fresh when [NoteSummary.hasFreshThumbnail] — the note's `localRev` equals the
+ * `thumbnailRev` the index recorded. That check is why tier 2 is safe to trust: every save
+ * clears `thumbnailRev` in the same statement that bumps `localRev`, so a stale image is a
+ * miss rather than a wrong picture.
+ *
+ * A **page** thumbnail is fresh when [pageRevisions] says it was rendered at the revision the
+ * caller asked for. Same rule, different register, and it exists for the same reason: without
+ * it, the only way to stop a page thumbnail going stale was to delete the note's whole page
+ * directory on every autosave tick — which it was, every two seconds, for the life of every
+ * writing session.
+ *
+ * ⚠️ **The invariant that makes both tiers safe is that a recorded revision is never *newer*
+ * than the pixels.** Recording an older one costs a re-render; recording a newer one shows the
+ * user a page they have since written on, and nothing about the app reveals it. Every writer
+ * of `localRev` records it in the index *after* the bytes are on disk (`NoteStore.appendOps`,
+ * then `LibraryRepository.noteSaved`), so a revision read *before* a fold is always a lower
+ * bound on what that fold saw. [storeCover] is where this is spent.
  *
  * ## Why generation is bounded
  *
@@ -44,7 +59,18 @@ import javax.inject.Singleton
  * placeholders resolve rather than a stalled app.
  */
 @Singleton
-class Thumbnails @Inject constructor(private val cache: ThumbnailCache, private val renderer: PageThumbnailRenderer) {
+class Thumbnails @Inject constructor(
+    private val cache: ThumbnailCache,
+    private val renderer: PageThumbnailRenderer,
+    /**
+     * Where SPEC §5.7's `thumbnailRev` is written.
+     *
+     * ⚠️ **Here rather than in [LibraryRepository] on purpose.** `thumbnailRev` and the WebP on
+     * disk are one fact — "this picture is of that revision" — and while they were two writes in
+     * two classes only one of the two cover-writing paths made both of them. See [storeCover].
+     */
+    private val index: LibraryIndex,
+) {
 
     /**
      * Decoded images, bounded by **byte count**, not entry count.
@@ -58,6 +84,27 @@ class Thumbnails @Inject constructor(private val cache: ThumbnailCache, private 
     }
 
     private val renderPermits = Semaphore(MAX_CONCURRENT_RENDERS)
+
+    /**
+     * The revision each cached **page** thumbnail was rendered at — the page tier's `thumbnailRev`.
+     *
+     * Keyed the same way the memory tier is, and it governs *both* the decoded image and the file
+     * on disk: a page image is served only when this map agrees with the revision the caller
+     * named. That is what replaced deleting the note's page directory on every autosave tick.
+     *
+     * ⚠️ **In memory, and therefore empty after a restart — deliberately.** A page WebP carries no
+     * revision anywhere, so a file found on disk by a *fresh process* cannot be shown to belong to
+     * the note's current contents. It usually does; but a process killed between
+     * `LibraryIndex.recordSave` and the render that follows it leaves one that does not, and the
+     * old code read that file blindly. The cost of distrusting it is one render per page per
+     * process, only for a sheet the user actually opens; the cost of trusting it is a wrong
+     * picture nobody can spot. The **cover** keeps a durable guard — `thumbnailRev` is a column —
+     * which is why the cover's disk tier survives a restart and this one does not.
+     *
+     * One `Long` per page ever thumbnailed, pruned per note by [invalidate]. It holds revisions,
+     * never pictures; the pictures are bounded by [memory] and by the cache directory.
+     */
+    private val pageRevisions = ConcurrentHashMap<String, Long>()
 
     /**
      * The library thumbnail for [note], rendering it if there is not a fresh one.
@@ -79,7 +126,10 @@ class Thumbnails @Inject constructor(private val cache: ThumbnailCache, private 
             memory.get(key)?.let { return@withPermit it }
             val page = fold(note.id) ?: return@withPermit null
             val bytes = renderer.render(note.id, page, ThumbnailCache.COVER_WIDTH_PX) ?: return@withPermit null
-            cache.writeCover(note.id, bytes)
+            // [note] is an immutable snapshot taken before the permit and before the fold, so
+            // `note.localRev` cannot be "the note's revision now" however this is edited later.
+            // [storeCover] explains why that distinction is the whole of the correctness argument.
+            storeCover(note.id, note.localRev, bytes)
             decode(bytes)?.also { memory.put(key, it) }
         }
     }
@@ -89,20 +139,38 @@ class Thumbnails @Inject constructor(private val cache: ThumbnailCache, private 
      *
      * Generated on demand rather than with the note's cover: a 200-page notebook would be
      * 200 renders on every save, for a screen the user may never open.
+     *
+     * @param revision the note's `localRev` that [fold] will produce this page from, or **null**
+     *   when the caller cannot say. Null reads nothing from either cache and records nothing:
+     *   a cached page with no revision beside it is exactly the stale picture [pageRevisions]
+     *   exists to prevent, and a render whose revision is unknown must not make one look fresh.
      */
-    suspend fun page(id: DocumentId, pageId: PageId, fold: suspend () -> FoldedPage?): ImageBitmap? {
-        val key = "${id.value}/${pageId.value}"
-        memory.get(key)?.let { return it }
-        cache.readPage(id, pageId)?.let { bytes -> return decode(bytes)?.also { memory.put(key, it) } }
+    suspend fun page(id: DocumentId, pageId: PageId, revision: Long?, fold: suspend () -> FoldedPage?): ImageBitmap? {
+        val key = pageKey(id, pageId)
+        if (isPageFresh(key, revision)) {
+            memory.get(key)?.let { return it }
+            cache.readPage(id, pageId)?.let { bytes -> return decode(bytes)?.also { memory.put(key, it) } }
+        }
 
         return renderPermits.withPermit {
-            memory.get(key)?.let { return@withPermit it }
+            if (isPageFresh(key, revision)) memory.get(key)?.let { return@withPermit it }
             val page = fold() ?: return@withPermit null
             val bytes = renderer.render(id, page, ThumbnailCache.PAGE_WIDTH_PX) ?: return@withPermit null
             cache.writePage(id, pageId, bytes)
+            // Recorded next to the write, and *removed* when the revision is unknown — otherwise a
+            // later known-revision read would trust a file this call wrote blind.
+            if (revision != null) {
+                pageRevisions[key] = revision
+            } else {
+                pageRevisions.remove(key)
+            }
             decode(bytes)?.also { memory.put(key, it) }
         }
     }
+
+    private fun isPageFresh(key: String, revision: Long?): Boolean = revision != null && pageRevisions[key] == revision
+
+    private fun pageKey(id: DocumentId, pageId: PageId): String = "${id.value}/${pageId.value}"
 
     /**
      * A folder's imported cover image.
@@ -128,25 +196,88 @@ class Thumbnails @Inject constructor(private val cache: ThumbnailCache, private 
         memory.remove("folder-image:$assetPath")
     }
 
-    /** Render and store a cover from a page already folded — the save path (SPEC §5.1). */
-    suspend fun refreshCover(id: DocumentId, page: FoldedPage): Boolean {
-        val bytes = renderer.render(id, page, ThumbnailCache.COVER_WIDTH_PX) ?: return false
-        cache.writeCover(id, bytes)
+    /**
+     * Render and store a cover from a page already folded — the materialize path (SPEC §5.1).
+     *
+     * @param localRev the revision [page] was folded from. The caller has it because the fold and
+     *   the revision came out of the same `NoteSession` close; see [storeCover] for why it must be
+     *   that one and not whatever the index says by the time the render finishes.
+     */
+    suspend fun refreshCover(id: DocumentId, localRev: Long, page: FoldedPage) {
+        val bytes = renderer.render(id, page, ThumbnailCache.COVER_WIDTH_PX) ?: return
+        storeCover(id, localRev, bytes)
         decode(bytes)?.let { memory.put(id.value, it) }
-        return true
+    }
+
+    /**
+     * ⭐ Write a cover **and record the revision it was rendered from**, as one step.
+     *
+     * ⚠️ **These were two writes in two classes, and [cover] only ever made the first.** Tier 2 is
+     * gated on `NoteSummary.hasFreshThumbnail`, which is `thumbnailRev == localRev`, and the only
+     * caller of `LibraryIndex.recordThumbnail` was the materialize path — so a WebP written by an
+     * on-demand render could never be read back by the on-demand render that wrote it. The disk
+     * tier it populated was dead, and every visit to the library re-rendered every cover from
+     * scratch: measured at 21 s for one 1000-stroke page on an emulator, two notes at a time.
+     * Both cover-writing paths go through here now, and it is the only mention of
+     * `cache.writeCover` in the app — so "wrote a cover and forgot to date it" has no call site
+     * left to happen at.
+     *
+     * @param renderedAtRev the revision the **pixels** belong to, read *before* the fold.
+     *
+     *   ⚠️ Never re-read it afterwards. A render waits for a permit — up to the length of every
+     *   render queued ahead of it — and then folds a page, and a save can land in either window.
+     *   `recordSave` clears `thumbnailRev` in the same statement that bumps `localRev` (SPEC §5.7),
+     *   so writing the *newer* number here would resurrect, as fresh, a picture that save had just
+     *   invalidated — and it would be a picture of the page before the stroke that caused the save.
+     *   Writing an older number can only ever produce a miss, which costs a render.
+     *
+     *   The reason an older number is *always* what happens rather than a wrong one is that the
+     *   index's `localRev` is never ahead of what a fold from disk sees: every writer of it records
+     *   it after the bytes are written. So this is a lower bound on the pixels, by construction.
+     */
+    private suspend fun storeCover(id: DocumentId, renderedAtRev: Long, bytes: ByteArray) {
+        cache.writeCover(id, bytes)
+        index.recordThumbnail(id, renderedAtRev)
+    }
+
+    /**
+     * ⭐ The whole invalidation an **autosave** owes SPEC §5.7 — and it touches no file.
+     *
+     * ⚠️ **This used to be [invalidate], on every two-second autosave tick.** That deleted the
+     * note's cover *and recursively deleted its entire page-thumbnail directory*, so while the user
+     * was writing, the page thumbnails of the note they were writing in were destroyed every two
+     * seconds and the in-note page overview could never hit a cache at all.
+     *
+     * It bought nothing. A save clears `thumbnailRev` in the same statement that bumps `localRev`,
+     * so the cover file on disk is already unreadable — `hasFreshThumbnail` is false and tier 2 is
+     * skipped — and it is overwritten in place by the next render rather than accumulating. Page
+     * thumbnails are covered by [pageRevisions] for the same reason. What is left is the one thing
+     * with no revision beside it: the **decoded cover in memory**, which [cover] reads before it
+     * checks freshness at all. Dropping that one entry is a map removal.
+     *
+     * Decoded *page* images are deliberately left where they are: they cannot be served, because
+     * the revision that would unlock them no longer matches, and they cost nothing but LRU space
+     * they will lose on their own.
+     */
+    fun forgetDecodedCover(id: DocumentId) {
+        memory.remove(id.value)
     }
 
     /**
      * Drop everything cached for a note, in memory and on disk.
      *
-     * The memory tier is swept by prefix because page thumbnails are keyed under the note.
-     * Rebuilding the whole snapshot to find them is affordable — this runs on save, not on
-     * the ink path, and the map holds tens of entries.
+     * For the events that genuinely destroy the pictures rather than merely date them — a
+     * materialize, a merge, a trash, a purge. **Not** an autosave: that is [forgetDecodedCover],
+     * and the difference is a recursive directory delete every two seconds.
+     *
+     * [pageRevisions] doubles as the registry of which page images this process cached, which is
+     * why the memory tier can be swept precisely instead of by rebuilding a whole `snapshot()`.
      */
     suspend fun invalidate(id: DocumentId) {
-        val prefix = id.value
-        for (key in memory.snapshot().keys) {
-            if (key == prefix || key.startsWith("$prefix/")) memory.remove(key)
+        forgetDecodedCover(id)
+        for (key in pageRevisions.keys.filter { it.startsWith("${id.value}/") }) {
+            pageRevisions.remove(key)
+            memory.remove(key)
         }
         cache.invalidate(id)
     }

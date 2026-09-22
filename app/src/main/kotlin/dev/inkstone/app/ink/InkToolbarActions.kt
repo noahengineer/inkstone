@@ -29,4 +29,9 @@ data class InkToolbarActions(
     val onFillSelection: (Int?, Float) -> Unit,
     val onRoundSelection: (Float) -> Unit,
     val onRouteSelection: (ConnectorRoute) -> Unit,
+    // ⭐ The two geometry buttons a selected shape offers. Each is one gesture and therefore one
+    // undo entry, and each writes nothing at all for a shape it would not change. The bar's third
+    // chip, `Grid`, is the *mode* toggle and needs no action of its own — see `ShapeGeometryChips`.
+    val onRegulariseSelection: () -> Unit,
+    val onArrowSelection: (Boolean) -> Unit,
 )

@@ -46,8 +46,28 @@ import dev.inkstone.core.model.ShapePath
  *   — the payload is first-write-wins (SPEC §4.2) and carries the values it was folded with. It is
  *   kept for what it alone says: an asset name, an extent, the words a box was created with.
  */
-internal sealed class DryBox(val obj: InkObject, val widthPt: Float, val heightPt: Float, content: String?) :
+internal sealed class DryBox(val obj: InkObject, widthPt: Float, heightPt: Float, content: String?) :
     DryObject(obj.transform, obj.style, obj.z) {
+
+    /**
+     * The frame this object occupies in its **own** space.
+     *
+     * ⚠️ **Not `obj.widthPt`, and the difference is a whole register.** The payload is
+     * first-write-wins (SPEC §4.2), so it says how big the box was *placed*; `SetFormat` may carry
+     * a frame the user has since dragged ([ObjectFormat.boxWidthPt]). Every consumer here — the
+     * silhouette a lasso is tested against, the rectangle a tap is tested against, the wrap width
+     * [DryTextBox] lays out to — has to be the live one, or the object is selectable somewhere it
+     * is not drawn.
+     *
+     * Only [DryTextBox] ever moves it. Resizing a picture is a scale, because scaling a photo is
+     * what that means; resizing a paragraph is a different wrap width, which is why the two kinds
+     * answer differently.
+     */
+    var widthPt: Float = widthPt
+        private set
+
+    var heightPt: Float = heightPt
+        private set
 
     final override val id: ObjectId get() = obj.id
 
@@ -90,11 +110,27 @@ internal sealed class DryBox(val obj: InkObject, val widthPt: Float, val heightP
      * the tap, the lasso and the eraser is what stops an image you can erase from being an image
      * you cannot select.
      */
-    private val outline: ShapePath = ShapeGeometry.outline(ShapeKind.RECTANGLE, widthPt, heightPt)
+    private var outline: ShapePath = ShapeGeometry.outline(ShapeKind.RECTANGLE, widthPt, heightPt)
 
     init {
         setBounds(PageBounds(0f, 0f, widthPt, heightPt))
         setErased(obj.erased.toRegion())
+    }
+
+    /**
+     * A new frame, from a register write.
+     *
+     * ⚠️ [outline] is rebuilt here and nowhere else. It is what the tap test and the eraser measure
+     * against, and leaving it at the placed size would give a resized box a hit area that does not
+     * match the one it is drawn at — the *"selectable with a lasso but not with a tap"* failure this
+     * class's KDoc exists to make impossible, arrived at through a stale cache instead of a second
+     * corner list. The caller sets [bounds]: a text box's painted extent is not its frame.
+     */
+    protected fun setFrame(widthPt: Float, heightPt: Float) {
+        if (this.widthPt == widthPt && this.heightPt == heightPt) return
+        this.widthPt = widthPt
+        this.heightPt = heightPt
+        outline = ShapeGeometry.outline(ShapeKind.RECTANGLE, widthPt, heightPt)
     }
 
     /** The render side of `SetTextContent`. Absolute, whole-string LWW (SPEC §4.2). */

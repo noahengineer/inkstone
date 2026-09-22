@@ -3,6 +3,7 @@ package dev.inkstone.core.model
 import kotlin.math.abs
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -31,6 +32,26 @@ class ConnectorTest {
             route = ConnectorRoute.ELBOW,
         )
         assertEquals(record, ShapeRecord.decode(record.encode()))
+    }
+
+    @Test
+    fun `the arrowhead override round-trips in both directions and stays out of a default record`() {
+        for (shown in listOf(true, false)) {
+            val record = ShapeRecord(arrow = shown)
+            assertEquals(record, ShapeRecord.decode(record.encode()))
+            assertFalse(record.isDefault, "an override is a record; omitting it would lose the user's choice")
+        }
+        // Null is "whatever the kind says", and must put nothing in the file — `ShapeEdit.create`
+        // omits a default record entirely, so a key here would be a string in every drawn line.
+        assertTrue(ShapeRecord.None.isDefault)
+        assertFalse(ShapeRecord.None.encode().contains("ah="))
+    }
+
+    @Test
+    fun `an unreadable arrowhead override leaves the head to the kind`() {
+        val decoded = ShapeRecord.decode("is1;ah=maybe")
+        assertNotNull(decoded)
+        assertNull(decoded.arrow, "fail-closed, like every other key in this codec")
     }
 
     @Test

@@ -45,6 +45,20 @@ import kotlin.math.sin
  *
  * Deliberately simple geometry. These are 40 px tiles in a grid, not illustrations, and a
  * shape that reads instantly at that size has no room for detail anyway.
+ *
+ * ## ⭐ ROADMAP M10 — why these are still icons in a design made of text chips
+ *
+ * The redesign's rule is *"explicit text chips over ambiguous icons"*, and it is a rule about
+ * **controls**: a chip is a word because a word says what pressing it does. A folder icon is not a
+ * control. It is the picture a user *chose* for their own folder, alongside its colour — the one
+ * place in the app where an icon is content rather than chrome, and replacing "the flask on my
+ * Chemistry folder" with the word CHEMISTRY is deleting a feature, not restyling one.
+ *
+ * Nothing in this file changed for M10, and nothing needed to. There is no colour here: every shape
+ * takes the caller's [tint], which `FolderTile` computes with `readableInkOn` from whatever the
+ * folder's own colour is. So the darker default fill the palette brought simply flips the glyph to
+ * white by the arithmetic that was already there — which is exactly what a colour decision hoisted
+ * out of the drawing code is supposed to buy.
  */
 @Composable
 fun FolderGlyph(icon: FolderIcon, tint: Color, modifier: Modifier = Modifier) {

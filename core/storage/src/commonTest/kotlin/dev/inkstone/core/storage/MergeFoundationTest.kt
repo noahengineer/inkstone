@@ -8,6 +8,7 @@ import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.NoteSyncState
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageRef
@@ -562,8 +563,13 @@ class MergeFoundationTest {
     }
 
     /** A single-page `pages` map, for the tests that hand-build a bundle. */
-    private fun onePage(note: OpenNote): Map<PageId, PageContents> =
-        mapOf(note.document.pages.single().id to PageContents(PageSize.Letter, Background.Blank, emptyList()))
+    private fun onePage(note: OpenNote): Map<PageId, PageContents> = mapOf(
+        note.document.pages.single().id to PageContents(
+            PageCanvas.fixed(PageSize.Letter),
+            Background.Blank,
+            emptyList(),
+        ),
+    )
 
     private companion object {
 

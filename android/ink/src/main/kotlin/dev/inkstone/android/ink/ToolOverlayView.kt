@@ -5,7 +5,13 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.view.View
 import dev.inkstone.core.model.Camera
+import dev.inkstone.core.model.PageCanvas
+import dev.inkstone.core.model.PageSize
+import dev.inkstone.core.model.SnapGrid
+import kotlin.math.ceil
 import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -49,27 +55,115 @@ internal class ToolOverlayView(context: Context) : View(context) {
     /** The laser trail to draw. Its own animation is driven from [onDraw]. */
     var laser: LaserController? = null
 
+    /**
+     * ⭐ The snap lattice to draw, or null — see [InkSurfaceView.gridSnapEnabled].
+     *
+     * ⚠️ **Chrome, and it must stay chrome.** The obvious home for this is
+     * [TemplateBackground], which is where every other lattice in this app is drawn — and that
+     * class is shared with the thumbnail renderer and states the rule that it rules a page
+     * *"identically on screen, in a thumbnail and in the published PDF"*. A grid that exists
+     * because a **setting** is on belongs in none of those: it would print, it would sync, and it
+     * would be in a PDF opened on a device where the setting is off. Here it is a view, over the
+     * dry layer, seen by nobody but the person who switched it on.
+     *
+     * A lattice the paper already draws is set here too and simply not drawn — see [drawSnapGrid].
+     * Nulling it out at the caller instead would put *"is this mine to draw"* somewhere other than
+     * the thing that draws it.
+     */
+    var snapGrid: SnapGrid? = null
+        set(value) {
+            if (field == value) return
+            field = value
+            invalidate()
+        }
+
+    /** The paper, so the lattice stops at its edge. Ink does too (SPEC §4.5). */
+    var pageCanvas: PageCanvas = PageCanvas.fixed(PageSize.Letter)
+        set(value) {
+            if (field == value) return
+            field = value
+            if (snapGrid != null) invalidate()
+        }
+
     /** Called by the owner when either tool changed under it. */
     fun onToolsChanged() {
         invalidate()
     }
 
     override fun onDraw(canvas: Canvas) {
+        drawSnapGrid(canvas)
         drawRuler(canvas)
         drawLaser(canvas)
     }
 
     /**
-     * The edge: a translucent slab with a bright line down the side strokes snap to, and a mark at
-     * each end where a finger rotates it.
+     * The snap lattice, hairline-faint, over the part of the paper that is on screen.
      *
-     * ⚠️ **The bright line is the line the projection uses**, down the middle of the slab and not
-     * along one of its faces. A real ruler's ink lands against its *edge*, so the obvious drawing —
-     * a wide bar with the snap line at one border — is what a person expects; it is not what is
-     * drawn, because the projection is onto the centre line and chrome that disagreed with the
-     * geometry by half the slab's width would make every ruled stroke land visibly beside the guide.
-     * If the chrome is ever changed to a one-sided edge, [RulerController.project] has to move with
-     * it.
+     * ⚠️ **Bounded twice, and both bounds matter.** The loop runs over the intersection of the
+     * paper and the viewport rather than the whole page, so an infinite canvas cannot turn this
+     * into an unbounded loop; and a lattice whose cells have shrunk below [MIN_CELL_DP] on the
+     * glass is not drawn at all, because at that point it is a grey wash rather than a grid and the
+     * line count is whatever the zoom says. M10's dot-grid note is the precedent — a per-cell draw
+     * call behind the ink is exactly where rule 7 says nothing heavy may go, and the cheap fix is
+     * to stop before the count is large rather than to draw it faster.
+     *
+     * An axis with no spacing draws no lines, which is what makes ruled paper's chrome (none, since
+     * its rules are the paper's own) and a free x axis fall out with no special case.
+     */
+    private fun drawSnapGrid(canvas: Canvas) {
+        val grid = snapGrid ?: return
+        // The paper's own lattice is the paper's to draw; a second one over it is the page
+        // moiréing against itself.
+        if (grid.isEmpty || grid.drawnByThePaper) return
+        val scale = camera.scale
+        if (scale <= 0f) return
+        val paper = pageCanvas.rect
+        // The viewport in page space, intersected with the paper.
+        val left = max(paper.left, -camera.translate.x / scale)
+        val top = max(paper.top, -camera.translate.y / scale)
+        val right = min(paper.right, (width - camera.translate.x) / scale)
+        val bottom = min(paper.bottom, (height - camera.translate.y) / scale)
+        if (right <= left || bottom <= top) return
+
+        gridPaint.strokeWidth = GRID_WIDTH_DP * density
+        val minCellPt = MIN_CELL_DP * density / scale
+        if (grid.snapsX && grid.spacingXPt >= minCellPt) {
+            var x = firstLine(left, grid.originXPt, grid.spacingXPt)
+            while (x <= right) {
+                val viewX = toViewX(x)
+                canvas.drawLine(viewX, toViewY(top), viewX, toViewY(bottom), gridPaint)
+                x += grid.spacingXPt
+            }
+        }
+        if (grid.snapsY && grid.spacingYPt >= minCellPt) {
+            var y = firstLine(top, grid.originYPt, grid.spacingYPt)
+            while (y <= bottom) {
+                val viewY = toViewY(y)
+                canvas.drawLine(toViewX(left), viewY, toViewX(right), viewY, gridPaint)
+                y += grid.spacingYPt
+            }
+        }
+    }
+
+    /** The first lattice line at or after [from]. */
+    private fun firstLine(from: Float, origin: Float, spacing: Float): Float =
+        origin + ceil((from - origin) / spacing) * spacing
+
+    /**
+     * The edge: a bright line strokes snap to, with a translucent body hanging **off one side** of
+     * it and a mark at each end where a finger rotates it.
+     *
+     * ⚠️ **The bright line is the line the projection uses, and it is not covered by anything.**
+     * The body used to be centred on it, on the argument that chrome disagreeing with the geometry
+     * by half a slab would land every ruled stroke visibly beside the guide. That argument is
+     * sound and it had a third answer: *move the body, keep the line*. Centred, the ruler sat on
+     * top of the line it had just ruled and on whatever was being ruled against — the report was
+     * *"otherwise it covers it"* — and a real straight edge has nothing between the nib and the
+     * paper either.
+     *
+     * ⚠️ The offset is [RulerController.bodyNormalX]/[RulerController.bodyNormalY], not a sign worked out here.
+     * [RulerController.begin] gives a finger the width of the body on that same side, and a chrome
+     * side that disagreed with the grab side would be a ruler you can see and cannot pick up.
      */
     private fun drawRuler(canvas: Canvas) {
         val ruler = this.ruler ?: return
@@ -89,8 +183,15 @@ internal class ToolOverlayView(context: Context) : View(context) {
         val toX = centreX + reachX
         val toY = centreY + reachY
 
-        slabPaint.strokeWidth = SLAB_WIDTH_DP * density
-        canvas.drawLine(fromX, fromY, toX, toY, slabPaint)
+        // A stroked line is centred on its own path, so the body's centre line is half a slab off
+        // the guide — which puts its near face exactly on the guide and the rest of it beyond.
+        val slab = ruler.bodyWidthDp * density
+        val offsetX = ruler.bodyNormalX * slab / 2f
+        val offsetY = ruler.bodyNormalY * slab / 2f
+        slabPaint.strokeWidth = slab
+        canvas.drawLine(fromX + offsetX, fromY + offsetY, toX + offsetX, toY + offsetY, slabPaint)
+
+        edgePaint.strokeWidth = EDGE_WIDTH_DP * density
         canvas.drawLine(fromX, fromY, toX, toY, edgePaint)
         val grip = GRIP_RADIUS_DP * density
         canvas.drawCircle(fromX, fromY, grip, edgePaint)
@@ -158,11 +259,16 @@ internal class ToolOverlayView(context: Context) : View(context) {
         isAntiAlias = true
     }
 
-    /** The line strokes actually snap to, and the two end grips. */
+    /**
+     * The line strokes actually snap to, and the two end grips.
+     *
+     * ⚠️ Its width is set per draw, in dp. It was a raw `1.5f` — **pixels** — which on a 320 dpi
+     * tablet is half the hairline this class's own KDoc promises every size here would be, and it
+     * was the one measurement in the file that did not go through [density].
+     */
     private val edgePaint = Paint().apply {
         style = Paint.Style.STROKE
         color = EDGE_COLOR
-        strokeWidth = 1.5f
         isAntiAlias = true
     }
 
@@ -180,10 +286,19 @@ internal class ToolOverlayView(context: Context) : View(context) {
         isAntiAlias = true
     }
 
+    /** Fainter than [TemplateBackground]'s own rules: this is a setting, not the paper. */
+    private val gridPaint = Paint().apply {
+        style = Paint.Style.STROKE
+        color = GRID_COLOR
+        isAntiAlias = false
+    }
+
     private companion object {
-        const val SLAB_WIDTH_DP = 44f
+        // ⚠️ The body's width is `InkRuler.bodyWidthDp`, which is also what decides what a
+        // finger has grabbed. See its KDoc on why there is one of it and not one each.
         const val SLAB_COLOR = 0x1F1E293B
         const val EDGE_COLOR = 0xFF1E293B.toInt()
+        const val EDGE_WIDTH_DP = 1.5f
         const val GRIP_RADIUS_DP = 7f
 
         const val LASER_COLOR = 0xFFEF4444.toInt()
@@ -193,5 +308,11 @@ internal class ToolOverlayView(context: Context) : View(context) {
         /** The trail is dimmer than the dot, so the live point reads as the pointer. */
         const val TRAIL_ALPHA = 0.55f
         const val FULL_ALPHA = 255f
+
+        const val GRID_COLOR = 0x142E4A6B
+        const val GRID_WIDTH_DP = 0.5f
+
+        /** Below this on the glass a lattice is a wash, and its line count is the zoom's business. */
+        const val MIN_CELL_DP = 7f
     }
 }

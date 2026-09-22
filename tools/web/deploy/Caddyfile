@@ -1,0 +1,45 @@
+# The Inkstone reader behind Caddy. This is the recommended front end: Caddy gets a certificate
+# and renews it by itself, which removes the single most common way a self-hosted thing ends up
+# quietly serving plain HTTP.
+#
+# Put the reader and Caddy on the same Docker network (`docker network create proxy`), then:
+#
+#     notes.example.com {
+#         ...as below...
+#     }
+#
+# `reader:8765` is the compose service name — Docker's embedded DNS resolves it on the shared
+# network. The reader publishes no host port at all, so this proxy is the only way in.
+
+notes.example.com {
+	encode zstd gzip
+
+	# ⚠️ Caddy sets X-Forwarded-For and X-Forwarded-Proto itself. The reader only believes them
+	# when INKSTONE_TRUST_PROXY=1, which compose.yaml sets — because a forwarded header from an
+	# untrusted source lets a caller invent a new identity per request and walk straight through
+	# the login rate limiter.
+	reverse_proxy reader:8765 {
+		# A lecture note is megabytes and is fetched with byte ranges by the browser's PDF
+		# viewer. The defaults are fine; this is here so nobody adds a small buffer later and
+		# wonders why opening a note became slow.
+		flush_interval -1
+	}
+
+	header {
+		# Nothing here is meant to be framed, and the reader serves a private Nextcloud.
+		X-Frame-Options DENY
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+		# 63072000 = two years. Only add `preload` if you mean it for the whole domain.
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+	}
+}
+
+# ⚠️ If you also want Claude to reach the MCP endpoint from a machine that is NOT yours — a phone,
+# a laptop elsewhere — that is the same hostname and the same TLS. There is nothing extra to
+# configure here: /mcp is a route on the reader, authenticated by its own bearer token.
+#
+# What you must NOT do is put HTTP Basic auth on this site in Caddy and expect MCP to work. The
+# MCP client sends `Authorization: Bearer <token>`; a Basic challenge would collide with that
+# header and the client has no way to satisfy both. Authentication for this service belongs in the
+# app, which is why it is there.

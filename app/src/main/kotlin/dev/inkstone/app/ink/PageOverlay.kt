@@ -116,7 +116,12 @@ private suspend fun PointerInputScope.gestureFor(
 ) {
     if (drag) {
         boxGesture(camera) { box, done ->
-            onPreview(box?.let(Preview::Box))
+            // ⚠️ The **final** call carries `done` and a non-null box, so drawing the preview
+            // unconditionally re-armed the outline one call after `boxGesture` had just cleared it
+            // — and nothing clears it again, so the capture rectangle stayed on the paper for the
+            // rest of the session, over the diagram it had just been drawn round. A preview
+            // belongs to the gesture; the reported box belongs to the caller.
+            if (done) onPreview(null) else onPreview(box?.let(Preview::Box))
             if (done && box != null) gestures.onDragBox(box)
         }
     } else {
@@ -216,5 +221,12 @@ private const val TAP_SLOP_PX = 24f
 /** Page points. Below this a drag is a mis-hit, not a rectangle. */
 private const val MIN_DRAG_PT = 4f
 
-private const val LASSO_ARGB = 0xFF1D4ED8.toInt()
+/**
+ * ⭐ ROADMAP M10 — sky-500, the same hue `SelectionOverlayView.ACCENT` uses.
+ *
+ * One colour for *"this is the region you are describing"* wherever it is drawn, and it is sky-500
+ * rather than the chrome's sky-400 for the reason recorded there: this is painted on **white paper**,
+ * not on the near-black canvas.
+ */
+private const val LASSO_ARGB = 0xFF0EA5E9.toInt()
 private const val OUTLINE_PX = 2f

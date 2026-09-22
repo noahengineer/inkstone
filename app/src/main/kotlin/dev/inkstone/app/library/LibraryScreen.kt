@@ -4,6 +4,8 @@ import android.net.Uri
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,19 +14,16 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
-import androidx.compose.material3.AssistChip
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.ExtendedFloatingActionButton
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.Stable
@@ -34,9 +33,23 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.inkstone.app.ui.ChipDivider
+import dev.inkstone.app.ui.ChipKind
+import dev.inkstone.app.ui.GlassBar
+import dev.inkstone.app.ui.GlassPanel
+import dev.inkstone.app.ui.Ink
+import dev.inkstone.app.ui.InkDims
+import dev.inkstone.app.ui.InkType
+import dev.inkstone.app.ui.MicroLabel
+import dev.inkstone.app.ui.Readout
+import dev.inkstone.app.ui.SegmentChip
+import dev.inkstone.app.ui.Segmented
+import dev.inkstone.app.ui.TextChip
+import dev.inkstone.app.ui.rememberDotGridBrush
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.Folder
 import dev.inkstone.core.model.FolderId
@@ -61,8 +74,14 @@ import androidx.compose.foundation.lazy.grid.items as gridItems
  * cell scrolled off screen cancels its own load. Generation is bounded inside [Thumbnails];
  * nothing here needs to know that, which is the point.
  *
- * The visual design is deliberately plain. M10 owns polish; this is the plainest thing that
- * makes every M3 acceptance criterion reachable on the tablet.
+ * ## ⭐ ROADMAP M10 — the polish M3 deferred
+ *
+ * M3 left this screen deliberately plain, on the note that *"M10 owns polish"*. This is M10
+ * owning it: the chrome is the redesign's floating pills over the same near-black, dot-gridded
+ * canvas the editor draws on, so opening a note is a change of content rather than a change of
+ * app. Everything the frame-rate criterion rests on is untouched — the keys are still ids, the
+ * thumbnail loads are still per cell and still cancelled by scrolling — because a restyle that
+ * reached into those would be trading an acceptance criterion for a colour.
  */
 @Composable
 fun LibraryScreen(state: LibraryUiState, actions: LibraryActions, modifier: Modifier = Modifier) {
@@ -80,31 +99,14 @@ fun LibraryScreen(state: LibraryUiState, actions: LibraryActions, modifier: Modi
         if (state.selection.isNotEmpty()) actions.onClearSelection() else actions.onGoUp()
     }
 
-    Box(modifier = modifier.fillMaxSize()) {
+    Box(modifier = modifier.fillMaxSize().background(Ink.Canvas)) {
+        // ⭐ M10 — the design's *"Deep Charcoal with a subtle dot-grid pattern for scale and
+        // alignment"*, the same two lines `InkScreen` opens with. One tiled draw call; see
+        // `rememberDotGridBrush` for why a loop of `drawCircle` is not an option.
+        Box(modifier = Modifier.fillMaxSize().background(rememberDotGridBrush()))
+
         Column(modifier = Modifier.fillMaxSize()) {
-            LibraryToolbar(state = state, actions = actions, onNewFolder = { dialogs.creatingFolder = true })
-
-            if (state.selection.isNotEmpty()) {
-                SelectionBar(
-                    count = state.selection.size,
-                    actions = actions,
-                    onMove = { dialogs.movingNotes = true },
-                )
-            }
-
-            // SPEC §8.4 — what the user wrote, above what the notes are called. The title
-            // match is the one they could have found by browsing; this is the one they could
-            // not, and burying it under the tiles would make the feature look absent.
-            if (state.handwritingHits.isNotEmpty()) {
-                HandwritingHits(hits = state.handwritingHits, onOpen = actions.onOpenHit)
-            }
-
-            // ROADMAP M7: *"search degrades to titles, message is clear"*. Shown only while
-            // searching, so it is an answer to a question the user just asked rather than a
-            // banner nagging about a 20 MB download on a screen they opened to find a note.
-            if (state.searching && !state.model.downloaded) {
-                RecognitionModelOffer(state.model, actions.onDownloadModel)
-            }
+            LibraryChrome(state = state, actions = actions, dialogs = dialogs)
 
             when {
                 !state.loaded -> Unit
@@ -121,28 +123,45 @@ fun LibraryScreen(state: LibraryUiState, actions: LibraryActions, modifier: Modi
             }
         }
 
-        Row(
-            modifier = Modifier.align(Alignment.BottomEnd).padding(24.dp),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            // ROADMAP M4 — PDF import, beside "New note" rather than buried in the
-            // toolbar. Importing a lecture is half of what this app is for, and a note
-            // started from a PDF is not a different kind of note.
-            ExtendedFloatingActionButton(
-                onClick = { importPdf.launch(arrayOf(PDF_MIME)) },
-                text = { Text("Import PDF") },
-                icon = { Text("⇩") },
-            )
-            ExtendedFloatingActionButton(
-                onClick = actions.onNewNote,
-                text = { Text("New note") },
-                icon = { Text("✎") },
-            )
-        }
+        CreateBar(
+            onImport = { importPdf.launch(arrayOf(PDF_MIME)) },
+            onImportFromNextcloud = actions.onImportFromNextcloud,
+            onNewNote = actions.onNewNote,
+            modifier = Modifier.align(Alignment.BottomEnd).padding(InkDims.EdgePadding),
+        )
     }
 
     LibraryDialogHost(state = state, actions = actions, dialogs = dialogs)
+}
+
+/**
+ * ⭐ M10 — the two ways a note starts, as one floating pill.
+ *
+ * The design has no FABs: *"everything is a floating pill of chips"*, and a bottom-end pill of two
+ * words is the same target as two extended FABs without the second shape.
+ */
+@Composable
+private fun CreateBar(
+    onImport: () -> Unit,
+    onImportFromNextcloud: () -> Unit,
+    onNewNote: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    GlassBar(modifier = modifier, scrollable = false) {
+        // ROADMAP M4 — PDF import, beside "New note" rather than buried in the
+        // toolbar. Importing a lecture is half of what this app is for, and a note
+        // started from a PDF is not a different kind of note.
+        TextChip(label = "Import PDF", onClick = onImport)
+        // ⭐ Where the PDFs actually are. A file picker reaches the tablet's own storage and the
+        // Nextcloud app's provider if one is installed — but that copies the file, and a copy can
+        // never write the user's ink back onto the document they keep on their server. This chip
+        // is the one that can, so it sits beside the picker rather than behind a menu.
+        // ⚠️ Three chips and no more: `docs/M10-PORTRAIT.md` — a bar that overflows at 800 dp hides
+        // its own last control behind a drag nothing suggests.
+        TextChip(label = "From Nextcloud", onClick = onImportFromNextcloud)
+        ChipDivider()
+        TextChip(label = "New note", onClick = onNewNote)
+    }
 }
 
 /**
@@ -258,65 +277,158 @@ private fun folderActions(folder: Folder, actions: LibraryActions, dialogs: Libr
     onSetAutoRecord = { value -> actions.onSetAutoRecord(folder.id, value) },
 )
 
+/**
+ * ⭐ M10 — everything that floats above the tiles, as one zone.
+ *
+ * The design's chrome is *"non-intrusive floating zones"* rather than a docked app bar, so these
+ * are five separate pills and panels in a padded column with nothing behind them. Progressive
+ * disclosure is the `if`s: the selection bar, the handwriting hits and the model offer are absent
+ * — not disabled, not empty — whenever they have nothing to act on.
+ */
 @Composable
-private fun LibraryToolbar(state: LibraryUiState, actions: LibraryActions, onNewFolder: () -> Unit) {
-    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            OutlinedTextField(
-                value = state.query,
-                onValueChange = actions.onQueryChange,
-                singleLine = true,
-                label = { Text("Search titles, folders and handwriting") },
-                modifier = Modifier.weight(1f),
+private fun LibraryChrome(state: LibraryUiState, actions: LibraryActions, dialogs: LibraryDialogState) {
+    Column(
+        modifier = Modifier.padding(InkDims.EdgePadding),
+        verticalArrangement = Arrangement.spacedBy(InkDims.GroupGap),
+    ) {
+        LibraryToolbar(state = state, actions = actions, onNewFolder = { dialogs.creatingFolder = true })
+        BreadcrumbBar(state = state, actions = actions)
+
+        if (state.selection.isNotEmpty()) {
+            SelectionBar(
+                count = state.selection.size,
+                actions = actions,
+                onMove = { dialogs.movingNotes = true },
             )
-            SortMenu(state = state, onSort = actions.onSort)
-            TextButton(
-                onClick = {
-                    actions.onLayout(
-                        if (state.layout == LibraryLayout.GRID) LibraryLayout.LIST else LibraryLayout.GRID,
-                    )
-                },
-            ) { Text(if (state.layout == LibraryLayout.GRID) "List" else "Grid") }
-            TextButton(onClick = onNewFolder) { Text("New folder") }
-            TextButton(onClick = actions.onOpenTrash) { Text("Trash") }
-            TextButton(onClick = actions.onOpenNextcloud) { Text("Nextcloud") }
-            // ⭐ SPEC §7.7's list, and it appears only when there is something in it (M6). A
-            // permanently visible "Needs attention" is a permanent suggestion that something is
-            // wrong, in an app whose whole conflict story is that nothing is.
-            if (state.attentionCount > 0) {
-                TextButton(onClick = actions.onOpenAttention) { Text("⚑ ${state.attentionCount}") }
-            }
-            MeasureMenu(actions)
         }
 
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            Breadcrumb(breadcrumb = state.breadcrumb, onOpen = actions.onOpenFolder)
-            FilterChip(
-                selected = state.favouritesOnly,
-                onClick = { actions.onFavouritesOnly(!state.favouritesOnly) },
-                label = { Text("★ Favourites") },
-            )
+        // SPEC §8.4 — what the user wrote, above what the notes are called. The title
+        // match is the one they could have found by browsing; this is the one they could
+        // not, and burying it under the tiles would make the feature look absent.
+        if (state.handwritingHits.isNotEmpty()) {
+            HandwritingHits(hits = state.handwritingHits, onOpen = actions.onOpenHit)
+        }
+
+        // ROADMAP M7: *"search degrades to titles, message is clear"*. Shown only while
+        // searching, so it is an answer to a question the user just asked rather than a
+        // banner nagging about a 20 MB download on a screen they opened to find a note.
+        if (state.searching && !state.model.downloaded) {
+            RecognitionModelOffer(state.model, actions.onDownloadModel)
         }
     }
 }
 
 @Composable
-private fun Breadcrumb(breadcrumb: List<Folder>, onOpen: (FolderId?) -> Unit) {
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        TextButton(onClick = { onOpen(null) }) { Text("Library") }
-        for (folder in breadcrumb) {
-            Text(" / ", style = MaterialTheme.typography.labelLarge)
-            TextButton(onClick = { onOpen(folder.id) }) {
-                Text(folder.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            }
+private fun LibraryToolbar(state: LibraryUiState, actions: LibraryActions, onNewFolder: () -> Unit) {
+    GlassBar {
+        SearchField(query = state.query, onQueryChange = actions.onQueryChange)
+
+        ChipDivider()
+        // A `Segmented` and not one chip that names the *other* layout: the choice is between two
+        // things, and a lone button reading "Grid" is ambiguous about whether that is the state or
+        // the consequence. `Segmented` exists for exactly this (see `Glass.kt`).
+        Segmented {
+            SegmentChip(
+                label = "List",
+                selected = state.layout == LibraryLayout.LIST,
+                onClick = { actions.onLayout(LibraryLayout.LIST) },
+            )
+            SegmentChip(
+                label = "Grid",
+                selected = state.layout == LibraryLayout.GRID,
+                onClick = { actions.onLayout(LibraryLayout.GRID) },
+            )
         }
+        SortMenu(state = state, onSort = actions.onSort)
+
+        ChipDivider()
+        TextChip(label = "New folder", onClick = onNewFolder)
+        TextChip(label = "Trash", onClick = actions.onOpenTrash)
+        TextChip(label = "Nextcloud", onClick = actions.onOpenNextcloud)
+        MeasureMenu(actions)
+
+        // ⭐ SPEC §7.7's list, and it appears only when there is something in it (M6). A
+        // permanently visible "Needs attention" is a permanent suggestion that something is
+        // wrong, in an app whose whole conflict story is that nothing is.
+        if (state.attentionCount > 0) {
+            ChipDivider()
+            TextChip(label = "⚑ ${state.attentionCount}", kind = ChipKind.VALUE, onClick = actions.onOpenAttention)
+        }
+    }
+}
+
+/**
+ * The one text input on this screen, and the reason the toolbar pill holds an `OutlinedTextField`
+ * rather than a chip: a query is *typed*, and the design system has nothing that types.
+ *
+ * ⚠️ Fixed width, for the same reason `DockRows`' angle field is. A `weight(1f)` cannot live in a
+ * horizontally scrolling [GlassBar] — the row is measured with an unbounded width — and the bar
+ * scrolls so that the last two chips are not simply gone when the tablet is held in portrait.
+ *
+ * ⚠️ The hint is a **placeholder and not a label**. A Material label rides up over the border and
+ * shrinks as it goes, so at a fixed width the sentence would be clipped in one of its two sizes —
+ * and the half that would go is *"and handwriting"*, which is the half that says the ink is searched
+ * at all (SPEC §8.4). A placeholder is one size and is on screen exactly when the field is empty,
+ * which is when a hint is worth anything.
+ *
+ * ⚠️ **It is a plain `Text` and not a [MicroLabel], and it ellipsises.** The field's width is in
+ * `dp` and the hint's size is in `sp`, so the two diverge the moment the user raises their font
+ * scale — and clipping the tail is exactly the failure the paragraph above claims to have designed
+ * out. The words are also shorter than they were: *"and handwriting"* now has room to survive a
+ * larger font rather than being the first thing to go.
+ */
+@Composable
+private fun SearchField(query: String, onQueryChange: (String) -> Unit) {
+    OutlinedTextField(
+        value = query,
+        onValueChange = onQueryChange,
+        singleLine = true,
+        placeholder = {
+            Text(
+                text = "Search notes and handwriting",
+                color = Ink.TextMuted,
+                fontSize = InkType.MicroSize,
+                letterSpacing = InkType.MicroTracking,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        },
+        modifier = Modifier.width(SearchFieldWidth),
+    )
+}
+
+/**
+ * The path, as chips separated by a muted `/`.
+ *
+ * ⚠️ The folder chips are [ChipKind.VALUE], so a folder called "pH notes" is not shown as "PH NOTES". A
+ * chip is uppercased because its word is a *control*; a breadcrumb segment is the user's own text,
+ * and [TextChip]'s KDoc makes the same argument about a measurement. It also puts the path in the
+ * readout face, which is what a path is.
+ */
+@Composable
+private fun BreadcrumbBar(state: LibraryUiState, actions: LibraryActions) {
+    GlassBar {
+        TextChip(
+            label = "Library",
+            selected = state.breadcrumb.isEmpty(),
+            onClick = { actions.onOpenFolder(null) },
+        )
+        for (folder in state.breadcrumb) {
+            MicroLabel("/")
+            TextChip(
+                label = folder.name,
+                kind = ChipKind.VALUE,
+                selected = folder.id == state.folderId,
+                onClick = { actions.onOpenFolder(folder.id) },
+            )
+        }
+
+        ChipDivider()
+        TextChip(
+            label = "★ Favourites",
+            selected = state.favouritesOnly,
+            onClick = { actions.onFavouritesOnly(!state.favouritesOnly) },
+        )
     }
 }
 
@@ -325,11 +437,11 @@ private fun SortMenu(state: LibraryUiState, onSort: (LibrarySort) -> Unit) {
     var open by remember { mutableStateOf(false) }
     val arrow = if (state.descending) "↓" else "↑"
     Box {
-        AssistChip(onClick = { open = true }, label = { Text("${state.sort.label} $arrow") })
+        TextChip(label = "${state.sort.label} $arrow", selected = open, onClick = { open = true })
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             for (sort in LibrarySort.entries) {
                 DropdownMenuItem(
-                    text = { Text(sort.label + if (sort == state.sort) " $arrow" else "") },
+                    text = { MicroLabel(sort.label + if (sort == state.sort) " $arrow" else "") },
                     onClick = {
                         onSort(sort)
                         open = false
@@ -349,18 +461,19 @@ private val LibrarySort.label: String
 
 @Composable
 private fun SelectionBar(count: Int, actions: LibraryActions, onMove: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Text("$count selected", style = MaterialTheme.typography.titleSmall)
-        TextButton(onClick = actions.onSelectAll) { Text("Select all") }
-        TextButton(onClick = onMove) { Text("Move to…") }
+    GlassBar {
+        // Sky and monospaced: how many are selected is a live number, and the one thing in this
+        // pill that changes while the user taps.
+        Readout(count.toString(), color = Ink.Focus)
+        MicroLabel("selected")
+
+        ChipDivider()
+        TextChip(label = "Select all", onClick = actions.onSelectAll)
+        TextChip(label = "Move to…", onClick = onMove)
         // "Trash", never "Delete" — ROADMAP M3's hard rule, in the wording as well as in
         // the behaviour. Nothing in this screen destroys a note.
-        TextButton(onClick = actions.onTrashSelection) { Text("Trash") }
-        TextButton(onClick = actions.onClearSelection) { Text("Cancel") }
+        TextChip(label = "Trash", danger = true, onClick = actions.onTrashSelection)
+        TextChip(label = "Cancel", onClick = actions.onClearSelection)
     }
 }
 
@@ -372,21 +485,36 @@ private fun SelectionBar(count: Int, actions: LibraryActions, onMove: () -> Unit
  */
 @Composable
 private fun HandwritingHits(hits: List<SearchHit>, onOpen: (SearchHit) -> Unit) {
-    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-        Text(
-            text = "In your handwriting",
-            style = MaterialTheme.typography.titleSmall,
-            modifier = Modifier.padding(bottom = 4.dp),
-        )
+    GlassPanel(modifier = Modifier.fillMaxWidth()) {
+        MicroLabel("In your handwriting")
         for (hit in hits.take(MAX_HANDWRITING_HITS)) {
-            TextButton(onClick = { onOpen(hit) }, modifier = Modifier.fillMaxWidth()) {
-                Text(
-                    text = "“${hit.word}” — ${hit.noteTitle}",
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.weight(1f),
-                )
-            }
+            HandwritingHitRow(hit = hit, onOpen = { onOpen(hit) })
         }
+    }
+}
+
+/**
+ * One hit, shaped like a chip and laid out like a row.
+ *
+ * ⚠️ Deliberately not a [TextChip]. That centres its label, keeps it to one line and uppercases it,
+ * and a hit is two pieces of the *user's own* text — the word, then the note it is in — which have
+ * to stay left-aligned and in the capitalisation they were written in.
+ */
+@Composable
+private fun HandwritingHitRow(hit: SearchHit, onOpen: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(InkDims.ChipCorner)
+            .clickable(onClick = onOpen)
+            .padding(horizontal = InkDims.ChipPaddingH, vertical = InkDims.ChipPaddingV),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(InkDims.GroupGap),
+    ) {
+        // Sky for the word, because sky is the design's *"this is live"* colour and the word is
+        // the thing this row will scroll to.
+        Readout("“${hit.word}”", color = Ink.Focus)
+        Readout(hit.noteTitle, modifier = Modifier.weight(1f), color = Ink.TextMuted)
     }
 }
 
@@ -396,39 +524,58 @@ private const val MAX_HANDWRITING_HITS = 8
 /**
  * SPEC §8.1 — the language model, offered at the moment it would have helped.
  *
- * ⚠️ **The size and the metrics disclosure are both on the button, not behind it.** SPEC §8.1
- * requires disclosing that ML Kit reports anonymous performance metrics to Google, and the only
- * useful place for that is before the download rather than after.
+ * ⚠️ **The size and the metrics disclosure are in front of the user, not behind the button.** SPEC
+ * §8.1 requires disclosing that ML Kit reports anonymous performance metrics to Google, and the
+ * only useful place for that is before the download rather than after.
+ *
+ * ⭐ ROADMAP M10 — that sentence used to be the button's *label*, which was the same argument by a
+ * different route and is no longer available: a [TextChip] is one clipped line, so a 74-character
+ * label would have silently truncated exactly the disclosure SPEC §8.1 requires, and the failure
+ * mode is that it still looks fine. Nothing is dropped — the size and the metrics sentence sit on
+ * their own line *above* the chip, which is earlier in the reading order than a button label, and
+ * the chip keeps only the verb.
  */
 @Composable
 private fun RecognitionModelOffer(model: RecognitionModelState, onDownload: () -> Unit) {
-    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+    GlassPanel(modifier = Modifier.fillMaxWidth()) {
+        MicroLabel("Handwriting search")
         Text(
             text = "Searching titles and folders only — handwriting recognition needs a language model.",
             style = MaterialTheme.typography.bodyMedium,
+            color = Ink.TextNormal,
+        )
+        Text(
+            text = "English (~20 MB) · ML Kit sends anonymous usage metrics to Google",
+            style = MaterialTheme.typography.bodySmall,
+            color = Ink.TextMuted,
         )
         model.error?.let {
-            Text(text = "Download failed: $it", style = MaterialTheme.typography.bodySmall)
-        }
-        TextButton(onClick = onDownload, enabled = !model.downloading) {
             Text(
-                if (model.downloading) {
-                    "Downloading English (~20 MB)…"
-                } else {
-                    "Download English (~20 MB) · ML Kit sends anonymous usage metrics to Google"
-                },
+                text = "Download failed: $it",
+                style = MaterialTheme.typography.bodySmall,
+                color = Ink.Danger,
             )
         }
+        TextChip(
+            label = if (model.downloading) "Downloading…" else "Download English",
+            enabled = !model.downloading,
+            onClick = onDownload,
+        )
     }
 }
 
 @Composable
 private fun EmptyLibrary(searching: Boolean, query: String) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        Text(
-            text = if (searching) "Nothing matches “$query”" else "No notes here yet",
-            style = MaterialTheme.typography.bodyLarge,
-        )
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(InkDims.ChipGap),
+        ) {
+            MicroLabel(if (searching) "Nothing matches" else "Empty")
+            // The query is the user's text and the sentence is ours, but both are the *answer*
+            // rather than a control, so both are readouts rather than chips.
+            Readout(if (searching) "“$query”" else "No notes here yet", color = Ink.TextMuted)
+        }
     }
 }
 
@@ -436,9 +583,9 @@ private fun EmptyLibrary(searching: Boolean, query: String) {
 private fun LibraryGrid(state: LibraryUiState, actions: LibraryActions, dialogs: LibraryDialogState) {
     LazyVerticalGrid(
         columns = GridCells.Adaptive(minSize = GRID_CELL_MIN_WIDTH.dp),
-        contentPadding = PaddingValues(16.dp),
-        horizontalArrangement = Arrangement.spacedBy(12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        contentPadding = ContentInset,
+        horizontalArrangement = Arrangement.spacedBy(TileGap),
+        verticalArrangement = Arrangement.spacedBy(TileGap),
         modifier = Modifier.fillMaxSize(),
     ) {
         // Keys are ids, never positions. Without them a note inserted at the top would
@@ -468,8 +615,8 @@ private fun LibraryGrid(state: LibraryUiState, actions: LibraryActions, dialogs:
 @Composable
 private fun LibraryList(state: LibraryUiState, actions: LibraryActions, dialogs: LibraryDialogState) {
     LazyColumn(
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = ContentInset,
+        verticalArrangement = Arrangement.spacedBy(InkDims.GroupGap),
         modifier = Modifier.fillMaxSize(),
     ) {
         items(state.folders, key = { "folder-${it.id.value}" }) { folder ->
@@ -513,6 +660,14 @@ data class LibraryActions(
     val onNewNote: () -> Unit,
     /** ROADMAP M4 — the PDF the user picked. What it *is* is SPEC §5.6's decision, not this one's. */
     val onImportPdf: (Uri) -> Unit,
+    /**
+     * Open the server's own file browser to pick a PDF to write on, in place.
+     *
+     * A different thing from [onImportPdf] rather than a source for it: that one ends in a note
+     * this device owns, and this one ends in a note **bound to the file it came from**, so the ink
+     * goes back to where the user keeps the document.
+     */
+    val onImportFromNextcloud: () -> Unit,
     val onNewFolder: (String) -> Unit,
     val onQueryChange: (String) -> Unit,
     val onSort: (LibrarySort) -> Unit,
@@ -601,10 +756,10 @@ private fun rememberFolderCover(folder: Folder, actions: LibraryActions): ImageB
 private fun MeasureMenu(actions: LibraryActions) {
     var open by remember { mutableStateOf(false) }
     Box {
-        TextButton(onClick = { open = true }) { Text("Measure") }
+        TextChip(label = "Measure", selected = open, onClick = { open = true })
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
             DropdownMenuItem(
-                text = { Text("Fill library (500 notes, 50 folders)") },
+                text = { MicroLabel("Fill library (500 notes, 50 folders)") },
                 onClick = {
                     actions.onFillForMeasurement()
                     open = false
@@ -622,3 +777,27 @@ private fun MeasureMenu(actions: LibraryActions) {
  * as the app being broken rather than as the file being the wrong kind.
  */
 private const val PDF_MIME = "application/pdf"
+
+/**
+ * Wide enough for the whole placeholder sentence at the micro size, and for a real query.
+ *
+ * A number rather than a `weight`: see [SearchField] for why a weighted child cannot live in a
+ * horizontally scrolling bar.
+ */
+private val SearchFieldWidth = 340.dp
+
+/** Between two tiles. The chrome's own gaps come from [InkDims]. */
+private val TileGap = 12.dp
+
+/**
+ * The margin round the tiles.
+ *
+ * ⚠️ The bottom is deep on purpose: the "Import PDF / New note" pill floats over this list, and
+ * without the inset the last row of a full library would sit permanently underneath it.
+ */
+private val ContentInset = PaddingValues(
+    start = TileGap,
+    top = TileGap,
+    end = TileGap,
+    bottom = 88.dp,
+)

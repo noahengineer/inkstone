@@ -69,3 +69,12 @@ __pycache__/
 
 # A stray file my own shell quoting kept creating. Belt and braces.
 $LOG
+
+# The reader's cache (tools/web). Note metadata, parsed transcripts and whole media files, keyed
+# by ETag — everything in here is recoverable by fetching from Nextcloud again, and it holds
+# copies of class recordings, which have no business in a repo.
+tools/web/.cache/
+
+# The reader's container secrets (tools/web/compose.yaml). Real credentials, one per file.
+secrets/
+.env

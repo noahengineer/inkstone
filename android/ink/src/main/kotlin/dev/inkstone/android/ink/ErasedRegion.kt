@@ -147,12 +147,32 @@ internal class ErasedRegion {
         !isEmpty && bounds.xMin >= minX && bounds.yMin >= minY && bounds.xMax <= maxX && bounds.yMax <= maxY
 
     /** True when [x], [y] lies under some capsule of this region. */
-    fun covers(x: Float, y: Float): Boolean {
-        for (index in _capsules.indices) {
+    fun covers(x: Float, y: Float): Boolean = coveringCapsule(x, y, 0) >= 0
+
+    /**
+     * ⭐ The index of a capsule covering [x], [y], or -1 — starting the scan at [hint] and wrapping.
+     *
+     * Exactly [covers]'s answer: every capsule is still visited at most once, so the start point
+     * changes only *how long* the search takes, never what it finds.
+     *
+     * It matters because [isFullyErased] asks this once per point of a stroke, in order, against a
+     * capsule list that is also in gesture order — and consecutive points of a stroke are near each
+     * other, so the capsule that covered the last one very often covers this one too. Feeding the
+     * previous answer back turns the common case from a scan of the whole region into a hit on the
+     * first compare. Without it the pass is `points × capsules` in the literal sense, which for a
+     * scribbled-over stroke is millions of `hypot` calls and is the reason the budget below exists
+     * at all.
+     */
+    fun coveringCapsule(x: Float, y: Float, hint: Int): Int {
+        val size = _capsules.size
+        if (size == 0) return -1
+        val start = if (hint in 0 until size) hint else 0
+        for (step in 0 until size) {
+            val index = if (start + step < size) start + step else start + step - size
             val c = _capsules[index]
-            if (distanceToSegment(x, y, c.fromX, c.fromY, c.toX, c.toY) <= c.radius) return true
+            if (distanceToSegment(x, y, c.fromX, c.fromY, c.toX, c.toY) <= c.radius) return index
         }
-        return false
+        return -1
     }
 }
 
@@ -182,27 +202,44 @@ internal fun isFullyErased(stroke: Stroke, bounds: PageBounds?, region: ErasedRe
     if (region.isEmpty) return false
     if (bounds == null || !region.contains(bounds)) return false
 
+    // The rolling hint, threaded through every point of this stroke — see [ErasedRegion.coveringCapsule].
+    val cursor = intArrayOf(0)
+
     val inputs = stroke.inputs
     val scratch = StrokeInput()
     for (index in 0 until inputs.size) {
         inputs.populate(index, scratch)
-        if (!region.covers(scratch.x, scratch.y)) return false
+        if (!region.covering(scratch.x, scratch.y, cursor)) return false
     }
 
     val shape = stroke.shape
     val point = MutableVec()
     for (group in 0 until shape.getRenderGroupCount()) {
-        if (!outlinesCovered(shape, group, region, point)) return false
+        if (!outlinesCovered(shape, group, region, point, cursor)) return false
     }
     return true
 }
 
+/** [ErasedRegion.coveringCapsule], remembering its answer in [cursor] for the next point. */
+private fun ErasedRegion.covering(x: Float, y: Float, cursor: IntArray): Boolean {
+    val found = coveringCapsule(x, y, cursor[0])
+    if (found < 0) return false
+    cursor[0] = found
+    return true
+}
+
 /** True when every silhouette vertex of one render group lies inside [region]. */
-private fun outlinesCovered(shape: PartitionedMesh, group: Int, region: ErasedRegion, point: MutableVec): Boolean {
+private fun outlinesCovered(
+    shape: PartitionedMesh,
+    group: Int,
+    region: ErasedRegion,
+    point: MutableVec,
+    cursor: IntArray,
+): Boolean {
     for (outline in 0 until shape.getOutlineCount(group)) {
         for (vertex in 0 until shape.getOutlineVertexCount(group, outline)) {
             shape.populateOutlinePosition(group, outline, vertex, point)
-            if (!region.covers(point.x, point.y)) return false
+            if (!region.covering(point.x, point.y, cursor)) return false
         }
     }
     return true

@@ -6,9 +6,11 @@ import android.view.MotionEvent
 import androidx.test.core.app.ActivityScenario
 import dev.inkstone.android.ink.InkSurfaceView
 import dev.inkstone.app.debug.InkHostActivity
+import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Camera
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.StrokeObject
@@ -30,10 +32,9 @@ import kotlin.test.assertTrue
  * finger-shaped event lands on the canvas and marks nothing, silently. `MotionEvent.obtain`'s short
  * overloads cannot set a tool type at all, which is why [stylus] builds one the long way.
  *
- * And one thing it deliberately does **not** offer: a way to synthesise geometry. Ink here is drawn.
- * `SyntheticInk` computes orientations without clamping to `[0, 2π)` and x86_64 rounding puts them
- * outside, which `androidx.ink` rejects — the known reason ten of `:android:ink`'s instrumented tests
- * are red on an emulator and green on the tablet. A test of anything else must not inherit that.
+ * And one thing it deliberately does **not** offer: a way to synthesise geometry. Ink here is drawn,
+ * so what these tests exercise is the real capture path — pressure, tilt, orientation and historical
+ * points all come off the `MotionEvent`, and a synthesised batch silently has none of them.
  */
 internal class InkHostDriver(private val deviceId: String) {
 
@@ -45,7 +46,17 @@ internal class InkHostDriver(private val deviceId: String) {
         private set
 
     /** Launch the host, bind the page, and wait until the surface has a size worth a camera. */
-    fun launch(pageSize: PageSize = PageSize.Letter): ActivityScenario<InkHostActivity> {
+    fun launch(
+        pageSize: PageSize = PageSize.Letter,
+        /**
+         * SPEC §4.5 — whether the paper grows to hold what is written on it.
+         *
+         * Set through `setPageMeta`, which is the door the app itself uses (`NoteEditor.reconcile`
+         * pushes a folded page's canvas through it), rather than by writing the surface's own
+         * field — which is private for exactly that reason.
+         */
+        infinite: Boolean = false,
+    ): ActivityScenario<InkHostActivity> {
         val launched = ActivityScenario.launch(InkHostActivity::class.java)
         scenario = launched
         onSurface { surface ->
@@ -59,6 +70,9 @@ internal class InkHostDriver(private val deviceId: String) {
                 nextClock = { LamportClock(++counter, deviceId) },
             )
             surface.pageSize = pageSize
+            if (infinite) {
+                surface.setPageMeta(PageCanvas(pageSize, infinite = true), Background.Blank)
+            }
         }
         awaitLaidOut()
         return launched
@@ -127,11 +141,41 @@ internal class InkHostDriver(private val deviceId: String) {
         )
     }
 
-    private fun stylus(action: Int, x: Float, y: Float): MotionEvent {
+    /**
+     * Drag one **finger** across the surface, which pans the camera.
+     *
+     * The realistic way to reach the empty space beside the page: SPEC §4.5 makes panning free,
+     * so a note can be moved almost entirely off screen and the paper's edge can be put anywhere.
+     * A test that reached the same place by writing to `camera` would be testing the leash rather
+     * than the thing a user does.
+     *
+     * A finger, not a stylus — with `fingerDrawingEnabled` false, that is what `PalmGuard` lets
+     * through to the camera (SPEC §3.3).
+     */
+    fun panBy(fromX: Float, fromY: Float, dx: Float, dy: Float) {
+        gestureDownTime = SystemClock.uptimeMillis()
+        gestureEventTime = gestureDownTime
+        onSurface { it.dispatchTouchEvent(finger(MotionEvent.ACTION_DOWN, fromX, fromY)) }
+        for (step in 1..PAN_STEPS) {
+            gestureEventTime += MOVE_MILLIS
+            val at = finger(MotionEvent.ACTION_MOVE, fromX + dx * step / PAN_STEPS, fromY + dy * step / PAN_STEPS)
+            onSurface { it.dispatchTouchEvent(at) }
+        }
+        gestureEventTime += MOVE_MILLIS
+        onSurface { it.dispatchTouchEvent(finger(MotionEvent.ACTION_UP, fromX + dx, fromY + dy)) }
+    }
+
+    private fun finger(action: Int, x: Float, y: Float): MotionEvent =
+        event(action, x, y, MotionEvent.TOOL_TYPE_FINGER, InputDevice.SOURCE_TOUCHSCREEN)
+
+    private fun stylus(action: Int, x: Float, y: Float): MotionEvent =
+        event(action, x, y, MotionEvent.TOOL_TYPE_STYLUS, InputDevice.SOURCE_STYLUS)
+
+    private fun event(action: Int, x: Float, y: Float, tool: Int, source: Int): MotionEvent {
         val properties = arrayOf(
             MotionEvent.PointerProperties().apply {
                 id = 0
-                toolType = MotionEvent.TOOL_TYPE_STYLUS
+                toolType = tool
             },
         )
         val coords = arrayOf(
@@ -157,7 +201,7 @@ internal class InkHostDriver(private val deviceId: String) {
             1f,
             0,
             0,
-            InputDevice.SOURCE_STYLUS,
+            source,
             0,
         )
     }
@@ -198,6 +242,7 @@ internal class InkHostDriver(private val deviceId: String) {
         const val PEN_UP_Y = 560f
 
         const val MOVE_STEPS = 6
+        const val PAN_STEPS = 8
         const val MOVE_MILLIS = 8L
         const val MOVE_DX = 20f
         const val MOVE_DY = 10f

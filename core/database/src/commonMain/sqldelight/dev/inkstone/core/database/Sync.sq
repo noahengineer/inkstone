@@ -371,6 +371,59 @@ CREATE TABLE peerClock (
     PRIMARY KEY (noteId, peerDeviceId)
 );
 
+
+-- ⭐ The folder browser's memory of the server's tree (offline folder picking).
+--
+-- SPEC §7.6 step 2's browser is one `PROPFIND Depth:1` per level and, until this table, kept
+-- nothing: with no network the picker showed an empty list, so *"save this note to
+-- Physics/Term 2"* — a decision that needs no network at all, since the binding enqueues
+-- MKCOL + UPLOAD either way — could only be **made** with one. That is the complaint this
+-- table answers.
+--
+-- ⚠️ **Deliberately NOT `remoteDirectory` above.** The two look alike and mean opposite
+-- things. `remoteDirectory` is the reconciler's prune cache: a row there says *"this directory
+-- was WALKED to completion at this ETag"*, and a row it did not earn is how a subtree stops
+-- being walked or a note gets read as deleted (see that table's comments, and CLAUDE.md's "a
+-- pruned subtree looks exactly like a deleted one"). Nothing the browser does may write into
+-- it. A row here says only *"a folder by this name was listed here at this time"*: it decides
+-- what a picker draws, and no sync decision reads it.
+--
+-- The reconciler's rows are still *read* for display — `SqlRemoteFolderCache` unions them in,
+-- so a user who has never opened the browser offline still sees the folders their notes
+-- actually live in. Read-only, one direction, and only into a list of names.
+CREATE TABLE browsedFolder (
+    accountId  TEXT    NOT NULL,
+    -- The folder's own remote path, as the browser addresses it: no leading or trailing '/'.
+    path       TEXT    NOT NULL,
+    -- The path of the listing this folder appeared in. '' is the account root, which is also a
+    -- legitimate `path` — so the root's own row has `parentPath = path = ''` and every read of
+    -- children filters the self-entry out by hand. Same shape as `RemoteWalk`'s `it.path ==
+    -- here`, and for the same reason: a `Depth: 1` listing contains its own collection.
+    parentPath TEXT    NOT NULL,
+    -- The last segment of the decoded path — `DavResource.name`. A column rather than a split
+    -- at read time, so the picker reads one value and an old row keeps displaying the name it
+    -- was listed under even if the splitting rule ever changes.
+    name       TEXT    NOT NULL,
+    ocId       TEXT,
+    -- When this folder was last seen in a successful listing of its parent.
+    seenAt     INTEGER NOT NULL DEFAULT 0,
+    -- ⚠️ When this folder's OWN children were last listed. 0 means never — which is not the
+    -- same as "listed, and empty", and the browser has to tell them apart: one is "no folders
+    -- in here", the other is "I have never seen inside here". Kept on the same row rather than
+    -- in a second table, which means every write of `seenAt` must carry it forward (see
+    -- `rememberFolder`): `INSERT OR REPLACE` resets what it omits, the trap
+    -- `remoteBinding.lastSeenRemoteAt` records.
+    listedAt   INTEGER NOT NULL DEFAULT 0,
+    -- 1 for a folder the user made while offline: it is in this list because they asked for it,
+    -- and it does not exist on the server yet. The MKCOL that creates it is the one the binding
+    -- already enqueues (`SyncEngine.bind` writes one unconditionally for exactly this reason),
+    -- so nothing here has to remember to create it. Drawn marked, never silently.
+    pending    INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (accountId, path)
+);
+
+CREATE INDEX browsedFolderByParent ON browsedFolder(accountId, parentPath);
+
 -- ---------------------------------------------------------------------------
 -- Accounts
 -- ---------------------------------------------------------------------------
@@ -735,3 +788,68 @@ VALUES (:noteId, :peerDeviceId,
         max(:highestCounter, coalesce((SELECT highestCounter FROM peerClock
                                        WHERE noteId = :noteId AND peerDeviceId = :peerDeviceId), 0)),
         :seenAt);
+
+-- ---------------------------------------------------------------------------
+-- The folder browser's cache (offline folder picking)
+-- ---------------------------------------------------------------------------
+
+-- One level, for drawing. Ordered here rather than in Kotlin because the browser draws them in
+-- this order and nothing else reads this query.
+--
+-- ⚠️ `path <> :parent` is the self-entry filter, and it is load-bearing exactly once: at the
+-- account root, where a folder's `parentPath` and the root's own `path` are both ''. Without it
+-- the root lists itself as a child of itself, which is a folder the user can open forever. Same
+-- fact as `RemoteWalk`'s `it.path == here` — a `Depth: 1` listing includes its own collection.
+selectBrowsedChildren:
+SELECT * FROM browsedFolder
+WHERE accountId = :accountId AND parentPath = :parent AND path <> :parent
+ORDER BY name COLLATE NOCASE;
+
+selectBrowsedFolder:
+SELECT * FROM browsedFolder WHERE accountId = :accountId AND path = :path;
+
+-- ⭐ Insert-if-absent then update, rather than one `INSERT OR REPLACE`.
+--
+-- `INSERT OR REPLACE` deletes the conflicting row and inserts a new one, so it resets every
+-- column the statement omits to its DEFAULT — and the column omitted here would be `listedAt`,
+-- i.e. *"I have seen inside this folder"*. Re-listing a parent would silently forget every
+-- child's own listing, and the browser would then report a folder it had listed last week as
+-- never seen. That is `remoteBinding.lastSeenRemoteAt`'s bug, and two statements make it
+-- unrepresentable instead of remembered.
+insertBrowsedFolderIfAbsent:
+INSERT OR IGNORE INTO browsedFolder(accountId, path, parentPath, name, ocId, seenAt, listedAt, pending)
+VALUES (:accountId, :path, :parent, :name, NULL, 0, 0, 0);
+
+-- A live sighting. `pending = 0` because the server has just shown us the folder: whatever the
+-- user created offline exists now, and the marker must come off the moment that is true.
+markBrowsedFolderSeen:
+UPDATE browsedFolder
+SET parentPath = :parent, name = :name, ocId = :ocId, seenAt = :seenAt, pending = 0
+WHERE accountId = :accountId AND path = :path;
+
+-- Only `listedAt`, and only for the folder that was listed. Everything else on the row is what
+-- the *parent's* listing said about it and is not this statement's to touch.
+markBrowsedFolderListed:
+UPDATE browsedFolder SET listedAt = :listedAt WHERE accountId = :accountId AND path = :path;
+
+-- A folder the user typed while offline. Marked, so nothing draws it as though the server had
+-- confirmed it.
+--
+-- ⚠️ `seenAt = 0` guards the folder that already exists. Typing the name of a folder the server
+-- has shown us — which is what "new folder" does when the name is already taken — must not put
+-- *"not created yet"* beside a folder that plainly is.
+markBrowsedFolderPending:
+UPDATE browsedFolder SET pending = 1 WHERE accountId = :accountId AND path = :path AND seenAt = 0;
+
+-- Gone from the server: it was not in this listing, and this listing succeeded.
+--
+-- ⚠️ `pending = 0` guards the one row a successful listing legitimately does not contain — a
+-- folder the user made offline whose MKCOL is still owed. Sweeping that would delete the
+-- destination out from under a binding the user has already chosen.
+deleteBrowsedChildrenNotSeen:
+DELETE FROM browsedFolder
+WHERE accountId = :accountId AND parentPath = :parent AND path <> :parent
+  AND pending = 0 AND seenAt < :cutoff;
+
+deleteBrowsedFoldersFor:
+DELETE FROM browsedFolder WHERE accountId = :accountId;

@@ -1,12 +1,15 @@
 package dev.inkstone.android.ink
 
 import dev.inkstone.core.model.ConnectorEnd
+import dev.inkstone.core.model.ConnectorRoute
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
+import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.ShapeEdit
 import dev.inkstone.core.model.ShapeKind
 import dev.inkstone.core.model.ShapeRecord
 import dev.inkstone.core.model.SnapCandidate
+import dev.inkstone.core.model.SnapGrid
 
 /**
  * ⭐ ROADMAP M8b — draw a shape, hold still, and the ink becomes the shape.
@@ -46,7 +49,7 @@ internal class ShapeSnapController(
     private val store: StrokeStore,
     private val brushes: InkBrushFactory,
     private val cancelWetStroke: () -> Unit,
-    private val onSnapped: (ObjectId, ShapeKind, Boolean) -> Unit,
+    private val onSnapped: (ObjectId, ShapeSnapResult) -> Unit,
 ) {
 
     private val detector = ShapeSnapDetector()
@@ -56,6 +59,15 @@ internal class ShapeSnapController(
 
     /** See [InkSurfaceView.arrowHeads]. */
     var arrowHeads: Boolean = false
+
+    /**
+     * ⭐ The lattice a snapped shape lands on — see [InkSurfaceView.gridSnapEnabled].
+     *
+     * [SnapGrid.None] when the setting is off, which makes every `snap*` the identity, so the
+     * feature genuinely costs nothing rather than costing a branch per shape. The surface keeps it
+     * in step with the paper: the grid a page snaps to is the one that page is drawing.
+     */
+    var grid: SnapGrid = SnapGrid.None
 
     val isArmed: Boolean get() = detector.isArmed
 
@@ -86,7 +98,11 @@ internal class ShapeSnapController(
         val candidate = detector.classify() ?: return false
         val recorder = store.recorder ?: return false
         val kind = kindFor(candidate.kind)
-        val record = connectorRecordFor(candidate, kind, bindSlopPt)
+        val placement = candidate.placement(bandPt = widthPt, asKind = kind, grid = grid)
+        // ⭐ A recognised **curve** arrives as a line plus an apex, and the apex has to be converted
+        // into the shape's own space before it can be stored — the recogniser only ever saw page
+        // coordinates, because the shape it was proposing did not exist yet.
+        val record = curved(connectorRecordFor(candidate, kind, bindSlopPt), candidate.bendLocal(placement))
         cancelWetStroke()
 
         // ⚠️ Hoisted out of the `create(...)` argument list, where it used to be minted inline. The
@@ -96,7 +112,7 @@ internal class ShapeSnapController(
         val id = recorder.newObjectId()
         val ops = ShapeEdit.create(
             id = id,
-            placement = candidate.placement(bandPt = widthPt, asKind = kind),
+            placement = placement,
             z = store.allocateTopZ(1).single(),
             // The pen's own colour and width, so a snapped shape looks like the ink it replaced.
             style = ObjectStyle(colorArgb, widthPt),
@@ -108,7 +124,15 @@ internal class ShapeSnapController(
         // undo come through. One construction path and one insertion path, so the screen cannot
         // disagree with the log about what was made.
         store.applyOps(ops, brushes, record = true)
-        onSnapped(id, kind, record.isConnector)
+        // Curved either way it was stored — as an apex in open space, as a route between two shapes.
+        onSnapped(
+            id,
+            ShapeSnapResult(
+                kind = kind,
+                attached = record.isConnector,
+                curved = record.bend != null || record.route == ConnectorRoute.CURVED,
+            ),
+        )
         return true
     }
 
@@ -146,6 +170,9 @@ internal class ShapeSnapController(
     private fun connectorRecordFor(candidate: SnapCandidate, kind: ShapeKind, slopPt: Float): ShapeRecord {
         if (kind != ShapeKind.LINE && kind != ShapeKind.ARROW) return ShapeRecord.None
         if (slopPt <= 0f) return ShapeRecord.None
+        // ⚠️ The **drawn** ends, not the grid-snapped ones. Where the pen went is what says
+        // which boxes the user meant to join; a snap can move an end up to half a cell, and half a
+        // cell of the wrong direction is a connector bound to the box next door.
         val from = store.shapeAt(candidate.from.x, candidate.from.y, slopPt)
         val to = store.shapeAt(candidate.to.x, candidate.to.y, slopPt)
         if (from == null && to == null) return ShapeRecord.None
@@ -157,6 +184,24 @@ internal class ShapeSnapController(
     }
 
     /**
+     * ⭐ The drawn arc's apex, put wherever this shape can actually use it.
+     *
+     * ⚠️ **A connector cannot use a bend, and storing one anyway would be dead data on disk.** Its
+     * geometry is derived from what its ends are attached to and re-derived every fold (SPEC
+     * §4.8.3), so `DryShape.reroute` paints straight over the payload outline — bend included. The
+     * vocabulary already has the right word for *"this connector is curved"*, and it is
+     * [ConnectorRoute.CURVED], which the router honours and which survives both ends moving.
+     *
+     * So: a curve drawn in open space keeps its exact apex, and a curve drawn **between two shapes**
+     * becomes a curved connector. Neither writes a value the renderer will ignore.
+     */
+    private fun curved(record: ShapeRecord, bendLocal: PagePoint?): ShapeRecord = when {
+        bendLocal == null -> record
+        record.isConnector -> record.copy(route = ConnectorRoute.CURVED)
+        else -> record.copy(bend = bendLocal)
+    }
+
+    /**
      * A recognised [ShapeKind.LINE] becomes an arrow when the arrow tool is on.
      *
      * SPEC §4.8.7: an arrowhead is a few samples at the end of a gesture and is indistinguishable
@@ -165,3 +210,13 @@ internal class ShapeSnapController(
     private fun kindFor(recognised: ShapeKind): ShapeKind =
         if (recognised == ShapeKind.LINE && arrowHeads) ShapeKind.ARROW else recognised
 }
+
+/**
+ * What a held gesture turned into — see [InkSurfaceView.onShapeSnapped].
+ *
+ * [curved] is not cosmetic. Draw-and-hold refused every arc until this milestone, so *"it should
+ * create a curve out of that"* was the report that changed it; a user who has just been told the
+ * feature does not eat their curves needs to see which of the two they got, and a line and a curve
+ * differ only by a register.
+ */
+public data class ShapeSnapResult(val kind: ShapeKind, val attached: Boolean, val curved: Boolean)

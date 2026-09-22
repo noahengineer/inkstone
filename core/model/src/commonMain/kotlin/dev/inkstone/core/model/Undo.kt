@@ -101,11 +101,18 @@ public object Undo {
             absolute = before.find(op.target)?.erased ?: ErasedArea.None,
         )
 
+        // ⚠️ Every field the op names, and only those. A `SetPageMeta` that grew the canvas names
+        // `size` and `origin` and nothing else, so its inverse must put both back and must not
+        // touch the background — and the whole gesture matters, because growth rides along with
+        // the stroke that caused it: undoing that stroke has to take the paper back down with it,
+        // or the page keeps an acre nobody wrote on.
         is PageOp.SetPageMeta -> PageOp.SetPageMeta(
             opId = opId,
             clock = clock,
             background = op.background?.let { before.background },
             size = op.size?.let { before.size },
+            origin = op.origin?.let { before.canvas.origin },
+            infinite = op.infinite?.let { before.canvas.infinite },
         )
 
         // This build does not know what it did, so it cannot know what undoes it.
