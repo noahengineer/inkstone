@@ -29,31 +29,37 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import dev.inkstone.app.ui.ChipDividerAcross
 import dev.inkstone.app.ui.GlassPanel
 import dev.inkstone.app.ui.Ink
 import dev.inkstone.app.ui.InkDims
 import dev.inkstone.app.ui.MicroLabel
 import dev.inkstone.app.ui.Readout
+import dev.inkstone.app.ui.SegmentChip
+import dev.inkstone.app.ui.Segmented
 import dev.inkstone.app.ui.SlimSlider
 import dev.inkstone.app.ui.TextChip
 import kotlin.math.roundToInt
 
 /**
- * ⭐ The layout editor's own controls: the overall size, a size for each panel and contextual bar,
- * *Reset* and *Done*.
+ * ⭐ The layout editor's own controls — and, first, **the bar you tapped**.
  *
- * Everything else the editor does happens on the bars themselves (`ChromeBarFrame`, `ChromeContainer`) —
- * a bar is moved by its handle, reshaped by its arrange key and resized by its grip where it is, and a
- * chip is carried to wherever it should go, because *"where should this go"* is a question you answer
- * by looking at the page. The panels are the exception: they are not on screen while the editor is,
- * so their sizes are here.
+ * *"I want to be able to click on a panel (like the undo panel) and be able to change the size of
+ * only that."* Tapping a bar chooses it (`ChromeBarFrame`); this panel then leads with that bar's name,
+ * its own **Size**, its **shape** (row, column, 2–4 across) and a **Reset** for it alone. Before
+ * anything is chosen the same place says so — the one line of instruction in the editor, because
+ * choosing a bar is an act with nothing on screen to suggest it.
+ *
+ * Below that: the overall size, the pop-up panels' sizes (folded away — they are not on screen while
+ * the editor is, so they cannot be tapped), *Reset all* and *Done*.
  *
  * - **It can be moved.** Drag the caption. It opens in the middle, which is exactly where a user
  *   rearranging bars may want to put one — and a panel that cannot be moved is a part of the screen
  *   no chip can be dropped on.
- * - ⚠️ **It is drawn at the screen's own size, never at [ChromeLayout.uiScale].** It holds the slider
- *   that sets that scale, and a slider that grows under the finger dragging it maps the same finger
- *   position to a different value every frame — it would chase itself.
+ * - ⚠️ **It is drawn at the screen's own size, never at [ChromeLayout.uiScale] or the chosen bar's.**
+ *   It holds the sliders that set those sizes, and a slider that grows under the finger dragging it
+ *   maps the same finger position to a different value every frame — it would chase itself. That is
+ *   also why the chosen bar's size is *here* and not on a bar that moves as it grows.
  * - ⚠️ Back closes the editor rather than the note: the editor is a mode of this screen, and a user
  *   pressing Back in it means *"stop arranging"*, not *"leave"*.
  */
@@ -61,6 +67,7 @@ import kotlin.math.roundToInt
 internal fun BoxScope.LayoutEditorPanel(ui: InkUiState) {
     BackHandler { ui.editingLayout = false }
     var moved by remember { mutableStateOf(Offset.Zero) }
+    var popups by remember { mutableStateOf(false) }
     GlassPanel(
         modifier = Modifier
             .align(Alignment.Center)
@@ -79,19 +86,58 @@ internal fun BoxScope.LayoutEditorPanel(ui: InkUiState) {
                     }
                 },
         )
+        ChosenBar(ui)
+        ChipDividerAcross()
         ScaleRow("UI size", ui.layout.uiScale, ChromeLayout.UI_SCALE) { ui.layout = ui.layout.withUiScale(it) }
-        ChromePanel.entries.forEach { panel ->
-            val own = ui.layout.panelScales[panel] ?: 1f
-            ScaleRow(panel.label, own, ChromeLayout.PANEL_SCALE) { scale ->
-                ui.layout = ui.layout.withPanelScale(panel, scale)
+        if (popups) {
+            ChromePanel.entries.forEach { panel ->
+                val own = ui.layout.panelScales[panel] ?: 1f
+                ScaleRow(panel.label, own, ChromeLayout.PANEL_SCALE) { scale ->
+                    ui.layout = ui.layout.withPanelScale(panel, scale)
+                }
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(InkDims.ChipGap)) {
-            TextChip(label = "Reset", enabled = ui.layout != ChromeLayout(), onClick = { ui.layout = ChromeLayout() })
+            TextChip(label = "Pop-up sizes", selected = popups, onClick = { popups = !popups })
+            TextChip(label = "Reset all", enabled = ui.layout != ChromeLayout(), onClick = {
+                ui.layout = ChromeLayout()
+            })
             TextChip(label = "Done", selected = true, onClick = { ui.editingLayout = false })
         }
     }
 }
+
+/**
+ * The tapped bar's own controls: its size, its shape, and putting it back — that bar and no other.
+ * Nothing chosen yet is a line saying how to choose one.
+ */
+@Composable
+private fun ChosenBar(ui: InkUiState) {
+    val id = ui.selectedBar
+    if (id == null) {
+        MicroLabel("Tap a bar to size it", color = Ink.Focus, modifier = Modifier.width(CaptionWidth))
+        return
+    }
+    val bar = ui.layout.bar(id)
+    MicroLabel(id.title, color = Ink.Focus, modifier = Modifier.width(CaptionWidth))
+    ScaleRow("Size", bar.scale, ChromeLayout.BAR_SCALE) { ui.layout = ui.layout.scaled(id, it) }
+    if (id.holdsChips) {
+        Segmented {
+            ChromeArrangement.entries.forEach { shape ->
+                SegmentChip(
+                    label = shape.label,
+                    selected = bar.arrangement == shape,
+                    onClick = { ui.layout = ui.layout.arranged(id, shape) },
+                )
+            }
+        }
+    }
+    val reset = ui.layout.reset(id)
+    TextChip(label = "Reset ${id.title}", enabled = reset != ui.layout, onClick = { ui.layout = reset })
+}
+
+/** What the panel calls a bar: *"Undo bar"*, or a floating one's own name — *"Bar 2"*. */
+private val BarId.title: String get() = if (this is BarId.Floating) label else "$label bar"
 
 @Composable
 private fun ScaleRow(label: String, value: Float, range: ClosedFloatingPointRange<Float>, onChange: (Float) -> Unit) {

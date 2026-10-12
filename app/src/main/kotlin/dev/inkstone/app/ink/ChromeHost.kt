@@ -22,7 +22,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
@@ -45,7 +44,6 @@ import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
 import dev.inkstone.app.ui.Ink
 import dev.inkstone.app.ui.InkDims
-import kotlin.math.min
 import kotlin.math.roundToInt
 
 /**
@@ -233,25 +231,23 @@ private fun InkUiState.isStock(bar: ChromeBar): Boolean = layout.bar(BarId.Stock
 
 /** What [id] is drawn at right now — its own size live while it is being resized. */
 internal fun InkUiState.chromeScale(id: BarId): Float =
-    layout.uiScale * (chromeDrag.scaleFor(id.sizedBy()) ?: layout.bar(id.sizedBy()).scale)
+    layout.uiScale * (chromeDrag.scaleFor(id) ?: layout.bar(id).scale)
 
-/** Whether a bar has a move handle and a resize grip: everything but the dock's second row. */
+/** Whether a bar has a move handle: everything but the dock's second row, which follows the dock. */
 internal val BarId.isMovable: Boolean get() = this !is BarId.Stock || bar.movable
 
 /** Whether a bar is made of chips — and so takes them, and can be laid out as a column or a grid. */
 internal val BarId.holdsChips: Boolean get() = this !is BarId.Stock || bar.holdsChips
 
 /**
- * How far the edit handles widen a bar on the left and on the right, in px: move and arrange on the
- * left, resize on the right — each only where the bar has it. At the overall size and not the bar's
- * own, because that is what the handles are drawn at — see [ChromeBarFrame].
+ * How far the edit handles widen a bar on the left and on the right, in px: the move handle on the
+ * left where the bar has one, the resize grip on the right on every bar. At the overall size and not
+ * the bar's own, because that is what the handles are drawn at — see [ChromeBarFrame].
  */
 private fun InkUiState.insets(id: BarId, density: Float): Pair<Float, Float> {
     if (!editingLayout) return 0f to 0f
     val slot = (HandleWidth.value + HandleGap.value) * density * layout.uiScale
-    val left = (if (id.isMovable) 1 else 0) + (if (id.holdsChips) 1 else 0)
-    val right = if (id.isMovable) 1 else 0
-    return left * slot to right * slot
+    return (if (id.isMovable) slot else 0f) to slot
 }
 
 /**
@@ -358,9 +354,15 @@ fun ScaledChrome(scale: Float, content: @Composable () -> Unit) {
 
 /**
  * One bar of chrome, as a child of [ChromeHost]: drawn at its size, and in the layout editor given a
- * handle to move it by, a button to lay it out as a row, a column or a grid, and a grip to resize it
- * by. Outside the editor a **long press on the bar itself** — its padding, a divider, anything that is
- * not a control — opens the editor.
+ * handle to move it by and a grip to resize it by.
+ *
+ * ## ⭐ Tap a bar to choose it
+ *
+ * *"I want to be able to click on a panel (like the undo panel) and be able to change the size of only
+ * that."* In the layout editor a tap anywhere on a bar — a chip, its background, its handles — makes it
+ * [InkUiState.selectedBar]: it is outlined brighter, and the editor's panel shows that bar's size, its
+ * shape and a reset for it alone (`LayoutEditorPanel`). Outside the editor a **long press on the
+ * bar's background** opens the editor with that bar already chosen.
  *
  * ⚠️ The content keeps the same place in the tree in both modes (the handles are `if`s either side of
  * it), so opening the editor does not reset a bar's own state — an open template menu, the width
@@ -373,6 +375,7 @@ fun ScaledChrome(scale: Float, content: @Composable () -> Unit) {
 @Composable
 internal fun ChromeBarFrame(id: BarId, ui: InkUiState, geometry: ChromeGeometry, content: @Composable () -> Unit) {
     val editing = ui.editingLayout
+    val chosen = editing && ui.selectedBar == id
     // ⛔ **The handles are drawn at the overall size only, never at the bar's own.** Compose restarts
     // a `pointerInput` gesture whenever the density under it changes, so a grip inside the bar it
     // resizes cancelled its own drag on the first frame — the bar flickered and stayed the size it
@@ -384,86 +387,79 @@ internal fun ChromeBarFrame(id: BarId, ui: InkUiState, geometry: ChromeGeometry,
             horizontalArrangement = Arrangement.spacedBy(HandleGap),
         ) {
             if (editing && id.isMovable) MoveHandle(id, ui, geometry)
-            if (editing && id.holdsChips) ArrangeButton(id, ui)
             // ⚠️ Weighted, so the Row measures the handles **first**. A scrolling bar takes every
             // pixel it is offered, and measured in order it left the grip after it zero wide — the
             // page bar, in its stock slot, had no resize grip at all (found on the emulator).
             val slotted = Modifier.weight(1f, fill = false)
-            val shape = if (ui.layout.bar(id).arrangement ==
-                ChromeArrangement.ROW
-            ) {
-                InkDims.Pill
-            } else {
-                InkDims.PanelCorner
-            }
-            ScaledChrome(ui.chromeDrag.scaleFor(id.sizedBy()) ?: ui.layout.bar(id.sizedBy()).scale) {
+            val row = ui.layout.bar(id).arrangement == ChromeArrangement.ROW
+            val shape = if (row) InkDims.Pill else InkDims.PanelCorner
+            val edge = if (chosen) ChosenOutline else EditOutline
+            val tint = if (chosen) Ink.Accent else Ink.Focus
+            ScaledChrome(ui.chromeDrag.scaleFor(id) ?: ui.layout.bar(id).scale) {
                 Box(
                     modifier = slotted.then(
                         if (editing) {
-                            Modifier.border(EditOutline, Ink.Focus, shape)
+                            Modifier
+                                .border(edge, tint, shape)
+                                .pointerInput(id) { detectTapGestures(onTap = { ui.selectedBar = id }) }
                         } else {
-                            Modifier.pointerInput(Unit) {
-                                detectTapGestures(onLongPress = { ui.editingLayout = true })
+                            Modifier.pointerInput(id) {
+                                detectTapGestures(
+                                    onLongPress = {
+                                        ui.editingLayout = true
+                                        ui.selectedBar = id
+                                    },
+                                )
                             }
                         },
                     ),
                 ) { content() }
             }
-            if (editing && id.isMovable) ResizeGrip(id, ui, geometry)
+            if (editing) ResizeGrip(id, ui, geometry)
         }
     }
 }
 
-/** A grip of six dots. Drag it to move the bar; it is what *"Move Tools"* is in the view tree. */
+/**
+ * A grip of six dots. Drag it to move the bar, tap it to choose the bar; it is what *"Move Tools"* is
+ * in the view tree.
+ */
 @Composable
 private fun MoveHandle(id: BarId, ui: InkUiState, geometry: ChromeGeometry) {
     val where = remember { RootMapper() }
-    val gesture = Modifier.pointerInput(id) {
-        detectDragGestures(
-            onDragStart = { at -> where.root(at)?.let { ui.chromeDrag.beginMove(id, it) } },
-            onDrag = { change, _ ->
-                change.consume()
-                where.root(change.position)?.let(ui.chromeDrag::moveTo)
-            },
-            onDragEnd = {
-                geometry.positionOf(id)?.let { ui.layout = ui.layout.placed(id, it) }
-                ui.chromeDrag.end()
-            },
-            onDragCancel = { ui.chromeDrag.end() },
-        )
-    }
+    val gesture = Modifier
+        .pointerInput(id) {
+            detectDragGestures(
+                onDragStart = { at ->
+                    ui.selectedBar = id
+                    where.root(at)?.let { ui.chromeDrag.beginMove(id, it) }
+                },
+                onDrag = { change, _ ->
+                    change.consume()
+                    where.root(change.position)?.let(ui.chromeDrag::moveTo)
+                },
+                onDragEnd = {
+                    geometry.positionOf(id)?.let { ui.layout = ui.layout.placed(id, it) }
+                    ui.chromeDrag.end()
+                },
+                onDragCancel = { ui.chromeDrag.end() },
+            )
+        }
+        .pointerInput(id) { detectTapGestures(onTap = { ui.selectedBar = id }) }
     Handle("Move ${id.label}", where, gesture) { dot ->
         dots(GRIP_COLUMNS, GRIP_ROWS, dot)
     }
 }
 
-/**
- * Row, column, two, three or four across — one tap each, round and back to a row. The key draws the
- * shape it is now, so a glance says which it is without a word beside it.
- */
-@Composable
-private fun ArrangeButton(id: BarId, ui: InkUiState) {
-    val arrangement = ui.layout.bar(id).arrangement
-    val gesture = Modifier.pointerInput(id) {
-        detectTapGestures(onTap = { ui.layout = ui.layout.arranged(id, ui.layout.bar(id).arrangement.next()) })
-    }
-    Handle("Arrange ${id.label}: ${arrangement.label}", where = null, gesture = gesture) { dot ->
-        when (arrangement) {
-            ChromeArrangement.ROW -> blocks(ROW_BLOCKS, 1, dot)
-            ChromeArrangement.COLUMN -> blocks(1, ROW_BLOCKS, dot)
-            else -> blocks(arrangement.columns, 2, dot)
-        }
-    }
-}
-
-/** Three diagonal strokes in a corner. Drag right to grow the bar, left to shrink it. */
+/** Three diagonal strokes in a corner. Drag right to grow the bar, left to shrink it; tap to choose it. */
 @Composable
 private fun ResizeGrip(id: BarId, ui: InkUiState, geometry: ChromeGeometry) {
     val where = remember { RootMapper() }
     val gesture = Modifier.pointerInput(id) {
         detectDragGestures(
             onDragStart = { at ->
-                val from = ui.layout.bar(id.sizedBy()).scale
+                ui.selectedBar = id
+                val from = ui.layout.bar(id).scale
                 val width = geometry.pills[id]?.width ?: 1f
                 where.root(at)?.let { ui.chromeDrag.beginResize(id, it, from, width) }
             },
@@ -477,7 +473,7 @@ private fun ResizeGrip(id: BarId, ui: InkUiState, geometry: ChromeGeometry) {
             },
             onDragCancel = { ui.chromeDrag.end() },
         )
-    }
+    }.pointerInput(id) { detectTapGestures(onTap = { ui.selectedBar = id }) }
     Handle("Resize ${id.label}", where, gesture) { dot ->
         val inset = size.width * GRIP_INSET
         val corner = Offset(size.width - inset, size.height / 2f + size.width / 2f - inset)
@@ -500,21 +496,6 @@ private fun DrawScope.dots(columns: Int, rows: Int, dot: Float) {
     for (column in 1..columns) {
         for (row in 1..rows) {
             drawCircle(Ink.TextStrong, dot, Offset(size.width * column / (columns + 1), size.height * row / (rows + 1)))
-        }
-    }
-}
-
-/** [columns] × [rows] small rounded blocks filling the key — the arrangement as a picture. */
-private fun DrawScope.blocks(columns: Int, rows: Int, dot: Float) {
-    val pad = size.width * BLOCK_PAD
-    val cellW = (size.width - 2 * pad) / columns
-    val cellH = (size.height - 2 * pad) / rows
-    val side = min(cellW, cellH) - dot
-    for (c in 0 until columns) {
-        for (r in 0 until rows) {
-            val x = pad + cellW * c + (cellW - side) / 2f
-            val y = pad + cellH * r + (cellH - side) / 2f
-            drawRoundRect(Ink.TextStrong, Offset(x, y), Size(side, side), CornerRadius(dot))
         }
     }
 }
@@ -566,9 +547,10 @@ private val HandleGap = 6.dp
 private val HandleCorner = 8.dp
 private val HandleDot = 2.dp
 private val EditOutline = 1.5.dp
+
+/** The chosen bar's edge: thicker, and near-white rather than sky, so it reads as *this one*. */
+private val ChosenOutline = 3.dp
 private const val GRIP_ROWS = 3
 private const val GRIP_COLUMNS = 2
 private const val GRIP_INSET = 0.22f
-private const val ROW_BLOCKS = 3
-private const val BLOCK_PAD = 0.2f
 private const val HALF = 0.5f

@@ -39,17 +39,34 @@ divider — never a chip, which keeps its own press). The page dims and takes no
 
 | You can… | How |
 |---|---|
-| Move any bar — tools, pen settings follow, undo, pages, zoom, record, calculator, your own | Drag its **dotted** handle |
-| Resize any bar on its own | Drag its **corner grip** right to grow, left to shrink |
-| Lay a bar out as a **row, a column, or 2 / 3 / 4 across** | Tap its **arrange** key (it draws the shape it is) |
-| Hide a chip you never use | **Tap** it (it goes faint; tap again to bring it back) |
-| Move a chip — within its bar, **into another bar**, or **onto the page as a bar of its own** | **Hold, then drag** it; a sky line shows where it lands |
+| **Choose a bar** — any of them | **Tap** it: a button on it, its background, or its handles. It is outlined white |
+| Size **only that bar** | The panel's **Size** slider for the chosen bar (60–200 %), or drag the bar's corner grip |
+| Lay **that bar** out as a row, a column, or 2 / 3 / 4 across | The shape buttons under its Size |
+| Put **that bar** back as it was | **Reset … bar** |
+| Move any bar | Drag its **dotted** handle |
+| Hide a button you never use | Its corner **−** badge (a hidden one shows **+** to bring it back) |
+| Move a button — within its bar, **into another bar**, or **onto the page as a bar of its own** | **Hold, then drag** it; a sky line shows where it lands |
 | Make all the chrome bigger or smaller | **UI size** slider (70–160 %) |
-| Size each panel and contextual bar on its own — colour, size, ⋯, selection, text, image | One slider each (60–200 %) |
-| Get the controls out of the way | Drag the panel's **Customise layout** caption |
-| Start again | **Reset** |
+| Size the pop-up panels and contextual bars — colour, size, ⋯, selection, text, image | **Pop-up sizes**, one slider each |
+| Get the panel out of the way | Drag its **Customise layout** caption |
+| Start again | **Reset all** |
 | Finish | **Done**, or Back |
 
+Outside the editor, a **long press on a bar's background** opens it with that bar already chosen.
+
+### Round three — *"click on a panel (like the undo panel) and change the size of only that"*
+
+Round two answered *"the size of specific panels"* with a slider per pop-up panel and a drag grip on
+each bar, and that was not the question: the user meant **this bar**, chosen by touching it. Now a tap
+on a bar chooses it and the panel leads with that bar's own Size, shape and Reset. Three things moved
+to make a tap mean "this bar":
+
+- **Tapping a button chooses its bar** — it used to hide the button, so reaching for a bar made part
+  of it vanish. Hiding is the −/+ badge in the button's corner.
+- **The pen-settings row has its own size.** It used to be drawn at the tool bar's, so sizing one
+  sized both — exactly what *"only that"* rules out.
+- **The shape moved from a key on every bar into the panel**, beside the size. The pop-up panels'
+  sliders are folded under *Pop-up sizes*: they cannot be tapped, because they are not on screen.
 Two chips cannot be hidden: **Draw** (an editor you cannot write in is not an editor) and **⋯** (the
 way into the layout editor — hiding it would hide the only way to show it again). Both can still be
 moved anywhere. A bar with nothing left in it disappears outside the editor, and inside it is drawn as
@@ -130,11 +147,14 @@ bar back to 100 %. The codec round trip went red on exactly that field.
 | Move a chip **into another bar** | ✅ | ✅ `ChromeLayoutTest`, `ChromeDropTest` | ✅ Undo carried into the tool column, under Draw; Redo stayed |
 | Drop a chip **on the page** as its own bar | ✅ | ✅ | ✅ Fit width became *Bar 1*, and still fits the width (100 % → 11 %) |
 | An emptied bar of your own is deleted, and stays deleted | ✅ | ✅ stale-row test | — |
-| Row / column / grid per bar | ✅ | ✅ cycle, codec | ✅ tool bar as a column; page bar 3 across |
+| Row / column / grid per bar | ✅ | ✅ codec | ✅ tool bar as a column; page bar 3 across (round two, from a key on the bar; now in the panel) |
 | Pen settings beside a column-shaped tool bar | ✅ | — | ✅ row starts right of the column |
 | Move a bar; second row flips above in the lower half | ✅ | ✅ (position maths) | ✅ (round one) |
 | Resize a bar, including from the screen edge | ✅ | — | ✅ Undo grew 100 → 173 px; Zoom shrank 152 → 109 px; no Back |
-| A size per panel | ✅ | ✅ | ✅ colour panel at 151 %: swatch 52 → 78 px, other panels unchanged |
+| A size per pop-up panel | ✅ | ✅ | ✅ colour panel at 151 %: swatch 52 → 78 px, other panels unchanged |
+| **Tap a bar, size only that bar** | ✅ | ✅ `sizing one bar sizes that bar and no other` | ✅ tapped Undo → *Undo bar* in the panel; 182 %: Undo 78 → 140 px wide, tool and zoom bars unchanged to the pixel; kept after force-stop |
+| Reset one bar | ✅ | ✅ | — |
+| Hide via the corner badge | ✅ | — | ✅ badges listed on every hideable button |
 | Round one's saved layout loads in round two | ✅ | ✅ legacy-key test | ✅ order, hidden chips and sizes intact after upgrade |
 | Long-press a bar's background opens the editor | ✅ | — | ✅ |
 | Layout survives leaving and reopening a note | ✅ | ✅ codec | ✅ column, moved Undo, grid and Bar 1 all back |

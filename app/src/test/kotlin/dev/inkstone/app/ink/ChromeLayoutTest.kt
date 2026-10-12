@@ -117,10 +117,7 @@ class ChromeLayoutTest {
     }
 
     @Test
-    fun `arrangements cycle round and a bar remembers its own`() {
-        val cycle = generateSequence(ChromeArrangement.ROW) { it.next() }.take(ChromeArrangement.entries.size)
-        assertEquals(ChromeArrangement.entries.toList(), cycle.toList())
-        assertEquals(ChromeArrangement.ROW, ChromeArrangement.GRID_4.next())
+    fun `a bar remembers its own arrangement`() {
         val layout = ChromeLayout().arranged(dock, ChromeArrangement.COLUMN)
         assertEquals(ChromeArrangement.COLUMN, layout.bar(dock).arrangement)
         assertEquals(ChromeArrangement.ROW, layout.bar(pages).arrangement)
@@ -128,10 +125,37 @@ class ChromeLayoutTest {
     }
 
     @Test
-    fun `the pen settings row is drawn at the dock's size`() {
-        val layout = ChromeLayout().withUiScale(1.5f).scaled(dock, 0.8f)
-        assertEquals(1.2f, layout.scaleOf(draw), 0.0001f)
-        assertEquals(1.5f, layout.scaleOf(zoom), 0.0001f)
+    fun `sizing one bar sizes that bar and no other`() {
+        // "click on a panel (like the undo panel) and be able to change the size of only that"
+        val layout = ChromeLayout().withUiScale(1.5f).scaled(history, 0.8f)
+        assertEquals(1.2f, layout.scaleOf(history), 0.0001f)
+        ChromeBar.entries.map(BarId::Stock).filter { it != history }.forEach { other ->
+            assertEquals(1.5f, layout.scaleOf(other), 0.0001f, "$other changed with the Undo bar")
+        }
+        // The pen settings row used to share the tool bar's size; it has its own now.
+        val pen = ChromeLayout().scaled(draw, 1.4f)
+        assertEquals(1.4f, pen.scaleOf(draw), 0.0001f)
+        assertEquals(1f, pen.scaleOf(dock), 0.0001f)
+    }
+
+    @Test
+    fun `resetting a bar puts back that bar alone`() {
+        val custom = ChromeLayout()
+            .scaled(history, 1.8f)
+            .placed(history, ChromePosition(0.5f, 0.5f))
+            .arranged(history, ChromeArrangement.COLUMN)
+            .scaled(zoom, 0.7f)
+        val reset = custom.reset(history)
+        assertEquals(BarLayout(), reset.bar(history))
+        assertEquals(0.7f, reset.bar(zoom).scale)
+        val floating = ChromeLayout().floated(ChromeItem.UNDO, ChromePosition(0.2f, 0.3f))
+        val bar = floating.floating.single()
+        val shrunk = floating.scaled(bar, 0.6f).arranged(bar, ChromeArrangement.GRID_2)
+        assertEquals(
+            BarLayout(position = ChromePosition(0.2f, 0.3f)),
+            shrunk.reset(bar).bar(bar),
+            "a floating bar keeps its place",
+        )
     }
 
     @Test

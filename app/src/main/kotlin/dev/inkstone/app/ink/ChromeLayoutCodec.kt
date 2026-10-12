@@ -73,11 +73,7 @@ internal object ChromeLayoutCodec {
             else -> null
         }
         var layout = placed(id, position)
-        // ⚠️ Only for a bar that owns its size. The dock's second row is drawn at the dock's, and
-        // `scaled` says so by writing the dock — so applying the row's own column here put the dock
-        // back to 1.0 on every launch. Caught by the codec round trip.
-        val scale = parts.getOrNull(2)?.trim()?.toFloatOrNull()
-        if (scale != null && id.sizedBy() == id) layout = layout.scaled(id, scale)
+        parts.getOrNull(2)?.trim()?.toFloatOrNull()?.let { layout = layout.scaled(id, it) }
         val arrangement = ChromeArrangement.entries.firstOrNull {
             it.name == parts.getOrNull(INDEX_ARRANGEMENT)?.trim()
         }

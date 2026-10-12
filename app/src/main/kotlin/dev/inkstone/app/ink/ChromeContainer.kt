@@ -1,17 +1,23 @@
 package dev.inkstone.app.ink
 
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -137,10 +143,13 @@ private fun EmptyBar(id: BarId) {
 
 /**
  * One chip in the layout editor: the real chip, under a transparent cover that takes every touch, so
- * nothing on a bar *does* anything while it is being arranged — a tap on `Delete` hides the chip and
- * must not delete the page.
+ * nothing on a bar *does* anything while it is being arranged — a tap on `Delete` must not delete the
+ * page.
  *
- * - **Tap** hides it, or shows it again.
+ * - **Tap** chooses the bar it is in (`InkUiState.selectedBar`), which is what puts that bar's own
+ *   size in the editor's panel. A chip is most of a bar, so a tap on one has to mean the bar — the
+ *   first editor used the same tap to *hide* the chip, so reaching for a bar made part of it vanish.
+ * - **The −/+ badge** in its corner hides it, or shows it again.
  * - **Hold, then drag** lifts it: a picture follows the finger (`ItemDragGhost`), a sky line shows
  *   where it will land, and letting go puts it there — in this bar, another bar, or on the page as a
  *   bar of its own. A hold first, for the reason `ColorSwatch` uses one: a plain drag is how an
@@ -158,17 +167,21 @@ private fun EditableItem(item: ChromeItem, deps: ChromeDeps, content: @Composabl
     val hidden = ui.layout.isHidden(item)
     DisposableEffect(item) { onDispose { drag.forgetSlot(item, token) } }
     Box(
-        modifier = Modifier
-            .onGloballyPositioned { drag.reportSlot(item, token, Rect(it.positionInRoot(), it.size.toSize())) }
-            .graphicsLayer {
+        modifier = Modifier.onGloballyPositioned {
+            drag.reportSlot(item, token, Rect(it.positionInRoot(), it.size.toSize()))
+        },
+    ) {
+        // Only the chip fades — the badge stays at full strength, because on a hidden chip it is the
+        // way back.
+        Box(
+            modifier = Modifier.graphicsLayer {
                 alpha = when {
                     drag.item == item -> LIFTED_ALPHA
                     hidden -> HIDDEN_ALPHA
                     else -> 1f
                 }
             },
-    ) {
-        content()
+        ) { content() }
         Box(
             modifier = Modifier
                 .matchParentSize()
@@ -178,7 +191,7 @@ private fun EditableItem(item: ChromeItem, deps: ChromeDeps, content: @Composabl
                     detectTapGestures(
                         onPress = { press.generation = drag.generation },
                         // A hold that became a drag still ends in an up; it is not also a tap.
-                        onTap = { if (press.generation == drag.generation) ui.layout = ui.layout.toggled(item) },
+                        onTap = { if (press.generation == drag.generation) ui.selectedBar = ui.layout.owner(item) },
                     )
                 }
                 .pointerInput(item) {
@@ -196,14 +209,39 @@ private fun EditableItem(item: ChromeItem, deps: ChromeDeps, content: @Composabl
                         onDragCancel = drag::end,
                     )
                 }
-                .semantics {
-                    contentDescription = when {
-                        !item.hideable -> item.label
-                        hidden -> "Show ${item.label}"
-                        else -> "Hide ${item.label}"
-                    }
-                },
+                .semantics { contentDescription = item.label },
         )
+        if (item.hideable) HideBadge(item, hidden, ui, Modifier.align(Alignment.TopEnd))
+    }
+}
+
+/**
+ * The chip's corner key: **−** hides it, **+** brings a hidden one back. Drawn by hand — a glyph in
+ * this font at this size is a smudge, and a missing one is tofu.
+ */
+@Composable
+private fun HideBadge(item: ChromeItem, hidden: Boolean, ui: InkUiState, modifier: Modifier) {
+    Canvas(
+        modifier = modifier
+            .size(BadgeSize)
+            .background(if (hidden) Ink.Focus else Ink.PanelRaised, CircleShape)
+            .border(ItemOutline, Ink.Focus, CircleShape)
+            .pointerInput(item) { detectTapGestures(onTap = { ui.layout = ui.layout.toggled(item) }) }
+            .semantics { contentDescription = if (hidden) "Show ${item.label}" else "Hide ${item.label}" },
+    ) {
+        val stroke = BadgeStroke.toPx()
+        val arm = size.width * BADGE_ARM
+        val colour = if (hidden) Ink.OnAccent else Ink.TextStrong
+        drawLine(colour, Offset(center.x - arm, center.y), Offset(center.x + arm, center.y), stroke, StrokeCap.Round)
+        if (hidden) {
+            drawLine(
+                colour,
+                Offset(center.x, center.y - arm),
+                Offset(center.x, center.y + arm),
+                stroke,
+                StrokeCap.Round,
+            )
+        }
     }
 }
 
@@ -235,6 +273,11 @@ private const val HIDDEN_ALPHA = 0.32f
 
 /** The chip left behind while its picture is in the air. */
 private const val LIFTED_ALPHA = 0.2f
+private val BadgeSize = 18.dp
+private val BadgeStroke = 2.dp
+
+/** Half the − and + as a share of the badge's width. */
+private const val BADGE_ARM = 0.25f
 private val ItemOutline = 1.dp
 private val EmptyWidth = 96.dp
 

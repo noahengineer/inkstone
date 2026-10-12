@@ -369,11 +369,26 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      */
     var layout by mutableStateOf(STOCK.layout)
 
+    private var layoutEditorOpen by mutableStateOf(false)
+
     /**
      * True while the layout editor is open. Volatile, like [tool]: reopening a note half-way through
      * rearranging its toolbars would be a surprise, and the editor's state is all in [layout] anyway.
+     * Closing it lets go of [selectedBar], so the next time it opens nothing is already chosen.
      */
-    var editingLayout by mutableStateOf(false)
+    var editingLayout: Boolean
+        get() = layoutEditorOpen
+        set(value) {
+            layoutEditorOpen = value
+            if (!value) selectedBar = null
+        }
+
+    /**
+     * ⭐ The bar tapped in the layout editor, whose own size, shape and reset the editor's panel shows —
+     * *"click on a panel (like the undo panel) and be able to change the size of only that"*. Null
+     * until a bar is tapped. Volatile.
+     */
+    var selectedBar by mutableStateOf<BarId?>(null)
 
     /** The bar under the finger in the layout editor, if any. See [ChromeDrag]. */
     val chromeDrag = ChromeDrag()

@@ -50,8 +50,8 @@ data class ChromeLayout(
 
     fun bar(id: BarId): BarLayout = bars[id] ?: BarLayout()
 
-    /** What [id] is drawn at: the overall size times its own — the dock's own for its second row. */
-    fun scaleOf(id: BarId): Float = uiScale * bar(id.sizedBy()).scale
+    /** What [id] is drawn at: the overall size times its own. */
+    fun scaleOf(id: BarId): Float = uiScale * bar(id).scale
 
     fun panelScale(panel: ChromePanel): Float = uiScale * (panelScales[panel] ?: 1f)
 
@@ -115,8 +115,21 @@ data class ChromeLayout(
         return withBar(id, bar(id).copy(position = position))
     }
 
-    fun scaled(id: BarId, scale: Float): ChromeLayout =
-        withBar(id.sizedBy(), bar(id.sizedBy()).copy(scale = scale.coerceIn(BAR_SCALE)))
+    /**
+     * [id] at its own [scale] — that bar and nothing else. *"i want to be able to click on a panel (like
+     * the undo panel) and be able to change the size of only that."*
+     *
+     * ⚠️ The pen-settings row used to be drawn at the tool bar's size, so sizing one sized both — exactly
+     * what that sentence rules out. Every bar owns its size now.
+     */
+    fun scaled(id: BarId, scale: Float): ChromeLayout = withBar(id, bar(id).copy(scale = scale.coerceIn(BAR_SCALE)))
+
+    /**
+     * [id] as the design has it: its stock slot, its own size and a row. A floating bar keeps its place,
+     * because it has no stock one to go back to.
+     */
+    fun reset(id: BarId): ChromeLayout =
+        withBar(id, BarLayout(position = if (id is BarId.Floating) bar(id).position else null))
 
     fun arranged(id: BarId, arrangement: ChromeArrangement): ChromeLayout =
         withBar(id, bar(id).copy(arrangement = arrangement))
@@ -190,9 +203,6 @@ data class ChromeLayout(
     }
 }
 
-/** The bar whose size [this] is drawn at: the dock's second row is the dock's. */
-internal fun BarId.sizedBy(): BarId = if (this == BarId.Stock(ChromeBar.DRAW)) BarId.Stock(ChromeBar.DOCK) else this
-
 /** A bar: one of the stock ones, or one the user made by dropping a chip on the page. */
 @Immutable
 sealed interface BarId {
@@ -237,10 +247,6 @@ enum class ChromeArrangement(val columns: Int, val label: String) {
     GRID_2(2, "2 across"),
     GRID_3(3, "3 across"),
     GRID_4(4, "4 across"),
-    ;
-
-    /** The arrange button's next press. */
-    fun next(): ChromeArrangement = entries[(ordinal + 1) % entries.size]
 }
 
 /** The summoned panels and contextual bars, each with a size of its own. */
