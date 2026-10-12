@@ -1,6 +1,7 @@
 package dev.inkstone.core.storage
 
 import dev.inkstone.core.model.ElementId
+import dev.inkstone.core.model.ElementInstance
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.FractionalKey
@@ -9,6 +10,7 @@ import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.InkObject
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.Matrix3
+import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PagePoint
@@ -63,6 +65,9 @@ import kotlinx.serialization.json.jsonPrimitive
  *   later — defined, non-crashing and reported by nothing.
  * @property widthPt the Element's extent, for a picker preview. **Zero when the selection was
  *   nothing but ink** — see [ElementLibrary.save].
+ * @property pivot ⭐ the point a placed copy snaps to the grid by, in the Element's own space
+ *   (SPEC §4.9.7). Null for an Element saved before pivots existed; a stamp then carries none and a
+ *   copy snaps the way any other selection does.
  */
 public data class Element(
     val id: ElementId,
@@ -74,6 +79,7 @@ public data class Element(
     val assets: Map<String, ByteArray>,
     val widthPt: Float,
     val heightPt: Float,
+    val pivot: PagePoint? = null,
 )
 
 /**
@@ -139,6 +145,12 @@ public class ElementLibrary(private val fs: FileSystem, private val ids: IdFacto
      * can measure the ink itself (`:android:ink` can; nothing here can) and fold the correction
      * into `at`.
      *
+     * @param measured ⭐ the selection's page-space box as the **platform** measured it, strokes
+     *   included — `InkSurfaceView.boundsOf` answers it, and nothing in `:core:*` can. When given it
+     *   is the origin, so an Element of handwriting lands at `at` like any other and has a real
+     *   [Element.widthPt] for the panel to draw. Null keeps the payload-only box described above,
+     *   which is what a caller with no ink renderer — a test, or a future iOS build that has not
+     *   written its measurer yet — gets.
      * @return the saved Element, already written. An empty [selection] yields an empty Element
      *   rather than an error: this is a save path, and refusing to write is not obviously kinder
      *   than writing nothing. A caller should not offer "save as Element" with nothing selected.
@@ -149,14 +161,17 @@ public class ElementLibrary(private val fs: FileSystem, private val ids: IdFacto
         page: FoldedPage,
         selection: Set<ObjectId>,
         assets: Map<String, ByteArray>,
+        measured: PageRect? = null,
+        pivot: PagePoint? = null,
+        replacing: ElementId? = null,
     ): Element {
         // Fold order, so the Element keeps the stacking the user saw; `stamp` re-keys from it.
         val picked = page.objects.filter { it.id in selection }
-        val box = boundsOf(picked)
+        val box = measured ?: boundsOf(picked)
         val toOrigin = Matrix3.translate(-box.left, -box.top)
         val relative = picked.map { it.withRegisters(transform = toOrigin * it.transform) }
         val element = Element(
-            id = ids.newElementId(),
+            id = replacing ?: ids.newElementId(),
             name = name,
             collection = collection,
             objects = relative,
@@ -164,16 +179,47 @@ public class ElementLibrary(private val fs: FileSystem, private val ids: IdFacto
             // two `continue`s is the shape of bug `copiedObjectOps` was hoisted to stop: an object
             // with a format and no text would silently lose the format.
             texts = picked.mapNotNull { obj -> page.textOf(obj.id)?.let { obj.id to it } }.toMap(),
-            formats = picked.mapNotNull { obj -> page.formatOf(obj.id)?.let { obj.id to it } }.toMap(),
+            // ⚠️ Without any instance tag. An Element saved from a placed copy — or from the editor,
+            // which works on one — would otherwise carry the copy's identity into every stamp of
+            // itself, and "update every copy" would then find copies of the wrong Element.
+            formats = picked.mapNotNull { obj -> untagged(page.formatOf(obj.id))?.let { obj.id to it } }.toMap(),
             assets = relative.filterIsInstance<ImageObject>()
                 .mapNotNull { image -> assets[image.asset]?.let { image.asset to it } }
                 .toMap(),
             widthPt = box.width,
             heightPt = box.height,
+            pivot = pivot?.let { PagePoint(it.x - box.left, it.y - box.top) },
         )
         fs.createDirectories(NoteLayout.ELEMENTS_DIR)
+        // ⭐ Revising an Element replaces its file, and CLAUDE.md rule 1 says the previous version
+        // goes to trash first — so an edit that went wrong has the original to go back to.
+        if (replacing != null) keepPreviousVersion(replacing)
         fs.writeBytesAtomically(NoteLayout.element(element.id), ElementCodec.write(element))
         return element
+    }
+
+    /**
+     * The file [id] is about to replace, moved to `elements/trash/` under a name no earlier version
+     * holds. A move, never a copy-then-delete, for [delete]'s reason.
+     */
+    private suspend fun keepPreviousVersion(id: ElementId) {
+        val current = NoteLayout.element(id)
+        if (!fs.exists(current)) return
+        fs.createDirectories(NoteLayout.ELEMENTS_TRASH_DIR)
+        var version = 1
+        while (fs.exists(previousVersion(id, version))) version++
+        fs.move(current, previousVersion(id, version))
+    }
+
+    private fun previousVersion(id: ElementId, version: Int): String =
+        "${NoteLayout.ELEMENTS_TRASH_DIR}/${id.value}.v$version${NoteLayout.ELEMENT_EXTENSION}"
+
+    /** A format register with its instance tag removed, or null when nothing else was in it. */
+    private fun untagged(record: String?): String? {
+        if (record == null) return null
+        val format = ObjectFormat.decode(record)
+        if (format.instance == null) return record
+        return format.copy(instance = null).encode().ifEmpty { null }
     }
 
     /**
@@ -243,24 +289,106 @@ public class ElementLibrary(private val fs: FileSystem, private val ids: IdFacto
      *   everything else in the session. **Called once per object, and its results must never be
      *   reused between two calls to this method** — that is the corruption in [Element]'s KDoc.
      */
+    @Suppress("LongParameterList") // Where, at which key, as which copy, and the three generators.
     public fun stamp(
         element: Element,
         at: Matrix3,
-        z: FractionalKey,
+        z: FractionalKey?,
         newObjectId: () -> ObjectId,
         nextOpId: () -> String,
         nextClock: () -> LamportClock,
+        instanceId: String? = null,
+    ): ElementStamp = stampAt(
+        element = element,
+        at = at,
+        keys = SelectionEdit.keysAbove(z, element.objects.size),
+        newObjectId = newObjectId,
+        nextOpId = nextOpId,
+        nextClock = nextClock,
+        instanceId = instanceId,
+    )
+
+    /**
+     * [stamp] with its keys chosen by the caller — what [replaceCopies] needs to put a revised copy
+     * back at the stacking position the old one had, rather than on top of the page.
+     *
+     * @param instanceId ⭐ when non-null, every piece is tagged with an [ElementInstance] (SPEC
+     *   §4.9.7) so this copy can be found, and updated, again.
+     */
+    @Suppress("LongParameterList")
+    private fun stampAt(
+        element: Element,
+        at: Matrix3,
+        keys: List<FractionalKey>,
+        newObjectId: () -> ObjectId,
+        nextOpId: () -> String,
+        nextClock: () -> LamportClock,
+        instanceId: String?,
     ): ElementStamp {
         // `(z, id)` is how a page resolves stacking, so the stamp is ordered the same way — two
         // objects saved at one key would otherwise take their new keys in map order and could
         // swap between two stamps of one Element.
         val ordered = element.objects.sortedWith(compareBy({ it.z }, { it.id.value }))
-        val keys = SelectionEdit.keysAbove(z, ordered.size)
         val placed = ordered.mapIndexed { index, obj ->
             obj.withRegisters(transform = at * obj.transform, z = keys[index])
         }
-        val ops = copiedObjectOps(placed, element.texts, element.formats, newObjectId, nextOpId, nextClock)
+        val formats = if (instanceId == null) element.formats else tagged(element, ordered, instanceId)
+        val ops = copiedObjectOps(placed, element.texts, formats, newObjectId, nextOpId, nextClock)
         return withFreshAssets(element, ops)
+    }
+
+    /** Every piece's format register with this copy's [ElementInstance] added to it. */
+    private fun tagged(element: Element, ordered: List<InkObject>, instanceId: String): Map<ObjectId, String> =
+        ordered.associate { obj ->
+            val tag = ElementInstance(
+                elementId = element.id.value,
+                instanceId = instanceId,
+                member = obj.transform,
+                pivot = element.pivot,
+                size = PagePoint(element.widthPt, element.heightPt),
+            )
+            obj.id to ObjectFormat.decode(element.formats[obj.id]).copy(instance = tag).encode()
+        }
+
+    /**
+     * ⭐ SPEC §4.9.7 — every copy of [element] on [page], replaced by the current [element], each at
+     * the placement and the stacking position the old one had.
+     *
+     * Pure, like [stamp]: the caller applies the ops through its own session (as one gesture, so
+     * one undo puts the old copies back) and stages [ElementStamp.assets].
+     *
+     * The old pieces are **deleted, not rewritten** — tombstones, so the log keeps them (CLAUDE.md
+     * rule 1) — because an edit can add or remove pieces, and there is no op that turns one object
+     * into another kind. Each new copy keeps its old copy's instance id, so a second update finds it.
+     *
+     * @param originMoved where the revised Element's origin now sits, measured in the **old**
+     *   Element's space. An edit that adds ink above or to the left of everything moves the origin
+     *   (it is the top-left of what was saved), and replacing at the old placement would then slide
+     *   every unchanged piece of every copy by that much. Zero for an edit that did not move it.
+     * @return null when there is no copy of [element] on [page].
+     */
+    @Suppress("LongParameterList")
+    public fun replaceCopies(
+        page: FoldedPage,
+        element: Element,
+        newObjectId: () -> ObjectId,
+        nextOpId: () -> String,
+        nextClock: () -> LamportClock,
+        originMoved: PagePoint = PagePoint(0f, 0f),
+    ): ElementStamp? {
+        val copies = ElementCopies.on(page, element.id)
+        if (copies.isEmpty()) return null
+        val ops = ArrayList<PageOp>()
+        val assets = LinkedHashMap<String, ByteArray>()
+        for (copy in copies) {
+            copy.pieces.forEach { ops += PageOp.DeleteObject(nextOpId(), nextClock(), it) }
+            val keys = ElementCopies.keysFor(page, copy, element.objects.size)
+            val at = copy.placement * Matrix3.translate(originMoved.x, originMoved.y)
+            val stamped = stampAt(element, at, keys, newObjectId, nextOpId, nextClock, copy.instanceId)
+            ops += stamped.ops
+            assets += stamped.assets
+        }
+        return ElementStamp(ops, assets)
     }
 
     /** See [stamp]'s point 2: each stamped picture gets its own entry name and its own bytes. */
@@ -354,6 +482,12 @@ internal object ElementCodec {
             put(F_OBJECTS, objects)
             put(F_TEXTS, registers(element.texts))
             put(F_FORMATS, registers(element.formats))
+            // Absent rather than null when there is none, so an Element without a pivot is
+            // byte-identical to one written before pivots existed.
+            element.pivot?.let {
+                put(F_PIVOT_X, JsonPrimitive(it.x))
+                put(F_PIVOT_Y, JsonPrimitive(it.y))
+            }
         }
         val entries = ArrayList<Zip.Entry>()
         entries += Zip.Entry(ENTRY_JSON, OpCodec.json.encodeToString(JsonObject.serializer(), json).encodeToByteArray())
@@ -403,7 +537,14 @@ internal object ElementCodec {
                 .toMap(),
             widthPt = json[F_WIDTH]?.jsonPrimitive?.content?.toFloatOrNull() ?: 0f,
             heightPt = json[F_HEIGHT]?.jsonPrimitive?.content?.toFloatOrNull() ?: 0f,
+            pivot = pivotOf(json),
         )
+    }
+
+    private fun pivotOf(json: JsonObject): PagePoint? {
+        val x = json[F_PIVOT_X]?.jsonPrimitive?.content?.toFloatOrNull() ?: return null
+        val y = json[F_PIVOT_Y]?.jsonPrimitive?.content?.toFloatOrNull() ?: return null
+        return PagePoint(x, y)
     }
 
     /** Sorted by object id, so the file's bytes do not depend on a map's iteration order. */
@@ -430,6 +571,8 @@ internal object ElementCodec {
     private const val F_OBJECTS = "objects"
     private const val F_TEXTS = "texts"
     private const val F_FORMATS = "formats"
+    private const val F_PIVOT_X = "px"
+    private const val F_PIVOT_Y = "py"
 
     /** One format, one version. A mismatch is unreadable rather than guessed — see [read]. */
     private const val VERSION = 1

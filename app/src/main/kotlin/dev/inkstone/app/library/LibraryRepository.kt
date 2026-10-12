@@ -789,7 +789,10 @@ class LibraryRepository @Inject constructor(
         // `recordThumbnail` used to be this method's business, which is how the *other* path that
         // writes a cover came to write one it could never read back. It is [Thumbnails]' now, and
         // inseparable from the write (see `Thumbnails.storeCover`).
-        thumbnails.refreshCover(id, localRev, cover)
+        //
+        // Queued, not awaited: the caller holds the editor's lock, and waiting for a render here
+        // held the autosave off for seconds per materialize. See `Thumbnails.refreshCoverLater`.
+        thumbnails.refreshCoverLater(id, localRev, cover)
         sync.noteChanged(id)
     }
 
@@ -969,6 +972,116 @@ class LibraryRepository @Inject constructor(
         val note = index.note(id) ?: return
         if (note.folderId == folderId) return
         index.moveNote(id, folderId, clock.nowEpochMillis())
+    }
+
+    /**
+     * ⭐ File bound notes into the library folders their remote paths already imply.
+     *
+     * ⛔ **Without this a factory reset returns every note to the top level**, which is what it
+     * did: 25 notes came back from `Documents/School/…` — Art, FS Math, Physical Sciences/
+     * Chemistry/Revision and twenty more — and landed flat, because the structure lived only in
+     * the database the reset destroyed. The paths on the server had it all along.
+     *
+     * `Reconciler.folderFor` was supposed to be this and is dead twice over: it resolves a
+     * **pre-existing** pin rather than creating anything, and it resolves it through
+     * `folderBinding.remoteOcId`, which no production code has ever written —
+     * [pinFolderToRemote] is the only writer of that table and leaves the column null, so
+     * `findByOcId`'s `remoteOcId = ?` can never match. Mirroring has therefore never worked for
+     * anyone, pinned or not. Fixing it there would also place none of these 25: a bound note
+     * whose bytes are unchanged never reaches `folderFor` at all (`Reconciler.visit` returns
+     * `Unchanged` first), so the repair has to be able to run over notes that are already here.
+     *
+     * ## What makes it safe
+     *
+     * ⚠️ **The index only — no outbox row, no request**, exactly as [noteFolderChanged] argues.
+     * Every folder is derived *from* the path the file already sits at, so enqueuing a MOVE would
+     * ask the server to repeat what it has already done.
+     *
+     * ⚠️ **`folderId == null` is the whole guard.** A note the user has filed by hand is never
+     * touched, on this pass or any later one, so this cannot fight the user for their own
+     * library.
+     *
+     * ⚠️ **An existing folder is adopted, never duplicated.** Resolution asks [resolveRemoteFolder]
+     * what each candidate folder would *upload* to and matches that against the directory — the
+     * forward map, used backwards. Keying on `oc:id` instead would miss every folder the user made
+     * by hand, since [createFolder] writes no binding, and mirroring would then fork the whole
+     * library in two and empty the originals into the copies.
+     *
+     * ⚠️ **And the chain is verified before the note moves.** [FolderTree.libraryPathFor]
+     * sanitises its segments, but [RemoteName.sanitise] is not injective — `a:b` and `a_b` both
+     * become `a_b` — so a derived chain can re-derive to a *different* directory. The final
+     * equality check makes that unable to mis-file a note rather than leaving it as a caveat.
+     *
+     * @return how many notes were filed, for the caller to log.
+     */
+    suspend fun mirrorRemoteFolders(): Int {
+        var placed = 0
+        for (account in sync.allAccounts()) {
+            val pins = tables.folders.pathsForAccount(account.id)
+            for (binding in sync.bindingsFor(account.id)) {
+                if (fileIntoMirroredFolder(account, pins, binding)) placed++
+            }
+        }
+        return placed
+    }
+
+    /**
+     * One note. Returns whether it moved — see [mirrorRemoteFolders] for why each refusal is a
+     * refusal rather than a best guess.
+     */
+    // Every return is a different reason to leave a note exactly where it is, and they mean
+    // different things — no row, the user filed it, outside the mirror, no chain, a mangled name.
+    // Collapsing them into one condition would make the KDoc's guarantees unreadable, which is the
+    // same reasoning `StrokeGeometryCodec.decode` gives for the same suppression.
+    @Suppress("ReturnCount")
+    private suspend fun fileIntoMirroredFolder(
+        account: SyncAccount,
+        pins: Map<FolderId, String>,
+        binding: RemoteBinding,
+    ): Boolean {
+        val note = index.note(binding.noteId) ?: return false
+        // The guard. Also skips a trashed note, whose folder is remembered for restore.
+        if (note.folderId != null || note.deletedEpochMillis != null) return false
+
+        val directory = binding.remotePath.trim('/').substringBeforeLast('/', "")
+        // Rule 1 of `remoteFolderFor` backwards: the deepest pin covering this path wins, and the
+        // chain hangs off *that folder* rather than off the library root.
+        val pin = pins.entries
+            .filter { covers(it.value, directory) }
+            .maxByOrNull { it.value.trim('/').length }
+        val segments = FolderTree.libraryPathFor(directory, pin?.value ?: account.defaultFolder) ?: return false
+
+        var parent: FolderId? = pin?.key
+        for (segment in segments) parent = folderNamed(segment, parent)
+        if (parent == null) return false
+
+        // The fixed-point check. A chain that does not re-derive to where the file actually is
+        // means a name was mangled on the way; leave the note where it is.
+        if (resolveRemoteFolder(account.id, parent) != directory) return false
+        index.moveNote(note.id, parent, clock.nowEpochMillis())
+        return true
+    }
+
+    /** True when [pinPath] is [directory] or an ancestor of it. `""` is the DAV root and covers all. */
+    private fun covers(pinPath: String, directory: String): Boolean {
+        val pin = pinPath.trim('/')
+        return pin.isEmpty() || directory == pin || directory.startsWith("$pin/")
+    }
+
+    /**
+     * The child of [parent] called [name], adopting an existing one before making a new one.
+     *
+     * Matching is by name within the parent, which is what makes it idempotent across passes —
+     * and [createFolder] applies the same [legalName] to the segment, so a folder made here is
+     * found here next time.
+     */
+    private suspend fun folderNamed(name: String, parent: FolderId?): FolderId {
+        val wanted = legalName(name)
+        val existing = FolderTree.childrenOf(parent, index.allFolders())
+            .firstOrNull { it.deletedEpochMillis == null && it.name == wanted }
+        // Nothing remote is owed either way: the directory this mirrors is already on the server,
+        // which is where the name came from. See the KDoc on [mirrorRemoteFolders].
+        return existing?.id ?: createFolder(parent, wanted)
     }
 
     /**

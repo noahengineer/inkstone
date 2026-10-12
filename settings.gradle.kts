@@ -35,6 +35,7 @@ include(":core:storage")
 include(":core:database")
 include(":core:sync")
 include(":core:search")
+include(":core:calc")
 
 include(":android:ink")
 include(":android:pdf")

@@ -4,7 +4,6 @@ import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
-import dev.inkstone.app.elements.Element
 import dev.inkstone.core.model.ImageCrop
 import dev.inkstone.core.model.ImageEdit
 import dev.inkstone.core.model.ImageObject
@@ -15,6 +14,7 @@ import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.TextBoxObject
 import dev.inkstone.core.model.bounds
+import dev.inkstone.core.storage.Element
 
 /**
  * ⭐ ROADMAP M8c — what the screen is doing with a text box, an image or an Element right now.
@@ -86,17 +86,26 @@ class ObjectToolState {
     /** Whether the Elements panel is open. */
     var elementsOpen by mutableStateOf(false)
 
+    /** ⭐ The Element editor's armed tool — an area to drag out, or the pivot to place — or null. */
+    var elementTool by mutableStateOf<ElementEditorTool?>(null)
+
+    /** ⭐ The Element editor's canvas. Dark, as asked; light for checking near-black ink. */
+    var backdrop by mutableStateOf(dev.inkstone.android.ink.ElementBackdrop.DARK)
+
     /** The Element a tap with the Element tool will stamp, or null when the next drag captures one. */
     var pendingElement by mutableStateOf<Element?>(null)
 
-    /** A captured area waiting for a name and a collection. */
-    var capturedArea by mutableStateOf<PageRect?>(null)
+    /**
+     * What is about to be saved as an Element, waiting for a name and a collection — from a box
+     * dragged with the Elements tool, or from *"Save as Element"* on a selection.
+     */
+    var capture by mutableStateOf<ElementCapture?>(null)
 
     /**
      * Bumped once the library on disk has changed, so an **open** panel re-reads it.
      *
      * ⚠️ It exists because the obvious key is the wrong one. `ObjectLayers` used to reload on
-     * [capturedArea], which `onSaveElement` clears on the *first* line — before the coroutine that
+     * the captured area (now [capture]), which `onSaveElement` clears on the *first* line — before the coroutine that
      * writes `elements/index.json` has run — so the panel re-read the index it already had and went
      * on saying *"Nothing saved yet"*. A closed panel hid it, because opening one afterwards reads
      * disk anyway; with the panel open, which is how anybody looking at the library saves into it,
@@ -331,7 +340,7 @@ class ObjectToolState {
         stopEditing()
         clearFocus()
         pendingElement = null
-        capturedArea = null
+        capture = null
     }
 
     companion object {
@@ -347,6 +356,19 @@ class ObjectToolState {
         val DEFAULT_TEXT_STYLE: ObjectStyle = ObjectStyle(colorArgb = 0xFF1A1A1A.toInt(), widthPt = 1f)
     }
 }
+
+/**
+ * ⭐ What a save as Element will take: the objects, and the box the surface measured them at.
+ *
+ * Ids rather than an area since Elements could hold handwriting — an area can only be turned into
+ * objects by something that can measure a stroke, and that is the surface (`objectsWithin`), so the
+ * screen asks it once, at capture time, and the save never has to guess.
+ *
+ * @property bounds null only when the surface could not measure them, which the core library then
+ *   answers from the payloads it can measure.
+ */
+@androidx.compose.runtime.Immutable
+data class ElementCapture(val ids: List<ObjectId>, val bounds: PageRect?)
 
 /**
  * Which text box the field belongs to, and where it sits in page space.

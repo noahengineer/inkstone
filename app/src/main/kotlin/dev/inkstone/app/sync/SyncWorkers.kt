@@ -7,6 +7,7 @@ import dagger.hilt.EntryPoint
 import dagger.hilt.InstallIn
 import dagger.hilt.android.EntryPointAccessors
 import dagger.hilt.components.SingletonComponent
+import dev.inkstone.app.library.LibraryRepository
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.WorkScheduler
 import dev.inkstone.core.sync.OutboxDrainer
@@ -40,6 +41,12 @@ internal interface SyncWorkEntryPoint {
 
     /** SPEC §7.6's pull side (M6). See [ReconcileWorker]. */
     fun reconciler(): Reconciler
+
+    /**
+     * The library, so a finished pass can file newly-adopted notes into the folders their
+     * remote paths imply — see `LibraryRepository.mirrorRemoteFolders`.
+     */
+    fun library(): LibraryRepository
 
     /** So a 412 can ask for the pass that resolves it — see [OutboxDrainWorker.doWork]. */
     fun scheduler(): WorkScheduler
@@ -106,6 +113,13 @@ class ReconcileWorker(context: Context, parameters: WorkerParameters) : Coroutin
     override suspend fun doWork(): Result {
         val entryPoint = EntryPointAccessors.fromApplication(applicationContext, SyncWorkEntryPoint::class.java)
         val report = entryPoint.reconciler().reconcile()
+
+        // ⭐ The folder mirror, after the walk rather than inside it. A note adopted from
+        // `Documents/School/Art/x.pdf` belongs in an `Art` folder, and before this it landed at
+        // the library root — which is what a factory reset looked like: every note back, none of
+        // the structure. Local and network-free, guarded on `folderId == null`, so it is cheap
+        // when there is nothing to do and never fights a note the user filed by hand.
+        entryPoint.library().mirrorRemoteFolders()
 
         return when {
             // ⚠️ SPEC §7.2 / CLAUDE.md rule 5, and it is the same sentence [OutboxDrainWorker]

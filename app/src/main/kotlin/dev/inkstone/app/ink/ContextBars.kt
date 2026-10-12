@@ -15,6 +15,7 @@ import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
@@ -83,7 +84,15 @@ fun ContextBars(
     return when {
         editing != null -> {
             // A box being typed into is not selected, so it has no grips to keep clear of.
-            AnchoredBar(editing.bounds, ui.camera, clearsGrips = false, hidden = false, modifier = modifier) {
+            AnchoredBar(
+                editing.bounds,
+                ui.camera,
+                clearsGrips = false,
+                hidden = false,
+                layout = ui.layout,
+                panel = ChromePanel.TEXT,
+                modifier = modifier,
+            ) {
                 TextFormatBar(editing.id, objects, ui.slots, objectActions, onSummon)
             }
             true
@@ -99,9 +108,11 @@ fun ContextBars(
                 ui.camera,
                 clearsGrips = chrome != null,
                 hidden = ui.selectionManipulating,
+                layout = ui.layout,
+                panel = ChromePanel.IMAGE,
                 modifier = modifier,
             ) {
-                ImageBar(objects, actions, objectActions)
+                ImageBar(ui, objects, actions, objectActions)
             }
             true
         }
@@ -112,6 +123,8 @@ fun ContextBars(
                 ui.camera,
                 clearsGrips = true,
                 hidden = ui.selectionManipulating,
+                layout = ui.layout,
+                panel = ChromePanel.SELECTION,
                 modifier = modifier,
             ) {
                 SelectionBar(ui, objects, actions, onSummon)
@@ -149,6 +162,8 @@ private fun AnchoredBar(
     camera: Camera,
     clearsGrips: Boolean,
     hidden: Boolean,
+    layout: ChromeLayout,
+    panel: ChromePanel,
     modifier: Modifier = Modifier,
     content: @Composable RowScope.() -> Unit,
 ) {
@@ -159,7 +174,7 @@ private fun AnchoredBar(
         val gap = with(density) { InkDims.ContextGap.toPx() }
         val reach = with(density) { InkSelection.HANDLE_REACH_DP.dp.toPx() }
         val pad = with(density) { InkDims.EdgePadding.toPx() }
-        val safeTop = with(density) { DockSafeTop.toPx() }
+        val safeTop = with(density) { layout.dockSafeTop().toPx() }
 
         val topLeft = pageToView(PagePoint(bounds.left, bounds.top), camera)
         val bottomRight = pageToView(PagePoint(bounds.right, bounds.bottom), camera)
@@ -177,14 +192,32 @@ private fun AnchoredBar(
             safeTop = safeTop,
         )
 
-        GlassBar(
-            modifier = Modifier
-                .offset { IntOffset(x.roundToInt(), y.roundToInt()) }
-                .onSizeChanged { size = it }
-                .alpha(if (size == IntSize.Zero) 0f else 1f),
-            content = content,
-        )
+        // ⭐ At this bar's own size (`ChromeLayout.panelScale`). The placement above stays in the screen's
+        // own px: it is about where the *object* is, and the object is not scaled.
+        ScaledChrome(layout.panelScale(panel)) {
+            GlassBar(
+                modifier = Modifier
+                    .offset { IntOffset(x.roundToInt(), y.roundToInt()) }
+                    .onSizeChanged { size = it }
+                    .alpha(if (size == IntSize.Zero) 0f else 1f),
+                content = content,
+            )
+        }
     }
+}
+
+/**
+ * Where a contextual bar may start: clear of the dock's first row while the dock is in its stock
+ * place across the top — taller when the dock has been made bigger — and nothing but the edge once
+ * the dock has been moved, so a selection near the top of the page is not pushed down for a dock
+ * that is no longer there.
+ */
+private fun ChromeLayout.dockSafeTop(): Dp = if (bar(Dock).position == null &&
+    bar(Dock).arrangement == ChromeArrangement.ROW
+) {
+    InkDims.EdgePadding + (DockSafeTop - InkDims.EdgePadding) * scaleOf(Dock)
+} else {
+    InkDims.EdgePadding
 }
 
 /**
@@ -248,6 +281,7 @@ private fun RowScope.SelectionBar(
         )
     }
     ShapeGeometryChips(ui, actions)
+    ElementChips(ui, actions)
     if (ui.selectedConnectors > 0) {
         ChipDivider()
         ConnectorRoute.entries.forEach { route ->
@@ -473,7 +507,12 @@ private fun RowScope.AlignAndLists(id: ObjectId?, state: ObjectToolState, action
  * `SetTransform` carrying a negated matrix — absolute, like everything else in that register.
  */
 @Composable
-private fun RowScope.ImageBar(state: ObjectToolState, actions: InkToolbarActions, objectActions: ObjectActions) {
+private fun RowScope.ImageBar(
+    ui: InkUiState,
+    state: ObjectToolState,
+    actions: InkToolbarActions,
+    objectActions: ObjectActions,
+) {
     val focused = state.image ?: return
     if (state.cropping != null) {
         TextChip(label = "Done", onClick = { state.commitCrop(objectActions) })
@@ -492,6 +531,33 @@ private fun RowScope.ImageBar(state: ObjectToolState, actions: InkToolbarActions
     ChipDivider()
     TextChip(label = "Duplicate", onClick = actions.onDuplicateSelection)
     TextChip(label = "Delete", danger = true, onClick = actions.onDeleteSelection)
+    // A sole image is the case the knockout chip matters most for — an icon with a transparent
+    // background — and the image bar replaces the selection bar, so it has to carry the chips too.
+    ElementChips(ui, actions)
+}
+
+/**
+ * ⭐ The two Element-follow-up chips, shared by the selection bar and the image bar.
+ *
+ * - **Knockout** (SPEC §4.9.6) — a toggle, for the reason `Rounded` and `Arrow` are toggles: one
+ *   boolean, and the chip shows which side of it you are on. *On* only when every eligible object
+ *   is, so pressing it on a half-flagged selection flags the rest rather than clearing the half.
+ * - **Save as Element** — the selection, handwriting included, into the same name dialog the
+ *   Elements tool's box opens. Here because a selection is how a person has already said *"this"*.
+ */
+@Composable
+private fun RowScope.ElementChips(ui: InkUiState, actions: InkToolbarActions) {
+    ChipDivider()
+    // ⭐ A copy with a pivot snaps by it, whatever it is made of — so the lattice's switch belongs
+    // here too, not only beside the shape chips. Not shown twice when shapes already put it there.
+    if (ui.selectionPivot != null && ui.selectedShapes == 0) {
+        TextChip(label = "Grid", selected = ui.gridSnapEnabled, onClick = { ui.gridSnapEnabled = !ui.gridSnapEnabled })
+    }
+    if (ui.selectedKnockoutEligible > 0) {
+        val allOn = ui.selectedKnockoutOn == ui.selectedKnockoutEligible
+        TextChip(label = "Knockout", selected = allOn, onClick = { actions.onKnockoutSelection(!allOn) })
+    }
+    TextChip(label = "Save as Element", onClick = actions.onSaveSelectionAsElement)
 }
 
 private fun ObjectToolState.resize(id: ObjectId?, delta: Float, actions: ObjectActions) {
@@ -540,6 +606,8 @@ private val ListStyle.label: String
         ListStyle.BULLET -> "Bullets"
         ListStyle.NUMBERED -> "Numbers"
     }
+
+private val Dock = BarId.Stock(ChromeBar.DOCK)
 
 /** Clear of the Dynamic Dock's primary row, which is the one row that is always on screen. */
 private val DockSafeTop = 78.dp

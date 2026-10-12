@@ -305,6 +305,44 @@ public object FolderTree {
     }
 
     /**
+     * ⭐ The inverse of [remoteFolderFor] — the library folder chain a remote *directory* implies.
+     *
+     * `Library.sq`'s own header says folder membership is the one thing that cannot be recovered
+     * if the database is lost, *"which is why M5 mirrors folders to Nextcloud, where they become a
+     * second copy that survives a reinstall."* Nothing ever read that second copy back, so a
+     * factory reset returned every note to the top level. This is the read.
+     *
+     * ⚠️ **Three answers, and two of them look alike from the call site**, so they are kept apart —
+     * the same reasoning as `OfflineBrowsing.notice`'s "empty" versus "never looked":
+     *
+     * - `emptyList()` — the directory **is** [base]. The note belongs at [base]'s own level, and
+     *   that is a decision rather than an absence.
+     * - `null` — the directory is **outside** the mirror. Decide nothing: inventing a folder from
+     *   a path the mirror does not cover is the reconciler reorganising someone's library.
+     * - a non-empty list — one segment per level below [base].
+     *
+     * ⚠️ Segments are [RemoteName.sanitise]d so the answer is a **fixed point**: a folder created
+     * from them re-derives through [remoteFolderFor] to the path it came from. Without that a
+     * later `moveNotes` would compute a different remote path and enqueue a MOVE that renames the
+     * user's own directory — rule 1 damage from a naming mismatch nobody would look for.
+     *
+     * @param base the pinned path when an ancestor is pinned (rule 2 of [remoteFolderFor] read
+     *   backwards — the pin contributes its path, so segments start *after* it), otherwise the
+     *   account's default folder.
+     */
+    public fun libraryPathFor(remoteDirectory: String, base: String): List<String>? {
+        val directory = remoteDirectory.trim('/')
+        val root = base.trim('/')
+        if (root.isEmpty()) {
+            // An empty base is the DAV root, which contains everything — so nothing is outside it.
+            return if (directory.isEmpty()) emptyList() else directory.split('/').map(RemoteName::sanitise)
+        }
+        if (directory == root) return emptyList()
+        if (!directory.startsWith("$root/")) return null
+        return directory.removePrefix("$root/").split('/').map(RemoteName::sanitise)
+    }
+
+    /**
      * `base/a/b`, with an empty base yielding `a/b` rather than `/a/b`.
      *
      * A leading slash would make the path absolute against the DAV endpoint instead of

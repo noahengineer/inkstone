@@ -6,10 +6,12 @@ import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Region
 import androidx.ink.brush.TextureBitmapStore
 import androidx.ink.geometry.Box
 import androidx.ink.rendering.android.canvas.CanvasStrokeRenderer
@@ -17,6 +19,9 @@ import dev.inkstone.android.ink.InkColor.withOpacity
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.PageCanvas
+import kotlin.math.ceil
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * Draws a page — paper, template, ink, erasures — onto a [Canvas] that already carries the
@@ -115,8 +120,20 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
      *   strokes at every zoom by construction: the canvas already carries the camera,
      *   and page space is defined as the CropBox with `/Rotate` applied (SPEC §4.4) —
      *   which is exactly the rectangle a rendered page fills.
+     * @param pageToCanvas the transform the canvas already carries, read for its scale only — the
+     *   dot grid bakes its lattice at the pixel density it will be drawn at. Null is 1:1.
      */
-    fun paintBackground(canvas: Canvas, page: PageCanvas, background: Background, sourcePage: Bitmap? = null) {
+    fun paintBackground(
+        canvas: Canvas,
+        page: PageCanvas,
+        background: Background,
+        sourcePage: Bitmap? = null,
+        pageToCanvas: Matrix? = null,
+    ) {
+        backdrop?.let {
+            paintBackdrop(canvas, page, it)
+            return
+        }
         val pageSize = page.size
         // ⭐ The paper's own top-left, which is the page-space origin on every fixed page and is
         // negative on a canvas that has grown up or to the left (SPEC §4.5, [PageCanvas]).
@@ -130,15 +147,136 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
             pageBounds.set(0f, 0f, pageSize.widthPt, pageSize.heightPt)
             canvas.drawBitmap(sourcePage, null, pageBounds, imagePaint)
         }
-        // Under the ink, over the paper. Culling it would mean clipping every rule to the
-        // viewport, and a page's worth of lines is a rounding error next to 5,000 strokes.
-        template.draw(canvas, background, pageSize)
+        // Under the ink, over the paper. Not culled: a page's worth of *lines* is a few hundred draws
+        // even on a grown canvas. The dots were the exception — one draw each, 39,000 on the physics
+        // note — and are a single shaded rectangle now (`TemplateBackground.drawDots`).
+        template.draw(canvas, background, pageSize, pxPerPt = pageToCanvas?.mapRadius(1f) ?: 1f)
         canvas.restoreToCount(saved)
     }
 
     /** The page's edge. Drawn last so ink cannot sit on top of it. */
     fun paintBorder(canvas: Canvas, page: PageCanvas) {
+        // The Element editor has no paper, so it has no paper's edge either.
+        if (backdrop != null) return
         canvas.drawRect(page.left, page.top, page.right, page.bottom, borderPaint)
+    }
+
+    // -----------------------------------------------------------------------
+    // ⭐ The Element editor's canvas (SPEC §4.9.7)
+    // -----------------------------------------------------------------------
+
+    /**
+     * Not null while an Element is being edited: a grid replaces the paper, and [showCutters] draws
+     * every invisible knockout area as a dashed outline so it can be seen, selected and moved.
+     *
+     * *"I would not want it to have like a paper — a black grid background to show it's just that
+     * element."* The grid is drawn across the page rectangle, which the editor makes far larger than
+     * the screen, so there is no edge anywhere a person would reach.
+     */
+    var backdrop: ElementBackdrop? = null
+
+    /** The editor's grid cell, in page points — the lattice it snaps to (`InkSurfaceView.elementGridPt`). */
+    var backdropCellPt: Float = BACKDROP_CELL_PT
+
+    /** Whether invisible knockout areas are drawn — only on the Element editor's canvas. */
+    val showCutters: Boolean get() = backdrop != null
+
+    private fun paintBackdrop(canvas: Canvas, page: PageCanvas, backdrop: ElementBackdrop) {
+        backdropPaint.color = backdrop.groundArgb
+        canvas.drawRect(page.left, page.top, page.right, page.bottom, backdropPaint)
+        var step = 0
+        val cell = backdropCellPt
+        var x = page.left - page.left % cell
+        while (x <= page.right) {
+            gridPaint.color = if (step++ % BACKDROP_MAJOR_EVERY == 0) backdrop.majorArgb else backdrop.minorArgb
+            canvas.drawLine(x, page.top, x, page.bottom, gridPaint)
+            x += cell
+        }
+        step = 0
+        var y = page.top - page.top % cell
+        while (y <= page.bottom) {
+            gridPaint.color = if (step++ % BACKDROP_MAJOR_EVERY == 0) backdrop.majorArgb else backdrop.minorArgb
+            canvas.drawLine(page.left, y, page.right, y, gridPaint)
+            y += cell
+        }
+    }
+
+    /**
+     * ⭐ SPEC §4.9.7 — the Element editor's guides, **over** every object: each knockout area dashed in
+     * sky blue, and the Element's bounds dashed in amber with its pivot marked.
+     *
+     * On top rather than at each object's own place in the stack, because an area sits at the bottom
+     * of the Element (it hides the note *behind* a copy, not the Element's own pieces) — drawn in
+     * place it was hidden under any filled piece above it, which is half of *"hard to position
+     * right"*. In page space, so a dash is the same length however the guide has been stretched.
+     */
+    fun paintGuides(canvas: Canvas, store: StrokeStore) {
+        if (!showCutters) return
+        store.forEachInRenderOrder(visibleBounds = null) { dry ->
+            if (dry !is DryShape || !dry.isGuide) return@forEachInRenderOrder
+            dry.transform.into(objectMatrix)
+            guidePath.set(dry.path)
+            guidePath.transform(objectMatrix)
+            canvas.drawPath(guidePath, if (dry.elementFrame) framePaint else cutterPaint)
+            if (dry.elementFrame) paintPivot(canvas, dry)
+        }
+    }
+
+    /**
+     * A ring with a cross through it — the same mark a selected copy's pivot gets on a note. Where
+     * `ElementEditing.frameOf` puts it: an offset in points from the bounds' top-left, clamped into
+     * them, or their centre. Reads [guidePath], which [paintGuides] has just mapped to page space.
+     */
+    private fun paintPivot(canvas: Canvas, frame: DryShape) {
+        guidePath.computeBounds(guideBounds, true)
+        val offset = frame.decodedFormat.framePivot
+        val x = offset?.let { (guideBounds.left + it.x).coerceIn(guideBounds.left, guideBounds.right) }
+            ?: guideBounds.centerX()
+        val y = offset?.let { (guideBounds.top + it.y).coerceIn(guideBounds.top, guideBounds.bottom) }
+            ?: guideBounds.centerY()
+        canvas.drawCircle(x, y, PIVOT_RADIUS_PT, pivotPaint)
+        canvas.drawLine(x - PIVOT_ARM_PT, y, x + PIVOT_ARM_PT, y, pivotPaint)
+        canvas.drawLine(x, y - PIVOT_ARM_PT, x, y + PIVOT_ARM_PT, pivotPaint)
+    }
+
+    private val guidePath = Path()
+    private val guideBounds = RectF()
+
+    /** The Element's bounds, as the editor shows them. Amber, the pivot's colour: both are the Element's own geometry. */
+    private val framePaint = Paint().apply {
+        style = Paint.Style.STROKE
+        strokeWidth = CUTTER_OUTLINE_PT
+        color = FRAME_ARGB
+        isAntiAlias = true
+        pathEffect = DashPathEffect(floatArrayOf(FRAME_DASH_PT, CUTTER_DASH_PT), 0f)
+    }
+
+    private val pivotPaint = Paint().apply {
+        style = Paint.Style.STROKE
+        strokeWidth = CUTTER_OUTLINE_PT
+        color = FRAME_ARGB
+        isAntiAlias = true
+    }
+
+    private val backdropPaint = Paint().apply {
+        style = Paint.Style.FILL
+        isAntiAlias = false
+    }
+
+    /** A hairline at any zoom: a stroke width of zero is one device pixel. */
+    private val gridPaint = Paint().apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 0f
+        isAntiAlias = false
+    }
+
+    /** An invisible knockout area, as the editor shows it. */
+    private val cutterPaint = Paint().apply {
+        style = Paint.Style.STROKE
+        strokeWidth = CUTTER_OUTLINE_PT
+        color = CUTTER_ARGB
+        isAntiAlias = true
+        pathEffect = DashPathEffect(floatArrayOf(CUTTER_DASH_PT, CUTTER_DASH_PT), 0f)
     }
 
     /**
@@ -151,9 +289,196 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
      */
     fun paintObjects(canvas: Canvas, store: StrokeStore, pageToCanvas: Matrix, visibleBounds: Box?, paper: PageCanvas) {
         val saved = clipToPaper(canvas, paper)
-        store.forEachInRenderOrder(visibleBounds) { dry -> paintObject(canvas, dry, pageToCanvas) }
+        if (store.hasKnockouts) {
+            paintWithKnockouts(canvas, store, pageToCanvas, visibleBounds)
+        } else {
+            store.forEachInRenderOrder(visibleBounds) { dry -> paintObject(canvas, dry, pageToCanvas) }
+        }
         canvas.restoreToCount(saved)
     }
+
+    // -----------------------------------------------------------------------
+    // ⭐ Knockout — SPEC §4.9.6
+    // -----------------------------------------------------------------------
+
+    /**
+     * Every object, with each knockout hiding whatever is beneath its filled silhouette.
+     *
+     * ## Why there is a layer, and only here
+     *
+     * `DST_OUT` clears whatever the canvas already holds — and on the plain path that includes the
+     * **paper**, which [paintBackground] drew onto the same canvas a moment earlier. Cleared paper is
+     * a hole through to the window behind the page. So the objects go into a layer of their own,
+     * where a cut clears ink and leaves transparency that composites back over the paper (and over
+     * an imported PDF page, which is paper too: a knockout hides ink, never the document). A page
+     * with no knockout never reaches this function, and pays for no layer.
+     *
+     * ## ⚠️ One knockout never hides another
+     *
+     * The case this has to get right is an Element made of several pieces — a hand-drawn icon is a
+     * dozen strokes, each flagged. If every piece cut everything beneath it, the face's outline
+     * would erase the eyes drawn before it. So a cut is followed by repainting, clipped to the cut,
+     * every knockout already drawn: inside the silhouette, everything below that is not a knockout
+     * is gone and every knockout comes back in its own order. Two *separate* icons overlapping
+     * therefore show through each other, which is the price of not having groups; it is the rarer
+     * case of the two by a long way.
+     *
+     * ## Highlighters
+     *
+     * The highlight band is drawn after all ink by design (SPEC §3.4), so a highlighter under a
+     * knockout would otherwise be painted back over it. It gets a layer of its own, interleaved with
+     * the knockouts by `(z, id)` — see [StrokeStore.forEachHighlightAmongKnockouts].
+     */
+    private fun paintWithKnockouts(canvas: Canvas, store: StrokeStore, pageToCanvas: Matrix, visibleBounds: Box?) {
+        val layer = canvas.saveLayer(null, null)
+        knockedSoFar.clear()
+        store.forEachInInkBand(visibleBounds) { dry ->
+            val cut = if (dry.knockout) silhouetteOf(dry) else null
+            if (cut == null) {
+                paintObject(canvas, dry, pageToCanvas)
+            } else {
+                cutOut(canvas, dry, cut)
+                restoreKnockoutsUnder(canvas, dry, cut, pageToCanvas)
+                paintObject(canvas, dry, pageToCanvas)
+                knockedSoFar += dry
+            }
+        }
+        if (store.hasHighlighter) {
+            val highlights = canvas.saveLayer(null, null)
+            store.forEachHighlightAmongKnockouts(
+                visibleBounds,
+                onHighlighter = { dry -> paintObject(canvas, dry, pageToCanvas) },
+                onKnockout = { dry -> silhouetteOf(dry)?.let { cutOut(canvas, dry, it) } },
+            )
+            canvas.restoreToCount(highlights)
+        }
+        knockedSoFar.clear()
+        canvas.restoreToCount(layer)
+    }
+
+    /** Clears [silhouette] — in [dry]'s own space — out of everything painted so far in this layer. */
+    private fun cutOut(canvas: Canvas, dry: DryObject, silhouette: Path) {
+        val saved = canvas.save()
+        if (dry.transform != Matrix3.Identity) {
+            dry.transform.into(objectMatrix)
+            canvas.concat(objectMatrix)
+        }
+        canvas.drawPath(silhouette, knockoutPaint)
+        canvas.restoreToCount(saved)
+    }
+
+    /** See [paintWithKnockouts] — every knockout already drawn, back, but only where [dry] just cut. */
+    private fun restoreKnockoutsUnder(canvas: Canvas, dry: DryObject, silhouette: Path, pageToCanvas: Matrix) {
+        if (knockedSoFar.isEmpty()) return
+        clipPath.set(silhouette)
+        if (dry.transform != Matrix3.Identity) {
+            dry.transform.into(objectMatrix)
+            clipPath.transform(objectMatrix)
+        }
+        val saved = canvas.save()
+        canvas.clipPath(clipPath)
+        for (index in knockedSoFar.indices) paintObject(canvas, knockedSoFar[index], pageToCanvas)
+        canvas.restoreToCount(saved)
+    }
+
+    /**
+     * ⭐ [dry]'s filled silhouette in its own space — built once, then cached on the object until
+     * something about how it looks changes (`DryObject.invalidateSilhouette`).
+     *
+     * A text box answers its **frame**, not its letters. The letters' silhouette is the rule applied
+     * faithfully and is useless — the gaps between words would show the lines underneath — and a
+     * label that clears a box behind it is the thing a person flagging a text box wants.
+     *
+     * Every other kind is drawn into a picture and handed to [SilhouetteMask], because "the outline
+     * with the holes filled in" has no per-kind definition that holds for a hand-drawn loop, a
+     * picture with an alpha channel and a rounded rectangle alike.
+     *
+     * @return null when there is nothing to cut yet — notably an image whose pixels have not loaded,
+     *   which is then *not* cached, so the cut appears with the picture rather than never.
+     */
+    internal fun silhouetteOf(dry: DryObject): Path? {
+        val source: Any = when (dry) {
+            is DryImage -> assets?.bitmap(dry.asset)?.takeUnless { it.isRecycled } ?: return null
+            else -> Unit
+        }
+        dry.silhouette?.let { cached -> if (dry.silhouetteSource === source) return cached }
+        val built = when {
+            dry is DryTextBox -> Path().apply { addRect(0f, 0f, dry.widthPt, dry.heightPt, Path.Direction.CW) }
+
+            // A cutter draws nothing, so there is no picture to measure — its silhouette is its
+            // outline, filled, which for a closed shape is exactly the area it names.
+            dry is DryShape && dry.cutter -> Path(dry.path).apply { fillType = Path.FillType.WINDING }
+
+            else -> rasterSilhouette(dry)
+        } ?: return null
+        dry.silhouette = built
+        dry.silhouetteSource = source
+        return built
+    }
+
+    /**
+     * Draw [dry] into a picture, find its filled silhouette, and bring that back as a [Path] in the
+     * object's own space.
+     *
+     * The picture is sized from the object's own box at up to [SILHOUETTE_PX_PER_PT], capped at
+     * [SILHOUETTE_MAX_PX] on the long side — a few milliseconds, once per change, and never on the
+     * ink path: it runs while the page is being recorded, which already walks every object.
+     */
+    private fun rasterSilhouette(dry: DryObject): Path? {
+        val box = dry.bounds ?: return null
+        val extent = max(box.xMax - box.xMin, box.yMax - box.yMin)
+        if (!(extent > 0f)) return null
+        val scale = min(SILHOUETTE_PX_PER_PT, SILHOUETTE_MAX_PX / extent)
+        val closeRadius = max(1, ceil(SILHOUETTE_GAP_PT * scale).toInt())
+        val pad = closeRadius + SILHOUETTE_MARGIN_PX
+        val width = ceil((box.xMax - box.xMin) * scale).toInt() + 2 * pad
+        val height = ceil((box.yMax - box.yMin) * scale).toInt() + 2 * pad
+
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val pixels = IntArray(width * height)
+        try {
+            val picture = Canvas(bitmap)
+            picture.translate(pad.toFloat(), pad.toFloat())
+            picture.scale(scale, scale)
+            picture.translate(-box.xMin, -box.yMin)
+            val toPicture = Matrix().apply { setScale(scale, scale) }
+            paintInObjectSpace(picture, dry, toPicture)
+            bitmap.getPixels(pixels, 0, width, 0, 0, width, height)
+        } finally {
+            bitmap.recycle()
+        }
+        for (index in pixels.indices) pixels[index] = pixels[index] ushr ALPHA_SHIFT
+
+        val mask = SilhouetteMask.of(pixels, width, height, closeRadius)
+        val region = Region()
+        SilhouetteMask.forEachRun(mask, width, height) { y, from, to ->
+            region.op(from, y, to, y + 1, Region.Op.UNION)
+        }
+        if (region.isEmpty) return null
+        val path = region.boundaryPath
+        // Picture pixels back to the object's own space: the inverse of the three steps above.
+        path.transform(
+            Matrix().apply {
+                setTranslate(-pad.toFloat(), -pad.toFloat())
+                postScale(1f / scale, 1f / scale)
+                postTranslate(box.xMin, box.yMin)
+            },
+        )
+        return path
+    }
+
+    /** Clears to transparent where a silhouette is drawn. Filled, antialiased. */
+    private val knockoutPaint = Paint().apply {
+        style = Paint.Style.FILL
+        isAntiAlias = true
+        xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT)
+    }
+
+    /** Knockouts drawn so far this pass — see [paintWithKnockouts]. Reused, never reallocated. */
+    private val knockedSoFar = ArrayList<DryObject>()
+
+    /** A silhouette moved into page space for a clip. Reused. */
+    private val clipPath = Path()
 
     /**
      * ⭐ **The paper is where the ink stops, on screen as well as in the PDF.**
@@ -348,7 +673,8 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
     private fun paintImage(canvas: Canvas, dry: DryImage) {
         val bitmap = assets?.bitmap(dry.asset)
         if (bitmap == null || bitmap.isRecycled) {
-            paintMissingImage(canvas, dry)
+            // Asked *after* [PageAssets.bitmap], because asking is what starts a decode.
+            if (assets?.isPending(dry.asset) == true) paintPendingImage(canvas, dry) else paintMissingImage(canvas, dry)
             return
         }
         val saved = canvas.save()
@@ -381,6 +707,16 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
     }
 
     /**
+     * A picture whose pixels are on their way: the same flat wash, **without** the cross or the
+     * dashed edge. See [PageAssets.isPending] — a page opening with eleven photographs used to show
+     * eleven fault markers for as long as their first decode took.
+     */
+    private fun paintPendingImage(canvas: Canvas, dry: DryImage) {
+        destRect.set(0f, 0f, dry.widthPt, dry.heightPt)
+        canvas.drawRect(destRect, missingFill)
+    }
+
+    /**
      * ⭐ M8b — a shape or a connector, in its own space.
      *
      * **Fill first, then the outline**, so a stroke of the same colour reads as an edge rather than
@@ -400,6 +736,10 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
      * plain alpha for the same reason the highlighter is.
      */
     private fun paintShape(canvas: Canvas, dry: DryShape) {
+        // ⭐ An invisible knockout area draws nothing — it only cuts (SPEC §4.9.6) — and the Element
+        // editor's bounds are not part of the picture at all. Both are drawn by [paintGuides], on top
+        // of everything, while an Element is being edited.
+        if (dry.isGuide) return
         val record = dry.record
         if (dry.fillable) {
             val fill = record.fillArgb ?: 0
@@ -521,5 +861,42 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
         const val MISSING_FILL_COLOR = 0x14000000
         const val MISSING_EDGE_COLOR = 0x59000000
         const val MISSING_DASH_PT = 4f
+
+        /** Picture resolution for a silhouette — finer than any tablet shows a point at fit width. */
+        const val SILHOUETTE_PX_PER_PT = 4f
+
+        /** And never more than this on the long side, so a full-page picture costs a bounded mask. */
+        const val SILHOUETTE_MAX_PX = 768f
+
+        /**
+         * ⭐ The widest gap, in page points, that still closes a shape — a hand-drawn circle whose
+         * pen lifted short of where it began. Three points is about a millimetre either side: wide
+         * enough for a careless loop, narrow enough that an arc is still an arc.
+         */
+        const val SILHOUETTE_GAP_PT = 3f
+
+        /** Blank border round the picture, so the outside can be flooded all the way round. */
+        const val SILHOUETTE_MARGIN_PX = 2
+
+        /**
+         * The Element editor's grid: a cell, and how often a heavier line is drawn.
+         *
+         * The grid the editor draws **is** the grid it snaps to: blank paper's lattice
+         * (`SnapGrid.DEFAULT_SPACING_PT`, the square-grid template's spacing). It was 12 pt against an
+         * 18 pt snap, so a snapped area landed between the lines the user was aiming at.
+         */
+        const val BACKDROP_CELL_PT = dev.inkstone.core.model.SnapGrid.DEFAULT_SPACING_PT
+        const val BACKDROP_MAJOR_EVERY = 5
+
+        /** sky-400, the chrome's accent — readable on both backdrops. */
+        const val CUTTER_ARGB = 0xFF38BDF8.toInt()
+        const val CUTTER_OUTLINE_PT = 1.5f
+        const val CUTTER_DASH_PT = 5f
+        const val FRAME_ARGB = 0xFFF59E0B.toInt()
+        const val FRAME_DASH_PT = 9f
+        const val PIVOT_RADIUS_PT = 6f
+        const val PIVOT_ARM_PT = 10f
+
+        const val ALPHA_SHIFT = 24
     }
 }

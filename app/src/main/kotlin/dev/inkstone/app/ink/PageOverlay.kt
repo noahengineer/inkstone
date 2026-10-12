@@ -139,7 +139,7 @@ private sealed interface Preview {
     data class Trace(val points: List<PagePoint>) : Preview
 }
 
-private suspend fun PointerInputScope.tapGesture(camera: Camera, onTap: (PagePoint) -> Unit) {
+internal suspend fun PointerInputScope.tapGesture(camera: Camera, onTap: (PagePoint) -> Unit) {
     awaitEachGesture {
         val down = awaitFirstDown()
         var moved = 0f
@@ -161,7 +161,7 @@ private suspend fun PointerInputScope.tapGesture(camera: Camera, onTap: (PagePoi
     }
 }
 
-private suspend fun PointerInputScope.boxGesture(camera: Camera, onBox: (PageRect?, Boolean) -> Unit) {
+internal suspend fun PointerInputScope.boxGesture(camera: Camera, onBox: (PageRect?, Boolean) -> Unit) {
     awaitEachGesture {
         val down = awaitFirstDown()
         down.consume()
@@ -197,7 +197,7 @@ private fun Camera.toPage(view: Offset): PagePoint = viewToPage(ViewOffset(view.
 
 private fun rectOf(a: PagePoint, b: PagePoint) = PageRect(min(a.x, b.x), min(a.y, b.y), max(a.x, b.x), max(a.y, b.y))
 
-private fun DrawScope.drawPageBox(box: PageRect, camera: Camera) {
+internal fun DrawScope.drawPageBox(box: PageRect, camera: Camera) {
     val topLeft = pageToView(PagePoint(box.left, box.top), camera)
     drawRect(
         color = Color(LASSO_ARGB),

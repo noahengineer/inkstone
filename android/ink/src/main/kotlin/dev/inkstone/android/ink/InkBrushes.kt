@@ -7,6 +7,7 @@ import androidx.ink.brush.BrushFamily
 import androidx.ink.brush.ExperimentalInkCustomBrushApi
 import dev.inkstone.android.ink.InkColor.withOpacity
 import dev.inkstone.core.model.ObjectStyle
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * ⭐ ROADMAP M8a — which tool the toolbar has selected.
@@ -149,6 +150,8 @@ public class InkBrushFactory(
     inputModel: InkInputModel = InkInputModel.SPRING,
 ) {
 
+    /** Read by a page load's worker threads while the toolbar may replace it — hence volatile. */
+    @Volatile
     private var families = buildBrushFamilies(inputModel)
 
     /**
@@ -253,8 +256,13 @@ public class InkBrushFactory(
      * A note whose strokes were captured with both models loads both, and constructing a
      * family crosses into native code — so they are cached rather than rebuilt per stroke.
      * There are two models, so this holds at most one entry.
+     *
+     * ⚠️ **Concurrent**, because a page load now builds its strokes on several threads at once
+     * (`PreparedPage.build`) and every one of them comes through [brushFor]. A plain `HashMap` filled
+     * by `getOrPut` from two threads can lose an entry or corrupt its table. Two threads racing to
+     * build the same family each build one and one wins, which is harmless: a family is a value.
      */
-    private val historicalFamilies = HashMap<InkInputModel, Map<InkBrushKind, BrushFamily>>()
+    private val historicalFamilies = ConcurrentHashMap<InkInputModel, Map<InkBrushKind, BrushFamily>>()
 
     /**
      * Ink's geometric simplification tolerance, in page points.

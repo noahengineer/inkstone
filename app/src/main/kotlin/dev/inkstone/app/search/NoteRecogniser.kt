@@ -92,12 +92,18 @@ class NoteRecogniser @Inject constructor(
      */
     private suspend fun readPage(session: NoteSession, pageId: PageId, gate: SessionGate): PageOutcome {
         val noteId = gate.locked { session.document.id }
-        val strokes = gate.locked {
+        val page = gate.locked {
             // ⚠️ Skipping a page whose text is already current is not an optimisation, it is what
             // stops the batch pass rewriting the bundle — and therefore re-uploading the note —
             // every night for a notebook nobody has touched.
-            if (session.recognisedText(pageId) != null) null else sampler.sample(session.page(pageId))
+            if (session.recognisedText(pageId) != null) null else session.page(pageId)
         } ?: return PageOutcome.Nothing
+        // ⭐ Sampled **outside** the gate. The fold is immutable, so nothing the lock protects is
+        // read here — and sampling rebuilds every stroke on the page from its blob, which for the
+        // chemistry note is ~2,100 strokes decoded (and, until the sampler stopped tessellating,
+        // meshed) three seconds after every burst of writing. Under the gate, that held the editor's
+        // lock the whole time: autosave, undo and page turns all waited on it.
+        val strokes = sampler.sample(page)
         if (strokes.isEmpty()) {
             index.forgetPage(noteId, pageId)
             return PageOutcome.Nothing

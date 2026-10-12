@@ -219,6 +219,7 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
 
     private fun rebuild(next: ShapePath) {
         outline = next
+        invalidateSilhouette()
         path.rewind()
         for (segment in next.segments) {
             when (segment) {
@@ -366,13 +367,40 @@ internal class DryShape(val obj: ShapeObject, record: ShapeRecord = ShapeRecord.
      * middle is empty. A line and an arrow are not closed, so they keep the outline test and are
      * still grabbed by reach alone.
      */
-    override fun tappedAt(localX: Float, localY: Float, reach: Float): Boolean = ShapeHit.hitsPoint(
+    // The Element editor's bounds are grabbed by their edge only: a tap inside them is a tap on the
+    // Element, which is the thing being edited (SPEC §4.9.7).
+    override fun tappedAt(localX: Float, localY: Float, reach: Float): Boolean =
+        if (elementFrame) edgeTappedAt(localX, localY, reach) else hits(localX, localY, reach, outline.closed)
+
+    override fun edgeTappedAt(localX: Float, localY: Float, reach: Float): Boolean =
+        hits(localX, localY, reach, filled = false)
+
+    private fun hits(localX: Float, localY: Float, reach: Float, filled: Boolean): Boolean = ShapeHit.hitsPoint(
         path = outline,
-        filled = outline.closed,
+        filled = filled,
         x = localX,
         y = localY,
         reach = reach + (style?.widthPt ?: obj.style?.widthPt ?: 0f) / 2f,
     )
+
+    /**
+     * ⚠️ **False — so a fully erased shape is never pruned, and that is a known cost, not an
+     * oversight.** On a real note (A: 101 erased objects) 17 were shapes, each still paying a
+     * `saveLayer` and a `DST_OUT` composite per re-record to draw nothing.
+     *
+     * It is false because no coverage test for a shape is both cheap and clearly right, and a wrong
+     * *true* hides a line the user can see. A stroke's test samples the tessellated mesh, which **is**
+     * what the painter fills. A shape has no mesh: what `PagePainter.paintShape` paints is this
+     * outline stroked at the style's width with round caps and joins, plus the fill when [fillable],
+     * plus two arrowhead barbs whose length the painter derives from the width. Deciding that area
+     * is covered would take a second definition of it here — the centre line densified to the
+     * eraser's radius (a rectangle's edge is two points, and a hole between them is invisible to
+     * a vertex test), offset either side by half the width, the interior sampled on a grid, the
+     * barbs rebuilt — and a second definition of what a shape paints is the kind of thing this
+     * codebase keeps finding drifted from the first. Until the painter and a test can share one
+     * definition, a fully erased shape costs one layer.
+     */
+    override fun isErasedAway(region: ErasedRegion): Boolean = false
 
     /** The outline in page space — what a lasso and the tap test measure against. */
     override fun forEachPagePoint(scratch: MutableVec, action: (Float, Float) -> Unit) {

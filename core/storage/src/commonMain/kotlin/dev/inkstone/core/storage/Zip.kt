@@ -84,7 +84,16 @@ internal object Zip {
      * reader that only wants the document's metadata reads the front of the file.
      */
     fun write(entries: List<Entry>): ByteArray {
-        val out = ByteBuffer()
+        // Sized exactly, up front. The buffer used to start at 1 KB and double, so writing the
+        // chemistry note's 8.4 MB bundle allocated ~16 MB of abandoned intermediate arrays and then
+        // copied the result once more — on every materialize. [ByteBuffer.toByteArray] hands the
+        // array back without a copy when it is exactly full, which it now is; if this sum were ever
+        // wrong the buffer would simply grow, so correctness does not depend on it.
+        val exactSize = entries.sumOf { entry ->
+            val nameBytes = entry.name.encodeToByteArray().size
+            LOCAL_HEADER_SIZE + CENTRAL_HEADER_SIZE + 2 * nameBytes + entry.bytes.size
+        } + END_OF_CENTRAL_SIZE
+        val out = ByteBuffer(exactSize)
         val offsets = ArrayList<Long>(entries.size)
         val crcs = ArrayList<Long>(entries.size)
 
@@ -221,6 +230,12 @@ internal object Zip {
         fun contains(name: String): Boolean = name in entries
 
         fun sizeOf(name: String): Int = entries[name]?.size ?: -1
+
+        /** Whether the file this index was read from is still the one at its path. See [ByteSource.isCurrent]. */
+        suspend fun isCurrent(): Boolean = source.isCurrent()
+
+        /** Release the source. See [ByteSource.close]. */
+        fun close() = source.close()
 
         /**
          * @return the entry's bytes, or null if it is absent.

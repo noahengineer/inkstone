@@ -1,17 +1,21 @@
 package dev.inkstone.app.sync
 
+import android.util.Log
 import dev.inkstone.app.library.LibraryRepository
 import dev.inkstone.app.search.NoteRecogniser
 import dev.inkstone.app.search.RecognitionReport
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.DocumentMaterializer
+import dev.inkstone.core.model.ElementId
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.MaterializedFile
 import dev.inkstone.core.model.PdfPublisher
 import dev.inkstone.core.storage.DeviceIdentity
+import dev.inkstone.core.storage.Element
+import dev.inkstone.core.storage.ElementCopies
 import dev.inkstone.core.storage.FileByteSource
 import dev.inkstone.core.storage.MergeReport
 import dev.inkstone.core.storage.NoteLayout
@@ -24,8 +28,14 @@ import dev.inkstone.core.sync.ConflictedCopy
 import dev.inkstone.core.sync.MergeCommit
 import dev.inkstone.core.sync.RemoteInstall
 import dev.inkstone.core.sync.RemoteMergeGate
+import kotlinx.coroutines.CoroutineExceptionHandler
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -100,6 +110,8 @@ class NoteSessionHost @Inject constructor(
     private val publisher: PdfPublisher,
     /** SPEC §8.3. Injected rather than built here so `:app` owns the ML Kit wiring. */
     private val recogniser: NoteRecogniser,
+    /** ⭐ SPEC §4.9.7 — the Element library, for replacing a revised Element's copies. */
+    private val elements: dev.inkstone.app.elements.ElementShelf,
 ) : DocumentMaterializer {
 
     private val ids = IdFactory(clock)
@@ -192,11 +204,89 @@ class NoteSessionHost @Inject constructor(
          *   where the host recognising through its own session is correct.
          */
         suspend fun recognise(): RecognitionReport?
+
+        /**
+         * ⭐ How many copies of an Element this editor's note holds (SPEC §4.9.7), counted through
+         * the session it already has. Suspends until there is one, like [mergeRemoteBundle].
+         */
+        suspend fun countElementCopies(elementId: ElementId): Int?
+
+        /**
+         * ⭐ Replace those copies with the revised Element, through this editor's session — the same
+         * reason a merge comes here: two sessions over one note each hold their own pending ops, and
+         * whichever materializes second drops the other's work.
+         */
+        suspend fun updateElementCopies(revision: dev.inkstone.app.elements.ElementRevision): Int?
     }
 
-    /** Called from the editor's `ViewModel` as it is created; must be paired with [unregister]. */
+    /** Called from the editor's `ViewModel` as it is created; must be paired with [unregister] or [retire]. */
     fun register(noteId: DocumentId, handle: NoteEditorHandle) {
         editors[noteId.value] = handle
+    }
+
+    /**
+     * ⛔ **Where a closing editor's last save runs — a scope no screen owns.**
+     *
+     * `NoteActivity.onStop` used to launch the save in `viewModelScope`, and pressing Back runs
+     * `onStop` and then clears the view model, which cancels that scope. The save's first
+     * suspension is the drain of the surface's recorder, and the drain is destructive: its result
+     * came back to a cancelled coroutine and was thrown away. Every stroke drawn in the two seconds
+     * before Back was lost — reproduced twice on the emulator on 2026-09-24, journal untouched.
+     *
+     * `Dispatchers.Main.immediate` because the editor's session is confined to the main thread by
+     * contract (`NoteEditor.work`), and immediate so the save starts inside `onStop` itself, while
+     * the surface is still attached. A failure is logged rather than thrown: an exception escaping a
+     * scope with no handler kills the process, which is not a better outcome for a note whose ink
+     * the journal already holds.
+     *
+     * Lazy because nothing but an editor closing needs it, and the JVM tests that build this class
+     * have no main dispatcher to create it with.
+     */
+    private val leaving by lazy {
+        CoroutineScope(
+            SupervisorJob() + Dispatchers.Main.immediate +
+                CoroutineExceptionHandler { _, failure -> Log.w(TAG, "a closing note's last save failed", failure) },
+        )
+    }
+
+    /**
+     * Where a session of this host's own does its work when the caller is a screen: the Element
+     * editor's Done and its *"Update them all"*. Opening and folding a note is the most expensive
+     * read the app does, and none of it needs the main thread. The session is local to the call and
+     * the note's mutex is held throughout, so only one coroutine ever touches it.
+     */
+    private val ownSessionContext = Dispatchers.Default
+
+    /**
+     * Run a stopping editor's [save] under this note's mutex, in [leaving] — so a finishing screen
+     * cannot cancel it, and a merge or a publish cannot interleave with it.
+     *
+     * [save] is a plain journal save for most stops, and the close-time materialize only when the
+     * screen is finishing. See `NoteEditorViewModel.onStopped` for why the two differ.
+     */
+    fun saveOnLeaving(noteId: DocumentId, save: suspend () -> Unit) {
+        leaving.launch { withLock(noteId) { save() } }
+    }
+
+    /**
+     * The editor has gone: unregister it and [close] it — **after** anything [saveOnLeaving] queued
+     * for this note has finished.
+     *
+     * [unregister] ran synchronously from `onCleared`, and that was right while the close-time save
+     * died with the view model. Now the save outlives it, and an editor that unregistered first
+     * would leave a gap in which the drainer finds no editor and publishes the note itself — reading
+     * `note.inkstone` while the editor rewrites it, which is the stale-marker overlap
+     * [materialize]'s KDoc describes. Doing both under the note's mutex, after the save, closes it:
+     * a merge that arrives meanwhile queues on the same mutex and still finds the editor, which
+     * still runs it.
+     */
+    fun retire(noteId: DocumentId, handle: NoteEditorHandle, close: () -> Unit) {
+        leaving.launch {
+            withLock(noteId) {
+                editors.remove(noteId.value, handle)
+                close()
+            }
+        }
     }
 
     /**
@@ -244,6 +334,87 @@ class NoteSessionHost @Inject constructor(
             library.noteRenamed(noteId, document.title, document.localRev, document.livePages.size)
             true
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ⭐ Element copies (SPEC §4.9.7)
+    // -----------------------------------------------------------------------
+
+    /**
+     * How many copies of [elementId] [noteId] holds — through its live editor if it has one, else
+     * through a session of this host's own, under the note's mutex either way.
+     *
+     * ⛔ **The own-session branch runs on [ownSessionContext], never on the caller's thread.** The
+     * caller is the Element editor's Done, from a Compose scope, so it used to open and fold the
+     * whole note on the UI thread. That cost the physics note several seconds of a frozen screen
+     * and, on 2026-10-10, an `OutOfMemoryError` in `BundleReader.page` on `AndroidUiDispatcher`,
+     * because the note's own editor was reloading the same note beside it
+     * (`docs/NOTE-STAYS-LOADED.md`). The merge and recognition branches below already run where
+     * their WorkManager callers do, which is never the UI thread.
+     *
+     * @return 0 for a note that no longer opens: it was trashed, or the list that named it is stale,
+     *   and in both cases there is nothing to update.
+     */
+    suspend fun countElementCopies(noteId: DocumentId, elementId: ElementId): Int = withLock(noteId) {
+        editorFor(noteId)?.countElementCopies(elementId)?.let { return@withLock it }
+        withContext(ownSessionContext) {
+            val note = store.open(noteId) ?: return@withContext 0
+            val session = NoteSession.open(store, ids, clock, note, deviceIdentity.get())
+            session.document.livePages.sumOf { ElementCopies.count(session.page(it.id), elementId) }
+        }
+    }
+
+    /**
+     * ⭐ Replace every copy of [element] in [noteId] with its current version.
+     *
+     * The rename's shape exactly: the live editor first, because it holds the session; otherwise a
+     * session of this host's own, then **materialize** (the new pieces' picture bytes travel as
+     * `extraCarried`, so they reach `assets/` in the same write as the ops that name them — SPEC
+     * §4.9.4's order) and **tell the library**, which is the only route to a fresh thumbnail and to
+     * an upload (CLAUDE.md: *"`session.flush()` is half of saving"*).
+     *
+     * One undo entry per page, recorded on the note's own stack — so a person who opens the note
+     * afterwards and regrets the update can press undo.
+     *
+     * The own-session branch runs on [ownSessionContext], for [countElementCopies]'s reason. This one
+     * also writes a whole bundle, so it costs even more on the UI thread.
+     *
+     * @return how many copies were replaced.
+     */
+    suspend fun updateElementCopies(noteId: DocumentId, revision: dev.inkstone.app.elements.ElementRevision): Int =
+        withLock(noteId) {
+            editorFor(noteId)?.updateElementCopies(revision)?.let { return@withLock it }
+            withContext(ownSessionContext) { updateCopiesInOwnSession(noteId, revision) }
+        }
+
+    private suspend fun updateCopiesInOwnSession(
+        noteId: DocumentId,
+        revision: dev.inkstone.app.elements.ElementRevision,
+    ): Int {
+        val element = revision.element
+        val note = store.open(noteId) ?: return 0
+        val session = NoteSession.open(store, ids, clock, note, deviceIdentity.get())
+        var replaced = 0
+        val assets = LinkedHashMap<String, ByteArray>()
+        for (ref in session.document.livePages) {
+            val folded = session.page(ref.id)
+            val update = elements.replaceCopies(
+                folded,
+                element,
+                ids::newObjectId,
+                session::nextOpId,
+                session::nextClock,
+                revision.originMoved,
+            ) ?: continue
+            replaced += ElementCopies.count(folded, element.id)
+            assets += update.assets
+            session.apply(ref.id, update.ops)
+        }
+        if (replaced > 0) {
+            session.materialize(extraCarried = assets)
+            library.noteSaved(noteId, session.document.localRev, session.pageCount)
+        }
+        return replaced
     }
 
     // -----------------------------------------------------------------------
@@ -513,6 +684,7 @@ class NoteSessionHost @Inject constructor(
     private fun titleOf(remotePath: String): String = remotePath.substringAfterLast('/').removeSuffix(PDF_EXTENSION)
 
     private companion object {
+        const val TAG = "NoteSessionHost"
         const val PDF_EXTENSION = ".pdf"
     }
 }

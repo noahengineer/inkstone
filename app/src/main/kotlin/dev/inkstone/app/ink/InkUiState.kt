@@ -30,12 +30,12 @@ import dev.inkstone.core.model.ShapeKind
  * the wrong thing is right is the expensive kind this codebase keeps paying for.
  *
  * [EditorPrefs] is the persisted subset: the palette **and its order**, the saved widths, the
- * default width, a pen per brush, and the four toggles. It arrives once through the constructor and
- * leaves through [toPrefs].
+ * default width, a pen per brush, and the four toggles. It arrives through [adopt] — from the
+ * constructor, and again on `ON_START` — and leaves through [toPrefs].
  *
- * WARNING: **The seeding is one-way.** `EditorPreferences` is read at startup and never re-adopted
- * — a debounced write echoing back into state the user is currently dragging is the *"two
- * mechanisms for one change"* trap `setTemplate` records.
+ * WARNING: **Never adopted mid-gesture.** A debounced write echoing back into state the user is
+ * currently dragging is the *"two mechanisms for one change"* trap `setTemplate` records; `ON_START`
+ * is the one other moment a value comes in, and nothing can be being dragged then.
  *
  * WARNING: **What is deliberately volatile**, and why, because the list is not obvious:
  * - [selectedSlot] — which swatch the panel is editing. Restoring it would mean the first movement
@@ -61,12 +61,9 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      * from the full default map and overlaying what was stored makes that unrepresentable here as
      * well as in the codec, which is deliberate belt and braces for a `getValue` this hot.
      */
-    private val perBrush = mutableStateMapOf<InkBrushKind, PenConfig>().apply {
-        putAll(EditorPrefs.DEFAULT_PENS)
-        putAll(initial.pens)
-    }
+    private val perBrush = mutableStateMapOf<InkBrushKind, PenConfig>().apply { putAll(EditorPrefs.DEFAULT_PENS) }
 
-    var kind by mutableStateOf(initial.brush)
+    var kind by mutableStateOf(STOCK.brush)
         private set
 
     /**
@@ -189,8 +186,24 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      */
     var selectedKind by mutableStateOf<ShapeKind?>(null)
 
+    /**
+     * ⭐ SPEC §4.9.6 — selected objects that can knock out (everything but a highlighter), and how
+     * many already do. The `Knockout` chip shows when the first is non-zero and reads *on* only when
+     * the two are equal, so it never claims a state half the selection is not in.
+     */
+    var selectedKnockoutEligible by mutableIntStateOf(0)
+
+    var selectedKnockoutOn by mutableIntStateOf(0)
+
+    /**
+     * ⭐ The pivot of the Element copy in the selection, in page space, or null (SPEC §4.9.7). Drawn,
+     * and it is what brings the Grid toggle to a selection with no shapes in it — handwriting snaps
+     * by its pivot.
+     */
+    var selectionPivot by mutableStateOf<dev.inkstone.core.model.PagePoint?>(null)
+
     /** SPEC §3.5, revised in M1: partial erase is the default. */
-    var eraseMode by mutableStateOf(initial.eraseMode)
+    var eraseMode by mutableStateOf(STOCK.eraseMode)
 
     var strokeCount by mutableIntStateOf(0)
 
@@ -202,9 +215,9 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
     var predictionEnabled by mutableStateOf(true)
 
     /** SPEC §3.4 — how much the raw input is smoothed before geometry. */
-    var inputModel by mutableStateOf(initial.inputModel)
+    var inputModel by mutableStateOf(STOCK.inputModel)
 
-    var fingerDrawingEnabled by mutableStateOf(initial.fingerDrawingEnabled)
+    var fingerDrawingEnabled by mutableStateOf(STOCK.fingerDrawingEnabled)
 
     /**
      * ⭐ ROADMAP M8b — draw a shape, hold still, and the ink becomes the shape.
@@ -213,7 +226,7 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      * freehand curve"*: the honest answer to somebody it still fights is a switch, not a promise
      * that the classifier's confidence bar is tuned correctly for their handwriting.
      */
-    var shapeSnapEnabled by mutableStateOf(initial.shapeSnapEnabled)
+    var shapeSnapEnabled by mutableStateOf(STOCK.shapeSnapEnabled)
 
     /**
      * Whether a snapped straight line gets an arrowhead.
@@ -221,7 +234,7 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      * SPEC §4.8.7 — an arrowhead is a few samples at the end of a gesture and is indistinguishable
      * from a hooked pen-lift, so it is never recognised. This is the choosing.
      */
-    var arrowHeads by mutableStateOf(initial.arrowHeads)
+    var arrowHeads by mutableStateOf(STOCK.arrowHeads)
 
     /**
      * ⭐ Whether a snapped shape, a move, a resize or a dragged shape vertex lands on a lattice.
@@ -238,7 +251,7 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      * `:android:ink`. `pageHasGrid` is deleted rather than left — the chip is offered on every page
      * now, so nothing needs the answer.
      */
-    var gridSnapEnabled by mutableStateOf(initial.gridSnapEnabled)
+    var gridSnapEnabled by mutableStateOf(STOCK.gridSnapEnabled)
 
     /**
      * ⭐ True while the page's paper is up and its objects are still being built off the main
@@ -288,7 +301,7 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
     var busyMessage by mutableStateOf<String?>(null)
 
     /** SPEC §3.4 — "12 saved slots". Seeded from [EditorPrefs.palette]; the order is the value. */
-    val slots = mutableStateListOf<Int>().apply { addAll(initial.palette) }
+    val slots = mutableStateListOf<Int>().apply { addAll(STOCK.palette) }
 
     /**
      * M10 — the saved stroke widths the dock's slider magnetises onto and marks on its track.
@@ -297,10 +310,10 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      * deduplicated **between** edits, which [EditorPrefsCodec] guarantees on the way in and
      * [finishWidthEdit] restores — see [editingWidthSlot] for why not during one.
      */
-    val widthSlots = mutableStateListOf<Float>().apply { addAll(initial.widthSlots) }
+    val widthSlots = mutableStateListOf<Float>().apply { addAll(STOCK.widthSlots) }
 
     /** The top of both width sliders' range — the user's, see [setMaxWidth]. */
-    var maxWidthDp by mutableFloatStateOf(WidthLadder.clampMax(initial.maxWidthDp))
+    var maxWidthDp by mutableFloatStateOf(STOCK.maxWidthDp)
         private set
 
     /**
@@ -327,7 +340,7 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      * wherever you happen to have left the slider. Someone whose default is 0.5 dp and who is
      * currently drawing at 12 dp has no way back without it.
      */
-    var defaultWidthDp by mutableFloatStateOf(initial.defaultWidthDp)
+    var defaultWidthDp by mutableFloatStateOf(STOCK.defaultWidthDp)
         private set
 
     /**
@@ -346,6 +359,73 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
 
     /** ⭐ M10 — a colour being dragged from one swatch to another. See [ColorDragState]. */
     val colorDrag = ColorDragState()
+
+    /**
+     * ⭐ Where the chrome sits, how big it is and which chips it shows. Persisted; see [ChromeLayout].
+     *
+     * ⚠️ Written at the **end** of a drag, not per frame — a bar being moved or resized lives in
+     * [chromeDrag] until it is let go. Writing here per frame would recompose every bar on screen
+     * and re-run [toPrefs] at 120 Hz for a value nobody reads until the finger lifts.
+     */
+    var layout by mutableStateOf(STOCK.layout)
+
+    /**
+     * True while the layout editor is open. Volatile, like [tool]: reopening a note half-way through
+     * rearranging its toolbars would be a surprise, and the editor's state is all in [layout] anyway.
+     */
+    var editingLayout by mutableStateOf(false)
+
+    /** The bar under the finger in the layout editor, if any. See [ChromeDrag]. */
+    val chromeDrag = ChromeDrag()
+
+    /** The chip in the air in the layout editor, if any. See [ItemDrag]. */
+    val itemDrag = ItemDrag()
+
+    // ⚠️ After every field [adopt] writes — Kotlin runs initialisers and `init` in textual order.
+    init {
+        adopt(initial)
+    }
+
+    /**
+     * Take [prefs] as the whole persisted subset — the inverse of [toPrefs].
+     *
+     * **The constructor is this and nothing else**: the fields above start at stock values and are
+     * seeded here. So a persisted field seeded on open but not on adopt is unrepresentable —
+     * forgetting it here forgets it on every open, which the first restart shows.
+     *
+     * Called on `ON_START` too, for the case where another editor changed the toolbar while this
+     * one was behind it: the Element editor is a second `NoteActivity` stacked on the note's, and
+     * without this, returning to the note showed the old palette and the next touch of any control
+     * wrote that old palette back over the new one. `ON_START` cannot be mid-gesture, which is what
+     * keeps this clear of the class KDoc's *"two mechanisms for one change"* — and an equal value
+     * returns before writing anything, so the common case costs one comparison.
+     */
+    fun adopt(prefs: EditorPrefs) {
+        if (prefs == toPrefs()) return
+        if (prefs.palette != slots.toList()) {
+            slots.clear()
+            slots.addAll(prefs.palette)
+            // The index now names a different colour; see [selectedSlot] on why that must not be kept.
+            selectedSlot = NO_SLOT
+        }
+        if (prefs.widthSlots != widthSlots.toList()) {
+            editingWidthSlot = NO_SLOT
+            widthSlots.clear()
+            widthSlots.addAll(prefs.widthSlots)
+        }
+        maxWidthDp = WidthLadder.clampMax(prefs.maxWidthDp)
+        defaultWidthDp = prefs.defaultWidthDp
+        // One write, and total over the brushes — see [perBrush] on why a partial map must not reach it.
+        perBrush.putAll(EditorPrefs.DEFAULT_PENS + prefs.pens)
+        kind = prefs.brush
+        eraseMode = prefs.eraseMode
+        inputModel = prefs.inputModel
+        fingerDrawingEnabled = prefs.fingerDrawingEnabled
+        shapeSnapEnabled = prefs.shapeSnapEnabled
+        arrowHeads = prefs.arrowHeads
+        gridSnapEnabled = prefs.gridSnapEnabled
+        layout = prefs.layout
+    }
 
     /**
      * Choose [index] and take its colour.
@@ -516,9 +596,13 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
         shapeSnapEnabled = shapeSnapEnabled,
         arrowHeads = arrowHeads,
         gridSnapEnabled = gridSnapEnabled,
+        layout = layout,
     )
 
     private companion object {
         const val NO_SLOT = -1
+
+        /** What every persisted field holds for the instant before [adopt] seeds it. */
+        val STOCK = EditorPrefs()
     }
 }

@@ -5,17 +5,11 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.unit.dp
 import dev.inkstone.app.ui.ChipDivider
 import dev.inkstone.app.ui.GlassBar
 import dev.inkstone.app.ui.InkDims
-import dev.inkstone.app.ui.TextChip
 
 /**
  * ⭐ ROADMAP M10 — **the Dynamic Dock**, the design's primary control hub.
@@ -47,84 +41,48 @@ import dev.inkstone.app.ui.TextChip
  * wired through the surface, and unreachable in the app is CLAUDE.md's definition-of-done #6
  * exactly — the failure this repo has shipped six times.
  *
- * @param secondarySuppressed true while a contextual toolbar is on screen. The design: *"Tapping any
- *   drawn object … summons its respective Contextual Toolbar and hides the Dynamic Dock's secondary
- *   row to maintain focus."*
+ * ## ⭐ The dock is two bars now, and neither knows which chips it holds
+ *
+ * Row one is the `DOCK` bar and row two's Draw controls are the `DRAW` bar — both drawn by
+ * `ChromeContainer` from whatever chips the user has put in them (`ChromeLayout`), so a tool can be
+ * moved into the page bar and `Undo` into the dock. `ChromeHost` places row two against row one:
+ * below it, above it once the dock is in the lower half of the screen, beside it once the dock is a
+ * column. In the stock slot that is the old `Column` exactly — centred, [DockRowGap] below.
  */
 @Composable
-fun EditorDock(
-    state: InkUiState,
-    objects: ObjectToolState,
-    actions: InkToolbarActions,
-    objectActions: ObjectActions,
-    onSummon: (PanelKind, Rect) -> Unit,
-    modifier: Modifier = Modifier,
-    secondarySuppressed: Boolean = false,
-) {
-    Column(
-        modifier = modifier,
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(DockRowGap),
+internal fun DockSecondary(deps: ChromeDeps, suppressed: Boolean) {
+    val state = deps.ui
+    val secondary = secondaryFor(state)
+    val drawBar = BarId.Stock(ChromeBar.DRAW)
+    // ⭐ A Draw row with nothing left in it is no row at all — an empty pill under the dock would be
+    // chrome with nothing in it. Never in the editor, which is where it gets things put back in.
+    val empty = secondary == SecondaryRow.DRAW && deps.items(drawBar).isEmpty()
+    val row = if (empty) SecondaryRow.NONE else secondary
+    // ⚠️ The ruler contributes to row two **on top of** whatever the tool contributes, rather
+    // than replacing it — it is a mode, so "the ruler is out" and "I am drawing" are both true
+    // and both need their controls. That is also why the visibility test is an `or`: with the
+    // Text tool the tool half is empty and the ruler half is the only reason the pill exists.
+    AnimatedVisibility(
+        visible = (row != SecondaryRow.NONE || state.rulerEnabled) && !suppressed,
+        enter = fadeIn() + expandVertically(),
+        exit = fadeOut() + shrinkVertically(),
     ) {
-        PrimaryRow(state, objects, objectActions)
-
-        val secondary = secondaryFor(state)
-        // ⚠️ The ruler contributes to row two **on top of** whatever the tool contributes, rather
-        // than replacing it — it is a mode, so "the ruler is out" and "I am drawing" are both true
-        // and both need their controls. That is also why the visibility test is an `or`: with the
-        // Text tool the tool half is empty and the ruler half is the only reason the pill exists.
-        AnimatedVisibility(
-            visible = (secondary != SecondaryRow.NONE || state.rulerEnabled) && !secondarySuppressed,
-            enter = fadeIn() + expandVertically(),
-            exit = fadeOut() + shrinkVertically(),
-        ) {
+        if (row == SecondaryRow.DRAW) {
+            val ruler: (@Composable () -> Unit)? = if (state.rulerEnabled && !state.editingLayout) {
+                { RulerControls(state, deps.objectActions) }
+            } else {
+                null
+            }
+            ChromeContainer(drawBar, deps, trailing = ruler)
+        } else {
             GlassBar {
-                SecondaryContent(
-                    row = secondary,
-                    state = state,
-                    objects = objects,
-                    actions = actions,
-                    objectActions = objectActions,
-                    onSummon = onSummon,
-                )
+                SecondaryContent(row, state, deps.objects, deps.actions, deps.objectActions)
                 if (state.rulerEnabled) {
-                    if (secondary != SecondaryRow.NONE) ChipDivider()
-                    RulerControls(state, objectActions)
+                    if (row != SecondaryRow.NONE) ChipDivider()
+                    RulerControls(state, deps.objectActions)
                 }
             }
         }
-    }
-}
-
-/**
- * Row 1 — the mutually exclusive modes, grouped by what they do to the page.
- *
- * ⚠️ Switching mode **resets whatever the previous one was holding**, exactly as the old chips did:
- * a text field floating over a page whose tool is now the eraser, or crop handles round a picture
- * nothing can crop, is chrome that lies about what a press will do.
- */
-@Composable
-private fun PrimaryRow(state: InkUiState, objects: ObjectToolState, objectActions: ObjectActions) {
-    GlassBar {
-        PRIMARY_TOOLS.forEachIndexed { index, entry ->
-            if (index > 0 && entry.startsGroup) ChipDivider()
-            TextChip(
-                label = entry.label,
-                selected = state.tool == entry.tool,
-                onClick = {
-                    if (state.tool != entry.tool) objects.reset()
-                    // ⚠️ Through `selectBrush` for the pen, so the brush the user last held comes
-                    // back rather than a fixed one — the same restoration `onSelectTappedAway` does.
-                    if (entry.tool == EditorTool.PEN) state.selectBrush(state.kind) else state.tool = entry.tool
-                },
-            )
-        }
-        ChipDivider()
-        TextChip(
-            label = "Ruler",
-            selected = state.rulerEnabled,
-            onClick = { objectActions.onRulerEnabled(!state.rulerEnabled) },
-        )
     }
 }
 
@@ -134,45 +92,49 @@ private fun PrimaryRow(state: InkUiState, objects: ObjectToolState, objectAction
  * A value rather than a chain of `AnimatedVisibility`s, because the design's row two *swaps* — it
  * does not stack. Stacking is what the old toolbar did, and it is why every row was on screen at
  * once. [SecondaryRow.NONE] is a real answer and collapses the pill.
+ *
+ * ⭐ In the layout editor it is always the Draw row: that is the one row two made of chips, and it has
+ * to be on screen to be arranged — or dropped into — whatever tool was in hand.
  */
-private fun secondaryFor(state: InkUiState): SecondaryRow = when (state.tool) {
-    EditorTool.PEN -> SecondaryRow.DRAW
+private fun secondaryFor(state: InkUiState): SecondaryRow = when {
+    state.editingLayout -> SecondaryRow.DRAW
 
-    EditorTool.ERASER -> SecondaryRow.ERASE
+    state.tool == EditorTool.PEN -> SecondaryRow.DRAW
 
-    EditorTool.SELECT -> SecondaryRow.SELECT
+    state.tool == EditorTool.ERASER -> SecondaryRow.ERASE
 
-    EditorTool.IMAGE -> SecondaryRow.IMAGE
+    state.tool == EditorTool.SELECT -> SecondaryRow.SELECT
 
-    EditorTool.ELEMENT -> SecondaryRow.ELEMENT
+    state.tool == EditorTool.IMAGE -> SecondaryRow.IMAGE
+
+    state.tool == EditorTool.ELEMENT -> SecondaryRow.ELEMENT
 
     // TEXT and LASER have no settings of their own — the design names TEXT as the case row two
     // collapses for, and a laser is a laser. Text *formatting* is a contextual toolbar over the
     // box being typed in, which is where the design puts it and where the box actually is.
-    EditorTool.TEXT, EditorTool.LASER -> SecondaryRow.NONE
+    else -> SecondaryRow.NONE
 }
 
 internal enum class SecondaryRow { NONE, DRAW, ERASE, SELECT, IMAGE, ELEMENT }
 
-/** One primary chip: the tool it selects, its word, and whether a rule precedes it. */
-private class PrimaryTool(val tool: EditorTool, val label: String, val startsGroup: Boolean = false)
-
 /**
- * The design's row one, in its order: what the pen does, then what a selection does, then what
- * places an object.
+ * The tool a row-one chip selects, or null for the ruler — which is a toggle beside the tools and not
+ * one of them (see the class KDoc). The order and the dividers are [ChromeItem]'s.
  */
-private val PRIMARY_TOOLS = listOf(
-    PrimaryTool(EditorTool.PEN, "Draw"),
-    PrimaryTool(EditorTool.ERASER, "Erase"),
-    PrimaryTool(EditorTool.LASER, "Laser"),
-    PrimaryTool(EditorTool.SELECT, "Select", startsGroup = true),
-    PrimaryTool(EditorTool.TEXT, "Text", startsGroup = true),
-    PrimaryTool(EditorTool.IMAGE, "Image"),
-    PrimaryTool(EditorTool.ELEMENT, "Elements"),
-)
+internal val ChromeItem.tool: EditorTool?
+    get() = when (this) {
+        ChromeItem.TOOL_DRAW -> EditorTool.PEN
+        ChromeItem.TOOL_ERASE -> EditorTool.ERASER
+        ChromeItem.TOOL_LASER -> EditorTool.LASER
+        ChromeItem.TOOL_SELECT -> EditorTool.SELECT
+        ChromeItem.TOOL_TEXT -> EditorTool.TEXT
+        ChromeItem.TOOL_IMAGE -> EditorTool.IMAGE
+        ChromeItem.TOOL_ELEMENTS -> EditorTool.ELEMENT
+        else -> null
+    }
 
-/** `gap-2` between the dock's two pills. */
-private val DockRowGap = 8.dp
+/** `gap-2` between the dock's two pills. `internal` so the calculator window can clear row two. */
+internal val DockRowGap = 8.dp
 
 /** Where the dock sits, as one value so the contextual bars can avoid it. See `ContextBars`. */
 internal val DockTopPadding = InkDims.EdgePadding

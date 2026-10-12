@@ -28,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import dagger.hilt.android.AndroidEntryPoint
 import dev.inkstone.app.audio.RecordingController
+import dev.inkstone.app.calculator.CalculatorPreferences
 import dev.inkstone.app.ink.EditorPreferences
 import dev.inkstone.app.library.FolderCoverImage
 import dev.inkstone.app.library.LibraryActions
@@ -109,6 +110,10 @@ class MainActivity : ComponentActivity() {
     @Inject
     lateinit var editorPreferences: EditorPreferences
 
+    /** The calculator's remembered state (docs/CALCULATOR.md D4), flushed in `onStop` beside the toolbar's. */
+    @Inject
+    lateinit var calculatorPreferences: CalculatorPreferences
+
     /**
      * M12 §9 — *"a process killed mid-lecture leaves an orphaned recording. The next launch
      * finalises it and offers to process it rather than discarding it."*
@@ -151,6 +156,20 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(statusBarStyle = DarkBars, navigationBarStyle = DarkBars)
         super.onCreate(savedInstanceState)
+        // ⛔ **A launcher tap must bring the app back, not stack a second library on top of it.**
+        // The tablet's task on 2026-09-24 was MainActivity → NoteActivity → MainActivity →
+        // MainActivity, the top two carrying the launcher's intent. AOSP only brings an existing
+        // task forward when its *root* intent matches the launcher's; a task first started any
+        // other way — the installer's "Open", `am start`, a notification — gets a fresh instance
+        // of this activity on top of whatever is open, every time the icon is pressed. Each one is
+        // a whole library (its view models, its hot flows, its thumbnail effects) and, worse, a
+        // way to open a note that a live editor underneath already holds: two sessions over one
+        // bundle, which is the data loss `NoteSessionHost` exists to prevent. So a launcher start
+        // that is not the task root is a request to resume, and resuming is what finishing does.
+        if (!isTaskRoot && intent?.action == Intent.ACTION_MAIN && intent.hasCategory(Intent.CATEGORY_LAUNCHER)) {
+            finish()
+            return
+        }
         pickingCoverFor = savedInstanceState?.getString(STATE_PICKING_COVER_FOR)?.let(::FolderId)
         // Only on a genuinely fresh start, not after a rotation: a saved instance state means this
         // process has been alive all along and anything interrupted has already been dealt with.
@@ -175,6 +194,7 @@ class MainActivity : ComponentActivity() {
         // The palette is only editable from the editor today. Flushed here anyway, because a flush
         // that exists on one screen is a flush somebody has to remember to add to the next one.
         editorPreferences.flush()
+        calculatorPreferences.flush()
         super.onStop()
     }
 

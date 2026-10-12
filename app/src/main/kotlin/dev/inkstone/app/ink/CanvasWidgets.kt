@@ -13,9 +13,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.inkstone.android.ink.InkInputModel
-import dev.inkstone.app.ui.ChipDivider
 import dev.inkstone.app.ui.ChipKind
-import dev.inkstone.app.ui.GlassBar
 import dev.inkstone.app.ui.GlassPanel
 import dev.inkstone.app.ui.Ink
 import dev.inkstone.app.ui.MicroLabel
@@ -25,54 +23,60 @@ import dev.inkstone.core.model.FitMode
 import kotlin.math.roundToInt
 
 /**
- * ⭐ ROADMAP M10 — the design's *"Bottom Left (History)"* zone.
+ * ⭐ ROADMAP M10 — the design's *"Bottom Left (History)"* zone, one chip at a time.
  *
  * > *"Separated from the main tools to prevent accidental taps during drawing."*
  *
  * Also two-finger tap and three-finger tap on the page. The chips exist so the gesture is
  * discoverable and so it is testable from `adb`, which is CLAUDE.md's definition-of-done #6 check
- * that catches an inert feature when a green suite does not.
+ * that catches an inert feature when a green suite does not. Both can be hidden — the gestures still
+ * undo and redo — and then their bar is gone rather than an empty pill in the corner.
  */
 @Composable
-fun HistoryWidget(state: InkUiState, actions: InkToolbarActions, modifier: Modifier = Modifier) {
-    GlassBar(modifier = modifier, scrollable = false) {
+internal fun HistoryChip(item: ChromeItem, state: InkUiState, actions: InkToolbarActions) {
+    if (item == ChromeItem.UNDO) {
         TextChip(label = "Undo", enabled = state.canUndo, onClick = actions.onUndo)
+    } else {
         TextChip(label = "Redo", enabled = state.canRedo, onClick = actions.onRedo)
     }
 }
 
 /**
- * ⭐ ROADMAP M10 — the design's *"Bottom Right (Zoom)"* zone: `FIT WIDTH`, `FIT PAGE`, `100%`.
+ * ⭐ ROADMAP M10 — the design's *"Bottom Right (Zoom)"* zone, one chip at a time: the level,
+ * `FIT WIDTH`, `FIT PAGE`, `100%` and `⋯`.
  *
- * ⚠️ **The `⋯` chip is not decoration and must not be dropped.** It is the only route to SPEC §3.6's
+ * ⚠️ **The `⋯` chip is not decoration and cannot be hidden.** It is the only route to SPEC §3.6's
  * measurement controls, which is the only route to the frame-rate gate's readout on the one device
  * the gate is actually about: `dumpsys gfxinfo` needs adb, adb needs USB debugging authorised, and
  * on the physical Galaxy Tab that CLAUDE.md's definition of done #4 is about that is routinely not
- * granted and cannot be granted from the desktop. Without this the gate is scored on whether it
- * *felt* smooth, which is what SPEC §3.6 opens by refusing.
+ * granted and cannot be granted from the desktop. It is also the way into the layout editor, so
+ * hiding it would hide the only way to show it again (`ChromeItem.hideable`). It can be *moved*.
  */
 @Composable
-fun ZoomWidget(
+internal fun ZoomChip(
+    item: ChromeItem,
     state: InkUiState,
     actions: InkToolbarActions,
-    onToggleDiagnostics: () -> Unit,
     diagnosticsOpen: Boolean,
-    modifier: Modifier = Modifier,
+    onToggleDiagnostics: () -> Unit,
 ) {
-    GlassBar(modifier = modifier, scrollable = false) {
+    when (item) {
         // ⚠️ Centred. The width is fixed so the bar does not re-flow between "9%" and "100%", and
         // left-aligned inside it the slack read as a random gap before the divider.
-        Readout(
+        ChromeItem.ZOOM_READOUT -> Readout(
             "${state.zoomPercent.roundToInt()}%",
             modifier = Modifier.width(ZoomReadout),
             textAlign = TextAlign.Center,
         )
-        ChipDivider()
-        TextChip(label = "Fit width", onClick = { actions.onFit(FitMode.FIT_WIDTH) })
-        TextChip(label = "Fit page", onClick = { actions.onFit(FitMode.FIT_PAGE) })
-        TextChip(label = "100%", kind = ChipKind.VALUE, onClick = { actions.onFit(FitMode.ACTUAL_SIZE) })
-        ChipDivider()
-        TextChip(
+
+        ChromeItem.FIT_WIDTH -> TextChip(label = "Fit width", onClick = { actions.onFit(FitMode.FIT_WIDTH) })
+
+        ChromeItem.FIT_PAGE -> TextChip(label = "Fit page", onClick = { actions.onFit(FitMode.FIT_PAGE) })
+
+        ChromeItem.ACTUAL_SIZE ->
+            TextChip(label = "100%", kind = ChipKind.VALUE, onClick = { actions.onFit(FitMode.ACTUAL_SIZE) })
+
+        else -> TextChip(
             label = "⋯",
             kind = ChipKind.GLYPH,
             selected = diagnosticsOpen,
@@ -113,6 +117,16 @@ fun DiagnosticsPanel(
             MicroLabel("Diagnostics", color = Ink.TextNormal)
             TextChip(label = "✕", kind = ChipKind.GLYPH, onClick = onClose, contentDescription = "Close")
         }
+
+        // ⭐ The layout editor's front door, behind the one chip that can never be hidden. A long
+        // press on any bar's background opens it too; this is the route that needs no discovering.
+        TextChip(
+            label = "Customise layout",
+            onClick = {
+                onClose()
+                state.editingLayout = true
+            },
+        )
 
         InputSwitches(state)
         LoadAndReset(state, actions)

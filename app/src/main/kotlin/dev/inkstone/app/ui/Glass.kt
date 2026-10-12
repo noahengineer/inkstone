@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -50,6 +51,7 @@ import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.positionInRoot
@@ -120,6 +122,82 @@ fun GlassBar(
             content = content,
         )
     }
+}
+
+/**
+ * ⭐ [GlassBar]'s material, for a bar laid out as a column or a grid rather than a row.
+ *
+ * Panel corners rather than a pill: a pill's ends are half its *height*, so a tall column drawn as one
+ * would be a lozenge with semicircular caps half a toolbar tall. It scrolls vertically when it does not
+ * fit, for the reason [GlassBar] scrolls sideways — a toolbar whose last chips are simply gone is
+ * definition-of-done #6 caused by a layout decision.
+ *
+ * @param columns how many chips go across; 1 is a column.
+ */
+@Composable
+fun GlassBlock(columns: Int, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    val shape = InkDims.PanelCorner
+    Box(
+        modifier = modifier
+            .shadow(BarElevation, shape, clip = false)
+            .background(Ink.Panel, shape)
+            .border(HairlineWidth, Ink.PanelBorder, shape)
+            .clip(shape),
+    ) {
+        ChipGrid(
+            columns = columns,
+            modifier = Modifier
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = InkDims.BarPadding + InkDims.ChipGap, vertical = InkDims.BarPadding),
+            content = content,
+        )
+    }
+}
+
+/**
+ * Chips in [columns] columns, in reading order: each column as wide as its widest chip, each row as
+ * tall as its tallest, every chip centred in its cell, [InkDims.ChipGap] between them.
+ *
+ * Hand-written rather than `FlowRow`, because a grid's cells have to line up down the page and a flow
+ * row does not — a `Fit width` chip would push the next row's second chip out of line with the first's.
+ */
+@Composable
+fun ChipGrid(columns: Int, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    Layout(content = content, modifier = modifier) { measurables, constraints ->
+        val gap = InkDims.ChipGap.roundToPx()
+        val loose = constraints.copy(minWidth = 0, minHeight = 0)
+        val placeables = measurables.map { it.measure(loose) }
+        if (placeables.isEmpty()) return@Layout layout(constraints.minWidth, constraints.minHeight) {}
+        val across = columns.coerceIn(1, placeables.size)
+        val rows = placeables.chunked(across)
+        val widths = IntArray(across) { col -> rows.maxOf { row -> row.getOrNull(col)?.width ?: 0 } }
+        val heights = rows.map { row -> row.maxOf { it.height } }
+        val width = widths.sum() + gap * (across - 1)
+        val height = heights.sum() + gap * (rows.size - 1).coerceAtLeast(0)
+        layout(width.coerceAtLeast(constraints.minWidth), height.coerceAtLeast(constraints.minHeight)) {
+            var y = 0
+            rows.forEachIndexed { r, row ->
+                var x = 0
+                row.forEachIndexed { c, placeable ->
+                    placeable.place(x + (widths[c] - placeable.width) / 2, y + (heights[r] - placeable.height) / 2)
+                    x += widths[c] + gap
+                }
+                y += heights[r] + gap
+            }
+        }
+    }
+}
+
+/** A divider between groups of chips stacked down a column — [ChipDivider] turned on its side. */
+@Composable
+fun ChipDividerAcross(modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .padding(vertical = InkDims.ChipGap)
+            .width(DividerHeight)
+            .height(HairlineWidth)
+            .background(Ink.Hairline),
+    )
 }
 
 /**
@@ -681,7 +759,9 @@ private val ScrollFade = 22.dp
 
 private val BarElevation = 8.dp
 private val PanelElevation = 14.dp
-private val PanelPadding = 14.dp
+
+/** `internal` so the calculator window can size its face to fit inside a [GlassPanel] exactly. */
+internal val PanelPadding = 14.dp
 private val HairlineWidth = 1.dp
 private val DividerHeight = 16.dp
 private val SegmentTrackPadding = 3.dp

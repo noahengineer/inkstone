@@ -356,7 +356,10 @@ something the existing gesture says unambiguously (CLAUDE.md: *"don't gold-plate
 What is deliberately refused, each because the alternative is worse than not binding: a rectangle
 whose corners touch two boxes (every diagram's outer box would start re-routing); both ends on one
 shape (two `Auto` anchors facing the same centre have no direction to resolve from); and attaching
-to another **connector** (its route would depend on a route, with no fixed point). An unbound end is
+to another **connector** (its route would depend on a route, with no fixed point). ⚠️ *Added
+2026-09-25:* a line with **only one** end on a shape, or one end inside the other end's shape, no
+longer binds at all — a line merely started inside a box was being re-routed off its own start
+(SPEC §4.8.9, `ShapeSnapBindingTest`). An unbound end is
 left `null` rather than `ConnectorEnd.Free` — identical geometry today, and they differ the moment
 the connector is *moved*, where null follows the transform and `Free` would stay behind.
 

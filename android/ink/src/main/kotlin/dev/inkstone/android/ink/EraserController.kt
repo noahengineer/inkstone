@@ -10,13 +10,16 @@ import dev.inkstone.core.model.Camera
  * is left exactly as drawn and the swept area is recorded beside it — see
  * [ErasedRegion], which also explains what M2's op vocabulary owes this.
  *
- * @param onErased called when at least one stroke was removed, so the dry layer
- *   can be invalidated and the caller's stroke count updated.
+ * @param onErased called when a sample changed at least one stroke (`gestureEnded` false), and
+ *   once more when the gesture ends (`gestureEnded` true), so the dry layer can be invalidated
+ *   and the caller's stroke count updated. ⚠️ The flag exists so that work which only the *end*
+ *   of a gesture can change — re-deriving an infinite page's paper — is not done per sample; see
+ *   the callback in `InkSurfaceView`, which did exactly that at 240 Hz.
  */
 internal class EraserController(
     private val store: StrokeStore,
     private val displayDensity: Float,
-    private val onErased: () -> Unit,
+    private val onErased: (gestureEnded: Boolean) -> Unit,
 ) {
 
     /** SPEC §3.5, revised in M1 — see [EraseMode]. */
@@ -75,10 +78,11 @@ internal class EraserController(
         val wasToolbarEraser = isActive && !isTemporary
         if (isActive) {
             // Only now, off the input path: coverage-testing every candidate is
-            // far too expensive per sample (CLAUDE.md rule 7).
+            // far too expensive per sample (CLAUDE.md rule 7). The store has queued exactly the
+            // objects this gesture bit, so this looks at those and nothing else.
             store.pruneFullyErased()
             store.endEdit()
-            onErased()
+            onErased(true)
         }
         pointerId = MotionEvent.INVALID_POINTER_ID
         isTemporary = false
@@ -89,7 +93,7 @@ internal class EraserController(
         // A constant size on the glass, so the eraser feels like a physical tip
         // rather than growing as the page is zoomed out.
         val radiusPageUnits = RADIUS_DP * displayDensity / camera.scale
-        if (store.eraseAlong(from, to, radiusPageUnits, mode) > 0) onErased()
+        if (store.eraseAlong(from, to, radiusPageUnits, mode) > 0) onErased(false)
     }
 
     private fun toPageSpace(viewX: Float, viewY: Float, camera: Camera, into: PagePointF) {

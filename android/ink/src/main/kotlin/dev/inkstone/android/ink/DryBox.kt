@@ -86,19 +86,8 @@ internal sealed class DryBox(val obj: InkObject, widthPt: Float, heightPt: Float
     var content: String? = content
         private set
 
-    /** The `SetFormat` register (SPEC §4.9.2), verbatim. See [decodedFormat] for the parsed view. */
-    var format: String? = null
-        private set
-
-    /**
-     * [format] parsed, decoded once per write rather than per draw.
-     *
-     * `ObjectFormat.decode` splits a string; doing it in `onDraw` would parse every text box's
-     * record on every frame (CLAUDE.md rule 7), and doing it inside a text layout would parse it
-     * again for every line.
-     */
-    var decodedFormat: ObjectFormat = ObjectFormat.Default
-        private set
+    // ⭐ The `SetFormat` register and its parsed view moved to [DryObject] with knockout (SPEC
+    // §4.9.6): every kind can carry one now. [onFormatChanged] is how this kind still hears about it.
 
     /**
      * The rectangle this object occupies in its **own** space, as a [ShapePath].
@@ -137,16 +126,12 @@ internal sealed class DryBox(val obj: InkObject, widthPt: Float, heightPt: Float
     fun setContent(text: String?) {
         if (content == text) return
         content = text
+        invalidateSilhouette()
         onPresentationChanged()
     }
 
-    /** The render side of `SetFormat` (SPEC §4.9.2). Absolute, like every register here. */
-    fun setFormat(record: String?) {
-        if (format == record) return
-        format = record
-        decodedFormat = ObjectFormat.decode(record)
-        onPresentationChanged()
-    }
+    /** The render side of `SetFormat` (SPEC §4.9.2) — the base records it; the box re-lays-out. */
+    override fun onFormatChanged() = onPresentationChanged()
 
     override fun restyle(style: ObjectStyle?, brushes: InkBrushFactory) {
         super.restyle(style, brushes)

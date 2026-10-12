@@ -1,12 +1,18 @@
 package dev.inkstone.app.platform
 
 import android.content.Context
+import android.system.ErrnoException
+import android.system.Os
 import dagger.hilt.android.qualifiers.ApplicationContext
+import dev.inkstone.core.model.FileIdentity
 import dev.inkstone.core.model.FileSystem
+import dev.inkstone.core.model.ReadHandle
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileNotFoundException
 import java.io.RandomAccessFile
+import java.nio.ByteBuffer
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -69,6 +75,77 @@ class AndroidFileSystem @Inject constructor(@ApplicationContext private val cont
             random.readFully(buffer)
         }
         buffer
+    }
+
+    /**
+     * ⛔ One open descriptor, read with positional reads — see [FileSystem.openRead] for the crash
+     * this closes. [writeBytesAtomically] replaces a file by `rename(2)`, which changes what the
+     * *name* points at and leaves an already-open descriptor on the old inode, so every read
+     * through the handle sees the file as it was when the handle was opened.
+     *
+     * `FileChannel.read(buffer, position)` rather than `seek` + `read`: a positional read has no
+     * shared cursor, so two coroutines reading one handle concurrently — which a session's reader
+     * can have — cannot move each other's position.
+     */
+    override suspend fun openRead(path: String): ReadHandle? = withContext(Dispatchers.IO) {
+        val file = resolve(path)
+        if (!file.isFile) return@withContext null
+        val random = try {
+            RandomAccessFile(file, "r")
+        } catch (_: FileNotFoundException) {
+            // Deleted between the check and the open — the same answer as never having existed.
+            return@withContext null
+        }
+        ChannelReadHandle(random)
+    }
+
+    /**
+     * Device and inode of what [path] names now — the other half of `FileByteSource.isCurrent`.
+     *
+     * ⚠️ Without this override (and [ChannelReadHandle.identity]) the interface defaults answer
+     * null, `isCurrent` answers *"cannot tell, so yes"*, and the guard in `NoteStore.materialize`
+     * is inert on every device while passing its JVM test — which is how it shipped for an hour.
+     */
+    override suspend fun identityOf(path: String): FileIdentity? = withContext(Dispatchers.IO) {
+        try {
+            val stat = Os.stat(resolve(path).path)
+            FileIdentity(device = stat.st_dev, inode = stat.st_ino)
+        } catch (_: ErrnoException) {
+            null
+        }
+    }
+
+    private class ChannelReadHandle(private val random: RandomAccessFile) : ReadHandle {
+
+        private val channel = random.channel
+
+        /** `fstat` of the open descriptor, so this is the size of the file actually held. */
+        override val size: Long = channel.size()
+
+        /** `fstat` again: the inode the descriptor holds, however the path has been renamed over since. */
+        override val identity: FileIdentity? = try {
+            val stat = Os.fstat(random.fd)
+            FileIdentity(device = stat.st_dev, inode = stat.st_ino)
+        } catch (_: ErrnoException) {
+            null
+        }
+
+        override suspend fun read(offset: Long, length: Int): ByteArray = withContext(Dispatchers.IO) {
+            if (offset < 0 || offset >= size) return@withContext ByteArray(0)
+            val wanted = length.toLong().coerceAtMost(size - offset).toInt()
+            val buffer = ByteBuffer.allocate(wanted)
+            var position = offset
+            while (buffer.hasRemaining()) {
+                val got = channel.read(buffer, position)
+                if (got < 0) break
+                position += got
+            }
+            if (buffer.position() == wanted) buffer.array() else buffer.array().copyOf(buffer.position())
+        }
+
+        override fun close() {
+            random.close()
+        }
     }
 
     override suspend fun writeBytesAtomically(path: String, bytes: ByteArray) = withContext(Dispatchers.IO) {

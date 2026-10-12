@@ -50,7 +50,11 @@ import kotlin.coroutines.EmptyCoroutineContext
  * in the code as an assertion."* [assertNotStale] is that assertion; the session calls
  * it when it closes a note.
  *
- * @property saveContext where [saveUndo]'s serialisation and write run.
+ * @property saveContext where the expensive serialisation runs: [saveUndo], the bundle encode in
+ *   [materialize], the page decode in [loadPage], and the journal's encode ([appendOps]) and decode
+ *   ([reloadJournal]). The last four joined it after the 2026-09-24 tablet trace: for the chemistry
+ *   and physics notes one materialize encoded 6–8 MB of JSON and then re-decoded the page on the UI
+ *   thread, ~0.8 s + ~1.2 s of frozen editor every ~30 s of writing on a synced note.
  *
  * ⚠️ **This module deliberately owns no dispatchers — the caller picks the thread** — and this
  * parameter does not change that: it defaults to [EmptyCoroutineContext], so every existing
@@ -72,6 +76,9 @@ public class NoteStore(
     private val ids: IdFactory,
     private val saveContext: CoroutineContext = EmptyCoroutineContext,
 ) {
+
+    /** Run CPU-bound [block] where [saveContext] says — for a session's pure computations. */
+    internal suspend fun <T> compute(block: () -> T): T = withContext(saveContext) { block() }
 
     // -----------------------------------------------------------------------
     // Create
@@ -207,7 +214,9 @@ public class NoteStore(
      * would give back exactly the memory the page cache is bounded to save.
      */
     public suspend fun reloadJournal(note: OpenNote): OpenNote {
-        val journal = Journal.read(fs, NoteLayout.journal(note.document.id))
+        // Decoded where [saveContext] says: a local-only note's journal is a whole session of
+        // absolute erase records, and this runs at every materialize.
+        val journal = withContext(saveContext) { Journal.read(fs, NoteLayout.journal(note.document.id)) }
         val opsByPage = LinkedHashMap<PageId, MutableList<PageOp>>()
         for (entry in journal.ops) {
             val pageId = entry.pageId ?: continue
@@ -229,7 +238,10 @@ public class NoteStore(
      * count"*).
      */
     public suspend fun loadPage(note: OpenNote, pageId: PageId): LoadedPage {
-        val stored = note.reader?.page(pageId)
+        // A page's JSON is decoded here — 6–7 MB and half a million numbers for the notes that
+        // made the tablet stutter — so it runs where [saveContext] says rather than on the caller,
+        // which for the editor is the UI thread.
+        val stored = withContext(saveContext) { note.reader?.page(pageId) }
         val journalOps = note.journalOps[pageId].orEmpty()
         return LoadedPage(
             pageId = pageId,
@@ -264,7 +276,9 @@ public class NoteStore(
     ): Long {
         if (ops.isEmpty() && document == null) return note.document.localRev
         val revision = note.document.localRev + 1
-        val record = Journal.record(revision, ops, pages, document?.let(::documentRecord))
+        // Encoded off the caller's thread for [loadPage]'s reason: an erase op carries its object's
+        // whole absolute region, which after a scribble is thousands of capsules.
+        val record = withContext(saveContext) { Journal.record(revision, ops, pages, document?.let(::documentRecord)) }
         fs.appendBytes(NoteLayout.journal(note.document.id), record)
         return revision
     }
@@ -346,8 +360,24 @@ public class NoteStore(
             assets = everything.filterKeys { Bundle.isAsset(it) },
         )
 
-        fs.writeBytesAtomically(NoteLayout.bundle(id), BundleWriter.write(contents))
+        // ⛔ **Refuse to overwrite a bundle this note did not read.** The reader holds its file open
+        // (`FileByteSource`), so if another writer replaced `note.inkstone` since — a merge that
+        // raced this session's open is the case `NoteSessionHost` documents — everything read
+        // through it is internally consistent and describes a file that is no longer the note.
+        // Writing now would put this session's pages over that writer's and reset the journal:
+        // their work gone, a valid PDF, nothing reported. Throwing leaves both bundle and journal
+        // exactly as they are, which is what the old re-open-per-read reader did by accident.
+        check(note.reader?.isCurrent() != false) { "note ${id.value} was rewritten by another writer while open" }
+
+        // The encode is the expensive part — every op of every page, 257–325 MB of allocation for
+        // the two notes that made the tablet stutter — so it runs where [saveContext] says, which is
+        // off the UI thread for the editor (`NoteEditor.work` is `Dispatchers.Main.immediate`).
+        val bytes = withContext(saveContext) { BundleWriter.write(contents) }
+        fs.writeBytesAtomically(NoteLayout.bundle(id), bytes)
         fs.writeBytesAtomically(NoteLayout.journal(id), Journal.header())
+        // The previous file's handle — this note's reader until a moment ago — is not needed any
+        // more; release the descriptor now rather than whenever it is collected.
+        note.reader?.close()
 
         val reader = BundleReader.open(FileByteSource(fs, NoteLayout.bundle(id)))
         return note.copy(
@@ -492,7 +522,11 @@ public class NoteStore(
         val path = NoteLayout.snapshot(id, pageId)
         if (!fs.exists(path)) return null
         val reader = BundleReader.open(FileByteSource(fs, path)) ?: return null
-        val page = reader.page(pageId) ?: return null
+        val page = try {
+            reader.page(pageId)
+        } finally {
+            reader.close()
+        } ?: return null
         return foldPage(pageId, page.ops, defaultCanvas = page.canvas)
     }
 

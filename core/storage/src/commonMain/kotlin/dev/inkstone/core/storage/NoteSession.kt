@@ -207,6 +207,19 @@ public class NoteSession(
     public val hasUnflushedWork: Boolean get() = pending.isNotEmpty() || documentDirty
 
     /**
+     * True when `note.inkstone` already holds everything this session knows: nothing written to the
+     * journal since the bundle was last written, nothing waiting to be, and no recognised text that
+     * only [materialize] would record. A materialize now would write the same ops back.
+     *
+     * ⭐ Exists for `NoteEditor`'s close path. `Activity.onStop` materializes, and it fires for a
+     * screen timeout, a lock and a glance at another app as well as for leaving — so opening the
+     * chemistry note to read it and letting the screen dim re-encoded 8.4 MB, republished the PDF
+     * and re-rendered the cover, all to write back what was already on disk.
+     */
+    public val bundleIsCurrent: Boolean
+        get() = journalBytes <= Journal.HEADER_SIZE && !hasUnflushedWork && pendingText.isEmpty() && clearedText.isEmpty()
+
+    /**
      * Whether [pageId] has a gesture to undo.
      *
      * ⚠️ Per page, and it takes the page as an argument for the same reason [UndoEntry] carries
@@ -368,7 +381,7 @@ public class NoteSession(
             ?: note.reader?.pageText(pageId).takeIf { pageId !in clearedText }
             ?: return null
         val text = PageTextCodec.decode(bytes) ?: return null
-        return text.takeIf { it.describes(PageTextCodec.inkDigestOf(page(pageId))) }
+        return text.takeIf { it.describes(digestOf(pageId)) }
     }
 
     /**
@@ -389,7 +402,7 @@ public class NoteSession(
         if (document.pages.none { it.id == pageId && !it.deleted }) return false
         val text = PageText(
             pageId = pageId,
-            inkDigest = PageTextCodec.inkDigestOf(page(pageId)),
+            inkDigest = digestOf(pageId),
             recogniser = recogniser,
             lines = lines,
         )
@@ -441,7 +454,33 @@ public class NoteSession(
     }
 
     /** The digest recognition would be certified against right now. For the merge rule. */
-    public suspend fun inkDigestOf(pageId: PageId): String = PageTextCodec.inkDigestOf(page(pageId))
+    public suspend fun inkDigestOf(pageId: PageId): String = digestOf(pageId)
+
+    /**
+     * The last digest computed and the fold it describes. A [FoldedPage] is immutable and a page's
+     * fold is replaced by every op that lands on it, so *the same instance* means the same ink.
+     */
+    private var digestMemo: Pair<FoldedPage, String>? = null
+
+    /**
+     * ⭐ SPEC §5.5's ink digest, **once per fold and off the caller's thread**.
+     *
+     * A recognition pass asks for it two or three times with nothing changing in between —
+     * [recognisedText] before sampling, [recognised] when storing, [recognisedText] again when
+     * indexing — and it stringifies every erase capsule of every stroke and SHA-256s the lot in
+     * pure Kotlin: for the chemistry note ~108k capsules, ~5 MB of text and ~900 large arrays per
+     * call, measured at ~0.2 s on a desktop JVM. It ran on the UI thread, because the recogniser
+     * takes the editor's gate there, three seconds after the pen stops — exactly when a user
+     * reaches for undo. The fold is immutable, so it can be hashed anywhere; [NoteStore.compute]
+     * puts it wherever the store's owner said heavy work goes.
+     */
+    private suspend fun digestOf(pageId: PageId): String {
+        val folded = page(pageId)
+        digestMemo?.let { (memoFold, digest) -> if (memoFold === folded) return digest }
+        val digest = store.compute { PageTextCodec.inkDigestOf(folded) }
+        digestMemo = folded to digest
+        return digest
+    }
 
     private suspend fun pageLog(pageId: PageId): PageLog {
         cache.remove(pageId)?.let { existing ->
@@ -738,9 +777,18 @@ public class NoteSession(
         clearedText.clear()
         document = note.document
         journalBytes = note.journalBytes
-        // The cached logs' ops are now in the bundle; keeping them would double-count
-        // them on the next materialize.
-        cache.clear()
+        // ⭐ **The page cache is kept.** It used to be cleared here on the grounds that the cached
+        // logs' ops were now in the bundle and *"keeping them would double-count them on the next
+        // materialize"* — but nothing appends to a cached log from the bundle: [pageLog] builds a
+        // log once, as bundle + journal + pending, and the next materialize writes `cached.ops`
+        // back verbatim (above). After this write the bundle holds exactly those ops and the
+        // journal is empty, so a kept log is identical to the one a reload would build.
+        //
+        // What clearing did cost was that reload, immediately: `NoteEditor` folds the first page
+        // for the library's cover on the very next line, and the one after that is whatever the
+        // user touches next. For the chemistry note that was 7.4 MB of JSON, ~650k numbers and
+        // 5,133 ops decoded on the UI thread after every materialize — the 50-frame skip on the
+        // tablet at 19:14:43, every ~30 s of writing on a synced note.
     }
 
     /**

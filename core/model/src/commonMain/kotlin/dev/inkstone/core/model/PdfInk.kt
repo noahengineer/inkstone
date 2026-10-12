@@ -81,6 +81,13 @@ public data class StrokeOutline(
 public fun interface StrokeOutliner {
     /** Outlines in render order: highlighters first, then ink (SPEC §3.4). */
     public suspend fun outline(page: FoldedPage): List<StrokeOutline>
+
+    /**
+     * ⭐ SPEC §4.9.6 — the same, with the note's image bytes by bundle entry name, so a knockout
+     * **picture** can cut by its own pixels. The default ignores them, which is the right answer for
+     * every implementation that has no knockout to draw.
+     */
+    public suspend fun outline(page: FoldedPage, assets: Map<String, ByteArray>): List<StrokeOutline> = outline(page)
 }
 
 /**

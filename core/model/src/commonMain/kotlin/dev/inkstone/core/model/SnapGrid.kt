@@ -1,6 +1,8 @@
 package dev.inkstone.core.model
 
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -93,10 +95,19 @@ public data class SnapGrid(
      * @param box the selection's bounds at pen-down, [dx]/[dy] the raw drag.
      * @return the delta to move by, alignment included.
      */
-    public fun moveBy(box: PageRect, dx: Float, dy: Float, alignment: Alignment): PagePoint {
+    public fun moveBy(box: PageRect, dx: Float, dy: Float, alignment: Alignment): PagePoint =
+        moveBy(PagePoint(box.left, box.top), dx, dy, alignment)
+
+    /**
+     * ⭐ [moveBy] with the point that lands on an intersection given explicitly — an Element copy's
+     * **pivot** (SPEC §4.9.7) rather than its box's top-left. *"A pivot point for snap, so it snaps to
+     * a grid when you move it"*: the corner of a hand-drawn icon's bounding box is a point nobody
+     * chose, and the pivot is the one somebody did.
+     */
+    public fun moveBy(anchor: PagePoint, dx: Float, dy: Float, alignment: Alignment): PagePoint {
         val withGuides = PagePoint(dx + alignment.dx, dy + alignment.dy)
         if (isEmpty) return withGuides
-        val offset = offsetTo(box.left + withGuides.x, box.top + withGuides.y)
+        val offset = offsetTo(anchor.x + withGuides.x, anchor.y + withGuides.y)
         return PagePoint(
             x = if (alignment.dx == 0f) withGuides.x + offset.x else withGuides.x,
             y = if (alignment.dy == 0f) withGuides.y + offset.y else withGuides.y,
@@ -199,6 +210,54 @@ public data class SnapGrid(
 
     private fun moved(before: Float, after: Float): Boolean = abs(after - before) > UNMOVED_PT
 
+    /**
+     * ⭐ A box someone dragged out, with every edge on the lattice — what the Element editor's area
+     * tool places (SPEC §4.9.7). Each edge rounds to its nearest line, so the box lands on the lines
+     * the user was aiming between; one that would collapse keeps a whole cell on that axis, because a
+     * box with no extent is not something anybody dragged out.
+     */
+    public fun snappedBox(box: PageRect): PageRect {
+        if (isEmpty) return box
+        var left = snapX(box.left)
+        var right = snapX(box.right)
+        var top = snapY(box.top)
+        var bottom = snapY(box.bottom)
+        if (snapsX && right - left < spacingXPt) right = left + spacingXPt
+        if (snapsY && bottom - top < spacingYPt) bottom = top + spacingYPt
+        if (!snapsX) {
+            left = box.left
+            right = box.right
+        }
+        if (!snapsY) {
+            top = box.top
+            bottom = box.bottom
+        }
+        return PageRect(left, top, right, bottom)
+    }
+
+    /**
+     * The smallest box on the lattice that holds all of [box] — the Element editor's *Fit*, which
+     * makes the bounds the content's own box widened outward to whole cells, so a copy dropped by its
+     * pivot lands every edge on a line. Never rounds inward: Fit must not put content outside.
+     */
+    public fun enclosing(box: PageRect): PageRect {
+        if (isEmpty) return box
+        return PageRect(
+            if (snapsX) lineAtOrBefore(box.left, originXPt, spacingXPt) else box.left,
+            if (snapsY) lineAtOrBefore(box.top, originYPt, spacingYPt) else box.top,
+            if (snapsX) lineAtOrAfter(box.right, originXPt, spacingXPt) else box.right,
+            if (snapsY) lineAtOrAfter(box.bottom, originYPt, spacingYPt) else box.bottom,
+        )
+    }
+
+    // A value within [UNMOVED_PT] of a line counts as on it, so float noise in a measured box does
+    // not push an edge that is already on the lattice out by a whole cell.
+    private fun lineAtOrBefore(value: Float, origin: Float, spacing: Float): Float =
+        origin + floor((value - origin + UNMOVED_PT) / spacing) * spacing
+
+    private fun lineAtOrAfter(value: Float, origin: Float, spacing: Float): Float =
+        origin + ceil((value - origin - UNMOVED_PT) / spacing) * spacing
+
     public companion object {
 
         /** No lattice at all: every `snap*` is the identity and [snapped] returns its argument. */
@@ -225,7 +284,12 @@ public data class SnapGrid(
          * with the ink on the paper by half a cell would be worse than no lattice at all, because
          * it would look like the shape had missed.
          */
-        public fun forBackground(background: Background): SnapGrid {
+        // ⚠️ [paperLeft] / [paperTop]: `PagePainter.paintBackground` draws the template from the
+        // **paper's** top-left, which is negative on an infinite canvas that has grown up or to the
+        // left (SPEC §4.5). A lattice from zero was then offset from every line on the paper by
+        // however far the canvas had grown — *"the grid of the note and the editor seem to be
+        // offset"*. Blank paper's lattice is chrome drawn from zero, so it stays there.
+        public fun forBackground(background: Background, paperLeft: Float = 0f, paperTop: Float = 0f): SnapGrid {
             val template = (background as? Background.Template)?.template ?: return blank()
             return when (template) {
                 PageTemplate.BLANK -> blank()
@@ -233,6 +297,8 @@ public data class SnapGrid(
                 PageTemplate.GRID, PageTemplate.DOT_GRID -> SnapGrid(
                     spacingXPt = template.spacingPt,
                     spacingYPt = template.spacingPt,
+                    originXPt = paperLeft,
+                    originYPt = paperTop,
                     drawnByThePaper = true,
                 )
 
@@ -242,7 +308,7 @@ public data class SnapGrid(
                 PageTemplate.RULED, PageTemplate.CORNELL -> SnapGrid(
                     spacingXPt = 0f,
                     spacingYPt = template.spacingPt,
-                    originYPt = PageTemplate.RULED_MARGIN_PT,
+                    originYPt = paperTop + PageTemplate.RULED_MARGIN_PT,
                     drawnByThePaper = true,
                 )
             }

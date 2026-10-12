@@ -30,6 +30,7 @@ val coreModules = listOf(
     ":core:database",
     ":core:sync",
     ":core:search",
+    ":core:calc",
 )
 
 // ---------------------------------------------------------------------------

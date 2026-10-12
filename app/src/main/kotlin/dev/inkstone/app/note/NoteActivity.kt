@@ -17,6 +17,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import dagger.hilt.android.AndroidEntryPoint
 import dev.inkstone.app.R
+import dev.inkstone.app.calculator.CalculatorPreferences
 import dev.inkstone.app.ink.EditorPreferences
 import dev.inkstone.app.ink.InkScreen
 import dev.inkstone.app.sync.PollTicker
@@ -32,20 +33,26 @@ import javax.inject.Inject
  * `SavedStateHandle`, which Hilt seeds from this activity's intent extras — so the right
  * note comes back after a process kill without anything having to remember it.
  *
- * ## Why `onStop` materializes
+ * ## Why `onStop` saves, and materializes only when the note is closing
  *
  * SPEC §5.1 makes materialization a close-time job — *"runs on: document close, before upload,
  * and on idle-while-charging. Never on the ink path"* — and states the invariant it protects:
  * `document.pdf` is never more than one editing session stale.
  *
  * `onStop` is the last callback Android guarantees before the process can be killed, so it is
- * the only honest place for it. `onDestroy` is not guaranteed, and a view model's `onCleared`
- * is not either. Everything written before this point is already in `journal.ops`, so a kill
- * that beats the materialization costs a fold on the next open and no data.
+ * the only honest place for the *save*. `onDestroy` is not guaranteed, and a view model's
+ * `onCleared` is not either. Everything written before this point is already in `journal.ops`,
+ * so a kill that beats the materialization costs a fold on the next open and no data.
  *
- * M3 added a second reason it has to be here: materializing is also what redraws the note's
- * library thumbnail (SPEC §5.7). Going back to the library stops this activity, so the
- * picture is up to date by the time the grid is on screen.
+ * ⛔ **The materialize itself runs only when [isFinishing]** — when the note is actually being
+ * closed. Until 2026-10 every stop materialized, and a stop is also the Element editor opening on
+ * top, a switch to another app and the screen timing out. On a big note that materialize is a
+ * few hundred megabytes of allocation in a process whose screen has just stopped, which is the
+ * moment Android is willing to destroy it — see [NoteEditorViewModel.onStopped].
+ *
+ * M3 added a second reason the close-time half has to be here: materializing is also what
+ * redraws the note's library thumbnail (SPEC §5.7). Going back to the library finishes this
+ * activity, so the picture is up to date by the time the grid is on screen.
  */
 @AndroidEntryPoint
 class NoteActivity : ComponentActivity() {
@@ -75,6 +82,10 @@ class NoteActivity : ComponentActivity() {
      */
     @Inject
     lateinit var editorPreferences: EditorPreferences
+
+    /** The calculator's remembered state (docs/CALCULATOR.md D4), flushed in `onStop` beside the toolbar's. */
+    @Inject
+    lateinit var calculatorPreferences: CalculatorPreferences
 
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge(statusBarStyle = DarkBars, navigationBarStyle = DarkBars)
@@ -131,14 +142,21 @@ class NoteActivity : ComponentActivity() {
 
     override fun onStop() {
         poll.release()
-        editor.materialize()
+        editor.onStopped(finishing = isFinishing)
         editorPreferences.flush()
+        calculatorPreferences.flush()
         super.onStop()
     }
 
     companion object {
         /** The note to open, as a [dev.inkstone.core.model.DocumentId]'s string value. */
         const val EXTRA_NOTE_ID: String = NoteEditorViewModel.ARG_NOTE_ID
+
+        /** ⭐ Open the Element editor on this `ElementId` instead of a note (SPEC §4.9.7). */
+        const val EXTRA_ELEMENT_ID: String = NoteEditorViewModel.ARG_ELEMENT_ID
+
+        /** The opening note's lattice spacing, in points, for the Element editor's grid (SPEC §4.9.7). */
+        const val EXTRA_GRID_PT: String = NoteEditorViewModel.ARG_GRID_PT
 
         /** SPEC §8.4 — the page a search hit is on. Absent means "wherever the note was". */
         const val EXTRA_PAGE_ID: String = NoteEditorViewModel.ARG_PAGE_ID

@@ -37,6 +37,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import dev.inkstone.app.calculator.CalculatorChip
+import dev.inkstone.app.calculator.CalculatorLayer
 import dev.inkstone.app.ui.ChipDivider
 import dev.inkstone.app.ui.ChipKind
 import dev.inkstone.app.ui.GlassBar
@@ -129,6 +131,10 @@ fun LibraryScreen(state: LibraryUiState, actions: LibraryActions, modifier: Modi
             onNewNote = actions.onNewNote,
             modifier = Modifier.align(Alignment.BottomEnd).padding(InkDims.EdgePadding),
         )
+        // ⭐ The calculator: BottomStart is free (the create bar is capped at three chips), and the
+        // window is the last layer, above the grid. Same calculator as in every note (docs/CALCULATOR.md D3).
+        CalculatorChip(Modifier.align(Alignment.BottomStart).padding(InkDims.EdgePadding))
+        CalculatorLayer()
     }
 
     LibraryDialogHost(state = state, actions = actions, dialogs = dialogs)

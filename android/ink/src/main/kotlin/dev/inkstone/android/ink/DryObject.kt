@@ -1,5 +1,6 @@
 package dev.inkstone.android.ink
 
+import android.graphics.Path
 import androidx.ink.geometry.ImmutableParallelogram
 import androidx.ink.geometry.ImmutableSegment
 import androidx.ink.geometry.ImmutableVec
@@ -7,6 +8,7 @@ import androidx.ink.geometry.MutableVec
 import androidx.ink.geometry.Parallelogram
 import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.Matrix3
+import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PagePoint
@@ -124,6 +126,106 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
         private set
 
     /**
+     * The `SetFormat` register (SPEC §4.9.2), verbatim — for **every** kind, not only a box.
+     *
+     * ⭐ It lived on `DryBox` until knockout (SPEC §4.9.6), because a font and a crop were the only
+     * things the register carried and only a text box and an image had either. The fold has always
+     * kept a format side table for any object (`FoldedPage.formats`); the render state now does too,
+     * so a stroke or a shape can carry the knockout flag, and a key from a later build survives on
+     * any kind it is written to.
+     */
+    var format: String? = null
+        private set
+
+    /**
+     * [format] parsed, decoded once per write rather than per draw.
+     *
+     * `ObjectFormat.decode` splits a string; doing it in `onDraw` would parse every object's record
+     * on every frame (CLAUDE.md rule 7).
+     */
+    var decodedFormat: ObjectFormat = ObjectFormat.Default
+        private set
+
+    /**
+     * ⭐ SPEC §4.9.6 — whether this object hides what is underneath its filled silhouette.
+     *
+     * Never for a highlighter: that band is drawn over all ink by design (SPEC §3.4), so a
+     * highlighter that knocked out would hide the writing it exists to mark.
+     */
+    val knockout: Boolean get() = decodedFormat.hidesBeneath && !drawsOverInk && !elementFrame
+
+    /**
+     * ⭐ An invisible knockout area (`ObjectFormat.cutter`): hides what is beneath and is not drawn —
+     * except, dashed, on the Element editor's canvas ([PagePainter.showCutters]).
+     */
+    val cutter: Boolean get() = decodedFormat.cutter && this is DryShape
+
+    /**
+     * ⭐ The bounds of the Element being edited (`ObjectFormat.elementFrame`, SPEC §4.9.7) — a guide on
+     * the editor's canvas. Drawn only as chrome ([PagePainter.paintGuides]), never erased, never a
+     * knockout, and grabbed by its edge only, so a tap inside the bounds lands on the Element.
+     */
+    val elementFrame: Boolean get() = decodedFormat.elementFrame && this is DryShape
+
+    /** A cutter or the frame: drawn by the editor on top of everything, as dashed chrome. */
+    val isGuide: Boolean get() = cutter || elementFrame
+
+    /**
+     * ⭐ SPEC §4.9.7 — where this piece's Element copy snaps by, in page space, or null when it is not
+     * part of a copy or its Element has no pivot.
+     */
+    val pivotOnPage: dev.inkstone.core.model.PagePoint? get() = decodedFormat.instance?.pivotOn(transform)
+
+    /**
+     * ⭐ The bounds of the Element copy this piece belongs to, on the page, or null. A selected copy's
+     * frame includes them, so the box the user set in the editor is the box the copy is moved,
+     * snapped and resized by (SPEC §4.9.7).
+     */
+    val copyBoundsOnPage: dev.inkstone.core.model.PageRect? get() = decodedFormat.instance?.boundsOn(transform)
+
+    /** Which Element copy this piece belongs to — `ElementInstance.copyKey` — or null for none. */
+    val copyKey: String? get() = decodedFormat.instance?.copyKey(transform)
+
+    /**
+     * The filled silhouette [PagePainter] built for [knockout], in this object's **own** space, or
+     * null when it has not been built since the object last changed.
+     *
+     * Object space for the reason [erased] is: a move is a matrix, so dragging a knockout across a
+     * page re-records the page and never rebuilds this.
+     */
+    internal var silhouette: Path? = null
+
+    /**
+     * What [silhouette] was built from beyond the object itself — an image's bitmap, which arrives
+     * after the object does. Compared by identity, so a picture that loads later gets a silhouette
+     * of its pixels rather than of the placeholder.
+     */
+    internal var silhouetteSource: Any? = null
+
+    /** Anything that changes what this object looks like has to call this. */
+    protected fun invalidateSilhouette() {
+        silhouette = null
+        silhouetteSource = null
+    }
+
+    /**
+     * The render side of `SetFormat` (SPEC §4.9.2). Absolute, like every register here.
+     *
+     * @return true when the record actually changed.
+     */
+    fun setFormat(record: String?): Boolean {
+        if (format == record) return false
+        format = record
+        decodedFormat = ObjectFormat.decode(record)
+        invalidateSilhouette()
+        onFormatChanged()
+        return true
+    }
+
+    /** A kind whose presentation depends on the format — a font, a crop, a frame — rebuilds here. */
+    protected open fun onFormatChanged() = Unit
+
+    /**
      * The one writer of the two boxes, so a subclass cannot update one and forget the other.
      *
      * Called from a subclass's initialiser and again whenever its own-space geometry is rebuilt —
@@ -156,6 +258,7 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
      */
     open fun restyle(style: ObjectStyle?, brushes: InkBrushFactory) {
         this.style = style
+        invalidateSilhouette()
     }
 
     /**
@@ -165,12 +268,16 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
      */
     fun setErased(region: ErasedRegion?) {
         erased = region
+        // An erased bite out of a knockout is a bite out of what it hides, so the silhouette follows
+        // what is drawn rather than what was placed.
+        invalidateSilhouette()
     }
 
     /** Extend the region by one eraser sample, in this object's own space. */
     fun eraseCapsule(capsule: ErasedRegion.Capsule) {
         val region = erased ?: ErasedRegion().also { erased = it }
         region.add(capsule)
+        invalidateSilhouette()
     }
 
     /** A page-space point in this object's own space, or false if [transform] cannot be inverted. */
@@ -231,6 +338,13 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
     }
 
     /**
+     * Whether the tap landed on what is **drawn** — the ink of a stroke, the outline of a shape —
+     * rather than only inside it. The same as [tappedAt] for every kind with no inside; [DryShape]
+     * overrides it. What the Element editor's tap order is built on (`StrokeStore.objectAt`).
+     */
+    open fun edgeTappedAt(localX: Float, localY: Float, reach: Float): Boolean = tappedAt(localX, localY, reach)
+
+    /**
      * Every silhouette vertex, in **page space** — what a lasso is tested against.
      *
      * The painted outline rather than any input path: a lasso drawn inside a thick loop must select
@@ -250,21 +364,28 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
      * ⭐ M8c: on the object rather than as a `when` in the prune loop, which is where the same
      * decision already lives for erasing ([hitBy]). Default **false**, which is the whole answer
      * for every kind but a stroke: pruning is only worth it when the thing dropped is expensive to
-     * keep drawing, and it costs the user their object until the page is reloaded — an undo of the
-     * erase writes `SetErasedRegion` at an id the store no longer holds, and `applyRegister`
-     * answers false for one.
+     * keep drawing, and a wrong *true* hides something the user can see. (An undo of the erase does
+     * reach a pruned object — `StrokeStore.prunedByErase` — but only after the user has noticed it
+     * missing.) [DryShape] explains why a shape, the one other kind that costs a layer, still says
+     * false.
      */
     open fun isErasedAway(region: ErasedRegion): Boolean = false
 
     /**
-     * The number of point-against-capsule distance tests [isErasedAway] would run if called
-     * now — the unit `pruneFullyErased`'s budget is denominated in — or 0 when a cheap gate
-     * already answers it.
+     * [isErasedAway], **metered and resumable** — what the prune queue asks (see [PruneQueue]).
      *
-     * The base answers 0 because the base [isErasedAway] answers false without work. [DryStroke]
-     * overrides with the real estimate; the budget used to charge the *capsule count* while the
-     * work was points × capsules, an under-count of about the point count (~100×) that let one
-     * eraser pen-up run for hundreds of milliseconds inside the very bound built to prevent it.
+     * Spends at most what [meter] has left (to within one point's scan) and answers
+     * [PruneVerdict.UNDECIDED] if that was not enough; the next call carries on from where this one
+     * stopped rather than starting again, provided the geometry and the region are still the ones
+     * it was measuring (see [ResumableCoverage]).
+     *
+     * ⚠️ **This replaced an estimate, `eraseCoverageCost`, and the estimate was the bug.** The
+     * budget charged `inputs × 3 × capsules` per candidate; on a real note that was 56–101× the
+     * work the test actually did, so a pass pruned two to six strokes and stopped. Counting the
+     * work as it happens is the only estimate that cannot drift from the thing it estimates.
+     *
+     * The base answers [PruneVerdict.VISIBLE] for nothing, for the reason [isErasedAway] gives —
+     * only a stroke is ever worth dropping.
      */
-    open fun eraseCoverageCost(region: ErasedRegion): Long = 0L
+    open fun probeErasedAway(region: ErasedRegion, meter: CoverageMeter): PruneVerdict = PruneVerdict.VISIBLE
 }

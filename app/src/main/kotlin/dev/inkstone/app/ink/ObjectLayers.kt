@@ -11,16 +11,32 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
-import dev.inkstone.app.elements.Element
+import dev.inkstone.app.elements.ElementDrag
 import dev.inkstone.app.elements.ElementPanel
+import dev.inkstone.app.elements.ElementPreviews
 import dev.inkstone.app.note.CropMath
 import dev.inkstone.app.note.NoteEditorViewModel
 import dev.inkstone.app.note.pageBounds
@@ -35,8 +51,11 @@ import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.TextBoxObject
 import dev.inkstone.core.model.formatting
 import dev.inkstone.core.model.viewToPage
+import dev.inkstone.core.storage.Element
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import dev.inkstone.core.model.Offset as ViewOffset
 
 /**
@@ -59,26 +78,14 @@ fun ObjectLayers(
     modifier: Modifier = Modifier,
 ) {
     val scope = rememberCoroutineScope()
-    var elements by remember { mutableStateOf(emptyList<Element>()) }
-
-    // Loaded when the panel opens rather than held for the note's lifetime: the library is a file
-    // on disk that another note may have written, so a list captured at open would go stale the
-    // moment an element was saved from anywhere else.
-    //
-    // ⚠️ Re-read on [ObjectToolState.libraryRevision], which is bumped when a write **finishes** —
-    // see its KDoc for the version of this that keyed on `capturedArea` and re-read the index a
-    // moment before the save wrote it.
-    LaunchedEffect(objects.libraryReloadKey) {
-        if (objects.elementsOpen) elements = editor.elements()
-    }
 
     Box(modifier = modifier.fillMaxSize()) {
         PageOverlay(
             ui = ui,
             objects = objects,
             gestures = PageGestures(
-                onTap = { point -> scope.launch { onTap(point, ui, objects, editor) } },
-                onDragBox = { box -> scope.launch { onDragBox(box, ui, objects) } },
+                onTap = { point -> scope.launch { onTap(point, ui, objects, editor, actions) } },
+                onDragBox = { box -> onDragBox(box, ui, objects, actions) },
             ),
         )
         // ⭐ Above the page overlay and below the panels: while it is up it owns the touches, which
@@ -87,10 +94,77 @@ fun ObjectLayers(
             CropOverlay(session = session, camera = ui.camera, onRegion = objects::dragCrop)
         }
         TextBoxLayer(ui, objects, actions)
+        // ⭐ SPEC §4.9.7 — the Element editor's area and pivot tools, and the pivot itself: always on
+        // the editor's canvas, and on a note for a selected copy that has one.
+        if (editor.editingElement != null) {
+            // The pivot itself is drawn by the page, on the bounds it belongs to (`PagePainter.paintGuides`),
+            // so an undo moves it back with no state here to fall out of step.
+            actions.elementEditor?.let { tools ->
+                ElementEditorOverlay(
+                    objects = objects,
+                    camera = ui.camera,
+                    onArea = { kind, box -> scope.launch { tools.addArea(kind, box) } },
+                    onPivot = { point -> scope.launch { tools.placePivot(point) } },
+                )
+            }
+        } else {
+            ui.selectionPivot?.takeUnless { ui.selectionManipulating }?.let { PivotMarker(it, ui.camera) }
+        }
+    }
+
+    // ⭐ M8c — the captured area's name and collection. A dialog rather than a bar, because it is a
+    // question with an answer and the page underneath is exactly what the answer is about.
+    //
+    // ⚠️ It lives here rather than in the Elements toolbar row, and that move is load-bearing: the
+    // redesign collapses row two whenever a contextual toolbar is up, so a dialog hung off that row
+    // would be *un-summonable* the moment anything on the page was selected — a capture gesture that
+    // does nothing, which is CLAUDE.md's definition-of-done #6 caused by a layout decision.
+    if (objects.capture != null) NameElementDialog(objects, actions)
+}
+
+/**
+ * ⭐ The Elements panel, and the ghost a drag out of it carries — **composed above the contextual
+ * bars**, which is why it is not part of [ObjectLayers].
+ *
+ * It was, until double-tap-to-edit made its rows targets worth hitting: a selection near the top
+ * right put its floating bar straight over the panel's first row, so the double-tap meant to open
+ * the Element editor pressed *Save as Element* instead (found on the emulator). `InkScreen` composes
+ * this after `TopChrome`, so a panel the user opened is above a bar they did not ask to move.
+ *
+ * Fills the screen with no input of its own, so everything outside the panel still reaches the ink
+ * surface; its origin is the surface's, which is what the drop converts window positions into.
+ */
+@Composable
+fun ElementPanelLayer(
+    ui: InkUiState,
+    objects: ObjectToolState,
+    editor: NoteEditorViewModel,
+    actions: ObjectActions,
+    modifier: Modifier = Modifier,
+) {
+    val scope = rememberCoroutineScope()
+    var elements by remember { mutableStateOf(emptyList<Element>()) }
+
+    // Loaded when the panel opens rather than held for the note's lifetime: the library is a file
+    // on disk that another note may have written, so a list captured at open would go stale the
+    // moment an element was saved from anywhere else.
+    //
+    // ⚠️ Re-read on [ObjectToolState.libraryRevision], which is bumped when a write **finishes** —
+    // see its KDoc for the version of this that keyed on the captured area and re-read the index a
+    // moment before the save wrote it.
+    LaunchedEffect(objects.libraryReloadKey) {
+        if (objects.elementsOpen) elements = editor.elements()
+    }
+    val previews = rememberElementPreviews(editor, elements)
+    val drop = remember { DropState() }
+    val drag = remember(actions) { drop.drag(ui, actions) }
+
+    Box(modifier = modifier.fillMaxSize().onGloballyPositioned { drop.layer = it }) {
         if (objects.elementsOpen) {
             ElementPanel(
                 elements = elements,
                 armed = objects.pendingElement,
+                previews = previews,
                 onArm = { objects.pendingElement = it },
                 onDelete = { id ->
                     scope.launch {
@@ -102,19 +176,19 @@ fun ObjectLayers(
                     }
                 },
                 onClose = { objects.elementsOpen = false },
-                modifier = Modifier.align(Alignment.TopEnd).padding(top = PANEL_TOP_DP.dp, end = 12.dp),
+                onEdit = actions.onEditElement,
+                drag = drag,
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(top = PANEL_TOP_DP.dp, end = 12.dp)
+                    .onGloballyPositioned { drop.panelBounds = it.boundsInWindow() },
             )
         }
+        drop.dragging?.let { held ->
+            val local = drop.layer?.windowToLocal(held.window)
+            if (local != null) DragGhost(held.element, previews[held.element.id], local, ui.camera)
+        }
     }
-
-    // ⭐ M8c — the captured area's name and collection. A dialog rather than a bar, because it is a
-    // question with an answer and the page underneath is exactly what the answer is about.
-    //
-    // ⚠️ It lives here rather than in the Elements toolbar row, and that move is load-bearing: the
-    // redesign collapses row two whenever a contextual toolbar is up, so a dialog hung off that row
-    // would be *un-summonable* the moment anything on the page was selected — a capture gesture that
-    // does nothing, which is CLAUDE.md's definition-of-done #6 caused by a layout decision.
-    if (objects.capturedArea != null) NameElementDialog(objects, actions)
 }
 
 /** Name and file the captured area. Two fields, because a library with one collection is a list. */
@@ -123,7 +197,7 @@ private fun NameElementDialog(state: ObjectToolState, actions: ObjectActions) {
     var name by remember { mutableStateOf("") }
     var collection by remember { mutableStateOf("") }
     AlertDialog(
-        onDismissRequest = { state.capturedArea = null },
+        onDismissRequest = { state.capture = null },
         title = { Text("Save as Element") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -136,7 +210,7 @@ private fun NameElementDialog(state: ObjectToolState, actions: ObjectActions) {
             }
         },
         confirmButton = { TextButton(onClick = { actions.onSaveElement(name, collection) }) { Text("Save") } },
-        dismissButton = { TextButton(onClick = { state.capturedArea = null }) { Text("Cancel") } },
+        dismissButton = { TextButton(onClick = { state.capture = null }) { Text("Cancel") } },
     )
 }
 
@@ -147,11 +221,20 @@ private fun NameElementDialog(state: ObjectToolState, actions: ObjectActions) {
  * comes back includes anything a peer merged a moment ago. A screen-held copy would hit-test
  * against a page that no longer exists, which is how a tap "misses" an image that is plainly there.
  */
-private suspend fun onTap(point: PagePoint, ui: InkUiState, objects: ObjectToolState, editor: NoteEditorViewModel) {
-    val fold = editor.currentFold() ?: return
+private suspend fun onTap(
+    point: PagePoint,
+    ui: InkUiState,
+    objects: ObjectToolState,
+    editor: NoteEditorViewModel,
+    actions: ObjectActions,
+) {
     when (ui.tool) {
-        EditorTool.TEXT -> tapText(point, fold, objects, editor)
-        EditorTool.ELEMENT -> objects.pendingElement?.let { editor.stampElement(it, point) }
+        EditorTool.TEXT -> editor.currentFold()?.let { fold -> tapText(point, fold, objects, editor) }
+
+        // Centred on the tap, exactly as a drop is centred on the finger — the two ways of placing
+        // one Element must not put it in two different places for the same point.
+        EditorTool.ELEMENT -> objects.pendingElement?.let { actions.onPlaceElement(it, point, false) }
+
         else -> Unit
     }
 }
@@ -203,9 +286,110 @@ private suspend fun tapText(
  * whole new region over a picture that was by then showing the *previous* crop's pixels. It lives
  * in `CropOverlay` now, which holds the region across the whole interaction and writes once.
  */
-private fun onDragBox(box: PageRect, ui: InkUiState, objects: ObjectToolState) {
+private fun onDragBox(box: PageRect, ui: InkUiState, objects: ObjectToolState, actions: ObjectActions) {
     if (ui.tool != EditorTool.ELEMENT) return
-    objects.capturedArea = box
+    // ⭐ Turned into objects **now**, by the surface — handwriting included — rather than handed to
+    // the save as an area. A box that encloses nothing opens no dialog at all; asking for a name for
+    // an Element of nothing and then saying so afterwards is the worse order.
+    objects.capture = actions.captureArea(box)
+}
+
+/**
+ * One picture per Element, drawn once and kept for the screen's life — an Element never changes
+ * after it is saved, so its id is a complete cache key.
+ */
+@Composable
+private fun rememberElementPreviews(
+    editor: NoteEditorViewModel,
+    elements: List<Element>,
+): Map<dev.inkstone.core.model.ElementId, ImageBitmap> {
+    val drawn = remember { mutableStateMapOf<String, ImageBitmap>() }
+    val widthPx = with(LocalDensity.current) { PREVIEW_DP.dp.roundToPx() } * PREVIEW_OVERSAMPLE
+    LaunchedEffect(elements) {
+        for (element in elements.filter { previewKey(it) !in drawn }) {
+            previewOf(editor, element, widthPx)?.let { drawn[previewKey(element)] = it }
+        }
+    }
+    return elements.mapNotNull { element -> drawn[previewKey(element)]?.let { element.id to it } }.toMap()
+}
+
+/**
+ * What a picture of [element] depends on. ⚠️ **Not its id alone**: since the Element editor (SPEC
+ * §4.9.7) an Element is revised in place under the same id, and a cache keyed on the id would go on
+ * showing the old picture for as long as the note stayed open.
+ */
+private fun previewKey(element: Element): String =
+    "${element.id.value}:${element.objects.hashCode()}:${element.texts.hashCode()}:${element.formats.hashCode()}"
+
+private suspend fun previewOf(editor: NoteEditorViewModel, element: Element, widthPx: Int): ImageBitmap? {
+    val bytes = editor.elementPreview(element, widthPx) ?: return null
+    return withContext(Dispatchers.Default) {
+        android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+    }
+}
+
+/**
+ * ⭐ A drag out of the panel. Window coordinates in, this layer's coordinates out — the layer sits
+ * exactly over the ink surface, so its local space is the surface's view space, which is what the
+ * camera maps to page space.
+ */
+@androidx.compose.runtime.Stable
+private class DropState {
+    var layer by mutableStateOf<LayoutCoordinates?>(null)
+    var panelBounds by mutableStateOf<Rect?>(null)
+    var dragging by mutableStateOf<DraggedElement?>(null)
+
+    fun drag(ui: InkUiState, actions: ObjectActions) = ElementDrag(
+        onStart = { element, window -> dragging = DraggedElement(element, window) },
+        onMove = { window -> dragging = dragging?.copy(window = window) },
+        onEnd = { drop(ui, actions) },
+        onCancel = { dragging = null },
+    )
+
+    private fun drop(ui: InkUiState, actions: ObjectActions) {
+        val dropped = dragging ?: return
+        dragging = null
+        // Letting go over the panel itself is "never mind", not "put it under the panel".
+        if (panelBounds?.contains(dropped.window) == true) return
+        val local = layer?.windowToLocal(dropped.window) ?: return
+        actions.onPlaceElement(dropped.element, viewToPage(ViewOffset(local.x, local.y), ui.camera), true)
+    }
+}
+
+/** An Element in flight out of the panel, and where the finger is in window space. */
+private data class DraggedElement(val element: Element, val window: Offset)
+
+/**
+ * What the finger carries: the Element's picture at the size it will land at, centred on the finger.
+ *
+ * At the page's own scale rather than the tile's, because *"how big is this going to be"* is the
+ * question a drag answers — a thumbnail-sized ghost dropped onto a page zoomed to 300 % lands three
+ * times larger than it looked, which reads as the drop having done something else. Drawn without
+ * input, so it never takes the touch it is following.
+ */
+@Composable
+private fun DragGhost(element: Element, preview: ImageBitmap?, centre: Offset, camera: Camera) {
+    val margin = ElementPreviews.marginPt(element) * camera.scale
+    val width = ElementPreviews.widthPt(element) * camera.scale
+    val height = ElementPreviews.heightPt(element) * camera.scale
+    androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+        val left = centre.x - width / 2f
+        val top = centre.y - height / 2f
+        if (preview != null) {
+            drawImage(
+                image = preview,
+                dstOffset = IntOffset((left - margin).toInt(), (top - margin).toInt()),
+                dstSize = IntSize((width + 2 * margin).toInt(), (height + 2 * margin).toInt()),
+                alpha = GHOST_ALPHA,
+            )
+        }
+        drawRect(
+            color = Color(GHOST_OUTLINE_ARGB),
+            topLeft = Offset(left, top),
+            size = Size(width, height),
+            style = Stroke(width = GHOST_OUTLINE_PX),
+        )
+    }
 }
 
 /**
@@ -236,3 +420,14 @@ private const val NEW_BOX_HEIGHT_PT = 44f
 
 /** Clear of the toolbar card, which is anchored to the same corner region. */
 private const val PANEL_TOP_DP = 76
+
+/** The panel's tile, and how many times its pixel size the preview is drawn at — crisp, and reused for the ghost. */
+private const val PREVIEW_DP = 52
+private const val PREVIEW_OVERSAMPLE = 3
+
+/** See-through enough to see what it is being dropped on. */
+private const val GHOST_ALPHA = 0.75f
+
+/** sky-500 — `PageOverlay`'s "the region you are describing" colour. */
+private const val GHOST_OUTLINE_ARGB = 0xFF0EA5E9.toInt()
+private const val GHOST_OUTLINE_PX = 2f

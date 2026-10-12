@@ -39,10 +39,15 @@ public value class FractionalKey(public val value: String) : Comparable<Fraction
      * True when this key can take part in [between].
      *
      * Non-empty, every character a digit, and not ending in the smallest digit.
+     *
+     * ⚠️ **A range test per character, not `it in DIGITS`.** That was a 62-character `indexOf` per
+     * character, and `StrokeStore` asks this of every object a page load installs — on the UI
+     * thread. On the physics note's 852-character keys it was ~26,000 comparisons per object and
+     * 8% of the main thread while the page opened (see [above] for why keys got that long).
      */
     public val isWellFormed: Boolean
         get() = value.isNotEmpty() &&
-            value.all { it in DIGITS } &&
+            value.all { isDigit(it) } &&
             value.last() != DIGITS.first()
 
     public companion object {
@@ -77,6 +82,8 @@ public value class FractionalKey(public val value: String) : Comparable<Fraction
             if (before != null && !before.isWellFormed) return null
             if (after != null && !after.isWellFormed) return null
             if (before != null && after != null && before >= after) return null
+            // ⭐ Nothing above: step rather than bisect. See [above].
+            if (before != null && after == null) return FractionalKey(above(before.value))
             return FractionalKey(midpoint(before?.value ?: "", after?.value))
         }
 
@@ -140,5 +147,52 @@ public value class FractionalKey(public val value: String) : Comparable<Fraction
             // any continuation of `a`'s digit is already below `b`.
             return if (b != null && b.length > 1) b.take(1) else DIGITS[digitA] + midpoint(a.drop(1), null)
         }
+
+        /**
+         * ⭐ The shortest key above [a]: its first digit that is not the largest, plus one, with
+         * everything after it dropped. `"V"` → `"W"`, `"zzk"` → `"zzl"`, and only an all-`z` key
+         * grows: `"zz"` → `"zz1"`.
+         *
+         * ## Why "above everything" does not bisect
+         *
+         * Because it is the most common call in the app by a distance — every stroke drawn goes on
+         * top of the page (`SelectionEdit.keyAbove`) — and bisecting towards the end of the alphabet
+         * halves the room left above the key each time. [midpoint] with no upper bound gave `z`,
+         * `zV`, `zk`, `zs`, `zw`, `zy`, `zz`, `zzV`…: **one character longer every six strokes**,
+         * i.e. linear in the strokes ever drawn on a page, and quadratic in what the log stores.
+         * The physics "Electrical energy" note reached **852-character** keys at 5,159 objects —
+         * 2.2 MB of its 14.8 MB page log was z keys, every one of them re-read on every open.
+         *
+         * Stepping by one digit spends the 61 values of a position before reaching for the next,
+         * so a page grows a character per ~61 strokes instead of per 6. It is still linear — a key
+         * above an all-`z` key cannot be shorter than it, which is also why a note already at 852
+         * characters stays there rather than shrinking — but it is ten times slower, and inserting
+         * *between* two stepped keys is untouched: that is [midpoint]'s job and it grows a
+         * character exactly as it did.
+         *
+         * Nothing about the order changed, so this is invisible to every build that reads the
+         * keys: the result is a digit string, compared as a string, and strictly greater than [a].
+         * Not ending in `'0'` holds by construction — the last digit is always a step up from
+         * something, or `'1'`.
+         */
+        private fun above(a: String): String {
+            for (index in a.indices) {
+                val digit = digitOf(a[index])
+                if (digit < DIGITS.length - 1) return a.substring(0, index) + DIGITS[digit + 1]
+            }
+            return a + DIGITS[1]
+        }
+
+        /** [DIGITS]`.indexOf(c)` without the scan. Only called on characters [isDigit] accepted. */
+        private fun digitOf(c: Char): Int = when (c) {
+            in '0'..'9' -> c - '0'
+            in 'A'..'Z' -> c - 'A' + DECIMAL_DIGITS
+            else -> c - 'a' + DECIMAL_DIGITS + LETTERS
+        }
+
+        private fun isDigit(c: Char): Boolean = c in '0'..'9' || c in 'A'..'Z' || c in 'a'..'z'
+
+        private const val DECIMAL_DIGITS = 10
+        private const val LETTERS = 26
     }
 }

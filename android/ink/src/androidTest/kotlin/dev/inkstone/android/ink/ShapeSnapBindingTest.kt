@@ -2,6 +2,7 @@ package dev.inkstone.android.ink
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.inkstone.core.model.ConnectorEnd
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
@@ -17,9 +18,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * ⭐ A snapped line binds to a **box**, never to another line.
+ * ⭐ A snapped line becomes a connector only when it **joins two boxes** — never because it started
+ * on something.
  *
- * ## The report
+ * ## The report, twice
  *
  * *"You create a line but start drawing your line on a stroke on the page, it does not form
  * correctly and goes into an image like selection, not the proper point based editing."* The
@@ -29,12 +31,20 @@ import org.junit.runner.RunWith
  * two points. Reproduced on an emulator before the fix: the journal held
  * `"x":"is1;a=o:<the line underneath>"`.
  *
+ * ⛔ That fix refused lines as anchors and kept *"a line drawn from inside a box still attaches to
+ * it"* as this class's **control** — asserting, as desired behaviour, the same symptom with a box
+ * underneath instead of a line. Three days later: *"if you start drawing your line on top of a
+ * different stroke it does not form a proper line and instead forms some weird image thing."* On
+ * the emulator a line started inside a rectangle came out re-routed to the rectangle's edge, with
+ * a zero-height selection frame whose eight grips stacked into three piles. A control is a claim
+ * about what the user wants, and this one had not been checked against the user's own words.
+ *
  * ## Through the production controller
  *
  * [ShapeSnapController.snap] is the only caller of `shapeAt`, so the gesture goes through it rather
  * than asking `shapeAt` directly — a test of the lookup alone would still pass if the controller
- * bound through some other path. [aLineDrawnFromInsideABoxStillAttachesToIt] is the control: without
- * it, a harness that could never bind anything would make the refusal pass vacuously.
+ * bound through some other path. [aLineDrawnFromOneBoxToAnotherAttachesBothEnds] is the control:
+ * without it, a harness that could never bind anything would make every refusal pass vacuously.
  *
  * Instrumented because `DryShape` builds an `android.graphics.Path` in its constructor. No `SyntheticInk`, so the
  * geometry here is arithmetic a reader can check.
@@ -126,13 +136,55 @@ class ShapeSnapBindingTest {
     }
 
     @Test
-    fun aLineDrawnFromInsideABoxStillAttachesToIt() {
+    fun aLineDrawnOutOfABoxIntoOpenSpaceStaysAPlainLine() {
+        createShape(ShapeEdit.place(ShapeKind.RECTANGLE, PageRect(BOX_LEFT, BOX_TOP, BOX_RIGHT, BOX_BOTTOM)))
+        val startX = (BOX_LEFT + BOX_RIGHT) / 2f
+        val startY = (BOX_TOP + BOX_BOTTOM) / 2f
+
+        val (id, result) = drawAndSnap(startX, startY, FAR_X, FAR_Y)
+
+        assertEquals("the gesture is not a line, so the question does not arise", ShapeKind.LINE, result.kind)
+        assertFalse("a line that only started in a box was attached to it", result.attached)
+        val line = required(store.shapeOf(id), "the line")
+        assertFalse("the line is a connector, so it was re-routed and has no point handles", line.isConnector)
+        // A connector would begin on the box's edge, 100 pt from here. The line begins where the pen did.
+        val bounds = required(line.pageBounds, "the line's bounds")
+        assertTrue(
+            "the line does not start where the pen went down",
+            bounds.containsWithin(startX, startY, PEN_WIDTH_PT),
+        )
+    }
+
+    @Test
+    fun aLineDrawnFromOneBoxToAnotherAttachesBothEnds() {
+        val left = createShape(ShapeEdit.place(ShapeKind.RECTANGLE, PageRect(BOX_LEFT, BOX_TOP, BOX_RIGHT, BOX_BOTTOM)))
+        val right = createShape(
+            ShapeEdit.place(ShapeKind.RECTANGLE, PageRect(OTHER_BOX_LEFT, BOX_TOP, OTHER_BOX_RIGHT, BOX_BOTTOM)),
+        )
+        val midY = (BOX_TOP + BOX_BOTTOM) / 2f
+
+        // Inside the one to inside the other: the gesture the whole-box reading exists for.
+        val (id, result) = drawAndSnap(BOX_RIGHT - INSET, midY, OTHER_BOX_LEFT + INSET, midY)
+
+        assertTrue("a line joining two boxes did not attach — every refusal here would be vacuous", result.attached)
+        val record = required(store.shapeOf(id), "the connector").record
+        val endA = (record.endA as? ConnectorEnd.Attached)?.target
+        val endB = (record.endB as? ConnectorEnd.Attached)?.target
+        assertEquals("end A is not on the box the line started in", left, endA)
+        assertEquals("end B is not on the box the line ended in", right, endB)
+    }
+
+    @Test
+    fun aLineFromInsideAFrameToABoxWithinItStaysAPlainLine() {
+        createShape(ShapeEdit.place(ShapeKind.RECTANGLE, PageRect(FRAME_LEFT, FRAME_TOP, FRAME_RIGHT, FRAME_BOTTOM)))
         createShape(ShapeEdit.place(ShapeKind.RECTANGLE, PageRect(BOX_LEFT, BOX_TOP, BOX_RIGHT, BOX_BOTTOM)))
 
-        val (id, result) = drawAndSnap((BOX_LEFT + BOX_RIGHT) / 2f, (BOX_TOP + BOX_BOTTOM) / 2f, FAR_X, FAR_Y)
+        // Two different shapes under the two ends — but the box is inside the frame, and an `Auto`
+        // anchor on the frame would face the box from the frame's far edge.
+        val (_, result) = drawAndSnap(FRAME_LEFT + INSET, FRAME_BOTTOM - INSET, BOX_LEFT + INSET, BOX_BOTTOM - INSET)
 
-        assertTrue("a line drawn out of a box did not attach — the refusal above would be vacuous", result.attached)
-        assertTrue("the attached line is not a connector", required(store.shapeOf(id), "the connector").isConnector)
+        assertEquals("the gesture is not a line, so the question does not arise", ShapeKind.LINE, result.kind)
+        assertFalse("a line inside a frame was attached to the frame it never left", result.attached)
     }
 
     private companion object {
@@ -159,5 +211,16 @@ class ShapeSnapBindingTest {
         const val BOX_BOTTOM = 300f
         const val FAR_X = 950f
         const val FAR_Y = 500f
+
+        const val OTHER_BOX_LEFT = 1000f
+        const val OTHER_BOX_RIGHT = 1200f
+
+        /** How far inside a box an end lands — well past the bind slop, so it is inside and not near. */
+        const val INSET = 40f
+
+        const val FRAME_LEFT = 500f
+        const val FRAME_TOP = 50f
+        const val FRAME_RIGHT = 900f
+        const val FRAME_BOTTOM = 600f
     }
 }

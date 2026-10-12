@@ -5,7 +5,6 @@ import androidx.ink.geometry.MutableVec
 import androidx.ink.geometry.PartitionedMesh
 import androidx.ink.strokes.Stroke
 import androidx.ink.strokes.StrokeInput
-import kotlin.math.hypot
 
 /**
  * The area an eraser has removed from one stroke, in page space.
@@ -60,7 +59,7 @@ import kotlin.math.hypot
  * [capsules] is the durable form: five floats each, resolution-independent,
  * replayable anywhere. [runs] is a render cache.
  */
-internal class ErasedRegion {
+internal class ErasedRegion : CoverageRegion {
 
     /** One eraser sample: the segment it swept, and its tip radius, in page units. */
     data class Capsule(val fromX: Float, val fromY: Float, val toX: Float, val toY: Float, val radius: Float)
@@ -88,7 +87,20 @@ internal class ErasedRegion {
     }
 
     private val _capsules = ArrayList<Capsule>()
-    val capsules: List<Capsule> get() = _capsules
+    override val capsules: List<Capsule> get() = _capsules
+
+    /**
+     * How many times [truncateTo] has taken capsules away from this object.
+     *
+     * ⚠️ The one thing that makes a paused coverage scan untrue ([ResumableCoverage]): everything
+     * else that can happen to a region either appends to it — which cannot uncover a point — or
+     * replaces the object outright, which the scan notices by identity. Nothing calls [truncateTo]
+     * today (an undone erase is an absolute `SetErasedRegion` since M2), which is exactly why it
+     * is counted rather than assumed away: the day something does, the prune must not act on
+     * progress measured against capsules that are gone.
+     */
+    override var shrinks: Int = 0
+        private set
 
     private val _runs = ArrayList<Run>()
     val runs: List<Run> get() = _runs
@@ -126,6 +138,7 @@ internal class ErasedRegion {
      */
     fun truncateTo(size: Int) {
         if (size >= _capsules.size) return
+        shrinks++
         val kept = ArrayList(_capsules.subList(0, size))
         _capsules.clear()
         _runs.clear()
@@ -146,6 +159,12 @@ internal class ErasedRegion {
     fun contains(bounds: PageBounds): Boolean =
         !isEmpty && bounds.xMin >= minX && bounds.yMin >= minY && bounds.xMax <= maxX && bounds.yMax <= maxY
 
+    /**
+     * The four-compare gate every coverage test opens with: an object whose box reaches outside the
+     * region's box cannot be fully covered by it, and nothing further need be read.
+     */
+    fun mayCover(bounds: PageBounds?): Boolean = bounds != null && contains(bounds)
+
     /** True when [x], [y] lies under some capsule of this region. */
     fun covers(x: Float, y: Float): Boolean = coveringCapsule(x, y, 0) >= 0
 
@@ -160,20 +179,13 @@ internal class ErasedRegion {
      * other, so the capsule that covered the last one very often covers this one too. Feeding the
      * previous answer back turns the common case from a scan of the whole region into a hit on the
      * first compare. Without it the pass is `points × capsules` in the literal sense, which for a
-     * scribbled-over stroke is millions of `hypot` calls and is the reason the budget below exists
-     * at all.
+     * scribbled-over stroke is millions of distance tests.
+     *
+     * ⚠️ And it is *why* an estimate of `points × capsules` was the wrong currency for the prune's
+     * budget: measured on a real note it was 56–101× the tests this actually runs. The arithmetic
+     * lives in [coveringCapsuleIn] now, beside the meter that counts it — see [PruneBudgets].
      */
-    fun coveringCapsule(x: Float, y: Float, hint: Int): Int {
-        val size = _capsules.size
-        if (size == 0) return -1
-        val start = if (hint in 0 until size) hint else 0
-        for (step in 0 until size) {
-            val index = if (start + step < size) start + step else start + step - size
-            val c = _capsules[index]
-            if (distanceToSegment(x, y, c.fromX, c.fromY, c.toX, c.toY) <= c.radius) return index
-        }
-        return -1
-    }
+    fun coveringCapsule(x: Float, y: Float, hint: Int): Int = coveringCapsuleIn(_capsules, x, y, hint, meter = null)
 }
 
 /**
@@ -197,63 +209,87 @@ internal class ErasedRegion {
  * erased when a ring-shaped erase cleared its edges and left the middle. Ink is
  * only dropped when both agree, because CLAUDE.md rule 1 means a false positive
  * here silently destroys something the user drew.
+ *
+ * ⭐ **Unmetered, and the metered form is the same scan.** This answers in full, now — the
+ * un-erase path needs that (`StrokeStore.unprune`). The prune queue asks the same question through
+ * [DryStroke.probeErasedAway], which runs the identical [CoverageScan] over the identical
+ * [StrokeCoveragePoints] and can stop and resume; there is one definition of "covered" either way.
  */
 internal fun isFullyErased(stroke: Stroke, bounds: PageBounds?, region: ErasedRegion): Boolean {
-    if (region.isEmpty) return false
-    if (bounds == null || !region.contains(bounds)) return false
-
-    // The rolling hint, threaded through every point of this stroke — see [ErasedRegion.coveringCapsule].
-    val cursor = intArrayOf(0)
-
-    val inputs = stroke.inputs
-    val scratch = StrokeInput()
-    for (index in 0 until inputs.size) {
-        inputs.populate(index, scratch)
-        if (!region.covering(scratch.x, scratch.y, cursor)) return false
-    }
-
-    val shape = stroke.shape
-    val point = MutableVec()
-    for (group in 0 until shape.getRenderGroupCount()) {
-        if (!outlinesCovered(shape, group, region, point, cursor)) return false
-    }
-    return true
+    if (!region.mayCover(bounds)) return false
+    val verdict = CoverageScan().run(
+        points = StrokeCoveragePoints(stroke),
+        capsules = region.capsules,
+        meter = CoverageMeter.unlimited(),
+        scratch = PagePointF(),
+    )
+    return verdict == PruneVerdict.ERASED_AWAY
 }
 
-/** [ErasedRegion.coveringCapsule], remembering its answer in [cursor] for the next point. */
-private fun ErasedRegion.covering(x: Float, y: Float, cursor: IntArray): Boolean {
-    val found = coveringCapsule(x, y, cursor[0])
-    if (found < 0) return false
-    cursor[0] = found
-    return true
-}
+/**
+ * A stroke's coverage points — every **input point**, then every **outline vertex**, render group
+ * by render group and outline by outline — by index. See [isFullyErased] for why both halves.
+ *
+ * The order is the one the coverage test has always used, and it matters beyond tidiness: the scan
+ * threads a rolling capsule hint from each point to the next, which only pays off because
+ * consecutive points here are neighbours on the page.
+ *
+ * Random access rather than an iterator because a paused scan resumes at an index
+ * ([ResumableCoverage]). Reading a point is one JNI call; the outline's layout is read once, here,
+ * as a handful of counts — a stroke's mesh has one render group and one or two outlines.
+ *
+ * Holds the stroke's mesh and batch, which are immutable (`PreparedPage` builds and probes these
+ * off the main thread for that reason), plus two scratch objects, so it is confined to one thread at
+ * a time like everything else in [StrokeStore].
+ */
+internal class StrokeCoveragePoints(stroke: Stroke) : CoveragePoints {
+    private val inputs = stroke.inputs
+    private val shape: PartitionedMesh = stroke.shape
+    private val inputCount = inputs.size
 
-/** True when every silhouette vertex of one render group lies inside [region]. */
-private fun outlinesCovered(
-    shape: PartitionedMesh,
-    group: Int,
-    region: ErasedRegion,
-    point: MutableVec,
-    cursor: IntArray,
-): Boolean {
-    for (outline in 0 until shape.getOutlineCount(group)) {
-        for (vertex in 0 until shape.getOutlineVertexCount(group, outline)) {
-            shape.populateOutlinePosition(group, outline, vertex, point)
-            if (!region.covering(point.x, point.y, cursor)) return false
+    /** Per outline, in iteration order: its render group, its index in that group, and where it ends. */
+    private val outlineGroup: IntArray
+    private val outlineIndex: IntArray
+    private val outlineEnd: IntArray
+
+    override val count: Int
+
+    private val input = StrokeInput()
+    private val vertex = MutableVec()
+
+    /** The outline the last [load] landed in — loads arrive in order, so this is nearly always a hit. */
+    private var segment = 0
+
+    init {
+        var outlines = 0
+        for (group in 0 until shape.getRenderGroupCount()) outlines += shape.getOutlineCount(group)
+        outlineGroup = IntArray(outlines)
+        outlineIndex = IntArray(outlines)
+        outlineEnd = IntArray(outlines)
+        var at = 0
+        var end = inputCount
+        for (group in 0 until shape.getRenderGroupCount()) {
+            for (outline in 0 until shape.getOutlineCount(group)) {
+                end += shape.getOutlineVertexCount(group, outline)
+                outlineGroup[at] = group
+                outlineIndex[at] = outline
+                outlineEnd[at] = end
+                at++
+            }
         }
+        count = end
     }
-    return true
-}
 
-/** Distance from a point to the segment `a`–`b`. */
-private fun distanceToSegment(px: Float, py: Float, ax: Float, ay: Float, bx: Float, by: Float): Float {
-    val dx = bx - ax
-    val dy = by - ay
-    val lengthSquared = dx * dx + dy * dy
-    val t = if (lengthSquared <= 0f) {
-        0f
-    } else {
-        (((px - ax) * dx + (py - ay) * dy) / lengthSquared).coerceIn(0f, 1f)
+    override fun load(index: Int, into: PagePointF) {
+        if (index < inputCount) {
+            inputs.populate(index, input)
+            into.set(input.x, input.y)
+            return
+        }
+        if (segment > 0 && index < outlineEnd[segment - 1]) segment = 0
+        while (index >= outlineEnd[segment]) segment++
+        val start = if (segment == 0) inputCount else outlineEnd[segment - 1]
+        shape.populateOutlinePosition(outlineGroup[segment], outlineIndex[segment], index - start, vertex)
+        into.set(vertex.x, vertex.y)
     }
-    return hypot(px - (ax + t * dx), py - (ay + t * dy))
 }

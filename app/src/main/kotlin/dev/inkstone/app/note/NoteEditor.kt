@@ -1,13 +1,14 @@
 package dev.inkstone.app.note
 
-import dev.inkstone.app.elements.Element
-import dev.inkstone.app.elements.ElementLibrary
+import dev.inkstone.app.elements.ElementRevision
+import dev.inkstone.app.elements.ElementShelf
 import dev.inkstone.app.search.NoteRecogniser
 import dev.inkstone.app.search.RecognitionReport
 import dev.inkstone.app.search.SessionGate
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.DocumentId
+import dev.inkstone.core.model.ElementId
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.FractionalKey
@@ -32,13 +33,18 @@ import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageTemplate
 import dev.inkstone.core.model.PdfPublisher
 import dev.inkstone.core.model.SelectionEdit
+import dev.inkstone.core.model.ShapeEdit
+import dev.inkstone.core.model.ShapeKind
 import dev.inkstone.core.model.ShapeObject
+import dev.inkstone.core.model.ShapePlacement
 import dev.inkstone.core.model.TextBoxEdit
 import dev.inkstone.core.model.TextBoxObject
 import dev.inkstone.core.model.selected
 import dev.inkstone.core.storage.Bundle
 import dev.inkstone.core.storage.BundleReader
 import dev.inkstone.core.storage.DeviceIdentity
+import dev.inkstone.core.storage.Element
+import dev.inkstone.core.storage.ElementCopies
 import dev.inkstone.core.storage.FileByteSource
 import dev.inkstone.core.storage.MergeReport
 import dev.inkstone.core.storage.NoteLayout
@@ -46,6 +52,7 @@ import dev.inkstone.core.storage.NoteMerge
 import dev.inkstone.core.storage.NoteSession
 import dev.inkstone.core.storage.NoteStore
 import dev.inkstone.core.sync.MergeCommit
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -137,6 +144,13 @@ class NoteEditor(
      * missing publisher costs interoperability, never data.
      */
     private val publisher: PdfPublisher? = null,
+    /**
+     * ⭐ Make the note this editor opens, before it opens it — the Element editor's scratch note
+     * (SPEC §4.9.7), seeded with the Element's pieces. Run on the open's own worker, under the
+     * editor's lock, so nothing can reach a note that is half made. Null — every real note — opens
+     * [documentId] as before.
+     */
+    private val prepare: (suspend (NoteStore, String) -> DocumentId)? = null,
     /**
      * SPEC §8.3's debounced recognition (M7). Null in tests and on a build with no ML Kit, in
      * which case the note is simply never read — search degrades to titles and nothing else
@@ -245,6 +259,25 @@ class NoteEditor(
 
     /** The surface [bindSurface] has already wired to the session, so it is not wired twice. */
     private var boundSurface: NoteSurface? = null
+
+    /**
+     * ⛔ **A surface that has gone away still owes its last strokes**, and this is where they wait.
+     *
+     * A surface's finished gestures live in its own `PageOpRecorder` until [drainLocked] takes
+     * them, and [onSurfaceDetached] used to drop the only reference to it. Pressing Back runs
+     * `onStop` — whose save may be queued behind the lock — and then detaches the view, so a save
+     * that ran after the detach drained *nothing*: whatever was drawn since the last 2-second
+     * autosave was gone. Reproduced on the emulator twice on 2026-09-24 — three strokes, Back, and
+     * a journal still holding an 8-byte header. The recorder is plain data and survives its view;
+     * it only needs someone to still be holding it when the drain comes.
+     */
+    private var detachedSurface: NoteSurface? = null
+
+    /**
+     * Whether a materialize still owes `document.pdf` a publish — set when one failed, cleared by
+     * the next that succeeds. [materializeIfChanged] may skip only when this is false.
+     */
+    private var publishOwed = false
     private var currentPage: PageId? = null
 
     /** The current page's template, for the picker. Set wherever the page or its background changes. */
@@ -443,7 +476,9 @@ class NoteEditor(
         // no ordering, only which thread pays.
         val opened = withContext(drainDispatcher) {
             val device = deviceIdentity.get()
-            val requested = documentId ?: fs.list(NoteLayout.NOTES_DIR).firstOrNull()?.let(::DocumentId)
+            val requested = prepare?.invoke(store, device)
+                ?: documentId
+                ?: fs.list(NoteLayout.NOTES_DIR).firstOrNull()?.let(::DocumentId)
             val note = requested?.let { store.open(it) }
                 ?: store.create(
                     title = DEFAULT_TITLE,
@@ -495,6 +530,8 @@ class NoteEditor(
     }
 
     fun onSurfaceDetached() {
+        // Kept until the next drain takes what it recorded — see [detachedSurface].
+        surface?.let { if (it === boundSurface) detachedSurface = it }
         surface = null
         boundSurface = null
     }
@@ -586,7 +623,11 @@ class NoteEditor(
      * @return whether any gesture landed.
      */
     private suspend fun drainLocked(session: NoteSession, page: PageId): Boolean {
-        val gestures = surface?.let { withContext(drainDispatcher) { it.drainOps() } }.orEmpty()
+        // A detached surface first: its gestures are older than anything the current one holds.
+        val detached = detachedSurface?.takeIf { it !== surface }
+        detachedSurface = null
+        val earlier = detached?.let { withContext(drainDispatcher) { it.drainOps() } }.orEmpty()
+        val gestures = earlier + surface?.let { withContext(drainDispatcher) { it.drainOps() } }.orEmpty()
         for (gesture in gestures) {
             session.apply(page, gesture)
         }
@@ -744,6 +785,33 @@ class NoteEditor(
     suspend fun materializeNow(): MaterializedFile? = serial.withLock { materializeLocked() }
 
     /**
+     * ⭐ The close path's materialize: save, and then rewrite the bundle and republish **only if
+     * something changed** since the bundle was last written.
+     *
+     * `Activity.onStop` was the caller for every stop, and a stop is a screen timeout, a lock and
+     * a glance at a notification as often as it is leaving. [materializeNow] rewrote the whole
+     * bundle every time — 6.7 MB for the physics note, 8.4 MB for the chemistry one, plus a PDF
+     * publish, a cover render and a full re-tessellation in the outliner — so a note opened only
+     * to be read paid all of it on every dim of the screen. The save still runs unconditionally: it
+     * is what makes the last strokes durable, and it is cheap. Since 2026-10 only a stop that
+     * *finishes* the activity calls this at all, and every other stop calls [save] alone — see
+     * `NoteEditorViewModel.onStopped`.
+     *
+     * Skipping leaves `document.pdf` as it was, which is correct exactly when nothing has changed
+     * since it was last published — hence [publishOwed]. A PDF left stale by a crash between a
+     * previous session's bundle write and its publish stays stale until the next edit; a synced
+     * note's queued upload republishes it first anyway, and export does not come through here.
+     */
+    suspend fun materializeIfChanged(): MaterializedFile? = serial.withLock {
+        val session = this.session ?: return@withLock null
+        saveLocked()
+        if (session.bundleIsCurrent && !publishOwed && stagedAssets(session.document.id).isEmpty()) {
+            return@withLock null
+        }
+        materializeLocked()
+    }
+
+    /**
      * ⭐ **The same materialize, for `MaterializeWorker` — which has to be able to *wait* for it.**
      *
      * `MaterializeWorker` republishes `document.pdf` for the notes the editor's `onStop` never
@@ -814,6 +882,7 @@ class NoteEditor(
         // on disk and is the truth; a note whose PDF could not be written is a note
         // that opens perfectly and cannot yet be read elsewhere.
         val published = publisher?.let { runCatching { it.publish(session.document.id) } }
+        publishOwed = published?.isFailure == true
         publish(message = if (published?.isFailure == true) PUBLISH_FAILED else null)
         return published?.getOrNull()
     }
@@ -1449,34 +1518,116 @@ class NoteEditor(
     }
 
     /**
-     * ⭐ One insertion of an Element — fresh ids and fresh asset names, minted by [ElementLibrary].
+     * ⭐ One insertion of an Element — fresh ids and fresh asset names, minted by [ElementShelf].
      *
-     * The library is a parameter rather than a constructor dependency because the editor is
+     * The shelf is a parameter rather than a constructor dependency because the editor is
      * constructed in unit tests that have no interest in it, and because this is the only method
      * that needs one. Its bytes are staged exactly as [insertImage]'s are, and for the same
      * reason.
      *
-     * @return how many objects landed, so the caller can say *"nothing to stamp"* rather than
-     *   flashing an empty acknowledgement.
+     * @param topLeft where the Element's own origin lands, in page space.
+     * @return the new objects' ids, in stacking order — so the caller can select what it just
+     *   dropped, and say *"nothing to stamp"* when this is empty.
      */
-    suspend fun stampElement(elements: ElementLibrary, element: Element, at: PagePoint): Int = onPage { session, page ->
+    suspend fun stampElement(shelf: ElementShelf, element: Element, topLeft: PagePoint): List<ObjectId> =
+        onPage { session, page ->
+            saveLocked()
+            val before = session.page(page)
+            val stamped = shelf.stamp(
+                element = element,
+                topLeft = topLeft,
+                topZ = topZ(before),
+                newObjectId = ids::newObjectId,
+                nextOpId = session::nextOpId,
+                nextClock = session::nextClock,
+                // ⭐ One id per drop, so this copy can be found again when the Element is edited
+                // (SPEC §4.9.7). A UUIDv7 from the same generator as everything else.
+                instanceId = ids.newObjectId().value,
+            )
+            if (stamped.ops.isEmpty()) return@onPage emptyList()
+            for ((name, bytes) in stamped.assets) stageAsset(session.document.id, name, bytes)
+            session.apply(page, stamped.ops)
+            afterEdit(session, page, before)
+            if (stamped.assets.isNotEmpty()) materializeLocked()
+            stamped.ops.mapNotNull { (it as? PageOp.AddObject)?.obj?.id }
+        } ?: emptyList()
+
+    /**
+     * ⭐ One undoable edit to the page on screen, built from that page as it is now — the Element
+     * editor's area, pivot and *Fit* (SPEC §4.9.7), whose decisions are `ElementEditing`'s.
+     *
+     * Through `apply`, so it is one entry on **this** editor's undo stack, in the order it happened —
+     * which is the whole answer to *"no undo"* for the editor's guides. [build] returning null or
+     * nothing is no edit and no entry.
+     */
+    suspend fun editShownPage(build: (FoldedPage, NoteSession) -> List<PageOp>?): Boolean = onPage { session, page ->
         saveLocked()
         val before = session.page(page)
-        val stamped = elements.stamp(
-            element = element,
-            at = at,
-            topZ = topZ(before),
-            newObjectId = ids::newObjectId,
-            nextOpId = session::nextOpId,
-            nextClock = session::nextClock,
-        )
-        if (stamped.ops.isEmpty()) return@onPage 0
-        for ((name, bytes) in stamped.assets) stageAsset(session.document.id, name, bytes)
-        session.apply(page, stamped.ops)
+        val ops = build(before, session)?.takeIf { it.isNotEmpty() } ?: return@onPage false
+        session.apply(page, ops)
         afterEdit(session, page, before)
-        if (stamped.assets.isNotEmpty()) materializeLocked()
-        stamped.ops.count { it is PageOp.AddObject }
+        true
+    } ?: false
+
+    /** How many copies of [elementId] this note holds, on every page. SPEC §4.9.7. */
+    suspend fun countElementCopies(elementId: ElementId): Int = onPage { session, _ ->
+        session.document.livePages.sumOf { ElementCopies.count(session.page(it.id), elementId) }
     } ?: 0
+
+    /**
+     * ⭐ Replace every copy of [element] in this note with its current version (SPEC §4.9.7).
+     *
+     * One undo entry **per page**, because undo is per page (SPEC §4.6) — so a person who regrets the
+     * update on the page they are looking at can put that page back with one press. The page on
+     * screen is reconciled like any other edit; the others are folded from the log when visited.
+     *
+     * ⛔ **Flushed and reported, and deliberately not materialized.** It ended in
+     * [materializeLocked] until 2026-10, and the caller is the Element editor's *"Update them
+     * all"*. At that moment this note's screen is stopped behind the Element editor. A whole-bundle
+     * rewrite there is the allocation that got it destroyed for memory (`docs/NOTE-STAYS-LOADED.md`),
+     * and the Element editor could not close until it finished, which on the physics note was
+     * seconds of a frozen button. Nothing needs it: the ops are in the journal, the new pieces'
+     * picture bytes are in the staging directory (durable, and drawn from there — see [assets]),
+     * and the next materialize folds both in, because [materializeIfChanged] does not skip while
+     * anything is staged.
+     *
+     * @return how many copies were replaced.
+     */
+    suspend fun updateElementCopies(shelf: ElementShelf, revision: ElementRevision): Int = onPage { session, shown ->
+        val element = revision.element
+        saveLocked()
+        val before = session.page(shown)
+        var replaced = 0
+        for (ref in session.document.livePages) {
+            val folded = session.page(ref.id)
+            val update = shelf.replaceCopies(
+                folded,
+                element,
+                ids::newObjectId,
+                session::nextOpId,
+                session::nextClock,
+                revision.originMoved,
+            ) ?: continue
+            replaced += ElementCopies.count(folded, element.id)
+            for ((name, bytes) in update.assets) stageAsset(session.document.id, name, bytes)
+            session.apply(ref.id, update.ops)
+        }
+        if (replaced > 0) {
+            flushAndReport(session)
+            reconcile(before, session.page(shown))
+            publish()
+        }
+        replaced
+    } ?: 0
+
+    /**
+     * The page on screen after draining the surface into the session — what the Element editor's
+     * Done saves. [currentFold] does not drain, so ink still on the glass would be left out.
+     */
+    suspend fun savedFold(): FoldedPage? = onPage { session, page ->
+        saveLocked()
+        session.page(page)
+    }
 
     /**
      * The words — `SetTextContent`, and never `SetFormat` (SPEC §4.9.2).
@@ -1615,16 +1766,52 @@ class NoteEditor(
      * user just inserted. Staged wins a name clash, which cannot happen — an asset name embeds a
      * UUIDv7 — but is the right way round if it ever did, because staged bytes are the newer.
      *
-     * Reads the whole family rather than one entry: `BundleReader` resolves names through a
-     * central directory it has already parsed, and the caller caches by name (`PageAssetCache`),
-     * so this runs about once per note rather than once per image.
+     * The whole family — for a capture, which has to carry every picture an Element names. The
+     * screen asks for [assets] by name instead.
      */
-    suspend fun assets(): Map<String, ByteArray> {
+    suspend fun assets(): Map<String, ByteArray> = readAssets(only = null)
+
+    /**
+     * ⭐ Just the `assets/` entries named in [names] — what the picture cache asks for, which is the
+     * pictures a page draws rather than every one the note has ever held.
+     *
+     * A deleted image's entry stays in the bundle for good (SPEC §4.9.4), and the cache used to
+     * read and decode the whole family on every revision: on the physics note that was thirteen
+     * 2,048-pixel photographs, two of them deleted, to draw eleven.
+     */
+    suspend fun assets(names: Set<String>): Map<String, ByteArray> =
+        if (names.isEmpty()) emptyMap() else readAssets(only = names)
+
+    /**
+     * ⚠️ **The source is closed whatever happens.** A [FileByteSource] holds one descriptor from its
+     * first read (docs/PERF-CRASH-2026-09.md §2), and this used to open a reader per call and drop it
+     * on the floor — the descriptor was released only when the collector found it, which StrictMode's
+     * close guard reported as *"A resource failed to call close"* twice on every open of the physics
+     * note. Closing the source rather than the reader also covers `open` answering null.
+     */
+    @Suppress("TooGenericExceptionCaught", "SwallowedException")
+    private suspend fun readAssets(only: Set<String>?): Map<String, ByteArray> {
         val id = session?.document?.id ?: return emptyMap()
-        val fromBundle = runCatching {
-            BundleReader.open(FileByteSource(fs, NoteLayout.bundle(id)))?.assets()
-        }.getOrNull().orEmpty()
-        return fromBundle + stagedAssets(id)
+        val staged = stagedAssets(id).let { all -> if (only == null) all else all.filterKeys { it in only } }
+        val fromBundle = if (only != null && staged.keys.containsAll(only)) {
+            emptyMap()
+        } else {
+            val source = FileByteSource(fs, NoteLayout.bundle(id))
+            try {
+                val reader = BundleReader.open(source)
+                if (only == null) reader?.assets() else reader?.assets(only - staged.keys)
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (unreadable: Exception) {
+                // A bundle that cannot be read draws placeholders — never a crash in a draw-time
+                // lookup, which is where the picture cache is asked from. It asks again on the next
+                // revision, by which time a bundle being replaced has been.
+                null
+            } finally {
+                source.close()
+            }
+        }
+        return fromBundle.orEmpty() + staged
     }
 
     /**

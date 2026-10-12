@@ -36,11 +36,25 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+      largeHeap (2026-10, docs/NOTE-STAYS-LOADED.md). Without it the heap limit is
+      `dalvik.vm.heapgrowthlimit`, 256m on the Galaxy Tab S9 FE+. ActivityThread's GC watcher asks
+      the system to destroy this app's stopped activities whenever a collection leaves the heap
+      above three quarters of that limit, 192 MB. The physics note alone holds most of that, so
+      putting the Element editor on top of it, or switching to another app, got the note's screen
+      destroyed (`wm_destroy_activity … low-mem`). Coming back reloaded the whole note, and once
+      it ran out of memory doing that. With largeHeap the limit is `dalvik.vm.heapsize`, 512m on
+      the tablet, so the watcher fires at 384 MB.
+      The working set is the notes themselves and nothing here grows to fill the space.
+      `PageAssetCache`'s budget derives from the limit, but it hits its 256 MiB ceiling, and those
+      pixels live in native memory anyway.
+    -->
     <application
         android:name=".InkstoneApplication"
         android:allowBackup="false"
         android:fullBackupContent="false"
         android:label="@string/app_name"
+        android:largeHeap="true"
         android:supportsRtl="true"
         android:theme="@style/Theme.Inkstone"
         android:usesCleartextTraffic="false"
@@ -49,7 +63,7 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density"
             android:label="@string/app_name"
             android:theme="@style/Theme.Inkstone">
             <intent-filter>
@@ -60,13 +74,19 @@
 
         <!--
           The editor (M3). Its own activity so that "which note" survives a process kill
-          through the intent extras, and so that leaving a note is an onStop — which is
-          where SPEC §5.1 materializes and where §5.7 redraws the thumbnail.
+          through the intent extras, and so that leaving a note is an onStop with isFinishing.
+          That stop is where SPEC §5.1 materializes and where §5.7 redraws the thumbnail. Any
+          other stop only saves; see NoteEditorViewModel.onStopped.
+
+          smallestScreenSize (2026-10): split screen, pop-up view and every window resize change
+          it, and without it each one recreated this activity. The view model survives that, but
+          the ink surface does not, so the page was rebuilt from scratch: the whole loading chip
+          on a big note.
         -->
         <activity
             android:name=".note.NoteActivity"
             android:exported="false"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density"
             android:parentActivityName=".MainActivity"
             android:theme="@style/Theme.Inkstone" />
 

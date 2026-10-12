@@ -69,6 +69,26 @@ import kotlin.math.roundToLong
  *   payload's. Only a [TextBoxObject] uses it — an image is scaled, because scaling a photo is
  *   what resizing one means.
  * @property boxHeightPt the frame's height, on the same terms.
+ * @property knockout ⭐ hides whatever is **underneath** this object's filled silhouette, without
+ *   touching it (SPEC §4.9.6). Any kind may carry it — a stroke, a shape, an image or a text box —
+ *   which is why it lives in this register and not in a kind's own record: the fold keeps a
+ *   `SetFormat` side table for every object (`FoldedPage.formats`), so no new op and no new payload
+ *   field is needed, and a build that predates the key carries it in [extras] and simply draws the
+ *   object without the effect. Non-destructive by construction: nothing beneath is written to, so
+ *   moving the object away, or switching this off, brings everything back exactly.
+ * @property cutter ⭐ an **invisible** knockout area (SPEC §4.9.6): hides what is beneath its filled
+ *   outline and is not itself drawn — except, as a dashed outline, while an Element is being edited.
+ *   Implies [knockout]. Only meaningful on a closed shape; anything else carrying it hides nothing.
+ * @property instance ⭐ which Element, and which drop of it, this object belongs to (SPEC §4.9.7) —
+ *   what lets an edited Element find and replace its copies. See [ElementInstance].
+ * @property elementFrame ⭐ this rectangle is the **bounds** of the Element being edited (SPEC
+ *   §4.9.7) — a guide on the Element editor's canvas, never part of what is saved. An object, and not
+ *   a value the screen holds, so that moving, resizing, snapping and undoing the bounds are the same
+ *   gestures, on the same undo stack, as everything else in the editor.
+ * @property framePivot the Element's pivot as an offset **in page points from the frame's top-left
+ *   corner**, or null for its centre. On the frame rather than an object of its own so it moves with
+ *   the bounds; points rather than a fraction so resizing the bounds does not slide it off the grid
+ *   point it was put on (`ElementEditing`).
  * @property extras keys this build does not recognise, kept verbatim and written back — what
  *   [OpExtras] does for an op, one level down. Without it a later build adding a key would have it
  *   destroyed by every M8c device that opened the note.
@@ -82,8 +102,16 @@ public data class ObjectFormat(
     val crop: ImageCrop? = null,
     val boxWidthPt: Float? = null,
     val boxHeightPt: Float? = null,
+    val knockout: Boolean = false,
+    val cutter: Boolean = false,
+    val instance: ElementInstance? = null,
+    val elementFrame: Boolean = false,
+    val framePivot: PagePoint? = null,
     val extras: Map<String, String> = emptyMap(),
 ) {
+
+    /** Whether this object hides what is beneath it — a flagged object, or an invisible cutter. */
+    public val hidesBeneath: Boolean get() = knockout || cutter
 
     /** The frame this object is laid out in, given the extents its payload was created with. */
     public fun frameWidth(payloadWidthPt: Float): Float = boxWidthPt ?: payloadWidthPt
@@ -192,6 +220,15 @@ public sealed interface ImageCrop {
  */
 private const val K_BOX_WIDTH = "w"
 private const val K_BOX_HEIGHT = "h"
+private const val K_KNOCKOUT = "ko"
+private const val K_CUTTER = "cut"
+private const val K_ELEMENT = "el"
+private const val K_FRAME = "ef"
+private const val K_PIVOT = "pv"
+private const val PIVOT_PARTS = 2
+
+/** The only value this build writes for [K_KNOCKOUT]. Absent means off, so off is never written. */
+private const val KNOCKOUT_ON = "1"
 
 /**
  * A text box's frame, from one record key.
@@ -207,6 +244,40 @@ private const val K_BOX_HEIGHT = "h"
 private fun ObjectFormat.withFrame(key: String, value: String): ObjectFormat {
     val extent = value.toFloatOrNull()?.takeIf { it >= ShapeGeometry.MIN_EXTENT_PT } ?: return this
     return if (key == K_BOX_WIDTH) copy(boxWidthPt = extent) else copy(boxHeightPt = extent)
+}
+
+/**
+ * The three keys knockout and Element copies added (SPEC §4.9.6–7), outside [ObjectFormatCodec] so the
+ * encoder stays a list of one line per property — and so that object stays under detekt's size limit.
+ */
+private fun elementParts(format: ObjectFormat, equals: Char): List<String> = buildList {
+    if (format.knockout) add("$K_KNOCKOUT$equals$KNOCKOUT_ON")
+    if (format.cutter) add("$K_CUTTER$equals$KNOCKOUT_ON")
+    // Ids a separator could hide in are not written at all — an instance that will not decode is
+    // worse than none, because the copy it names could then never be found again.
+    format.instance
+        ?.takeIf { ElementInstance.isCarriable(it.elementId) && ElementInstance.isCarriable(it.instanceId) }
+        ?.let { add("$K_ELEMENT$equals${it.encode()}") }
+    if (format.elementFrame) add("$K_FRAME$equals$KNOCKOUT_ON")
+    format.framePivot?.let { add("$K_PIVOT$equals${RecordText.number(it.x)}:${RecordText.number(it.y)}") }
+}
+
+/** A frame's pivot, `x:y` — null for anything else, which [ObjectFormat.extras] then keeps. */
+private fun pivotOf(value: String): PagePoint? {
+    val parts = value.split(':')
+    if (parts.size != PIVOT_PARTS) return null
+    val x = parts[0].toFloatOrNull()?.takeIf { it.isFinite() } ?: return null
+    val y = parts[1].toFloatOrNull()?.takeIf { it.isFinite() } ?: return null
+    return PagePoint(x, y)
+}
+
+/** One of [elementParts]' keys, read back. Only reached with a value the codec's `understood` accepted. */
+private fun applyElementKey(format: ObjectFormat, key: String, value: String): ObjectFormat = when (key) {
+    K_KNOCKOUT -> format.copy(knockout = true)
+    K_CUTTER -> format.copy(cutter = true)
+    K_FRAME -> format.copy(elementFrame = true)
+    K_PIVOT -> format.copy(framePivot = pivotOf(value))
+    else -> format.copy(instance = ElementInstance.decode(value))
 }
 
 internal object ObjectFormatCodec {
@@ -235,6 +306,11 @@ internal object ObjectFormatCodec {
         K_CROP_POLY,
         K_BOX_WIDTH,
         K_BOX_HEIGHT,
+        K_KNOCKOUT,
+        K_CUTTER,
+        K_ELEMENT,
+        K_FRAME,
+        K_PIVOT,
     )
 
     private const val RECT_PARTS = 4
@@ -266,6 +342,7 @@ internal object ObjectFormatCodec {
         // every note that has never been resized.
         format.boxWidthPt?.let { parts += "$K_BOX_WIDTH$EQUALS${RecordText.number(it)}" }
         format.boxHeightPt?.let { parts += "$K_BOX_HEIGHT$EQUALS${RecordText.number(it)}" }
+        parts += elementParts(format, EQUALS)
         // Sorted, so identical content produces identical bytes whatever order a future build read
         // them in — the discipline `BundleReader` applies to unknown manifest members (SPEC §5.8).
         // `sortedBy`, not `toSortedMap`: the latter is JVM-only and fails the iOS compile.
@@ -292,9 +369,28 @@ internal object ObjectFormatCodec {
             if (split <= 0) continue
             val key = pair.substring(0, split)
             val value = pair.substring(split + 1)
-            if (key in knownKeys) format = applyKnown(format, key, value) else extras[key] = value
+            if (key in knownKeys && understood(key, value)) {
+                format = applyKnown(format, key, value)
+            } else {
+                extras[key] = value
+            }
         }
         return format.copy(extras = extras)
+    }
+
+    /**
+     * False for a known key carrying a value this build did not write, which is then kept verbatim
+     * in [ObjectFormat.extras] instead of being interpreted.
+     *
+     * Only the knockout flag needs it. A later build that widens `ko` into a mode (`ko=2`) must get
+     * its value back on the next autosave here, and parsing it as "off" would write nothing and
+     * destroy it; parsing it as "on" would hide ink this build cannot know should be hidden.
+     */
+    private fun understood(key: String, value: String): Boolean = when (key) {
+        K_KNOCKOUT, K_CUTTER, K_FRAME -> value == KNOCKOUT_ON
+        K_ELEMENT -> ElementInstance.decode(value) != null
+        K_PIVOT -> pivotOf(value) != null
+        else -> true
     }
 
     /**
@@ -318,6 +414,9 @@ internal object ObjectFormatCodec {
         K_CROP_RECT -> decodeRect(value)?.let { format.copy(crop = it) } ?: format
 
         K_CROP_POLY -> decodePolygon(value)?.let { format.copy(crop = it) } ?: format
+
+        // Only ever reached with the one value this build writes — see [understood].
+        K_KNOCKOUT, K_CUTTER, K_ELEMENT, K_FRAME, K_PIVOT -> applyElementKey(format, key, value)
 
         // The frame, in the `else` rather than in two branches of its own. `applyKnown` is reached
         // only for a key in [knownKeys], so the remaining two are exactly `w` and `h`.

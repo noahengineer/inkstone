@@ -321,6 +321,38 @@ public interface FileSystem {
      */
     public suspend fun readRange(path: String, offset: Long, length: Int): ByteArray
 
+    /**
+     * ⛔ **Open [path] once and read it through one handle — the only safe way to read a file in
+     * several pieces while something else may replace it.** Null when there is no such file.
+     *
+     * [readRange] resolves the *path* on every call. Every writer here replaces a file by rename
+     * (rule 10), so a reader that takes the ZIP central directory from one call and an entry from
+     * the next can be handed offsets from one version of `note.inkstone` and bytes from another.
+     * That is exactly the 2026-09-24 crash on the tablet — *"Bundle entry 'pages/….ink' has no
+     * local header"* — a library thumbnail reading the physics note while its own editor
+     * materialized it: the page JSON had grown by a few ops, so the `.ink` entry's old offset
+     * pointed into the middle of the new JSON. A handle pins the file the first read saw; a rename
+     * afterwards replaces the *name* and leaves the open file intact, so every read through it
+     * agrees with every other.
+     *
+     * The default reads the whole file up front. That is a consistent snapshot but not a lazy one,
+     * and it exists so that every fake in the test suites keeps working unchanged; a platform whose
+     * files can be large overrides it with a real handle (`AndroidFileSystem`).
+     */
+    public suspend fun openRead(path: String): ReadHandle? {
+        if (!exists(path)) return null
+        return SnapshotReadHandle(readBytes(path))
+    }
+
+    /**
+     * Which file [path] names right now, or null when there is none or the platform cannot say.
+     *
+     * Compared against [ReadHandle.identity] to ask *"is the file I have open still the one at this
+     * path?"* — the question a long-lived reader has to answer before its owner overwrites the
+     * path with something built from it. See `FileByteSource.isCurrent`.
+     */
+    public suspend fun identityOf(path: String): FileIdentity? = null
+
     public suspend fun writeBytesAtomically(path: String, bytes: ByteArray)
 
     public suspend fun appendBytes(path: String, bytes: ByteArray)
@@ -346,6 +378,44 @@ public interface FileSystem {
 
     /** Immediate children of [path], names only, empty when [path] is not a directory. */
     public suspend fun list(path: String): List<String>
+}
+
+/**
+ * One open file, read in pieces. See [FileSystem.openRead].
+ *
+ * [size] is the size of the file that was opened, fixed for the handle's lifetime — not whatever
+ * the path names now.
+ */
+public interface ReadHandle : AutoCloseable {
+    public val size: Long
+
+    /**
+     * Which file this handle holds, or null when the platform cannot say. Two identities are
+     * equal exactly when they are the same file — a rename over the path gives a different one.
+     */
+    public val identity: FileIdentity? get() = null
+
+    /** [length] bytes from [offset], or fewer at end of file. */
+    public suspend fun read(offset: Long, length: Int): ByteArray
+}
+
+/** A file, as the filesystem distinguishes files: device and inode on POSIX. */
+public data class FileIdentity(val device: Long, val inode: Long)
+
+/** [FileSystem.openRead]'s default: the whole file, read once. */
+public class SnapshotReadHandle(private val bytes: ByteArray) : ReadHandle {
+
+    override val size: Long get() = bytes.size.toLong()
+
+    override suspend fun read(offset: Long, length: Int): ByteArray {
+        val start = offset.coerceIn(0L, bytes.size.toLong()).toInt()
+        val end = (start.toLong() + length).coerceAtMost(bytes.size.toLong()).toInt()
+        return bytes.copyOfRange(start, end)
+    }
+
+    override fun close() {
+        // Nothing to release: the bytes are an ordinary array.
+    }
 }
 
 /**

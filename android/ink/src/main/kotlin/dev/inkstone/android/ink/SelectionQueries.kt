@@ -64,20 +64,62 @@ internal fun StrokeStore.objectsIn(lasso: Lasso): List<ObjectId> {
  *   broken; the caller converts from dp through the camera.
  */
 internal fun StrokeStore.objectAt(x: Float, y: Float, slopPageUnits: Float): ObjectId? {
+    if (guidesShown) return objectAtWithGuides(x, y, slopPageUnits)
     var hit: ObjectId? = null
     val local = PagePointF()
     forEachInRenderOrder(visibleBounds = null) { dry ->
-        val bounds = dry.pageBounds
-        if (bounds != null && !bounds.containsWithin(x, y, slopPageUnits)) return@forEachInRenderOrder
-        if (!dry.toLocal(x, y, local)) return@forEachInRenderOrder
-        // Erased away here means not here: tapping a hole in a stroke must not select it.
-        if (dry.erased?.covers(local.x, local.y) == true) return@forEachInRenderOrder
+        if (!dry.reachedBy(x, y, slopPageUnits, local)) return@forEachInRenderOrder
         // [DryObject.tappedAt] rather than `hitBy`: a tap and an eraser disagree about the inside
         // of a hollow shape, and only about that. See its KDoc — sharing one predicate is what made
         // a snapped rectangle need an 8 dp landing on a hairline.
         if (dry.tappedAt(local.x, local.y, dry.toLocalLength(slopPageUnits))) hit = dry.id
     }
     return hit
+}
+
+/** Cheap bounds test, the map into [dry]'s space, and the erased-hole check — every tap's preamble. */
+private fun DryObject.reachedBy(x: Float, y: Float, slopPageUnits: Float, local: PagePointF): Boolean {
+    val bounds = pageBounds
+    if (bounds != null && !bounds.containsWithin(x, y, slopPageUnits)) return false
+    if (!toLocal(x, y, local)) return false
+    // Erased away here means not here: tapping a hole in a stroke must not select it.
+    return erased?.covers(local.x, local.y) != true
+}
+
+/**
+ * ⭐ SPEC §4.9.7 — [objectAt] on the Element editor's canvas, where the guides are drawn on top.
+ *
+ * Knockout areas sit at the **bottom** of an Element (they hide the note behind a copy, not the
+ * Element's own pieces), so plain topmost-wins handed a tap inside an area to whatever piece covered
+ * it — usually a filled shape, whose inside counts as a hit. The area could be seen and not got hold
+ * of: *"hard to position right with no … edit"*. The order here follows what is drawn:
+ *
+ * 1. a guide's **dashed line** — it is drawn over everything;
+ * 2. anything's **ink** — a stroke, a shape's outline;
+ * 3. the **inside of an area** — it is what this canvas is for, and it is never covered by chrome;
+ * 4. the inside of anything else.
+ *
+ * The bounds offer only rule 1 ([DryShape.tappedAt]), so a tap inside them is a tap on the Element.
+ */
+private fun StrokeStore.objectAtWithGuides(x: Float, y: Float, slopPageUnits: Float): ObjectId? {
+    var guideEdge: ObjectId? = null
+    var ink: ObjectId? = null
+    var areaInside: ObjectId? = null
+    var inside: ObjectId? = null
+    val local = PagePointF()
+    forEachInRenderOrder(visibleBounds = null) { dry ->
+        if (!dry.reachedBy(x, y, slopPageUnits, local)) return@forEachInRenderOrder
+        val reach = dry.toLocalLength(slopPageUnits)
+        val edge = dry.edgeTappedAt(local.x, local.y, reach)
+        val anywhere = edge || dry.tappedAt(local.x, local.y, reach)
+        when {
+            dry.isGuide && edge -> guideEdge = dry.id
+            edge -> ink = dry.id
+            dry.cutter && anywhere -> areaInside = dry.id
+            anywhere && !dry.isGuide -> inside = dry.id
+        }
+    }
+    return guideEdge ?: ink ?: areaInside ?: inside
 }
 
 /**
@@ -93,6 +135,9 @@ internal fun StrokeStore.objectAt(x: Float, y: Float, slopPageUnits: Float): Obj
  *   right for selecting and wrong here: dropping a line's end in the **middle** of a rectangle is
  *   the clearest way a person can say "attach to this box", and an outline test would answer no.
  *   [ShapeHit] with `filled = true` is that question, asked of the shape's own outline.
+ *   ⚠️ It is only that clear when the line's **other** end lands on a different shape. On its own,
+ *   an end inside a box is just as often a line that starts there — a radius, a divider, an arrow
+ *   out of a labelled box — so `ShapeSnapController.connectorRecordFor` binds both ends or neither.
  * - **Closed shapes only** ([isAnchorable]). A line or an arrow has no inside for
  *   `filled = true` to test, so the question quietly became *"within slop of the segment"* — and a
  *   snapped line that merely **started on** another line bound to it, collapsed to a stub on it,
@@ -118,6 +163,21 @@ internal fun StrokeStore.shapeAt(x: Float, y: Float, slopPageUnits: Float): Obje
         if (ShapeHit.hitsPoint(dry.outline, filled = true, x = local.x, y = local.y, reach = slop)) hit = dry.id
     }
     return hit
+}
+
+/**
+ * True when the page point is inside shape [id]'s outline — the nesting test a connector's two ends
+ * must pass (`ShapeSnapController.connectorRecordFor`).
+ *
+ * The same [ShapeHit] question [shapeAt] asks, with **no** slop: this asks whether a point is
+ * *within* a shape, not whether a pen aimed at it, and a box beside a frame is not inside the frame
+ * just because it comes within a finger's width of it.
+ */
+internal fun StrokeStore.shapeEncloses(id: ObjectId, x: Float, y: Float): Boolean {
+    val dry = shapeOf(id) ?: return false
+    val local = PagePointF()
+    if (!dry.toLocal(x, y, local)) return false
+    return ShapeHit.hitsPoint(dry.outline, filled = true, x = local.x, y = local.y, reach = 0f)
 }
 
 /** The registers a selection edit reads, for the ids given, in render order. */
@@ -153,12 +213,29 @@ internal fun StrokeStore.allSelected(): List<SelectedObject> {
  */
 internal fun StrokeStore.pageBoundsOf(ids: Collection<ObjectId>): PageRect? {
     var union: PageRect? = null
-    for (id in ids) {
-        val bounds = objectOf(id)?.pageBounds ?: continue
-        val rect = bounds.asRect()
-        union = union?.union(rect) ?: rect
+    for (dry in ids.mapNotNull { objectOf(it) }) {
+        dry.pageBounds?.let { union = union.unionOrNull(it.asRect()) }
+        // ⭐ An Element copy's own bounds as well (SPEC §4.9.7): the box set in the editor, which may
+        // be larger than what its pieces cover — a margin, or a corner placed on the grid.
+        dry.copyBoundsOnPage?.let { union = union.unionOrNull(it) }
     }
     return union
+}
+
+/**
+ * ⭐ [ids], with every **other** piece of any Element copy among them — so a tap on one stroke of a
+ * placed copy selects the copy, and moving it moves all of it (SPEC §4.9.7). A copy is one thing to
+ * the person who dropped it; selecting a single stroke of it and dragging that stroke off by its
+ * copy's pivot was half of *"the pivot does not work"*.
+ */
+internal fun StrokeStore.withWholeCopies(ids: List<ObjectId>): List<ObjectId> {
+    val copies = ids.mapNotNullTo(HashSet()) { objectOf(it)?.copyKey }
+    if (copies.isEmpty()) return ids
+    val result = LinkedHashSet(ids)
+    forEachInRenderOrder(visibleBounds = null) { dry ->
+        if (dry.copyKey in copies) result += dry.id
+    }
+    return result.toList()
 }
 
 /**

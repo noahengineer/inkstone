@@ -273,6 +273,80 @@ class SnapGridTest {
         assertTrue(abs(expected - actual) < TOLERANCE, "${message.orEmpty()} expected $expected but was $actual")
     }
 
+    @Test
+    fun a_move_by_a_pivot_lands_the_pivot_and_not_the_box_corner() {
+        // SPEC §4.9.7 — an Element copy snaps by the point somebody chose, not by its bounding box.
+        val grid = SnapGrid(spacingXPt = 0f, spacingYPt = 24f, originYPt = 36f)
+        val pivot = PagePoint(90f, 101f)
+        val delta = grid.moveBy(pivot, dx = 3f, dy = 10f, alignment = Alignment.None)
+        assertEquals(93f, pivot.x + delta.x, TOLERANCE)
+        assertEquals(108f, pivot.y + delta.y, TOLERANCE)
+    }
+
+    @Test
+    fun a_move_by_a_box_is_a_move_by_its_top_left() {
+        val grid = SnapGrid(spacingXPt = 10f, spacingYPt = 10f)
+        val box = PageRect(3f, 7f, 50f, 60f)
+        assertEquals(
+            grid.moveBy(PagePoint(3f, 7f), 4f, 4f, Alignment.None),
+            grid.moveBy(box, 4f, 4f, Alignment.None),
+        )
+    }
+
+    @Test
+    fun a_paper_grid_starts_from_the_papers_own_corner() {
+        // An infinite canvas that grew 40 pt up and 25 pt left draws its squares from (-25, -40),
+        // so its lattice must start there too, or every snap misses the lines by that much.
+        val grid = SnapGrid.forBackground(Background.Template(PageTemplate.GRID), paperLeft = -25f, paperTop = -40f)
+        assertEquals(-7f, grid.snapX(-5f), TOLERANCE)
+        assertEquals(-4f, grid.snapY(-3f), TOLERANCE)
+    }
+
+    @Test
+    fun ruled_paper_rules_from_its_margin_below_the_papers_corner() {
+        val grid = SnapGrid.forBackground(Background.Template(PageTemplate.RULED), paperLeft = 0f, paperTop = -50f)
+        // Rules at -50 + 36 + 24k: -14, 10, 34, …
+        assertEquals(10f, grid.snapY(12f), TOLERANCE)
+        assertEquals(41f, grid.snapX(41f), TOLERANCE)
+    }
+
+    @Test
+    fun a_dragged_box_lands_every_edge_on_the_lattice() {
+        val grid = SnapGrid(spacingXPt = 18f, spacingYPt = 18f)
+        assertEquals(PageRect(36f, 18f, 90f, 72f), grid.snappedBox(PageRect(40f, 20f, 85f, 70f)))
+    }
+
+    @Test
+    fun a_dragged_box_too_small_to_round_keeps_a_whole_cell() {
+        val grid = SnapGrid(spacingXPt = 18f, spacingYPt = 18f)
+        assertEquals(PageRect(36f, 36f, 54f, 54f), grid.snappedBox(PageRect(37f, 37f, 40f, 40f)))
+    }
+
+    @Test
+    fun a_dragged_box_on_ruled_paper_moves_only_vertically() {
+        val grid = SnapGrid(spacingXPt = 0f, spacingYPt = 24f, originYPt = 36f)
+        assertEquals(PageRect(41f, 36f, 97f, 84f), grid.snappedBox(PageRect(41f, 40f, 97f, 80f)))
+    }
+
+    @Test
+    fun enclosing_widens_outward_and_never_cuts_content_off() {
+        val grid = SnapGrid(spacingXPt = 18f, spacingYPt = 18f)
+        assertEquals(PageRect(18f, 0f, 108f, 54f), grid.enclosing(PageRect(19f, 1f, 107f, 37f)))
+    }
+
+    @Test
+    fun enclosing_leaves_a_box_already_on_the_lattice_alone() {
+        val grid = SnapGrid(spacingXPt = 18f, spacingYPt = 18f)
+        assertEquals(PageRect(18f, 36f, 90f, 72f), grid.enclosing(PageRect(18f, 36f, 90f, 72f)))
+    }
+
+    @Test
+    fun no_grid_changes_no_box() {
+        val box = PageRect(1f, 2f, 3f, 4f)
+        assertEquals(box, SnapGrid.None.snappedBox(box))
+        assertEquals(box, SnapGrid.None.enclosing(box))
+    }
+
     private companion object {
         const val TOLERANCE = 1e-3f
         const val QUARTER = 0.4f

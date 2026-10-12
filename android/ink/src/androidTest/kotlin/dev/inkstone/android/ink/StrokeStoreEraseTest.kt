@@ -4,6 +4,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.inkstone.core.model.ErasedArea
 import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
 import org.junit.Assert.assertEquals
@@ -106,26 +107,20 @@ class StrokeStoreEraseTest {
     }
 
     /**
-     * ⛔ **A stroke scribbled over hard must still be pruned, and it never was.**
+     * ⛔ **A stroke scribbled over hard must be pruned in one ordinary pass.**
      *
-     * `pruneIfAffordable` skipped any candidate whose estimate exceeded the budget left. That
-     * estimate is `inputs x 3 x capsules`; the region is append-only and `inputs` is fixed, so a
-     * stroke that once exceeded `PRUNE_BUDGET` exceeded it on **every future pass, forever**. The
-     * KDoc called the degradation *"not pruning yet"*; it was *"never pruning"*.
+     * Twice wrong before this. First `pruneIfAffordable` skipped any candidate whose *estimate* —
+     * `inputs × 3 × capsules` — exceeded the budget left, and since the region only grows that
+     * meant **never**. Then a forced candidate per pass made it *eventually*, still charging the
+     * estimate: on a real note (B) that was 56–101× the work the test really does, so a pass pruned
+     * two to six strokes and ~555 invisible strokes kept a `saveLayer` + `DST_OUT` each on every
+     * re-record — *"when there are a lot of erases when you zoom in and out it seem to lag"*.
      *
-     * The threshold is low enough that ordinary use crosses it: a 200-sample stroke needs about
-     * 333 capsules, and one second of scribbled erasing at 240 Hz is roughly 240 of them.
-     *
-     * What it costs is not the prune. A fully erased stroke is invisible and still costs
-     * `PagePainter` a `saveLayer` + `DST_OUT` sandwich in every record of the page, and
-     * `DryStrokesView` re-records the whole page after any change of scale — so the bill is paid
-     * again on every pinch, in proportion to how much has been erased. That is the report this
-     * test exists for: *"when there are a lot of erases when you zoom in and out it seem to lag"*.
-     *
-     * The fixture erases the stroke away in **many small dabs** rather than one wide sweep, which
-     * is what a person scribbling actually produces and is the only way to get the capsule count
-     * over the line. It asserts the estimate really does exceed the whole budget, so the test
-     * cannot quietly stop covering the bug if the constants move.
+     * The budget is now charged in work actually done (`CoverageMeter`), so a stroke whose estimate
+     * is several budgets over is pruned in one pass that spends a small fraction of one. The fixture
+     * erases in **many small dabs** — what a person scribbling produces, and the only way to get the
+     * capsule count up — and asserts the old estimate really was over the whole budget, so the test
+     * cannot quietly stop being about the bug if the constants move.
      */
     @Test
     fun aStrokeWithMoreCapsulesThanTheBudgetIsStillPruned() {
@@ -147,15 +142,121 @@ class StrokeStoreEraseTest {
         }
 
         val region = checkNotNull(stroke.erased)
+        val oldEstimate = stroke.stroke.inputs.size.toLong() * OLD_POINTS_PER_INPUT * region.capsules.size
         assertTrue(
             "the fixture is too cheap to cover the bug: ${region.capsules.size} capsules",
-            stroke.eraseCoverageCost(region) > PRUNE_BUDGET_ESTIMATE,
+            oldEstimate > PruneBudgets.PEN_UP,
         )
         assertEquals("nothing should vanish before the gesture ends", 1, store.size)
 
         store.pruneFullyErased()
 
-        assertEquals("a heavily erased stroke was skipped, and would be skipped forever", 0, store.size)
+        assertEquals("a heavily erased stroke was not pruned in one pass", 0, store.size)
+        assertTrue(
+            "the pass spent ${store.lastPruneWork} units against an estimate of $oldEstimate",
+            store.lastPruneWork <= PruneBudgets.PEN_UP,
+        )
+    }
+
+    /**
+     * ⭐ **The pen-up pass looks at what this gesture erased, and nothing else on the page.**
+     *
+     * It walked the whole page from the front on every pen-up, re-examining objects no gesture had
+     * touched since they were last decided — and paying for them out of the budget the new erasure
+     * needed. Here the first gesture leaves many strokes partially erased (decided visible), and the
+     * second touches one; the second pass must probe what the second gesture bit and no more.
+     */
+    @Test
+    fun thePenUpPassLooksOnlyAtWhatTheGestureErased() {
+        loadStrokes(SMALL_COUNT)
+        val midpoints = ArrayList<PagePointF>()
+        store.forEachStrokeInRenderOrder(null) { dry ->
+            val inputs = dry.stroke.inputs
+            val middle = inputs.get(inputs.size / 2)
+            midpoints += PagePointF(middle.x, middle.y)
+        }
+
+        store.beginEdit()
+        for (at in midpoints) store.eraseAlong(at, at, DAB_RADIUS_PT, EraseMode.PARTIAL)
+        store.pruneFullyErased()
+        store.endEdit()
+        val erasedObjects = store.erasedCount
+        assertTrue("the first gesture erased too little to prove anything: $erasedObjects", erasedObjects > 10)
+        assertEquals("a decided candidate stayed queued", 0, store.pendingPruneCount)
+
+        store.beginEdit()
+        val touched = store.eraseAlong(midpoints[0], midpoints[0], DAB_RADIUS_PT, EraseMode.PARTIAL)
+        assertEquals("the queue should hold exactly what the dab bit", touched, store.pendingPruneCount)
+        store.pruneFullyErased()
+        store.endEdit()
+
+        assertEquals("the pass probed objects this gesture never touched", touched, store.lastPruneProbes)
+        assertTrue("the fixture's second dab touched everything", touched < erasedObjects)
+    }
+
+    /**
+     * Every register reaches a pruned stroke — not only the erased region.
+     *
+     * Pruning takes a fully erased stroke off the page and emits nothing, so it is still in the fold
+     * and a peer can move or recolour it. That op used to be dropped here, and an undo of the erase
+     * then brought the stroke back **where it was before the move**. It mattered little while a pass
+     * pruned a handful; a page load now parks every fully erased stroke.
+     */
+    @Test
+    fun aMoveOfAPrunedStrokeIsKeptForWhenItComesBack() {
+        store.addAll(SyntheticInk.generate(1, page, factory, seed = 3, pointsPerStroke = 60).items)
+        val id = onlyStroke().id
+        eraseAll()
+        store.pruneFullyErased()
+        assertEquals("the fixture never pruned, so this test proves nothing", 0, store.size)
+
+        val moved = Matrix3.translate(MOVE_X, MOVE_Y)
+        store.applyOps(listOf(PageOp.SetTransform("move-1", LamportClock(1L, DEVICE), id, moved)), factory)
+        assertEquals("a move must not bring an erased stroke back", 0, store.size)
+
+        store.applyOps(
+            listOf(PageOp.SetErasedRegion(UNDO_OP_ID, LamportClock(2L, DEVICE), id, ErasedArea.None)),
+            factory,
+        )
+
+        assertEquals(1, store.size)
+        assertEquals("the move made while it was pruned was lost", moved, onlyStroke().transform)
+    }
+
+    /**
+     * A clear deletes what is on the page; a stroke erased away is not on it, is not deleted, and
+     * must still be reachable by the un-erase an undo will eventually write.
+     */
+    @Test
+    fun aClearLeavesAPrunedStrokeReachableForAnUnErase() {
+        store.addAll(SyntheticInk.generate(2, page, factory, seed = 3, pointsPerStroke = 60).items)
+        var erasedId: dev.inkstone.core.model.ObjectId? = null
+        store.forEachStrokeInRenderOrder(null) { dry -> if (erasedId == null) erasedId = dry.id }
+        val id = checkNotNull(erasedId)
+        val bounds = checkNotNull(store.objectOf(id)?.bounds)
+        val from = PagePointF(bounds.xMin - WIDE_PT, bounds.yMin - WIDE_PT)
+        val to = PagePointF(bounds.xMax + WIDE_PT, bounds.yMax + WIDE_PT)
+        store.eraseAlong(from, to, WIDE_PT, EraseMode.PARTIAL)
+        store.pruneFullyErased()
+        assertTrue("the fixture never pruned the stroke", store.objectOf(id) == null)
+
+        store.clear()
+        assertEquals(0, store.size)
+        store.applyOps(
+            listOf(PageOp.SetErasedRegion(UNDO_OP_ID, LamportClock(1L, DEVICE), id, ErasedArea.None)),
+            factory,
+        )
+
+        assertEquals("the un-erase after a clear landed on nothing", 1, store.size)
+        assertEquals(id, onlyStroke().id)
+    }
+
+    /** Sweep an eraser far wider than the only stroke along its whole extent. */
+    private fun eraseAll() {
+        val bounds = checkNotNull(onlyStroke().bounds)
+        val from = PagePointF(bounds.xMin - WIDE_PT, bounds.yMin - WIDE_PT)
+        val to = PagePointF(bounds.xMax + WIDE_PT, bounds.yMax + WIDE_PT)
+        store.eraseAlong(from, to, WIDE_PT, EraseMode.PARTIAL)
     }
 
     @Test
@@ -186,8 +287,8 @@ class StrokeStoreEraseTest {
      * until the page was reloaded. The user's report was *"erasing seems to mess it up as well…
      * you cant go back to how it was"*.
      *
-     * It was intermittent because pruning is rationed by `PRUNE_BUDGET`: whether a given stroke
-     * had actually left the page depended on how much else had been erased first.
+     * It was intermittent because pruning is rationed by a budget: whether a given stroke had
+     * actually left the page depended on how much else had been erased first.
      *
      * ⚠️ Asserting on `store.size` and on the **render** walk, not on `objectOf`: the failure is
      * precisely that nothing is drawn, and an id lookup that answered would not have caught it.
@@ -400,20 +501,22 @@ class StrokeStoreEraseTest {
         const val PRUNE_BUDGET_MS = 500
 
         /**
-         * Enough dabs that the estimate clears `StrokeStore.PRUNE_BUDGET` several times over.
+         * Enough dabs that the **old** estimate clears the pen-up budget several times over.
          *
-         * Derived, because the first value did not: the cost is
+         * Derived, because the first value did not: the estimate was
          * `inputs × COVERAGE_POINTS_PER_INPUT × capsules` = `60 × 3 × capsules`, and one dab
          * records one capsule (measured: 900 steps ⇒ 901 capsules), so clearing 200,000 needs
-         * **1,112** and 900 gave 162,180. At 3,600 the estimate is 648,180 — 3.2× the budget,
-         * which is what "several times over" has to mean for the forced-candidate path to be
-         * the only thing that can prune this stroke.
+         * **1,112** and 900 gave 162,180. At 3,600 the estimate is 648,180 — 3.2× the budget, which
+         * is what "several times over" has to mean for a one-pass prune to be evidence that the
+         * budget is no longer charged in estimates.
          */
         const val DAB_STEPS = 3600
 
-        /** `StrokeStore.PRUNE_BUDGET`, which is private — asserted against rather than reused. */
-        const val PRUNE_BUDGET_ESTIMATE = 200_000L
+        /** The retired estimate's per-input factor, `DryStroke.COVERAGE_POINTS_PER_INPUT`. */
+        const val OLD_POINTS_PER_INPUT = 3L
         const val UNDO_OP_ID = "undo-1"
         const val DEVICE = "device-a"
+        const val MOVE_X = 120f
+        const val MOVE_Y = 40f
     }
 }

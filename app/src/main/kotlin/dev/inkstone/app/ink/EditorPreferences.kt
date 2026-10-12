@@ -26,7 +26,22 @@ import kotlinx.coroutines.launch
  * trap `setTemplate` records — where a debounced write echoing back fights the next frame of the
  * gesture.
  *
- * So the rule is: **seeding is one-way.** The store is read at startup and never re-adopted.
+ * So the rule is: **seeding is one-way.** The store is read at startup and never re-adopted
+ * *mid-gesture*.
+ *
+ * ## ⛔ …but a seed is the newest value, not the startup one
+ *
+ * *"the favorite colors does not stay like that and the pencil size"*. This class is a process-wide
+ * singleton and [snapshot] is the store as it was at **launch**. Every editor seeded from it, so the
+ * second note opened in a process — or the Element editor, which is a second `NoteActivity` — started
+ * from the launch-time palette, and `InkScreen`'s `snapshotFlow` then emitted that stale seed straight
+ * back into [changed], which wrote it over the user's real choices 400 ms later. Nothing threw, every
+ * codec test passed, and a force-stop was the only route that ever showed the saved value, because it
+ * is the only one that re-reads the store.
+ *
+ * [snapshot] is now only the *"the store has been read"* signal. What an editor seeds from is
+ * [current]: the last value any editor reported, or the store's if none has. [changed] keeps it up to
+ * date synchronously, so it never trails the debounce.
  *
  * ## Why a debounce and not a gesture-end callback
  *
@@ -53,11 +68,24 @@ class EditorPreferences(private val store: SettingStore, private val scope: Coro
 
     private val _snapshot = MutableStateFlow<EditorPrefs?>(null)
 
-    /** Null until [warm] completes. `InkScreen` waits for the first non-null and then stops looking. */
+    /**
+     * Null until [warm] completes, and then the store **as it was at launch** — a readiness signal.
+     * ⚠️ Seed from [current], never from this value; see the class KDoc.
+     */
     val snapshot: StateFlow<EditorPrefs?> = _snapshot.asStateFlow()
 
     @Volatile
     private var pending: EditorPrefs? = null
+
+    /** The last value [changed] was given — written there synchronously, never by the debounce. */
+    @Volatile
+    private var latest: EditorPrefs? = null
+
+    /**
+     * What an editor opening **now** should start from: the newest value any editor has reported, or
+     * the stored one if none has. Null exactly when [snapshot] is.
+     */
+    fun current(): EditorPrefs? = latest ?: _snapshot.value
 
     private val writes = MutableStateFlow(0L)
 
@@ -90,6 +118,7 @@ class EditorPreferences(private val store: SettingStore, private val scope: Coro
 
     /** Record [prefs] as the newest value, to be written when the user stops moving. */
     fun changed(prefs: EditorPrefs) {
+        latest = prefs
         pending = prefs
         writes.value = writes.value + 1
     }

@@ -58,6 +58,7 @@ internal object EditorPrefsCodec {
         put(SHAPE_SNAP, prefs.shapeSnapEnabled.toString())
         put(ARROW_HEADS, prefs.arrowHeads.toString())
         put(GRID_SNAP, prefs.gridSnapEnabled.toString())
+        putAll(ChromeLayoutCodec.encode(prefs.layout))
     }
 
     /**
@@ -79,6 +80,7 @@ internal object EditorPrefsCodec {
             shapeSnapEnabled = stored.flag(SHAPE_SNAP, true),
             arrowHeads = stored.flag(ARROW_HEADS, false),
             gridSnapEnabled = stored.flag(GRID_SNAP, false),
+            layout = ChromeLayoutCodec.decode(stored),
         )
     }
 

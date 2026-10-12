@@ -14,10 +14,13 @@ import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PageThumbnailRenderer
 import dev.inkstone.core.storage.NoteLayout
 import dev.inkstone.core.storage.ThumbnailCache
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -242,5 +245,40 @@ class ThumbnailsTest {
         thumbnails.page(other, pageId, revision = 5L) { folded }
         assertEquals("invalidating one note dropped another note's page cache", rendersBefore, renderer.renders)
         assertTrue("the other note's file was deleted too", fs.exists(NoteLayout.pageThumbnail(other, pageId)))
+    }
+
+    // -----------------------------------------------------------------------
+    // ⛔ The 2026-09-24 crash: a tile's effect must not be able to kill the app
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `a cover whose fold throws is a placeholder and not a crash`() = runTest {
+        // The tablet's exception, arriving the way it did: out of the fold, into a tile effect,
+        // where Compose rethrows it and the process dies.
+        insertNoteAt(localRev = 5L)
+
+        val image = thumbnails.cover(summary()) { error("Bundle entry 'pages/x.ink' has no local header") }
+
+        assertNull("a failed fold produced a picture", image)
+        assertEquals(0, renderer.renders)
+        // Nothing was recorded for the failure, so the next visit simply tries again.
+        thumbnails.cover(summary()) { folded }
+        assertEquals("a failed fold stopped the cover ever being drawn", 1, renderer.renders)
+    }
+
+    @Test
+    fun `a cancelled cover stays cancelled rather than becoming a placeholder`() = runTest {
+        // A tile scrolled away must stop. Swallowing its cancellation would let it run on and write.
+        insertNoteAt(localRev = 5L)
+
+        val thrown = try {
+            thumbnails.cover(summary()) { throw CancellationException("scrolled away") }
+            null
+        } catch (cancelled: CancellationException) {
+            cancelled
+        }
+
+        assertNotNull("the cancellation was swallowed as though the fold had merely failed", thrown)
+        assertEquals(0, renderer.renders)
     }
 }

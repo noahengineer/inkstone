@@ -266,6 +266,8 @@ A milestone is done when:
 | **M8 follow-up 7 — a small shape could not be drawn: the dwell radius was the sampling spacing, and the travel gate counted in lumps** | `docs/M8-SMALL-SHAPES.md` (§4 is the size floor, SPEC §4.8.7) |
 | **M8 follow-up 8 — a saved Element never reached the open panel, so there was nothing to arm and nothing to stamp** | `docs/M8-ELEMENTS.md` (§6 is the emulator's own traps) |
 | **M8 follow-up 9 — snap to grid, and the selection bar's Circle / Arrow / Grid buttons** | `docs/M8-GRID-SNAP.md` (§6 is the per-claim table, §8 the buttons) |
+| **Elements follow-up — handwriting in Elements, drag-and-drop from the panel, and knockout (an object that hides what is under it)** | `docs/M8-ELEMENTS-KNOCKOUT.md` (SPEC §4.9.4, §4.9.6) |
+| **The Element editor — knockout areas, a pivot that snaps to the grid, and updating placed copies** | `docs/M8-ELEMENT-EDITOR.md` (SPEC §4.9.7; §8 is why the bounds and areas are objects, §10 why a copy is one thing and the grid leads) |
 | **M8 follow-up 10 — an axis-aligned line could not be moved, and a scribbled-over stroke was never pruned** | `docs/M8-LINE-MOVE-ERASE-PRUNE.md` (§3 is what was measured and what was not) |
 | **M12 lecture recording — capture built, alignment still designed** | `docs/M12-AUDIO.md` (§15 is what exists) |
 | **M10 redesign — the design system, the Dynamic Dock, and why there is no backdrop blur** | `docs/M10-DESIGN.md` |
@@ -274,7 +276,12 @@ A milestone is done when:
 | **Writing on a PDF that already lives on Nextcloud — the third binding, and why the first upload is owed at once** | `docs/REMOTE-PDF.md` (§6 is the sharp edge) |
 | **The paper as a value, ink that stops at its edge, and the infinite canvas** | `docs/INFINITE-CANVAS.md` (SPEC §4.5) |
 | **Choosing an upload path with no network — the browser's cache, and the table it must not be** | `docs/OFFLINE-FOLDERS.md` (§2 the two caches, §5 the per-claim table, §6 unverified) |
+| **Slow, stuttering, and a crash on two big one-page notes — torn reads, Back losing ink, UI-thread folds, and the debug build** | `docs/PERF-CRASH-2026-09.md` (§5 per-claim table, §6 found and not fixed) |
+| **Photos drawn as crossed boxes, 852-character z keys, 39,000 dots — the physics note at 3× the size** | `docs/IMAGES-PERF-2026-10.md` (§4 per-claim table, §6 found and not fixed) |
+| **The note stays loaded — `onStop` saves, only a finishing stop materializes, `largeHeap`, and why leaving for the Element editor destroyed the note** | `docs/NOTE-STAYS-LOADED.md` (§3 before/after, §4 per-claim table, §5 found and not fixed) |
 | **The reader — a website and an MCP server over your Nextcloud** | `docs/WEB-READER.md` (§2 Login Flow v2 in Python, §6 per-claim buckets, §7 unproven, §9 hosting it with Docker) |
+| **The built-in calculator — an fx-991ZA PLUS II rebuilt from scratch in `:core:calc`, its window and face in `:app` `calculator/`** | `docs/CALCULATOR.md` (§2 decisions D1–D7, §3 the firmware guesses; research in `docs/calculator/research/`) |
+| **Saved toolbar preferences that stay, and the layout editor — move, resize and reshape (row / column / grid) any bar, hide chips, carry a chip into another bar or onto the page, size each panel** | `docs/CUSTOM-LAYOUT.md` (§1 the stale-seed bug, §3 what the emulator found, §4 per-claim table) |
 
 ---
 
@@ -568,6 +575,15 @@ Collected during research so they don't get reintroduced from stale training dat
   with the mode off the shape jumped onto lines nobody could see — *"it just snaps the points to an
   invisible grid"*. It is the mode's toggle now. Before shipping a one-shot beside a mode, ask what
   the user sees afterwards, not what the op says.
+- ⛔ **A fix's positive control can be the bug with a different object underneath** (2026-09-25).
+  *"Start drawing your line on a stroke … goes into an image like selection"* was fixed by refusing
+  a snapped **line** as a connector anchor, and `ShapeSnapBindingTest` kept *"a line drawn from
+  inside a box still attaches to it"* as its control — so the refusal could not pass vacuously.
+  Three days later the same report came back, and the control was the reproduction: a line started
+  inside a box (or on handwriting inside one) was re-routed to the box's edge and given a
+  zero-height frame of stacked grips. A control is a claim about what the user wants; **check it
+  against the user's own words, not only against the code's design.** A drawn line now binds both
+  ends to two different shapes or neither (SPEC §4.8.9).
 - ⚠️ **A geometric threshold measured against a *polyline* is measured against the instrument, not
   the gesture** (M8 follow-up 3). The arc→curve classifier scores how far the ink strays from the
   curve it would become. `adb shell input stylus motionevent` sends one event per invocation, so a
@@ -906,6 +922,74 @@ Collected during research so they don't get reintroduced from stale training dat
   beside it records which. The decision is a pure function (`OfflineBrowsing.notice`) for the
   reason this file keeps giving — `SyncViewModel` cannot be built in a JVM test, so the *decision*
   is hoisted where one can reach it and the composable keeps nothing but a `Text`.
+- ⛔ **A reader that re-opens a file by path for every read sees two files when a writer renames
+  over it** (2026-09-24, the tablet's only crash). `FileByteSource` called `fs.readRange(path, …)`
+  per read, so a `Zip.Directory` built from one `note.inkstone` read its entries out of the next —
+  *"Bundle entry 'pages/….ink' has no local header"* — while the note's own editor materialized it.
+  Rule 10 makes every write a rename, so **every multi-read reader must hold one descriptor**
+  (`FileSystem.openRead`). And pinning is not free: a session that no longer fails when another
+  writer replaces its file will happily write over that file, so `NoteStore.materialize` checks
+  `reader.isCurrent()` (inode) first. ⚠️ That guard shipped inert for an hour — the interface
+  defaults answer *"cannot tell, so yes"* and only `AndroidFileSystem` can say otherwise. A guard
+  whose platform half is a default is a JVM test and nothing else.
+- ⛔ **An exception escaping a `LaunchedEffect` kills the process, and a `LaunchedEffect` runs on the
+  UI thread** — so a library tile that folded a note (`Thumbnails.cover` → `foldCoverPage`) did 6–8 MB
+  of CRC, JSON and folding on the main thread, and the first torn read took the app down. Anything a
+  composition effect calls that can throw or read a file must switch dispatcher and catch
+  (`Thumbnails.orPlaceholder`), rethrowing only cancellation.
+- ⛔ **`Activity.onStop` → `viewModelScope.launch { save }` loses ink on Back.** Back runs `onStop` and
+  then clears the view model, which cancels the scope; the save's first suspension is the surface
+  drain, which is destructive, so the strokes it had just taken were dropped. Reproduced twice on the
+  emulator. The close-time save runs in `NoteSessionHost`'s own scope under the note's mutex now, and
+  the editor keeps a detached surface until something drains it. Same family as M12's
+  *"`ViewModel.onCleared` cannot suspend"* — it is the scope, not the callback, that dies.
+- ⚠️ **The tablet had only ever run the debug APK**, which Android never compiles ahead of time. On
+  the emulator, same code and data, release was 3.5–4× faster on the paths the user complained about
+  (library 16.6 s → 4.6 s). `send-to-tablet.ps1` sends a debug-key-signed release build by default now;
+  `-DebugBuild` for when `run-as` on the tablet is needed.
+- ⚠️ **`androidx.ink`'s `StrokeInputBatch.decode` allocates a 32 KB buffer per stroke**
+  (`DecompressedBytes`, read with `javap`). Rebuilding a 2,000-stroke page is ~69 MB of large-object
+  garbage — which is what *"GC freed 40MB … 957(40MB) LOS objects"* every few hundred ms was. Count the
+  full-page rebuilds (open, cover, recognition, publish) before blaming anything else for GC churn.
+- ⚠️ **A stand-in whose KDoc says "moving this is a change of import" is a feature shipping with the
+  stand-in's limits until somebody makes the move** (Elements follow-up). M8c's `:app`
+  `ElementLibrary` said exactly that and skipped every pen stroke; `:core:storage`'s finished,
+  tested library — which holds handwriting — had **no caller** for four milestones, so the user's
+  *"the elements thing does not work too well"* was a hand-drawn icon saving as nothing. Grep for the
+  real implementation's callers, not for the stand-in's TODO. `docs/M8-ELEMENTS-KNOCKOUT.md` §1.
+- ⚠️ **`DST_OUT` on the dry layer's own canvas punches through the paper.** Background and objects
+  share one canvas, so a knockout has to cut inside a `saveLayer` of the objects alone — and the
+  append tail, drawn straight onto the view over the recording, must never carry one
+  (`StrokeStore.noteAppendedOnTop` refuses it). SPEC §4.9.6.
+- ⛔ **A stand-in reached the tablet through the one constructor no test called** (the calculator,
+  2026-10-11). `:core:calc`'s key machine was built in parallel with its evaluator, against an
+  integer-only stand-in, and `Calculator()` — the public constructor, the only one the app uses —
+  still built that stand-in after the real evaluator landed. 556 tests were green: every machine test
+  ran on documented fakes through the *internal* constructor, and every evaluator test ran without
+  the machine. The tablet showed **Math ERROR for `100 ÷ 1,80`**. Two habits: when a seam exists so
+  parts can be built in parallel, the wiring that removes the stand-in is a deliverable with its own
+  test, and **at least one test must go through exactly the entry point production uses** — here
+  `e2e/*` drive the public `Calculator()` with the guide's own key sequences.
+- ⛔ **A singleton's launch-time snapshot is not a seed for the second screen** (2026-10-12).
+  `EditorPreferences` read the `setting` table once and every editor seeded from that read, so the
+  second note opened in a process showed the launch-time palette — and `snapshotFlow`'s *first*
+  emission, which is the seed itself, wrote it back over the user's choice 400 ms later. *"The
+  favorite colors does not stay like that and the pencil size."* The codec was right and its test was
+  green; the test that would have caught it was named in that test's KDoc and did not exist. Seed from
+  the **newest** value (`EditorPreferences.current`), re-adopt on `ON_START`, and when a KDoc names a
+  test as the one that covers the rest, check that it exists. `docs/CUSTOM-LAYOUT.md` §1.
+- ⛔ **Compose restarts a `pointerInput` gesture when the density under it changes.** A resize grip
+  inside the `CompositionLocalProvider(LocalDensity …)` it was resizing cancelled its own drag on the
+  first frame: the bar flickered and stayed the size it was, while *moving* the same bar — which
+  changes no density — worked. Anything that changes a scale must be driven from outside that scale.
+- ⚠️ **A drag that moves its own node to another parent cancels itself.** Compose disposes a node
+  whose parent changes, and the gesture coroutine in its `pointerInput` goes with it — so a chip that
+  trades places *live* works inside one row and dies on the first bar boundary. Describe the drop
+  while dragging (a picture under the finger, a caret where it lands) and change the tree once, on
+  lift (`ChromeDrop`). Within one parent, `key()` moves the node and the gesture survives.
+- ⚠️ **Chrome 12 dp from a screen edge is inside the system Back gesture.** A drag that starts there
+  and moves inward is Back, not your gesture — logcat says `startBackNavigation` at the instant it
+  begins. Handles that are dragged need `Modifier.systemGestureExclusion()`.
 - **`EncryptedSharedPreferences` was deprecated in 2025.** Keystore AES-GCM directly.
 - Nextcloud's `loginName` is **not** the WebDAV path segment. Fetch the UID from `/ocs/v2.php/cloud/user`.
 - Nextcloud forbids only `\` and `/` by default — **not** the Windows character set. Read the real rules from capabilities.
@@ -1284,3 +1368,48 @@ Collected during research so they don't get reintroduced from stale training dat
   startup** on a cold emulator (*"failed to complete startup"*, killed at ~20 s, no stack trace,
   ML Kit and Firebase dex verification in the log); `adb shell cmd package compile -m speed -f
   dev.inkstone` fixes it and is worth running before reading it as an app bug.
+- ⛔ **A cache budget written as "about N entries" is a claim about an entry's size — check it**
+  (2026-10, `docs/IMAGES-PERF-2026-10.md` §2). `PageAssetCache` held *"48 MB — about a dozen images
+  at M8c's 2,048 px cap"*; a 2,048 × 1,536 photograph is 12 MiB decoded, so it held **four**, and on
+  the physics note seven of eleven slides drew the crossed missing-picture box. A cache that also
+  re-decodes everything on every revision turns a too-small budget into a thrash. The picture cache
+  now decodes only what is drawn, never evicts the page on screen, and downsamples a page that does
+  not fit rather than showing part of it (`PictureCache`).
+- ⚠️ **Anything that loops over "the paper" is unbounded since the canvas became infinite.**
+  `TemplateBackground.drawDots` was one `drawCircle` per dot, unculled, budgeted at *"a Letter page …
+  about 1,400"*; the physics note's grown paper is 5,364 × 2,376 pt — 39,000 circles per dry-layer
+  re-record, 14× the cost of every object on screen. It is one shaded rectangle now. Grep for loops
+  over `page.widthPt` / `heightPt` before believing a per-page cost is small.
+- ⚠️ **Appending above the top fractional key must step, not bisect.** Bisection towards the end of
+  the alphabet grows a key by a character every ~6 strokes — linear in a page's lifetime, quadratic in
+  its log — and the physics note's keys reached 852 characters (2.2 MB of a 14.8 MB page). Stepping
+  costs a character per ~61. An all-`z` key cannot be undercut, so long keys already on disk stay long
+  (SPEC §4.3).
+- ⛔ **A stopped activity is *destroyed* whenever a GC leaves the heap above ¾ of its limit, and a
+  materialize in `onStop` was exactly that** (2026-10, `docs/NOTE-STAYS-LOADED.md`). ActivityThread's
+  GC watcher calls `releaseSomeActivities` after any collection that ends above `3/4 × maxMemory()`
+  with an activity recently changed, and the system destroys every stopped activity with saved
+  state: `wm_destroy_activity … low-mem`. It is not the low-memory killer and not a crash. It is an
+  ordinary destroy, so the view model is cleared, the editor closed, and coming back reopens the
+  whole note. The old `onStop` materialized whenever there was unsaved work, which put a whole-bundle
+  encode in the very window the note had become a candidate. On the emulator, one stroke and Home
+  took the heap from 96 to 149 MB against a 144 MB line, the note was destroyed 1 ms after the GC,
+  and coming back died with `OutOfMemoryError`: the destroyed editor's queued materialize still held
+  its copy of the note while the new one loaded. Opening the physics note alone peaked at 143–163 MB
+  over two opens, and at 163 the *library* behind it was destroyed. **`low-mem` in that event means the app's own
+  heap, not the device's RAM** — read the reason before blaming the killer. Now: `largeHeap`, a
+  materialize only on a finishing stop, none in *Update them all*, and the host's own sessions off
+  the UI thread.
+- ⚠️ **A pass-through that does not change thread runs on whatever thread called it, and a Compose
+  scope is the UI thread.** `NoteSessionHost.countElementCopies` and `updateElementCopies` opened and
+  folded a whole note in their own-session branch with no `withContext`. Every other caller of that
+  pattern is a WorkManager job, so it had always run on a worker. The Element editor's Done called
+  it from a `rememberCoroutineScope`, and the tablet's `OutOfMemoryError` landed on
+  `AndroidUiDispatcher`. A suspend function that does heavy work must pick its own dispatcher. Never
+  trust the caller to have picked one.
+- ⚠️ **Building a page's strokes in parallel did not shorten the open on the emulator**, and the
+  `DecompressedBytes` entry above is why: its 32 KB per stroke goes through ART's large-object
+  allocator under one lock, so four workers spent most of the phase waiting on it and the collector
+  (~6 CPU-seconds over a 9–11 s phase). `PreparedPage.build` is kept — it is exact
+  (`PreparedPageParallelTest`) — but "parallel" is not a speed claim until it is measured on the
+  tablet's release build.

@@ -28,11 +28,11 @@ import dev.inkstone.app.ui.TextChip
 import kotlin.math.roundToInt
 
 /**
- * ⭐ ROADMAP M10 — row two of the Dynamic Dock, whichever row that currently is.
+ * ⭐ ROADMAP M10 — row two of the Dynamic Dock for every tool but the pen.
  *
  * One `when` over [SecondaryRow] rather than a stack of `AnimatedVisibility`s, because the design's
- * row two *swaps* rather than accumulating. See [EditorDock] for why that distinction is the whole
- * point of the redesign.
+ * row two *swaps* rather than accumulating. The pen's row is not here: it is the `DRAW` bar, made of
+ * chips the user can rearrange and move elsewhere, and `DockSecondary` draws it with `ChromeContainer`.
  */
 @Composable
 internal fun RowScope.SecondaryContent(
@@ -41,11 +41,9 @@ internal fun RowScope.SecondaryContent(
     objects: ObjectToolState,
     actions: InkToolbarActions,
     objectActions: ObjectActions,
-    onSummon: (PanelKind, Rect) -> Unit,
 ) {
     when (row) {
-        SecondaryRow.NONE -> Unit
-        SecondaryRow.DRAW -> DrawControls(state, onSummon)
+        SecondaryRow.NONE, SecondaryRow.DRAW -> Unit
         SecondaryRow.ERASE -> EraseControls(state)
         SecondaryRow.SELECT -> SelectControls(state, actions)
         SecondaryRow.IMAGE -> ImageInsertControls(objectActions)
@@ -54,26 +52,59 @@ internal fun RowScope.SecondaryContent(
 }
 
 /**
- * The design's Draw state: *"Brush Types · Width Slider · Inline Color Swatches · Extended Color
- * Toggle"*, plus the two chips that change what a drawn stroke *becomes*.
+ * One chip of the design's Draw state: *"Brush Types · Width Slider · Inline Color Swatches ·
+ * Extended Color Toggle"*, plus the two chips that change what a drawn stroke *becomes*.
  *
- * ⚠️ Draw-and-hold lives here rather than behind a settings panel because it changes what the pen
- * does, and a setting that changes the pen has to be where the pen is — the argument M8b's `SnapRow`
- * made and the redesign does not overturn. `Arrow` is enabled only with it, because an arrowhead is
- * a property of a *snapped* line (SPEC §4.8.7).
+ * A brush is drawn as a bare segment; whichever bar holds it puts it in a recessed track — one track
+ * for a run of brushes in a row, which with the stock order is the one segmented control the design
+ * draws.
+ *
+ * ⚠️ Draw-and-hold lives with the pen rather than behind a settings panel because it changes what the
+ * pen does — the argument M8b's `SnapRow` made and the redesign does not overturn. `Arrow` is enabled
+ * only with it, because an arrowhead is a property of a *snapped* line (SPEC §4.8.7).
  */
 @Composable
-private fun RowScope.DrawControls(state: InkUiState, onSummon: (PanelKind, Rect) -> Unit) {
-    Segmented {
-        InkBrushKind.entries.forEach { kind ->
-            SegmentChip(
-                label = kind.label,
-                selected = state.kind == kind,
-                onClick = { state.selectBrush(kind) },
-            )
-        }
+internal fun DrawChip(item: ChromeItem, state: InkUiState, onSummon: (PanelKind, Rect) -> Unit) {
+    val brush = item.brush
+    if (brush != null) {
+        SegmentChip(label = brush.label, selected = state.kind == brush, onClick = { state.selectBrush(brush) })
+        return
     }
-    ChipDivider()
+    when (item) {
+        ChromeItem.WIDTH_SLIDER -> WidthSlider(state)
+
+        ChromeItem.WIDTH_READOUT -> WidthReadoutChip(state, onSummon)
+
+        ChromeItem.SWATCHES -> QuickSwatches(state, onSummon)
+
+        ChromeItem.SNAP -> TextChip(
+            label = "Snap",
+            selected = state.shapeSnapEnabled,
+            onClick = { state.shapeSnapEnabled = !state.shapeSnapEnabled },
+        )
+
+        ChromeItem.ARROW -> TextChip(
+            label = "Arrow",
+            selected = state.arrowHeads,
+            enabled = state.shapeSnapEnabled,
+            onClick = { state.arrowHeads = !state.arrowHeads },
+        )
+
+        // ⚠️ Deliberately **not** gated on [InkUiState.shapeSnapEnabled], unlike Arrow. Draw-and-hold
+        // is one of the three things this lattice catches — a move, a resize and a dragged vertex are
+        // the others, and all three are reachable with draw-and-hold switched off.
+        ChromeItem.GRID -> TextChip(
+            label = "Grid",
+            selected = state.gridSnapEnabled,
+            onClick = { state.gridSnapEnabled = !state.gridSnapEnabled },
+        )
+
+        else -> Unit
+    }
+}
+
+@Composable
+private fun WidthSlider(state: InkUiState) {
     SlimSlider(
         value = state.pen.widthDp,
         // The top is the user's — `SizePanel`'s MAX.
@@ -88,7 +119,11 @@ private fun RowScope.DrawControls(state: InkUiState, onSummon: (PanelKind, Rect)
         ticks = state.widthSlots,
         gamma = WIDTH_GAMMA,
     )
-    // ⭐ M10 — the number opens the panel that manages those sizes.
+}
+
+/** ⭐ M10 — the number opens the panel that manages the saved sizes. */
+@Composable
+private fun WidthReadoutChip(state: InkUiState, onSummon: (PanelKind, Rect) -> Unit) {
     var sizeAnchor by remember { mutableStateOf(Rect.Zero) }
     ReadoutChip(
         text = WidthLadder.label(state.pen.widthDp),
@@ -97,7 +132,10 @@ private fun RowScope.DrawControls(state: InkUiState, onSummon: (PanelKind, Rect)
         onBounds = { sizeAnchor = it },
         contentWidth = WidthReadout,
     )
-    ChipDivider()
+}
+
+@Composable
+private fun QuickSwatches(state: InkUiState, onSummon: (PanelKind, Rect) -> Unit) {
     SwatchStrip(
         colors = state.slots.take(QUICK_SLOTS),
         selectedArgb = state.pen.colorArgb,
@@ -110,26 +148,6 @@ private fun RowScope.DrawControls(state: InkUiState, onSummon: (PanelKind, Rect)
         onMore = { onSummon(PanelKind.COLOUR, it) },
         drag = state.colorDrag,
         onDropped = state::swapSlots,
-    )
-    ChipDivider()
-    TextChip(
-        label = "Snap",
-        selected = state.shapeSnapEnabled,
-        onClick = { state.shapeSnapEnabled = !state.shapeSnapEnabled },
-    )
-    TextChip(
-        label = "Arrow",
-        selected = state.arrowHeads,
-        enabled = state.shapeSnapEnabled,
-        onClick = { state.arrowHeads = !state.arrowHeads },
-    )
-    // ⚠️ Deliberately **not** gated on [InkUiState.shapeSnapEnabled], unlike Arrow. Draw-and-hold
-    // is one of the three things this lattice catches — a move, a resize and a dragged vertex are
-    // the others, and all three are reachable with draw-and-hold switched off.
-    TextChip(
-        label = "Grid",
-        selected = state.gridSnapEnabled,
-        onClick = { state.gridSnapEnabled = !state.gridSnapEnabled },
     )
 }
 
@@ -220,7 +238,7 @@ private fun RowScope.ElementControls(objects: ObjectToolState) {
  * string would show the angle the user last entered rather than the angle the ruler is at.
  */
 @Composable
-internal fun RowScope.RulerControls(state: InkUiState, actions: ObjectActions) {
+internal fun RulerControls(state: InkUiState, actions: ObjectActions) {
     var typed by remember(state.rulerAngleDegrees) {
         mutableStateOf(state.rulerAngleDegrees.roundToInt().toString())
     }
@@ -245,6 +263,16 @@ internal fun RowScope.RulerControls(state: InkUiState, actions: ObjectActions) {
         )
     }
 }
+
+/** The brush a Draw-row chip selects, or null for every chip that is not a brush. */
+internal val ChromeItem.brush: InkBrushKind?
+    get() = when (this) {
+        ChromeItem.BRUSH_FOUNTAIN -> InkBrushKind.FOUNTAIN
+        ChromeItem.BRUSH_BALLPOINT -> InkBrushKind.BALLPOINT
+        ChromeItem.BRUSH_PENCIL -> InkBrushKind.PENCIL
+        ChromeItem.BRUSH_HIGHLIGHTER -> InkBrushKind.HIGHLIGHTER
+        else -> null
+    }
 
 private val InkBrushKind.label: String
     get() = when (this) {

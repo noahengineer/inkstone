@@ -34,4 +34,9 @@ data class InkToolbarActions(
     // chip, `Grid`, is the *mode* toggle and needs no action of its own — see `ShapeGeometryChips`.
     val onRegulariseSelection: () -> Unit,
     val onArrowSelection: (Boolean) -> Unit,
+    // ⭐ SPEC §4.9.6 — hide what is underneath. One `SetFormat` per object, one gesture.
+    val onKnockoutSelection: (Boolean) -> Unit,
+    // ⭐ The selection, as an Element — handwriting included, which the Elements tool's box could
+    // not save before the surface could enumerate it. Opens the same name dialog the box does.
+    val onSaveSelectionAsElement: () -> Unit,
 )

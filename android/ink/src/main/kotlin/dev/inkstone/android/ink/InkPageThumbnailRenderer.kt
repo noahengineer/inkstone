@@ -102,7 +102,7 @@ public class InkPageThumbnailRenderer(
 
                 val painter = PagePainter()
                 painter.assets = assets
-                painter.paintBackground(canvas, paper, page.background, sourcePage)
+                painter.paintBackground(canvas, paper, page.background, sourcePage, pageToThumbnail)
                 // No culling: the whole page is "on screen" in a thumbnail by definition, and a
                 // cull rect would only add a compare per stroke.
                 painter.paintObjects(canvas, toStrokeStore(page), pageToThumbnail, visibleBounds = null, paper = paper)

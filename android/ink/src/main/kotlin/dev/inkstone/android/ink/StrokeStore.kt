@@ -156,19 +156,23 @@ internal class DryStroke(
      */
     override fun isErasedAway(region: ErasedRegion): Boolean = isFullyErased(stroke, bounds, region)
 
-    override fun eraseCoverageCost(region: ErasedRegion): Long {
-        val bounds = bounds
-        // The same cheap gates `isFullyErased` opens with: a stroke they reject costs four
-        // compares, and charging it the full estimate would spend the whole budget on strokes
-        // the test never actually measures.
-        if (region.isEmpty || bounds == null || !region.contains(bounds)) return 0L
-        // Input points plus outline vertices, and the outline runs to roughly two vertices per
-        // input. An upper-boundish estimate is all a budget needs.
-        return stroke.inputs.size.toLong() * COVERAGE_POINTS_PER_INPUT * region.capsules.size
+    /**
+     * The prune's paused scan of this stroke, or null until one is first asked for — so a stroke
+     * nobody has erased carries nothing. Keyed to the [Stroke] it was built for: [restyle] replaces
+     * the mesh, and a scan of the old outline says nothing about the new one.
+     */
+    private var coverage: StrokeCoverage? = null
+
+    private class StrokeCoverage(val stroke: Stroke) {
+        val points = StrokeCoveragePoints(stroke)
+        val scan = ResumableCoverage()
     }
 
-    private companion object {
-        const val COVERAGE_POINTS_PER_INPUT = 3L
+    override fun probeErasedAway(region: ErasedRegion, meter: CoverageMeter): PruneVerdict {
+        // The four-compare gate first: most partially erased strokes stop here and read nothing.
+        if (!region.mayCover(bounds)) return PruneVerdict.VISIBLE
+        val current = coverage?.takeIf { it.stroke === stroke } ?: StrokeCoverage(stroke).also { coverage = it }
+        return current.scan.probe(current.points, region, meter)
     }
 
     /**
@@ -272,17 +276,45 @@ internal class StrokeStore {
      * [applyRegister] opened with `byId[target] ?: return false`. Correct op, correct fold, one
      * consumer that could not act on it — the shape CLAUDE.md's definition-of-done #6 is about,
      * and the same one `DryShape`'s missing `setErased` had (M8 follow-up 3). It was intermittent
-     * because pruning is capped by [PRUNE_BUDGET], so whether a given stroke had actually left the
+     * because pruning was rationed by a budget, so whether a given stroke had actually left the
      * page depended on how much else had been erased.
      *
      * Retaining the object costs the memory the page was already carrying: pruning is a **render**
      * optimisation by its own KDoc, not a way to release a stroke, and nothing about it was ever
      * meant to be one-way.
      *
-     * Only strokes ever appear here — [DryObject.isErasedAway] answers true for nothing else — so
-     * this map holds no [DryShape] and [shapes] has nothing to say about it.
+     * ⚠️ **Every register reaches it, not only the erased region** — see [applyToPruned]. That was
+     * a small gap while a pass pruned two to six strokes; once the load pass started pruning *every*
+     * fully erased stroke (B: ~555 of them) a peer's move or recolour of one would otherwise have
+     * been dropped here and shown stale the moment an undo brought it back.
+     *
+     * Two doors in: [pruneFullyErased] on the UI thread, and [install] for what `PreparedPage.of`
+     * already decided off it. Only strokes ever appear here — [DryObject.isErasedAway] answers true
+     * for nothing else — so this map holds no [DryShape] and [shapes] has nothing to say about it.
      */
     private val prunedByErase = HashMap<ObjectId, DryObject>()
+
+    /**
+     * ⭐ Objects whose *"is it erased away?"* answer may have changed since it was last decided —
+     * the whole population a prune pass looks at. See [PruneQueue] for why it is a queue and not a
+     * walk of the page.
+     *
+     * Offered to wherever an object's coverage can change: an eraser sample that bit it
+     * ([applyErase]), an absolute `SetErasedRegion` or a restyle ([applyRegister]), an object
+     * arriving with a region already on it ([addObject]), and what the load pass could not finish
+     * ([install]).
+     * Removed wherever `byId` loses the object ([unindex]), so a deleted object is never probed.
+     */
+    private val pruneQueue = PruneQueue<DryObject>()
+
+    /** How many objects are waiting for a prune pass — for tests, which assert the pass stayed small. */
+    internal val pendingPruneCount: Int get() = pruneQueue.size
+
+    /** How many candidates the last prune pass looked at. */
+    internal val lastPruneProbes: Int get() = pruneQueue.lastProbes
+
+    /** Work units the last prune pass spent — see [CoverageMeter]. */
+    internal val lastPruneWork: Long get() = pruneQueue.lastWork
 
     /** Set when a z key changed or an object was inserted out of order. See [ink]. */
     private var orderDirty = false
@@ -396,6 +428,12 @@ internal class StrokeStore {
      * nothing else.
      */
     var recorder: PageOpRecorder? = null
+
+    /**
+     * True on the Element editor's canvas, where knockout areas and the bounds are drawn as guides on
+     * top of everything — and so are tapped as if they were on top (see [objectAt]).
+     */
+    var guidesShown: Boolean = false
 
     /** Which input model finished strokes were captured with, for the geometry blob. */
     var inputModel: InkInputModel = InkInputModel.SPRING
@@ -527,6 +565,10 @@ internal class StrokeStore {
      * writing over the highlight instead of under it.
      */
     private fun noteAppendedOnTop(dry: DryObject) {
+        // ⭐ A knockout is never an append. The tail is drawn straight onto the view's canvas, over
+        // the recording, and a `DST_OUT` there would punch through the paper as well as the ink —
+        // a hole to the window behind. Refusing re-records, which puts it inside the layer.
+        if (dry.knockout) return
         if (!dry.drawsOverInk && highlight.isNotEmpty()) return
         if (topZ != dry.z) return
         appends.addLast(Append(revision, dry))
@@ -585,6 +627,26 @@ internal class StrokeStore {
     private var erasedCountRevision = -1L
 
     /**
+     * ⭐ SPEC §4.9.6 — whether anything on the page hides what is underneath it.
+     *
+     * What [PagePainter] decides its layer on: a page with no knockout draws exactly as it always
+     * has, with no extra layer and no extra pass, and only a page that has one pays for either.
+     * Memoised on [revision] for [erasedCount]'s reason — it is read once per re-record, and a walk
+     * per read would be a walk per pan frame on the software path.
+     */
+    val hasKnockouts: Boolean
+        get() {
+            if (knockoutRevision != revision) {
+                knockoutValue = ink.any { it.knockout }
+                knockoutRevision = revision
+            }
+            return knockoutValue
+        }
+
+    private var knockoutValue = false
+    private var knockoutRevision = -1L
+
+    /**
      * Whether the page holds any highlighter object.
      *
      * ⚠️ Worth surfacing because **one highlighter silently disables the append fast path** for
@@ -632,6 +694,9 @@ internal class StrokeStore {
     private fun unindex(dry: DryObject) {
         byId.remove(dry.id)
         if (dry is DryShape) shapes -= dry
+        // Beside `byId` for the same reason as [shapes]: a queued object that has left the page
+        // would be probed — and, found erased away, parked in [prunedByErase] — after its delete.
+        pruneQueue.remove(dry)
     }
 
     /**
@@ -658,15 +723,16 @@ internal class StrokeStore {
      * Write [region] onto a stroke [pruneFullyErased] took off the page, and put it back if the
      * region no longer covers it.
      *
-     * The inverse of the drop in [pruneIfAffordable], and the render half of undoing an erase.
+     * The inverse of the drop in [pruneFullyErased], and the render half of undoing an erase.
      * A region that still covers the stroke leaves it pruned and reports **no change**, because
      * nothing on screen moved — bumping the revision there would repaint the page for a stroke
      * that is invisible either way.
      *
-     * ⚠️ [DryObject.isErasedAway] is the same points × capsules test [PRUNE_BUDGET] exists to
-     * ration, and it is unrationed here on purpose: this runs once per op in an undo, not once
-     * per eraser sample, and the alternative — restoring optimistically and re-pruning later —
-     * leaves a fully erased stroke back in the render list until the next erase gesture ends.
+     * ⚠️ [DryObject.isErasedAway] is the same coverage test [PruneBudgets.PEN_UP] rations, and it
+     * is unrationed here on purpose: this runs once per op in an undo, not once per eraser sample,
+     * and a stroke the region no longer covers usually fails on its first few points. The
+     * alternative — restoring optimistically and re-pruning later — would put an invisible stroke
+     * back in the render list for at least a frame.
      */
     private fun unprune(dry: DryObject, region: ErasedRegion?): Boolean {
         dry.setErased(region)
@@ -730,16 +796,17 @@ internal class StrokeStore {
      */
     private fun applyRegister(op: PageOp, brushes: InkBrushFactory): Boolean {
         val target = op.target ?: return false
-        // ⭐ The one register that can name a stroke which is not on the page: an un-erase.
-        // See [prunedByErase] — the lookup below would answer null and the op would be dropped.
-        if (op is PageOp.SetErasedRegion) {
-            prunedByErase[target]?.let { return unprune(it, op.absolute.toRegion()) }
-        }
+        // ⭐ A stroke the prune took off the page is still in the fold, so every register can name
+        // it — see [prunedByErase]. The lookup below would answer null and the op would be dropped.
+        prunedByErase[target]?.let { return applyToPruned(it, op, brushes) }
         val dry = byId[target] ?: return false
         return when (op) {
             // Absolute: the whole region is replaced, never merged.
             is PageOp.SetErasedRegion -> {
                 dry.setErased(op.absolute.toRegion())
+                // A redo of a full erase, or a peer's, can cover a stroke that is on the page —
+                // and nothing else would ever look at it again until it was next erased.
+                pruneQueue.offer(dry)
                 true
             }
 
@@ -753,6 +820,8 @@ internal class StrokeStore {
 
             is PageOp.SetStyle -> {
                 dry.restyle(op.style, brushes)
+                // A thinner line can now sit wholly inside what was erased around it.
+                if (dry.erased != null) pruneQueue.offer(dry)
                 true
             }
 
@@ -775,6 +844,50 @@ internal class StrokeStore {
 
             else -> false
         }
+    }
+
+    /**
+     * A register aimed at a stroke [pruneFullyErased] took off the page — applied, so the stroke is
+     * right whenever it comes back.
+     *
+     * ⚠️ This handled `SetErasedRegion` alone, which dropped a peer's `SetTransform`, `SetStyle` or
+     * `SetZOrder` on a pruned stroke without a trace: correct in the log and the fold, and wrong on
+     * screen the moment an undo of the erase brought it back — in the old place, the old colour.
+     * Harmless-looking while a pass pruned a handful; not once the load pass prunes all of them.
+     *
+     * Nothing here is drawn, so only the two branches that can put the stroke back report a change:
+     * the un-erase, and a restyle — which re-tessellates, so a stroke that a thicker line now pokes
+     * out of must be re-decided rather than assumed still covered. The z register raises [topZ]
+     * exactly as it does for a visible object; a pruned stroke's key is still a key on this page.
+     */
+    private fun applyToPruned(dry: DryObject, op: PageOp, brushes: InkBrushFactory): Boolean = when (op) {
+        is PageOp.SetErasedRegion -> unprune(dry, op.absolute.toRegion())
+
+        is PageOp.SetStyle -> {
+            dry.restyle(op.style, brushes)
+            unprune(dry, dry.erased)
+        }
+
+        is PageOp.SetTransform -> {
+            dry.setTransform(op.absolute)
+            false
+        }
+
+        is PageOp.SetZOrder -> {
+            dry.setZ(op.z)
+            raiseTop(op.z)
+            false
+        }
+
+        // ⭐ A stroke carries the format register since knockout (SPEC §4.9.6). Kept, not drawn —
+        // a pruned stroke is invisible either way — so an un-erase brings it back with its flag.
+        is PageOp.SetFormat -> {
+            dry.setFormat(op.record)
+            false
+        }
+
+        // A stroke carries no content register — [applyContent] answers false for one.
+        else -> false
     }
 
     /**
@@ -806,28 +919,26 @@ internal class StrokeStore {
         }
     }
 
-    /** `SetFormat` — SPEC §4.9.2's presentation record. */
-    private fun applyFormat(dry: DryObject, record: String): Boolean = when (dry) {
-        is DryStroke -> false
-
-        // Nothing: a format record is a text box's font and an image's crop, and a shape has
-        // neither — its own record is `SetTextContent` (SPEC §4.8.2). Carried in the log by the
-        // fold either way, so a build that gives a shape a format later loses nothing.
-        is DryShape -> false
-
-        // ⭐ M8c — the font, size, alignment and list for a text box; the crop for an image.
-        is DryBox -> {
-            dry.setFormat(record)
-            true
-        }
-    }
+    /**
+     * `SetFormat` — SPEC §4.9.2's presentation record, for **every** kind.
+     *
+     * ⭐ It answered false for a stroke and a shape until knockout (SPEC §4.9.6), because the record
+     * held only a font and a crop. The fold kept the value either way, so nothing written before was
+     * lost — but a knockout flag on a hand-drawn loop would have been in the file and ignored here.
+     */
+    private fun applyFormat(dry: DryObject, record: String): Boolean = dry.setFormat(record)
 
     private fun addObject(op: PageOp.AddObject, brushes: InkBrushFactory): Boolean {
         val obj = op.obj
         // A re-add of something already on screen is an undo of a delete that never took effect
-        // here — nothing to do, and inserting twice would double-draw it.
-        if (obj.id in byId) return false
-        insert(dryObjectFor(obj, brushes) ?: return false)
+        // here — nothing to do, and inserting twice would double-draw it. ⚠️ A *pruned* stroke is
+        // "already here" too: building a second copy would draw it while [prunedByErase] kept the
+        // first, and the next un-erase would insert that one beside it.
+        if (obj.id in byId || obj.id in prunedByErase) return false
+        val dry = dryObjectFor(obj, brushes) ?: return false
+        insert(dry)
+        // An undo's re-add of a fully erased stroke arrives erased away, exactly as a load does.
+        if (dry.erased != null) pruneQueue.offer(dry)
         return true
     }
 
@@ -867,10 +978,24 @@ internal class StrokeStore {
      * The registers come after **all** the adds rather than interleaved with them, which is what
      * `InkPageThumbnailRenderer.toStrokeStore` already does and for the same reason: a record may
      * name an object that sorts after it, and applying it before that object exists drops it.
+     *
+     * ⭐ **The page's fully erased strokes arrive already decided** ([PreparedPage.erasedAway]) and
+     * go straight into [prunedByErase] — never into the render lists, never onto the UI thread's
+     * budget. This used to be a [pruneFullyErased] call after the install, on the UI thread, which
+     * on B pruned a handful of 555 and left the rest drawing nothing through a `saveLayer` each for
+     * as long as the note was open. Each one still raises [topZ], as it did when it was inserted and
+     * then pruned: its key is on the page, and the next stroke must land above it.
      */
     fun install(prepared: PreparedPage, brushes: InkBrushFactory) {
         reset()
         for (dry in prepared.objects) insert(dry)
+        for (dry in prepared.erasedAway) {
+            prunedByErase[dry.id] = dry
+            raiseTop(dry.z)
+        }
+        // What the load budget could not reach, with the progress it made — the first prune pass on
+        // this thread carries on from there.
+        for (dry in prepared.undecided) pruneQueue.offer(dry)
         if (prepared.registers.isNotEmpty()) applyOps(prepared.registers, brushes, record = false)
         revision++
     }
@@ -885,6 +1010,7 @@ internal class StrokeStore {
         // Beside `byId.clear()` for the reason [unindex] gives: the two are one index in two maps,
         // and a page's shapes outliving the page would re-route against the next one's objects.
         shapes.clear()
+        pruneQueue.clear()
         removedThisGesture.clear()
         erasedThisGesture.clear()
         inGesture = false
@@ -918,8 +1044,14 @@ internal class StrokeStore {
         ink.clear()
         highlight.clear()
         byId.clear()
-        prunedByErase.clear()
+        // ⚠️ [prunedByErase] is deliberately **kept**. Only what is in `byId` gets a `DeleteObject`
+        // above, so an erased-away stroke is not deleted by a clear — it is still in the fold,
+        // erased — and an undo that walks back past the clear to the erase will write its
+        // `SetErasedRegion` here. Dropping the map made that un-erase land on nothing, which is
+        // [prunedByErase]'s own bug again; it mattered little while a prune pass took a handful of
+        // strokes and matters now that a page load parks every fully erased one.
         shapes.clear()
+        pruneQueue.clear()
         routesDirty = true
         endEdit()
         revision++
@@ -1119,6 +1251,51 @@ internal class StrokeStore {
      * visible stroke covers more pixels.
      */
     fun forEachInRenderOrder(visibleBounds: Box?, action: (DryObject) -> Unit) {
+        prepareRenderOrder()
+        emit(ink, visibleBounds, action)
+        emit(highlight, visibleBounds, action)
+    }
+
+    /**
+     * ⭐ SPEC §4.9.6 — the ink band alone, for a page [PagePainter] draws with knockouts.
+     *
+     * The two bands are walked separately there because a knockout has to cut a highlighter
+     * *beneath* it too, and the highlight band is drawn after every piece of ink by design (SPEC
+     * §3.4). See [forEachHighlightAmongKnockouts].
+     */
+    fun forEachInInkBand(visibleBounds: Box?, action: (DryObject) -> Unit) {
+        prepareRenderOrder()
+        emit(ink, visibleBounds, action)
+    }
+
+    /**
+     * ⭐ The highlight band, interleaved in `(z, id)` order with the ink band's knockouts.
+     *
+     * Drawn into its own layer, [onKnockout] cuts every highlighter painted so far — exactly those
+     * below it — and none painted after, so a highlight over a knockout still tints it and one under
+     * it is hidden with the rest. Allocation-free: two indices over the two sorted lists.
+     */
+    fun forEachHighlightAmongKnockouts(
+        visibleBounds: Box?,
+        onHighlighter: (DryObject) -> Unit,
+        onKnockout: (DryObject) -> Unit,
+    ) {
+        prepareRenderOrder()
+        var next = 0
+        for (index in highlight.indices) {
+            val highlighter = highlight[index]
+            while (next < ink.size && RENDER_ORDER.compare(ink[next], highlighter) < 0) {
+                val below = ink[next++]
+                if (below.knockout && visible(below, visibleBounds)) onKnockout(below)
+            }
+            if (visible(highlighter, visibleBounds)) onHighlighter(highlighter)
+        }
+    }
+
+    private fun visible(dry: DryObject, visibleBounds: Box?): Boolean =
+        visibleBounds == null || overlaps(dry.pageBounds, visibleBounds)
+
+    private fun prepareRenderOrder() {
         // ⭐ Before the cull, because a re-route changes `pageBounds` — routing after culling would
         // drop a connector whose old box was off screen and whose new one is not, which reads as a
         // connector that disappears when you drag the shape it is attached to.
@@ -1131,8 +1308,6 @@ internal class StrokeStore {
             highlight.sortWith(RENDER_ORDER)
             orderDirty = false
         }
-        emit(ink, visibleBounds, action)
-        emit(highlight, visibleBounds, action)
     }
 
     /**
@@ -1259,6 +1434,9 @@ internal class StrokeStore {
         // Cheap float compares first, in page space. Only strokes whose bounds the eraser actually
         // swept get a native coverage test, which keeps erasing usable with 5,000 strokes.
         if (!overlaps(dry.pageBounds, coarse)) return null
+        // The Element editor's bounds are chrome, not ink — "nothing the user cannot see may be
+        // erased" is about the picture, and the frame is not part of it (SPEC §4.9.7).
+        if (dry.elementFrame) return null
 
         if (dry.transform == Matrix3.Identity) {
             return if (dry.hitBy(sweep.pageTip, sweep.pageCapsule)) sweep.pageCapsule else null
@@ -1308,105 +1486,67 @@ internal class StrokeStore {
                 dry.eraseCapsule(capsule)
                 // One entry per stroke per gesture; the op carries the whole region at the end.
                 if (erasedThisGesture.none { it === dry }) erasedThisGesture += dry
+                // ⭐ And a prune candidate — the pen-up pass looks at nothing else. Outside the
+                // per-gesture check on purpose: queue membership outlives a gesture (an undecided
+                // candidate waits for the next pass), so "already in this gesture's list" is not
+                // "already queued". An identity-hash lookup per hit; allocation only on the first.
+                pruneQueue.offer(dry)
             }
         }
         return touched
     }
 
     /**
-     * Drop strokes that have been erased away completely.
+     * Drop strokes that have been erased away completely — **as many as a bounded pass can reach,
+     * resuming where the last pass stopped, and looking only at what changed.**
      *
-     * Runs when an erase gesture ends, never per sample (CLAUDE.md rule 7). Until it runs, a
+     * Runs when an erase gesture ends, never per sample (CLAUDE.md rule 7), and after an
+     * `applyOps` that changed an erased region (`InkSurfaceView.applyOps`). Until it runs, a
      * fully erased stroke is simply invisible, which the user cannot tell apart from gone.
      *
      * **This emits no ops.** A fully erased stroke is not deleted — its `SetErasedRegion`
      * already describes it, and dropping it here is a render optimisation. Emitting a delete
      * would make un-erasing it impossible, and would be the one place in this file that
-     * destroyed something.
+     * destroyed something. The stroke goes to [prunedByErase], where every register can still
+     * reach it.
      *
-     * **Bounded work.** [isFullyErased] costs roughly `points × capsules` for a stroke that
-     * really is covered, and a determined scribble-erase produces thousands of capsules. The
-     * budget below means the pathological case degrades into *not pruning yet* rather than into
-     * a frozen UI. An earlier version had no such bound and used `Path.op`, and it hung and
-     * killed the app on exactly this input.
+     * ## ⛔ What it was, and what that cost
+     *
+     * It walked the page from the front, charged each candidate an *estimate* of
+     * `inputs × 3 × capsules`, and stopped at 200,000. Measured on a real note (B: 653 erased
+     * strokes, ~114,000 capsules) the estimate was **48.8M against 0.70–0.87M** real distance
+     * tests, so one pass pruned two to six strokes; and every pass restarted at the front,
+     * re-charging the same candidates and re-forcing the same over-budget one, so a simulated B
+     * stopped progressing after 19 pen-ups with 145 of 561 pruned. The ~555 left over were
+     * invisible and still cost a `saveLayer` + `DST_OUT` pair on every full re-record — every
+     * erase frame, drag frame, zoom settle and undo. It is the earlier report (*"when there are a
+     * lot of erases when you zoom in and out it seem to lag"*) surviving its first fix, because
+     * that fix made progress *possible* and left it two orders of magnitude too slow.
+     *
+     * ## What it is
+     *
+     * [pruneQueue] holds only objects whose coverage can have changed, oldest first; this spends
+     * [PruneBudgets.PEN_UP] **real** work units on them ([CoverageMeter]); a candidate the meter
+     * stops keeps its progress and stays at the head ([ResumableCoverage]). So a pass is a hard
+     * bound — to within one point's scan — and a page still converges, at no less than a whole
+     * budget of real work per pass. The page-load half does not happen here at all: see
+     * [install] and `PreparedPage.of`.
+     *
+     * An earlier version had no bound at all and used `Path.op`, and it hung and killed the app on
+     * a scribble-erase — which is why there is a budget, and why it must be counted honestly.
      */
     fun pruneFullyErased() {
-        var budget = PRUNE_BUDGET
-        // ⛔ **At least one candidate per pass runs whatever it costs, and without this the
-        // degradation was not "not pruning yet" but "never pruning".**
-        //
-        // [pruneIfAffordable] skips a stroke whose estimate exceeds what is left. The estimate is
-        // `inputs × 3 × capsules`, the region only ever grows (it is append-only, and
-        // `SetErasedRegion` is absolute), and `inputs` is fixed — so a stroke that once exceeded
-        // [PRUNE_BUDGET] exceeds it on **every future pass, forever**. The threshold is
-        // `inputs × 3 × capsules > 200_000`: a 200-sample stroke needs only ~333 capsules, and one
-        // second of scribbled erasing at 240 Hz is ~240. In other words essentially every stroke a
-        // user really scribbles over becomes permanently unprunable.
-        //
-        // What that costs is not the prune — it is the *drawing*. A fully erased stroke is
-        // invisible and still costs `PagePainter` a `saveLayer` + `DST_OUT` sandwich in every
-        // record of the page, and `DryStrokesView` re-records the whole page 120 ms after any
-        // scale change. So the bill is paid on every pinch, in proportion to how much the user has
-        // erased — which is exactly the report: *"when there are a lot of erases when you zoom in
-        // and out it seem to lag"*.
-        //
-        // Letting the first candidate through guarantees forward progress: each pass retires at
-        // least one over-budget stroke (or settles that it is not erased away), and a prune runs
-        // per erase gesture, so a page cleans itself up over the next few gestures instead of
-        // never. The work is still bounded — one stroke's coverage test, now with
-        // [ErasedRegion.coveringCapsule]'s rolling hint under it — which is what the budget was
-        // really protecting against.
-        var forceAllowed = true
-        for (list in listOf(ink, highlight)) {
-            val iterator = list.iterator()
-            while (iterator.hasNext() && budget > 0) {
-                val dry = iterator.next()
-                val cost = coverageCostToSpend(dry, budget, forceAllowed)
-                if (cost <= 0L) continue
-                // Over budget and taken anyway: that was this pass's one forced candidate.
-                if (cost > budget) forceAllowed = false
-                budget -= pruneCandidate(iterator, dry, cost)
-            }
+        val erasedAway = pruneQueue.drain(PruneBudgets.PEN_UP) { dry, meter ->
+            val region = dry.erased
+            if (region == null) PruneVerdict.VISIBLE else dry.probeErasedAway(region, meter)
         }
-    }
-
-    /**
-     * What examining [dry] would cost, or `0` for *"skip it"*.
-     *
-     * Zero covers three different noes, and none of them is worth telling apart here: the object
-     * has no erased region at all; [DryObject.eraseCoverageCost]'s own cheap gates rejected it in
-     * four compares (empty region, no bounds, or the stroke reaches outside the region's box, all
-     * of which mean it cannot be fully erased); or it is over budget and this pass has already
-     * spent its one forced candidate.
-     */
-    private fun coverageCostToSpend(dry: DryObject, budget: Long, forceAllowed: Boolean): Long {
-        val region = dry.erased ?: return 0L
-        val cost = dry.eraseCoverageCost(region)
-        if (cost == 0L) return 0L
-        return if (cost > budget && !forceAllowed) 0L else cost
-    }
-
-    /**
-     * Coverage-test [dry], drop it when it is fully erased, and return the [cost] that was spent.
-     *
-     * ⚠️ **The affordability decision is the caller's**, and it moved there when "too expensive"
-     * turned out to mean "forever" — see [pruneFullyErased]. This runs the test unconditionally;
-     * it does not get to refuse.
-     *
-     * [cost] is charged in the unit the work actually happens in — point × capsule distance tests,
-     * estimated by the object itself ([DryObject.eraseCoverageCost]). The budget used to charge
-     * `capsules.size` while `isErasedAway` ran points × capsules, an under-count of the whole
-     * point factor: one pen-up after scribbling over a dense, heavily-erased area ran ~100× the
-     * bound and froze the UI at exactly the moment the budget exists to protect.
-     *
-     * ⭐ M8c: the kind check is [DryObject.isErasedAway]'s default rather than a cast here. Only
-     * a stroke answers true; the others refuse for the reason [DryTextBox] gives, which is that
-     * dropping one costs the user their object until the page reloads.
-     */
-    private fun pruneCandidate(iterator: MutableIterator<DryObject>, dry: DryObject, cost: Long): Long {
-        val region = dry.erased ?: return 0L
-        if (dry.isErasedAway(region)) {
-            iterator.remove()
+        if (erasedAway.isEmpty()) return
+        // One pass over each band rather than a `remove` per stroke: `ArrayList.remove` is a scan
+        // plus an arraycopy, and a pass can retire hundreds. Identity semantics — see [PruneQueue].
+        val gone = erasedAway.toHashSet()
+        ink.removeAll(gone)
+        highlight.removeAll(gone)
+        for (dry in erasedAway) {
             // [unindex], not [tombstone]: this emits no ops and deletes nothing (see the KDoc
             // above), so claiming a tombstone would make a connector aimed at this object report
             // its target as *deleted* when the log still holds it whole.
@@ -1414,20 +1554,11 @@ internal class StrokeStore {
             // ⭐ And kept, because the log still holds it whole — so an undo of this erase has
             // something to put back. See [prunedByErase].
             prunedByErase[dry.id] = dry
-            revision++
         }
-        return cost
+        revision++
     }
 
     private companion object {
-        /**
-         * Point-against-capsule distance tests allowed per prune pass — the unit
-         * [DryObject.eraseCoverageCost] estimates in. Sized so the worst case stays comfortably
-         * inside one frame rather than by measurement — the number to trust is whatever the
-         * device says, not this one.
-         */
-        const val PRUNE_BUDGET = 200_000L
-
         /**
          * How many appended objects [appendsSince] will answer for before demanding a re-record.
          *
@@ -1444,10 +1575,16 @@ internal class StrokeStore {
          * would be obvious rather than plausible.
          */
         const val UNBOUND_ID_PREFIX = "unbound-"
-
-        val RENDER_ORDER = compareBy<DryObject>({ it.z.value }, { it.id.value })
     }
 }
+
+/**
+ * `(z, id)` — the order both bands are drawn in, and the comparator `PageFolder.build` sorts by.
+ *
+ * Top-level rather than in the store's companion since knockout (SPEC §4.9.6): the PDF outliner has
+ * to ask *"is this knockout above that stroke"* with exactly the rule the screen draws by.
+ */
+internal val RENDER_ORDER: Comparator<DryObject> = compareBy({ it.z.value }, { it.id.value })
 
 /**
  * SPEC §3.5, revised twice in M1 after device testing.

@@ -40,6 +40,7 @@ dependencies {
     implementation(project(":core:database"))
     implementation(project(":core:sync"))
     implementation(project(":core:search"))
+    implementation(project(":core:calc"))
     implementation(project(":android:ink"))
     implementation(project(":android:pdf"))
     implementation(project(":android:ocr"))
@@ -55,6 +56,8 @@ dependencies {
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
+    // `LifecycleStartEffect`, for re-seeding the toolbar when an editor comes back to the front.
+    implementation(libs.androidx.lifecycle.runtime.compose)
 
     implementation(libs.androidx.work.runtime.ktx)
     // SPEC §7.1 — the login flow opens in a Custom Tab.

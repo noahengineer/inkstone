@@ -127,6 +127,28 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
             invalidate()
         }
 
+    /** ⭐ The Element editor's grid in place of paper, or null for a note. See [PagePainter.backdrop]. */
+    var backdrop: ElementBackdrop?
+        get() = painter.backdrop
+        set(value) {
+            if (painter.backdrop == value) return
+            painter.backdrop = value
+            store.guidesShown = value != null
+            invalidate()
+        }
+    private var recordedBackdrop: ElementBackdrop? = null
+
+    /** The Element editor's grid cell — see `InkSurfaceView.elementGridPt`. */
+    var backdropCellPt: Float
+        get() = painter.backdropCellPt
+        set(value) {
+            if (painter.backdropCellPt == value) return
+            painter.backdropCellPt = value
+            // Not part of [recordedBackdrop]'s check, so drop the recording outright.
+            recordedBackdrop = null
+            invalidate()
+        }
+
     /**
      * The rasterised source page, when this page came from an imported PDF
      * (SPEC §6.2). Null until `:android:pdf` has rendered it, and null forever for
@@ -276,6 +298,7 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
         recordedAssetsEpoch == assetsEpoch &&
         recordedPageCanvas == pageCanvas &&
         recordedBackground == pageBackground &&
+        recordedBackdrop == painter.backdrop &&
         recordedSourcePage === sourcePage &&
         viewportInsideRecordedRegion()
 
@@ -455,6 +478,7 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
         recordedAssetsEpoch = assetsEpoch
         recordedPageCanvas = pageCanvas
         recordedBackground = pageBackground
+        recordedBackdrop = painter.backdrop
         recordedSourcePage = sourcePage
     }
 
@@ -485,8 +509,9 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
 
     /** Paper, template, source page, ink and the page edge — the whole cacheable picture. */
     private fun paintPage(canvas: Canvas, pageToView: android.graphics.Matrix, cull: ImmutableBox) {
-        painter.paintBackground(canvas, pageCanvas, pageBackground, sourcePage)
+        painter.paintBackground(canvas, pageCanvas, pageBackground, sourcePage, pageToView)
         painter.paintObjects(canvas, store, pageToView, cull, pageCanvas)
+        painter.paintGuides(canvas, store)
         painter.paintBorder(canvas, pageCanvas)
     }
 

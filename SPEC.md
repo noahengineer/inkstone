@@ -113,6 +113,7 @@ No real-time collaboration. No AI. No infinite canvas. Audio recording — desig
 :core:database    KMP  · SQLDelight schema + queries.
 :core:sync        KMP  · Nextcloud client (Ktor), outbox, reconciler, merge engine. NO OkHttp, NO dav4jvm.
 :core:search      KMP  · Tokenizer + FTS index over recognised text.
+:core:calc        KMP  · fx-991ZA PLUS II calculator engine: physical keys in, 96×31 LCD frame out. Zero deps.
 
 :android:ink      AND  · androidx.ink, MotionEvent handling, renderer, stroke blob encode/decode.
 :android:pdf      AND  · PDF import, render, materialize (annotations + text layer + embedded bundle).
@@ -528,6 +529,18 @@ Not a CRDT in the fancy sense. **Total-order state-machine replication:** sort t
 **The rule the agent will get wrong:** you cannot append an out-of-order op to already-applied state. When an incoming op has a clock lower than ops you've already applied, you must **re-fold the page from the last snapshot**. Never patch in place.
 
 **Page ordering** uses fractional keys (`sortKey`), resolved by `(sortKey, pageId)`. This means two devices adding a page offline both keep their page — a plain LWW list would silently drop one device's page while orphaning its file. **Any page not present in a merged order is appended at the end, never dropped.**
+
+*Key length (corrected 2026-10).* Object z-order uses the same keys, and **"above everything" is the
+commonest key the app makes** — every stroke drawn takes one. `FractionalKey.between(top, null)`
+used to bisect towards the end of the alphabet, which halves the room above each new key: it grew a
+character every ~6 strokes, linear in the strokes ever drawn on a page and quadratic in the bytes the
+log holds. The physics "Electrical energy" note reached **852-character keys** at 5,159 objects —
+2.2 MB of a 14.8 MB page log. It now **steps** the first digit that is not `z` (`V`→`W`, `zzk`→`zzl`,
+and only an all-`z` key grows: `zz`→`zz1`), a character per ~61 strokes. Inserting *between* two keys
+still bisects. Nothing about ordering changed — a key is a digit string compared as a string — so this
+is invisible to every older build; and a key above an all-`z` key cannot be shorter than it, so a page
+whose keys are already long stays at that length rather than shrinking (shortening them would mean a
+`SetZOrder` per object, which nothing does).
 
 *Made structural in M6.* Three things this section describes as rules are now properties of
 the types, because each was a rule a caller could silently break:
@@ -1162,6 +1175,20 @@ frame's grips instead of its points. The refusal is at **binding** time only: a 
 attached to a line in an existing note still routes as before, because changing what the fold
 resolves would change how every synced copy of that note draws.
 
+**A drawn line binds both ends or neither**, and only when they land on two different shapes
+neither of which contains the other end. The rule was *"bind whichever end lands on a shape"*, and
+it produced the report above a second time with a box underneath instead of a line: *"if you start
+drawing your line on top of a different stroke it does not form a proper line and instead forms
+some weird image thing."* A line started inside a rectangle — or on handwriting sitting inside
+one — was re-routed to begin on the rectangle's edge, and as a connector offered a zero-height
+frame whose eight grips stacked into three piles. A radius from a circle's centre, a divider across
+a box and an arrow out of a labelled box all *start on* a shape without asking to be attached to
+it; joining two shapes is the one gesture that says so. The nesting refusal covers a line inside a
+frame ending on a box drawn within it: an `Auto` anchor on the frame is the boundary point facing
+the box, i.e. on the frame's far side, so the route would cross the box it was meant to reach.
+Like the kind refusal, this is decided when a binding is **made**: a connector already attached at
+one end still routes as before, and an end still comes unbound when its shape is deleted (§4.8.4).
+
 ### 4.9 Text boxes, images, and the format register ⭐
 
 *Added in M8c. ROADMAP M8c's scope list asks for text boxes with "font, size, colour, alignment,
@@ -1304,6 +1331,16 @@ Element twice would otherwise give **one** object carrying the first stamp's pay
 stamp's transform, and the first stamp visibly vanishes — §5.6's duplicate-`ObjectId` corruption
 arriving from the other direction.
 
+**An Element holds every kind, handwriting included** (Elements follow-up, 2026-10). The library the
+app used until then was M8c's `:app` stand-in, which skipped strokes because `:app` cannot measure
+one (§5.4) and the lasso reported a count rather than ids. The app now uses `:core:storage`'s
+`ElementLibrary`, which copies a stroke's geometry blob verbatim; the platform supplies what core
+cannot know — **which** objects a capture encloses (`InkSurfaceView.objectsWithin`) and **the box
+they were drawn at** (`boundsOf`), which becomes the Element's origin. Existing stand-in Elements are
+migrated once, from `elements/index.json`, into `elements/<id>.element`; the index row is removed and
+its picture files are left where they were. An Element is placed **centred** on the point where it is
+dropped or tapped, and what lands is selected. `docs/M8-ELEMENTS-KNOCKOUT.md`.
+
 #### 4.9.5 Font: a subset-embedded CID font, decided here after M4 booked it and M7 deferred it
 
 **The decision: `PDType0Font`, `Identity-H`, subset-embedded, with a `/ToUnicode` CMap.** Not
@@ -1343,6 +1380,123 @@ fonts, which is a different feature from embedding one.
 been wrong about it once. A page content stream has none of its own; an inherited dictionary is
 copied down first and our entry merged into a **copy**, because source resource dictionaries are
 routinely shared between pages.
+
+#### 4.9.6 Knockout — an object that hides what is underneath it ⭐
+
+*"I create an icon and drag it on something, and since there is some transparency in that icon it
+non-destructively erases the stuff behind it."*
+
+**A flag in the format register:** `ObjectFormat.knockout`, key `ko=1`, absent when off. Any kind
+may carry it — the fold has kept a `SetFormat` side table for every object since M8c, so this needed
+no new op and no new payload field (§4.2's vocabulary stays frozen). An older build carries the key
+in `extras` and draws the object without the effect; a value other than `1` is kept verbatim and
+read as *off*. A highlighter never knocks out — that band is drawn over ink by design (§3.4).
+
+**What it hides: the object's filled silhouette** — its outline with every enclosed hole filled in.
+A ring hides what is inside the ring; the paper round an icon stays visible. It is computed by
+drawing the object into a picture (≤ 4 px/pt, ≤ 768 px) and flooding the outside from the border
+(`SilhouetteMask`): gaps narrower than 3 pt close, so a hand-drawn loop that does not quite meet
+still counts, and the result is eroded one pixel so its staircase edge sits under the object's own
+ink. A text box's silhouette is its **frame**, not its letters, because a letter-shaped hole shows
+the lines between the words.
+
+**What it hides from: everything beneath it in `(z, id)` order, except other knockouts.** A
+hand-drawn icon is a dozen flagged strokes, and the outline must not erase the eyes drawn before it;
+two separate icons overlapping therefore show through each other, which is the price of having no
+groups. Highlighters beneath a knockout are hidden too, although their band is drawn last. **Never
+the paper or an imported PDF page** — the objects are cut in a layer of their own, which a page with
+no knockout never pays for.
+
+**Non-destructive by construction.** Nothing beneath is written to; moving the object, or switching
+the flag off, brings everything back, and the undo of a toggle is the previous `SetFormat`.
+
+**Knockout areas** (`ObjectFormat.cutter`, key `cut=1`) are the invisible kind: a closed shape that
+hides what is beneath its outline and is **not drawn** — except, dashed, on the Element editor's
+canvas (§4.9.7) so it can be seen and moved. Its silhouette is its filled outline, exact, since there
+is no picture to measure. It publishes no ink of its own and still cuts what is beneath. Drawn with
+the editor's area tools, it goes to the **back** of the page, so it hides the note behind a placed
+copy and not the Element's own pieces.
+
+**Published PDF:** strokes and shapes beneath a knockout have its silhouette subtracted with the
+same `Path.op` an erasure uses (`InkStrokeOutliner`), so the file and the screen agree. ⚠️ **A text
+box or an image beneath a knockout is not cut in the PDF** — they are page content, not
+annotations, and that boundary has no subtraction. `docs/M8-ELEMENTS-KNOCKOUT.md` §5.
+
+#### 4.9.7 The Element editor, copies, and the pivot ⭐
+
+*"Double-click an element to open an editor where you can change it and add non-destructive erasing
+areas … and a pivot point, so it snaps to a grid when you move it."*
+
+**The editor is the note editor.** Double-tapping an Element in the panel opens `NoteActivity` with
+`EXTRA_ELEMENT_ID`: every tool is the ordinary one, pointed at a **scratch note** under
+`elements/editing/<session>/` through a `ScopedFileSystem`, and given no library, no publisher and no
+recogniser — so it cannot be indexed, published or synced, and it has **no note id**, so nothing it
+does — undo included — can reach the note it was opened from (checked on the emulator: six undos in
+the editor left the note's `undo.json` byte-identical). Paper is replaced by a grid
+(`ElementBackdrop`, dark by default, light for near-black ink) drawn at **the snap lattice's own
+spacing** (`SnapGrid.DEFAULT_SPACING_PT`, 18 pt), so what is drawn is what things snap to; the bar
+offers knockout areas, the pivot, *Fit*, Cancel and Done. The scratch page is 3000 pt square with the Element in the middle, framed on
+open, so a stroke can begin anywhere. Earlier sessions' scratch folders are **moved** to
+`elements/trash/editing/` when the next edit starts, never deleted and never while in use.
+
+**The guides are objects.** The Element's **bounds** are a rectangle on the scratch page whose format
+register carries `ef=1` (`ObjectFormat.elementFrame`) and the pivot (`pv=x:y`, an offset in points
+from the bounds' top-left — not a fraction, so resizing from the far corner leaves a pivot on its grid
+point). Knockout areas are cutters (§4.9.6). Being objects is the point: they are selected, moved,
+resized and grid-snapped by the gestures every object has, and every change is an op on **the
+editor's** undo stack, in order. `ElementEditing` (`:core:storage`, pure over a fold) makes every
+decision — which object is the bounds, what a save keeps, where an area goes, what the pivot and *Fit*
+write — and `NoteEditor.editShownPage` applies it as one undoable edit. On the editor's canvas only
+(`StrokeStore.guidesShown`):
+
+- guides are drawn **on top** of everything, dashed — areas in sky blue, the bounds and pivot in amber
+  (`PagePainter.paintGuides`); an area sits at the bottom of the Element, so drawn in place it was hidden
+  under any filled piece;
+- a tap prefers a guide's dashed line, then anything's ink, then the **inside of an area**, then the
+  inside of anything else (`objectAtWithGuides`) — an area under a piece could be seen and not selected;
+- the bounds are grabbed by their **edge** only, resize by the selection frame's grips rather than by
+  corner points, are never erased, never a knockout, and never saved or published.
+
+The area tool lands its box on the lattice (`SnapGrid.snappedBox`) and leaves the new area selected
+with the Select tool; the Pivot tool lands on an intersection; *Fit* makes the bounds the content's box
+widened outward to whole cells (`SnapGrid.enclosing`), keeping a placed pivot where it is, and brings
+back bounds that were deleted. An area's style has **zero width**: the grid lands a dragged selection
+by its bounds' corner, and a 1 pt stroke put every area half a point off the lattice.
+
+**Done revises the Element in place** — same `ElementId`, previous version moved to
+`elements/trash/<id>.v<n>.element` first (CLAUDE.md rule 1). What is saved is every piece but the
+bounds; the Element's box **is** the bounds (the content's measured box only for a canvas whose bounds
+were deleted), and its pivot is theirs. How far the origin moved in the edit is carried as
+`ElementRevision.originMoved`, so copies are not shifted by a change of bounds.
+
+**Copies.** Each drop tags its pieces with an `ElementInstance` in the format register (key `el`):
+the Element's id, an instance id per drop, the piece's transform *inside the Element*, and the pivot.
+A copy's placement is recovered from any piece as `transform × member⁻¹`, so a copy that was dragged,
+scaled or rotated is found where it is now; pieces are grouped by instance id **and** placement, so a
+duplicated copy is a second copy. Each Element keeps `elements/uses/<id>.uses`, the notes this device
+placed it in. On Done, if those notes hold copies, the user is asked once: **update them all** or keep
+them. Updating goes through `NoteSessionHost` — the live editor if the note is open, else the host's
+own session, then materialize and `noteSaved` — and replaces each copy with tombstones plus a fresh
+stamp at the old placement and stacking (`ElementLibrary.replaceCopies`), one undo entry per page.
+⚠️ Copies placed on another device, or carried into a duplicated note, are not in the list and are not
+updated from this one.
+
+**A copy is one thing.** Its tag also carries the Element's bounds (`el=…:px:py:w:h`, `-` for no
+pivot); a tap or lasso on any piece selects the whole copy (`withWholeCopies`), and its frame is its
+pieces and its bounds. Tags written before bounds were carried decode unchanged and have none.
+
+**The pivot** is a point in the Element's space (`Element.pivot`, stored relative to its origin); with
+none, a copy with bounds snaps by its **bounds' top-left corner**, and that is where the editor marks
+the default. With grid snap on, moving a copy lands the pivot on the lattice (`SnapGrid.moveBy(anchor,
+…)`), handwriting included, and the **grid leads**: alignment guides are not consulted for a selection
+with a pivot, nor on the editor's canvas, because there a snap is what was asked for. A drop lands
+the pivot on the lattice too, and a capture is saved with its bounds widened onto the note's lattice
+(`SnapGrid.enclosing`).
+
+**One grid.** The editor opens at the spacing of the note it was opened from (`EXTRA_GRID_PT`: 24 pt
+for ruled and Cornell, 18 pt otherwise). A paper's lattice starts at **the paper's own corner**
+(`SnapGrid.forBackground(background, paperLeft, paperTop)`), which is where its lines are drawn from
+and which is negative on a canvas that has grown up or left (§4.5).
 
 ---
 
@@ -1392,6 +1546,7 @@ overwrite each other.
 
 - **Autosave = append to `journal.ops`.** Cheap, bounded, crash-safe. This is what runs every 2 seconds.
 - **Materialization = rewrite `document.pdf`.** Runs on: document close, before upload, and on idle-while-charging. Never on the ink path.
+  *Refined 2026-10:* "document close" means the note's screen **finishing**, i.e. `onStop` with `isFinishing`. Every other stop only saves the journal: the Element editor opening on top, a switch to another app, the screen timing out. Until then the code materialized on every stop with unsaved work. That allocates a whole bundle (250–325 MB on the two biggest notes) at the one moment Android will destroy a stopped activity to get heap back, and it did. The note's screen was destroyed behind the Element editor, and coming back reloaded the note from scratch (`docs/NOTE-STAYS-LOADED.md`). The invariant below is unaffected, because a stop in the middle of a session does not end the session.
 - **Open = load the bundle, then replay `journal.ops` on top.** *Refined in M4:* the bundle stays a file of its own, `note.inkstone`, and `document.pdf` carries a **copy** of it. Opening reads the file, not the PDF. ~~"load the embedded bundle from `document.pdf`"~~ reads well and would cost a full PDF parse plus a stream decode on every open, which defeats §5.3's whole lazy-loading design — that depends on random access into the ZIP's central directory, and a bundle inflated out of a `/EmbeddedFile` has to be materialised whole first. The published copy is what *travels*; the local file is what is *read*. The marker's `bundleSha256` is what keeps the two honest: it always describes the copy inside the PDF, so a mismatch means something outside this app touched it (§5.6). The duplication is a few hundred KB of op metadata beside a 20 MB PDF — and it is the second copy §5.2 was careful about, `source.pdf`, that would have been the expensive one.
 - **Invariant: `document.pdf` is never more than one editing session stale.** State this in the code as an assertion.
 

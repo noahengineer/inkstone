@@ -1,6 +1,7 @@
 package dev.inkstone.app.library
 
 import android.graphics.BitmapFactory
+import android.util.Log
 import android.util.LruCache
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
@@ -11,7 +12,12 @@ import dev.inkstone.core.model.NoteSummary
 import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageThumbnailRenderer
 import dev.inkstone.core.storage.ThumbnailCache
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -112,19 +118,25 @@ class Thumbnails @Inject constructor(
      * @param fold supplies the note's first page — a suspending call because it opens the
      *   note. Only invoked on a miss, which is the whole point of the two tiers above it.
      */
-    suspend fun cover(note: NoteSummary, fold: suspend (DocumentId) -> FoldedPage?): ImageBitmap? {
+    suspend fun cover(note: NoteSummary, fold: suspend (DocumentId) -> FoldedPage?): ImageBitmap? = orPlaceholder {
         val key = note.id.value
-        memory.get(key)?.let { return it }
+        memory.get(key)?.let { return@orPlaceholder it }
 
         if (note.hasFreshThumbnail) {
-            cache.readCover(note.id)?.let { bytes -> return decode(bytes)?.also { memory.put(key, it) } }
+            cache.readCover(note.id)?.let { bytes -> return@orPlaceholder decode(bytes)?.also { memory.put(key, it) } }
         }
 
-        return renderPermits.withPermit {
+        renderPermits.withPermit {
             // Re-checked under the permit: while this call waited, the note it was queued
             // behind may have been the same note, and rendering it twice is pure waste.
             memory.get(key)?.let { return@withPermit it }
-            val page = fold(note.id) ?: return@withPermit null
+            // ⛔ **Off the main thread.** The caller is a tile's `LaunchedEffect`, which runs on the
+            // UI dispatcher, and the fold opens the note, CRCs the bundle, parses the whole page
+            // JSON and folds every op. For the chemistry revision note that is 7.4 MB of JSON and
+            // 5,133 ops, and an emulator walk logged *"Skipped 5409 frames"* — a 90-second freeze
+            // of the whole library — while two such covers were drawn. The permit above never
+            // protected the UI thread: it bounds how many folds run, not where.
+            val page = withContext(Dispatchers.Default) { fold(note.id) } ?: return@withPermit null
             val bytes = renderer.render(note.id, page, ThumbnailCache.COVER_WIDTH_PX) ?: return@withPermit null
             // [note] is an immutable snapshot taken before the permit and before the fold, so
             // `note.localRev` cannot be "the note's revision now" however this is edited later.
@@ -132,6 +144,28 @@ class Thumbnails @Inject constructor(
             storeCover(note.id, note.localRev, bytes)
             decode(bytes)?.also { memory.put(key, it) }
         }
+    }
+
+    /**
+     * ⛔ **A thumbnail that cannot be drawn is a placeholder, never a crash.**
+     *
+     * Every caller is a composition effect, and an exception escaping a `LaunchedEffect` is fatal
+     * to the process — Compose rethrows it. So a note whose bundle is being rewritten, damaged, or
+     * deleted between the index read and the fold used to take the whole app down from a tile
+     * nobody was looking at: the 2026-09-24 crash, *"Bundle entry … has no local header"*, came out
+     * of exactly this path while the user was writing in the editor on top of it. Nothing is
+     * recorded on failure, so the next composition simply tries again.
+     *
+     * Cancellation is rethrown: a tile scrolled away must stop, not report an empty picture.
+     */
+    @Suppress("TooGenericExceptionCaught") // The point: any failure to draw a tile is a placeholder.
+    private inline fun orPlaceholder(block: () -> ImageBitmap?): ImageBitmap? = try {
+        block()
+    } catch (cancelled: CancellationException) {
+        throw cancelled
+    } catch (failure: Exception) {
+        Log.w(TAG, "thumbnail not drawn", failure)
+        null
     }
 
     /**
@@ -145,28 +179,32 @@ class Thumbnails @Inject constructor(
      *   a cached page with no revision beside it is exactly the stale picture [pageRevisions]
      *   exists to prevent, and a render whose revision is unknown must not make one look fresh.
      */
-    suspend fun page(id: DocumentId, pageId: PageId, revision: Long?, fold: suspend () -> FoldedPage?): ImageBitmap? {
-        val key = pageKey(id, pageId)
-        if (isPageFresh(key, revision)) {
-            memory.get(key)?.let { return it }
-            cache.readPage(id, pageId)?.let { bytes -> return decode(bytes)?.also { memory.put(key, it) } }
-        }
-
-        return renderPermits.withPermit {
-            if (isPageFresh(key, revision)) memory.get(key)?.let { return@withPermit it }
-            val page = fold() ?: return@withPermit null
-            val bytes = renderer.render(id, page, ThumbnailCache.PAGE_WIDTH_PX) ?: return@withPermit null
-            cache.writePage(id, pageId, bytes)
-            // Recorded next to the write, and *removed* when the revision is unknown — otherwise a
-            // later known-revision read would trust a file this call wrote blind.
-            if (revision != null) {
-                pageRevisions[key] = revision
-            } else {
-                pageRevisions.remove(key)
+    suspend fun page(id: DocumentId, pageId: PageId, revision: Long?, fold: suspend () -> FoldedPage?): ImageBitmap? =
+        orPlaceholder {
+            val key = pageKey(id, pageId)
+            if (isPageFresh(key, revision)) {
+                memory.get(key)?.let { return@orPlaceholder it }
+                cache.readPage(id, pageId)?.let { bytes ->
+                    return@orPlaceholder decode(bytes)?.also { memory.put(key, it) }
+                }
             }
-            decode(bytes)?.also { memory.put(key, it) }
+
+            renderPermits.withPermit {
+                if (isPageFresh(key, revision)) memory.get(key)?.let { return@withPermit it }
+                // Off the main thread for [cover]'s reason; the fold here is the open editor's session.
+                val page = withContext(Dispatchers.Default) { fold() } ?: return@withPermit null
+                val bytes = renderer.render(id, page, ThumbnailCache.PAGE_WIDTH_PX) ?: return@withPermit null
+                cache.writePage(id, pageId, bytes)
+                // Recorded next to the write, and *removed* when the revision is unknown — otherwise a
+                // later known-revision read would trust a file this call wrote blind.
+                if (revision != null) {
+                    pageRevisions[key] = revision
+                } else {
+                    pageRevisions.remove(key)
+                }
+                decode(bytes)?.also { memory.put(key, it) }
+            }
         }
-    }
 
     private fun isPageFresh(key: String, revision: Long?): Boolean = revision != null && pageRevisions[key] == revision
 
@@ -181,10 +219,10 @@ class Thumbnails @Inject constructor(
      *
      * @param load reads the stored bytes. Only called on a miss.
      */
-    suspend fun folderImage(assetPath: String, load: suspend () -> ByteArray?): ImageBitmap? {
+    suspend fun folderImage(assetPath: String, load: suspend () -> ByteArray?): ImageBitmap? = orPlaceholder {
         val key = "folder-image:$assetPath"
-        memory.get(key)?.let { return it }
-        return renderPermits.withPermit {
+        memory.get(key)?.let { return@orPlaceholder it }
+        renderPermits.withPermit {
             memory.get(key)?.let { return@withPermit it }
             val bytes = load() ?: return@withPermit null
             decodeDownsampled(bytes, ThumbnailCache.COVER_WIDTH_PX)?.also { memory.put(key, it) }
@@ -207,6 +245,40 @@ class Thumbnails @Inject constructor(
         val bytes = renderer.render(id, page, ThumbnailCache.COVER_WIDTH_PX) ?: return
         storeCover(id, localRev, bytes)
         decode(bytes)?.let { memory.put(id.value, it) }
+    }
+
+    /**
+     * [refreshCover], queued rather than awaited — for the editor's materialize.
+     *
+     * ⛔ **The editor used to wait for this render while holding its lock.** `NoteEditor`'s
+     * materialize calls `LibraryRepository.noteMaterialized` under `serial`, and a cover render
+     * re-tessellates every stroke on the page: seconds for the chemistry note's 2,097 objects, every
+     * ~30 s of writing on a synced note. For all of it the 2-second autosave could not run — it
+     * takes the same lock — so new ink sat in memory and in no journal, and undo and page turns
+     * queued and then landed together. The render needs nothing the lock protects: [page] is an
+     * immutable fold taken under it, and [storeCover] is written for a render that finishes after
+     * the note has moved on.
+     *
+     * **One queue, in order**, not a launch per call: two renders of one note racing would let the
+     * older one's WebP land after the newer one's revision was recorded — a fresh-looking picture of
+     * a page the user has since written on, which is the one outcome [storeCover]'s invariant exists
+     * to rule out.
+     */
+    fun refreshCoverLater(id: DocumentId, localRev: Long, page: FoldedPage) {
+        coverRefreshes.trySend(CoverRefresh(id, localRev, page))
+    }
+
+    private class CoverRefresh(val id: DocumentId, val localRev: Long, val page: FoldedPage)
+
+    private val coverRefreshes = Channel<CoverRefresh>(Channel.UNLIMITED).also { queue ->
+        CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            for (request in queue) {
+                orPlaceholder {
+                    refreshCover(request.id, request.localRev, request.page)
+                    null
+                }
+            }
+        }
     }
 
     /**
@@ -321,5 +393,7 @@ class Thumbnails @Inject constructor(
 
         /** See the class KDoc: a fling must not become hundreds of concurrent note opens. */
         const val MAX_CONCURRENT_RENDERS = 2
+
+        const val TAG = "Thumbnails"
     }
 }

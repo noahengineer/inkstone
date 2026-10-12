@@ -156,16 +156,26 @@ internal class ShapeSnapController(
      * - **Both ends on the same shape.** Two `Auto` anchors on one box both face its own centre,
      *   so the route has no direction to resolve from. It stays a plain line, which is what was
      *   drawn.
+     * - ⛔ **Only one end on a shape.** This used to bind that end, and it was the same report
+     *   twice: *"if you start drawing your line on top of a different stroke it does not form a
+     *   proper line and instead forms some weird image thing."* A line started inside a box — or on
+     *   handwriting that happens to sit inside one — became a connector: its start was re-routed
+     *   out to the box's edge, so the line no longer began where the pen did, and being a connector
+     *   it offered the frame's grips (a zero-height frame, eight handles stacked into three piles)
+     *   instead of its two points. A radius drawn from a circle's centre, a label arrow pointing
+     *   into a diagram, a divider across a box: every one of them is a line that *starts on* a
+     *   shape and is not a request to be attached to it. Joining two shapes is the one gesture that
+     *   says so unambiguously.
+     * - **An end inside the other end's shape.** A line from inside a frame to a box drawn within
+     *   that frame lands on two different shapes, and an `Auto` anchor on the frame is the boundary
+     *   point *facing the box* — out past the box on the frame's far edge, so the route would run
+     *   back across the box it was meant to reach. Nested shapes are not two shapes being joined.
      * - **Neither end on a shape.** Returns [ShapeRecord.None], and `ShapeEdit.create` then emits
      *   the `AddObject` alone — so an ordinary snapped line still writes **no record at all** and
      *   costs no string in the file.
      *
-     * ## An unbound end is left null rather than [ConnectorEnd.Free]
-     *
-     * Both resolve to the same page point today — the connector's own payload endpoint. They
-     * differ the moment the connector is *moved*: a null end follows the object's transform, which
-     * is what dragging a half-attached connector should do, while a `Free` end is an absolute page
-     * point that would stay behind. Null is also fewer bytes on a path that runs per snapped line.
+     * An end can still come *unbound* later — its shape deleted, or not yet arrived from a peer —
+     * and resolves to the connector's own payload endpoint (SPEC §4.8.4). Drawing never makes one.
      */
     private fun connectorRecordFor(candidate: SnapCandidate, kind: ShapeKind, slopPt: Float): ShapeRecord {
         if (kind != ShapeKind.LINE && kind != ShapeKind.ARROW) return ShapeRecord.None
@@ -173,14 +183,16 @@ internal class ShapeSnapController(
         // ⚠️ The **drawn** ends, not the grid-snapped ones. Where the pen went is what says
         // which boxes the user meant to join; a snap can move an end up to half a cell, and half a
         // cell of the wrong direction is a connector bound to the box next door.
-        val from = store.shapeAt(candidate.from.x, candidate.from.y, slopPt)
-        val to = store.shapeAt(candidate.to.x, candidate.to.y, slopPt)
-        if (from == null && to == null) return ShapeRecord.None
-        if (from != null && from == to) return ShapeRecord.None
-        return ShapeRecord(
-            endA = from?.let { ConnectorEnd.Attached(it) },
-            endB = to?.let { ConnectorEnd.Attached(it) },
-        )
+        val from = store.shapeAt(candidate.from.x, candidate.from.y, slopPt) ?: return ShapeRecord.None
+        val to = store.shapeAt(candidate.to.x, candidate.to.y, slopPt) ?: return ShapeRecord.None
+        val joinsTwoShapes = from != to &&
+            !store.shapeEncloses(from, candidate.to.x, candidate.to.y) &&
+            !store.shapeEncloses(to, candidate.from.x, candidate.from.y)
+        return if (joinsTwoShapes) {
+            ShapeRecord(endA = ConnectorEnd.Attached(from), endB = ConnectorEnd.Attached(to))
+        } else {
+            ShapeRecord.None
+        }
     }
 
     /**

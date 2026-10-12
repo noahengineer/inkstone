@@ -60,6 +60,8 @@ data class EditorPrefs(
     val shapeSnapEnabled: Boolean = true,
     val arrowHeads: Boolean = false,
     val gridSnapEnabled: Boolean = false,
+    /** Where the chrome sits, how big it is, and which chips it shows — see [ChromeLayout]. */
+    val layout: ChromeLayout = ChromeLayout(),
 ) {
 
     companion object {

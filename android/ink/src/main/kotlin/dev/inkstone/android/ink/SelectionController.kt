@@ -116,6 +116,38 @@ public interface InkSelection {
     public val shapeCounts: ShapeSelectionCounts
 
     /**
+     * ⭐ The selected objects' ids, in render order.
+     *
+     * Exposed for *"save this selection as an Element"*. It used to be a count and nothing else, and
+     * `ElementLibrary`'s KDoc named that as the reason handwriting could not be saved: `:app` can
+     * read an object out of the fold by id, but only `:android:ink` can measure a stroke, so without
+     * the ids the lasso could not say *which* ink it had just enclosed.
+     */
+    public val ids: List<ObjectId>
+
+    /**
+     * ⭐ SPEC §4.9.7 — the pivot of the Element copy in the selection, in page space, or null when
+     * nothing selected came from an Element with one. With the grid on, a move lands this point on
+     * an intersection; `:app` draws it and offers the grid toggle when it is not null.
+     */
+    public val pivot: PagePoint?
+
+    /**
+     * ⭐ SPEC §4.9.6 — how many selected objects can carry knockout, and how many already do.
+     *
+     * Two numbers rather than a boolean so the chip can show *on* only when every one is, and so a
+     * selection of nothing but highlighters — which never knock out — offers no chip at all.
+     */
+    public val knockoutCounts: KnockoutCounts
+
+    /**
+     * ⭐ SPEC §4.9.6 — hide, or stop hiding, whatever is underneath each selected object's filled
+     * silhouette. One `SetFormat` per object whose record actually changes, as one gesture, so one
+     * undo puts all of them back. Nothing beneath is written to.
+     */
+    public fun setKnockout(on: Boolean)
+
+    /**
      * ⭐ The one selected image, or null when the selection is not exactly one image.
      *
      * ## Why the selection had to start answering this
@@ -271,6 +303,14 @@ public data class ShapeSelectionCounts(
      */
     val soleKind: ShapeKind? = null,
 )
+
+/**
+ * ⭐ SPEC §4.9.6 — what the knockout chip needs to know about a selection.
+ *
+ * @property eligible selected objects that can knock out — everything but a highlighter.
+ * @property on how many of those already do.
+ */
+public data class KnockoutCounts(val eligible: Int, val on: Int)
 
 /**
  * [SelectedText] for a lone selected text box, or null for anything else. Top-level for
@@ -473,6 +513,13 @@ internal class SelectionController(
      */
     private var startSelected: List<SelectedObject> = emptyList()
     private var startBounds: PageRect? = null
+
+    /**
+     * ⭐ The selection's Element pivot at pen-down, in page space, or null — what a move lands on
+     * the grid instead of the box's top-left (SPEC §4.9.7). Latched with [startBounds] for the same
+     * reason: every frame solves the drag against where the gesture began.
+     */
+    private var startPivot: PagePoint? = null
     private var startHandle: SelectionHandle? = null
 
     /** The shape handle grabbed at pen-down, and the shape as it was then. Both null off [Mode.POINT]. */
@@ -546,7 +593,7 @@ internal class SelectionController(
      * gesture and a snap must be decided while the finger is still down, not recomputed after.
      */
     private fun flushPreview() {
-        if (mode == Mode.MOVE) {
+        if (mode == Mode.MOVE && !gridLeads()) {
             val box = startBounds
             val targets = guideTargets
             if (box != null && targets != null) {
@@ -618,13 +665,16 @@ internal class SelectionController(
                 // against what is on screen would apply the gesture once per frame.
                 startShape = point?.let { soleShape()?.asPointTarget() }
                 startBounds = box
+                startPivot = pivot
                 startSelected = store.selected(selection)
                 guideTargets = if (mode == Mode.MOVE) {
                     AlignmentGuides.AlignmentTargets(store.pageBoundsExcluding(selection), pageSize)
                 } else {
                     null
                 }
-                gestureGrid = store.gridFor(selection, grid)
+                // A selection with a pivot snaps by it whatever it is made of — handwriting included,
+                // which the lattice otherwise leaves alone (`gridFor`).
+                gestureGrid = if (startPivot != null && mode == Mode.MOVE) grid else store.gridFor(selection, grid)
             }
         }
         onChanged()
@@ -755,6 +805,8 @@ internal class SelectionController(
         alignment = Alignment.None
         startSelected = emptyList()
         startBounds = null
+        startPivot = null
+        startPivot = null
         startHandle = null
         startPoint = null
         startShape = null
@@ -816,7 +868,7 @@ internal class SelectionController(
 
             else -> store.objectsIn(Lasso.freehand(points))
         }
-        select(hits)
+        select(store.withWholeCopies(hits))
         // ⭐ A tap on bare paper is the gesture for *"done"*: it clears the selection, and now it
         // also hands the tool back. Only for a **tap that hit nothing** — a tap that selects
         // something is the opposite intention, and a lasso that happens to enclose nothing is a
@@ -880,7 +932,9 @@ internal class SelectionController(
      * recomputed together, at every door the store can change through.
      */
     private fun editablePoints(): List<PointHandle> {
-        val shape = soleShape() ?: return emptyList()
+        // The Element editor's bounds stay a rectangle: they resize by the selection frame's grips, which
+        // snap to the grid, rather than by corners that would each drag on their own (SPEC §4.9.7).
+        val shape = soleShape()?.takeIf { !it.elementFrame } ?: return emptyList()
         return ShapePoints.of(
             kind = shape.obj.shape,
             widthPt = shape.obj.widthPt,
@@ -931,7 +985,12 @@ internal class SelectionController(
         val dx = current.x - start.x
         val dy = current.y - start.y
         val box = startBounds ?: return SelectionGesture.move(dx + alignment.dx, dy + alignment.dy)
-        val delta = gestureGrid.moveBy(box, dx, dy, alignment)
+        val pivot = startPivot
+        val delta = if (pivot != null) {
+            gestureGrid.moveBy(pivot, dx, dy, alignment)
+        } else {
+            gestureGrid.moveBy(box, dx, dy, alignment)
+        }
         return SelectionGesture.move(delta.x, delta.y)
     }
 
@@ -953,6 +1012,18 @@ internal class SelectionController(
         val to = gestureGrid.snappedResize(from, dragged, minimum)
         return SelectionGesture.resize(from, to)
     }
+
+    /**
+     * ⭐ Whether the lattice, rather than the alignment guides, decides this move.
+     *
+     * `SnapGrid.moveBy` lets a guide win on any axis it speaks for, which is right for a box on a
+     * page of boxes. It is wrong for an Element copy with a pivot — *"a pivot point for snap so it
+     * snaps to a grid"* is an explicit request, and on a page of handwriting some edge is always
+     * within a guide's reach, so the pivot almost never landed on the grid (*"it just does not snap
+     * at all really"*). And on the Element editor's canvas the grid is the instrument. In both, the
+     * grid leads and no guide is drawn for a snap that is not going to happen.
+     */
+    private fun gridLeads(): Boolean = !gestureGrid.isEmpty && (startPivot != null || store.guidesShown)
 
     private fun rotateGesture(): Matrix3 {
         val box = startBounds ?: return Matrix3.Identity
@@ -1267,6 +1338,33 @@ internal class SelectionController(
 
     override val shapeCounts: ShapeSelectionCounts
         get() = countShapes(selection.mapNotNull { store.shapeOf(it) })
+
+    override val ids: List<ObjectId> get() = selection
+
+    override val pivot: PagePoint?
+        get() = selection.firstNotNullOfOrNull { store.objectOf(it)?.pivotOnPage }
+
+    override val knockoutCounts: KnockoutCounts
+        get() {
+            val eligible = selection.mapNotNull { store.objectOf(it) }.filterNot { it.drawsOverInk || it.elementFrame }
+            return KnockoutCounts(eligible = eligible.size, on = eligible.count { it.knockout })
+        }
+
+    override fun setKnockout(on: Boolean) {
+        val recorder = store.recorder ?: return
+        val ops = selection.mapNotNull { id ->
+            val dry = store.objectOf(id) ?: return@mapNotNull null
+            // A highlighter never knocks out (DryObject.knockout), so a flag written on one would be a
+            // value in the file that this build ignores and a later one might not.
+            if (dry.drawsOverInk || dry.elementFrame) return@mapNotNull null
+            // The live record, copied and re-encoded — never rebuilt from the one field changing, or
+            // a crop, a font or a later build's key on the same object would be reset by the press.
+            val next = dry.decodedFormat.copy(knockout = on).encode()
+            if (next == dry.format.orEmpty()) return@mapNotNull null
+            PageOp.SetFormat(recorder.newOpId(), recorder.newClock(), id, next)
+        }
+        applyAsGesture(ops)
+    }
 
     /**
      * Exactly one, deliberately. Rotate, flip and crop each act on a single picture, and a bar that

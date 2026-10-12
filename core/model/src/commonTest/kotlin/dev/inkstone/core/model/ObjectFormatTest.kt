@@ -187,4 +187,32 @@ class ObjectFormatTest {
         assertEquals("a,b", decoded.extras["zz"])
         assertTrue("zz=a,b" in decoded.encode())
     }
+
+    // -----------------------------------------------------------------------
+    // ⭐ Knockout (SPEC §4.9.6)
+    // -----------------------------------------------------------------------
+
+    @Test
+    fun `knockout round-trips and leaves the rest of the record alone`() {
+        val format = ObjectFormat(crop = ImageCrop.Rect(0.1f, 0.2f, 0.9f, 0.8f), knockout = true)
+        val decoded = ObjectFormat.decode(format.encode())
+        assertEquals(format, decoded)
+        assertTrue(decoded.knockout)
+        assertEquals(format.crop, decoded.crop)
+    }
+
+    @Test
+    fun `knockout off writes no key so an untouched object stays default`() {
+        assertEquals("", ObjectFormat(knockout = false).encode())
+        assertTrue(ObjectFormat.decode(ObjectFormat(knockout = true).encode()).copy(knockout = false).isDefault)
+    }
+
+    @Test
+    fun `a knockout value this build did not write survives a re-save and is not read as on`() {
+        val later = "if1;ko=2"
+        val decoded = ObjectFormat.decode(later)
+        assertEquals(false, decoded.knockout)
+        assertEquals("2", decoded.extras["ko"])
+        assertEquals(later, decoded.encode())
+    }
 }

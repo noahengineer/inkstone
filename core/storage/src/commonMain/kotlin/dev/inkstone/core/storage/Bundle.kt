@@ -387,6 +387,19 @@ public class BundleReader private constructor(
     public val pageIds: List<PageId> get() = document.pages.map { it.id }
 
     /**
+     * False when the file this reader holds has since been replaced at its path by another writer.
+     * `NoteStore.materialize` refuses to overwrite a bundle it did not read — see
+     * `FileByteSource.isCurrent` for why that check exists now that readers hold their file open.
+     */
+    public suspend fun isCurrent(): Boolean = directory.isCurrent()
+
+    /**
+     * Release the file this reader holds open. Reading afterwards reopens it by path, which is the
+     * pre-handle behaviour — correct only if nothing has replaced the file meanwhile.
+     */
+    public fun close(): Unit = directory.close()
+
+    /**
      * ⭐ **Names of entries this build cannot interpret** — the writer's verbatim pass-through set.
      *
      * ⚠️ **`text/` and `assets/` are excluded, and both exclusions are load-bearing** (M7, M8c).
@@ -448,6 +461,16 @@ public class BundleReader private constructor(
 
     /** SPEC §5.3's `assets/` family, by full entry name. */
     public suspend fun assets(): Map<String, ByteArray> = read(assetNames)
+
+    /**
+     * Only the members of the `assets/` family named in [names] — the rest are not read.
+     *
+     * For the editor's picture cache, which wants the pictures a page draws and not every picture
+     * the note has ever held: a deleted image keeps its entry forever (SPEC §4.9.4), and reading
+     * every one of them to show the three on screen is the cost this exists to avoid. A name with no
+     * entry is simply absent from the answer.
+     */
+    public suspend fun assets(names: Collection<String>): Map<String, ByteArray> = read(assetNames.filter { it in names })
 
     private suspend fun read(names: List<String>): Map<String, ByteArray> =
         names.mapNotNull { name -> directory.read(name)?.let { name to it } }.toMap()

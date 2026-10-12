@@ -6,13 +6,10 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.BoxWithConstraints
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -26,6 +23,7 @@ import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -38,6 +36,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.layoutId
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.layout.positionInRoot
@@ -48,15 +47,16 @@ import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.LifecycleStartEffect
 import dev.inkstone.android.ink.InkSelection
 import dev.inkstone.android.ink.InkSurfaceView
 import dev.inkstone.android.ink.SyntheticInk
-import dev.inkstone.app.audio.RecordingUiState
+import dev.inkstone.app.calculator.CalculatorChip
+import dev.inkstone.app.calculator.CalculatorLayer
 import dev.inkstone.app.note.CameraCapture
 import dev.inkstone.app.note.NoteEditor
 import dev.inkstone.app.note.NoteEditorState
 import dev.inkstone.app.note.NoteEditorViewModel
-import dev.inkstone.app.note.PageBar
 import dev.inkstone.app.note.PageBarActions
 import dev.inkstone.app.note.PageOverviewSheet
 import dev.inkstone.app.ui.GlassBar
@@ -70,8 +70,11 @@ import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageCanvas
 import dev.inkstone.core.model.PageOp
+import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.PageSize
+import dev.inkstone.core.model.SnapGrid
+import dev.inkstone.core.storage.Element
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -95,7 +98,6 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     val objects = remember { ObjectToolState() }
     val scope = rememberCoroutineScope()
     val note by editor.state.collectAsState()
-    val recording by editor.recording.collectAsState()
     var surface by remember { mutableStateOf<InkSurfaceView?>(null) }
     var pageOverviewOpen by remember { mutableStateOf(false) }
     var exporting by remember { mutableStateOf(false) }
@@ -105,19 +107,18 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     var panel by remember { mutableStateOf<SummonedPanel?>(null) }
     var diagnosticsOpen by remember { mutableStateOf(false) }
     var origin by remember { mutableStateOf(Offset.Zero) }
-    val context = LocalContext.current
     val objectActions = rememberObjectActions(ui, objects, editor, surface)
 
     SurfaceEffects(ui = ui, note = note, surface = surface)
     ObjectEffects(ui, objects, note, surface, editor, objectActions)
+    val elementDone = ElementEditorEffects(editor, objects, objectActions, surface, scope)
 
     DisposableEffect(surface) {
         surface?.let { editor.onSurfaceAttached(it.asNoteSurface(scope, editor)) }
         onDispose { editor.onSurfaceDetached() }
     }
 
-    val actions = inkToolbarActions(surface, editor, ui, scope)
-    val onSummon: (PanelKind, Rect) -> Unit = { kind, at -> panel = panel.toggled(kind, at) }
+    val actions = inkToolbarActions(surface, editor, ui, objects, scope)
 
     Box(
         modifier = modifier
@@ -126,26 +127,25 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
             .onGloballyPositioned { origin = it.positionInRoot() },
     ) {
         EditorCanvas(ui, objects, editor, objectActions) { surface = it }
+        CalculatorLayer() // ⭐ Above every page layer, below the chrome: docs/CALCULATOR.md D2.
 
-        TopChrome(
+        val exports = Exports(exporting, { exporting = it }, scope, LocalContext.current, editor)
+        Chrome(
             ui = ui,
             objects = objects,
             actions = actions,
             objectActions = objectActions,
-            onSummon = onSummon,
-            recording = recording,
-            onToggleRecording = { editor.toggleRecording() },
+            editor = editor,
+            element = elementDone,
+            wiring = ChromeWiring(
+                onSummon = { kind, at -> panel = panel.toggled(kind, at) },
+                note = note,
+                pageActions = pageBarActions(editor, note, { pageOverviewOpen = true }, exports),
+                exporting = exporting,
+                diagnosticsOpen = diagnosticsOpen,
+                onToggleDiagnostics = { diagnosticsOpen = !diagnosticsOpen },
+            ),
         )
-
-        val exports = Exports(exporting, { exporting = it }, scope, context, editor)
-        BottomWidgets(
-            ui = ui,
-            note = note,
-            actions = actions,
-            pageActions = pageBarActions(editor, note, { pageOverviewOpen = true }, exports),
-            exporting = exporting,
-            diagnosticsOpen = diagnosticsOpen,
-        ) { diagnosticsOpen = !diagnosticsOpen }
 
         val panels = OpenPanels(
             panel?.let { it.copy(anchor = it.anchor.translate(-origin.x, -origin.y)) },
@@ -153,11 +153,139 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
             diagnosticsOpen,
             note.localRev,
         ) { diagnosticsOpen = false }
-        SidePanels(ui, objects, actions, objectActions, panels)
+        SidePanels(ui, objects, editor, actions, objectActions, panels)
+        if (ui.editingLayout) LayoutEditorPanel(ui)
+        ItemDragGhost(ui.itemDrag, origin)
         ui.colorDrag.colorArgb?.let { DragPreview(it, ui.colorDrag.position - origin) }
     }
 
     if (pageOverviewOpen) PageOverview(note, editor) { pageOverviewOpen = false }
+}
+
+/** The Element editor's label, read from the view model. See [ElementEditorLabel]. */
+@Composable
+private fun ElementEditorLabel(editor: NoteEditorViewModel, modifier: Modifier) {
+    val name by editor.elementName.collectAsState()
+    ElementEditorLabel(name, modifier)
+}
+
+/** [UpdateCopiesDialog], while Done is waiting on the answer. */
+@Composable
+private fun UpdateCopiesPrompt(done: ElementDone) {
+    val prompt = done.prompt ?: return
+    UpdateCopiesDialog(
+        name = prompt.revision.element.name,
+        copies = prompt.copies,
+        notes = prompt.notes.size,
+        onUpdate = { done.update(prompt) },
+        onKeep = { done.finish() },
+    )
+}
+
+/**
+ * ⭐ SPEC §4.9.7 — the Element editor's half of the screen: it is this screen on a scratch note, with
+ * a grid for paper. Pushes the backdrop to the surface, frames the camera on the Element, shows the
+ * update-copies question, and returns the Done/Cancel controller whose bar replaces the page bar (an
+ * Element has one page and is not shared on its own). Nothing here does anything for a note.
+ */
+@Composable
+private fun ElementEditorEffects(
+    editor: NoteEditorViewModel,
+    objects: ObjectToolState,
+    actions: ObjectActions,
+    surface: InkSurfaceView?,
+    scope: CoroutineScope,
+): ElementDone {
+    val editing = editor.editingElement != null
+    LaunchedEffect(surface, objects.backdrop, editing) {
+        // The lattice first, so the backdrop's first frame is drawn at the right spacing.
+        if (editing) surface?.elementGridPt = editor.elementGridPt
+        surface?.elementBackdrop = if (editing) objects.backdrop else null
+    }
+    // Framed on the Element rather than fitted to the page's width — the page itself is 3000 pt wide.
+    val elementFrame by editor.elementFrame.collectAsState()
+    LaunchedEffect(surface, elementFrame) {
+        surface?.preferredFrame = elementFrame
+    }
+    val done = rememberElementDone(editor, objects, surface, scope, actions.elementEditor)
+    UpdateCopiesPrompt(done)
+    return done
+}
+
+/**
+ * ⭐ The Element editor's way out (SPEC §4.9.7): save, ask about copies if there are any, then leave.
+ *
+ * The Activity is finished with `RESULT_OK` after a save, so the screen that opened the editor knows
+ * to re-read its panel — the Element's picture has changed under the same id.
+ */
+private class ElementDone(
+    /** The editor's bottom bar, or null for a note — which then shows its page bar. */
+    val bar: (@Composable () -> Unit)?,
+    /** The editor's top-left label, or null for a note. */
+    val label: (@Composable (Modifier) -> Unit)?,
+    val done: () -> Unit,
+    val cancel: () -> Unit,
+    val prompt: NoteEditorViewModel.ElementEditOutcome.Saved?,
+    val update: (NoteEditorViewModel.ElementEditOutcome.Saved) -> Unit,
+    val finish: () -> Unit,
+)
+
+@Composable
+private fun rememberElementDone(
+    editor: NoteEditorViewModel,
+    objects: ObjectToolState,
+    surface: InkSurfaceView?,
+    scope: CoroutineScope,
+    tools: ElementEditorActions?,
+): ElementDone {
+    val activity = LocalContext.current as? android.app.Activity
+    var prompt by remember { mutableStateOf<NoteEditorViewModel.ElementEditOutcome.Saved?>(null) }
+    val finish: () -> Unit = {
+        prompt = null
+        activity?.setResult(android.app.Activity.RESULT_OK)
+        activity?.finish()
+    }
+    val done: () -> Unit = {
+        scope.launch {
+            when (val outcome = editor.saveElementEdit { ids -> surface?.boundsOf(ids) }) {
+                is NoteEditorViewModel.ElementEditOutcome.Saved ->
+                    if (outcome.copies > 0) prompt = outcome else finish()
+
+                NoteEditorViewModel.ElementEditOutcome.Empty -> editor.report(EMPTY_ELEMENT)
+
+                NoteEditorViewModel.ElementEditOutcome.Gone -> activity?.finish()
+            }
+        }
+    }
+    val cancel: () -> Unit = { activity?.finish() }
+    val bar: (@Composable () -> Unit)? = if (editor.editingElement == null) {
+        null
+    } else {
+        {
+            ElementEditorBar(
+                objects,
+                onFit = { tools?.let { scope.launch { it.fit() } } },
+                onCancel = cancel,
+                onDone = done,
+            )
+        }
+    }
+    return ElementDone(
+        bar = bar,
+        label = if (editor.editingElement == null) null else { modifier -> ElementEditorLabel(editor, modifier) },
+        done = done,
+        cancel = cancel,
+        prompt = prompt,
+        update = { saved ->
+            prompt = null
+            scope.launch {
+                val updated = editor.updateElementCopies(saved.revision, saved.notes)
+                editor.report(if (updated == 1) "Updated 1 copy" else "Updated $updated copies")
+                finish()
+            }
+        },
+        finish = finish,
+    )
 }
 
 /**
@@ -207,8 +335,15 @@ private fun DragPreview(argb: Int, at: Offset) {
  */
 @Composable
 private fun rememberInkUiState(editor: NoteEditorViewModel): InkUiState? {
-    val prefs = editor.editorPrefs.collectAsState().value ?: return null
-    val ui = remember(prefs) { InkUiState(prefs) }
+    val stored = editor.editorPrefs.collectAsState().value ?: return null
+    // ⛔ The *newest* value, not [stored]: that one is the store as it was at launch, and seeding a
+    // second note from it wrote the launch-time palette back over the user's (`EditorPreferences`).
+    val ui = remember { InkUiState(editor.currentEditorPrefs() ?: stored) }
+    // Another editor may have changed the toolbar while this one was behind it — see [InkUiState.adopt].
+    LifecycleStartEffect(ui) {
+        editor.currentEditorPrefs()?.let(ui::adopt)
+        onStopOrDispose { }
+    }
     LaunchedEffect(ui) {
         snapshotFlow { ui.toPrefs() }.collect(editor::editorPrefsChanged)
     }
@@ -281,128 +416,84 @@ private fun BoxScope.PageLoadingNote() {
 }
 
 /**
- * ⭐ ROADMAP M10 — the design's three bottom zones: history left, pages centre, zoom right.
+ * ⭐ ROADMAP M10 — all of the chrome: the contextual toolbars, the Dynamic Dock, the two top corners,
+ * and the design's three bottom zones — placed by [ChromeHost] and arranged by the user
+ * ([ChromeLayout]; the layout editor is [LayoutEditorPanel]).
  *
  * > *"Separated from the main tools to prevent accidental taps during drawing."*
  *
- * ⚠️ **One `Row`, not three `align`ments, and that is a bug fix rather than tidiness.** Aligning the
- * three independently to `BottomStart` / `BottomCenter` / `BottomEnd` is what the design describes
- * and it is what shipped for exactly one emulator run: the page bar is eleven chips wide, so on a
- * 2560 px tablet it ran *underneath* the zoom widget and the two share chips were unreachable —
- * drawn, listed by `uiautomator`, and covered by a pill that swallowed the tap. Laying them out as
- * siblings makes the overlap unrepresentable: the centre zone is what is left after the other two,
- * and `GlassBar` scrolls inside it.
- *
- * The page bar is therefore centred **between its neighbours** rather than on the screen. They
- * differ in width by about 90 dp, so it sits ~45 dp off true centre — which is invisible, and is the
- * price of a bar that cannot hide its own controls.
- *
- * ## ⚠️ Why this stays one row even when it does not fit
- *
- * On a narrow window it genuinely does not: 143 dp of history, 598 dp of page bar and 390 dp of
- * zoom, with two [ZONE_GAP]s and the edge padding, is 1,211 dp against **800 dp** of tablet held in
- * portrait, so the weighted centre zone collapses to 188 dp and most of the page bar is reachable
- * only by dragging it sideways.
- *
- * Moving the page bar onto a second line fixes that and was tried, twice — above the other two, then
- * below them — and both were rejected on sight: *"the thing that has ADD DUPLICATE and DELETE is
- * moved up and i dont like that"*, then *"its not like how it was at all"*. The second version was
- * worse than the first for a reason worth keeping: a stacked row pushes the history and zoom pills
- * **up onto the paper**, so they straddle the page's bottom edge instead of sitting on the canvas
- * below it, and two pills cut in half by the edge of the page read as broken rather than as
- * separated.
- *
- * So the layout does not change with the window, and what changed instead is that `GlassBar` now
- * *fades* at an end it has more content beyond — the same controls, in the same places, with the
- * one thing they were missing, which is any sign that the bar can be dragged.
- */
-@Composable
-private fun BoxScope.BottomWidgets(
-    ui: InkUiState,
-    note: NoteEditorState,
-    actions: InkToolbarActions,
-    pageActions: PageBarActions,
-    exporting: Boolean,
-    diagnosticsOpen: Boolean,
-    onToggleDiagnostics: () -> Unit,
-) {
-    val edge = InkDims.EdgePadding
-    Row(
-        modifier = Modifier.align(Alignment.BottomCenter).fillMaxWidth().padding(edge),
-        // ⚠️ **Wider than `edge`.** At 12 dp the page bar's rounded end sat almost against the zoom
-        // widget's, and two pills a hairline apart read as one bar that has been sliced rather than
-        // as the design's three separate zones.
-        horizontalArrangement = Arrangement.spacedBy(ZONE_GAP.dp),
-        verticalAlignment = Alignment.Bottom,
-    ) {
-        HistoryWidget(ui, actions)
-        Box(modifier = Modifier.weight(1f), contentAlignment = Alignment.BottomCenter) {
-            PageBar(state = note, actions = pageActions, exporting = exporting)
-        }
-        ZoomWidget(
-            state = ui,
-            actions = actions,
-            diagnosticsOpen = diagnosticsOpen,
-            onToggleDiagnostics = onToggleDiagnostics,
-        )
-    }
-}
-
-/**
- * ⭐ ROADMAP M10 — the contextual toolbars, the Dynamic Dock, and the record chip.
- *
- * ⚠️ **`ContextBars` is composed before `EditorDock`, and that is two things at once.** Composition
+ * ⚠️ **`ContextBars` is composed before the host, and that is two things at once.** Composition
  * order is draw order in a `Box`, so the dock draws over a bar that would otherwise slide under it;
  * and the bars' return value is what tells the dock to collapse its secondary row — the design's
  * *"summons its respective Contextual Toolbar and hides the Dynamic Dock's secondary row"*. Swapping
- * the two lines breaks the second silently, because a `Boolean` read one recomposition late is a
- * row that flickers rather than a compile error.
+ * the two breaks the second silently, because a `Boolean` read one recomposition late is a row that
+ * flickers rather than a compile error. In the layout editor they are not composed at all: a
+ * selection's bar would be the one live control on a screen whose every other control is covered.
  *
- * ⚠️ **The dock and the record chip abut; they do not overlap, and this was checked.** Held in
- * portrait the dock's primary row ends at x=1401 and `RECORD` begins at x=1401, so the two touch
- * and the rounded ends read as one merged blob — but every chip keeps its own hit rectangle and
- * `RULER` is pressable. Row two is 100 dp lower and never meets the chip at all.
+ * ## What the stock layout keeps, and why — moved here from `BottomWidgets` and `TopChrome`
  *
- * ⚠️ **Two fixes for that crowding were built and both were reverted, which is worth recording
- * so a third is not attempted.** Laying the two out as siblings in a `Row` — which is what
- * [BottomWidgets] does, and which makes overlap unrepresentable — centres the dock in what is left
- * rather than on the window, and moved it **63 dp** in landscape. Reserving the record chip's
- * measured width symmetrically instead keeps landscape byte-identical, but narrows the dock in
- * portrait by 212 dp, which pushes `RULER` off the end of a scrolling bar: it trades a chip that
- * looks cramped for a chip that is not there. Neither is worth it for an appearance problem, and
- * the user's requirement is that landscape stay exactly as it shipped.
+ * - **The page bar is measured into the space between history and zoom, and centred there.** Aligned
+ *   on its own it ran *underneath* the zoom widget on a 2560 px tablet and the share chips were
+ *   unreachable — drawn, listed by `uiautomator`, and covered by a pill that swallowed the tap. It sits
+ *   ~45 dp off true centre as a result, which is invisible. ([ChromeHost] keeps the arithmetic.)
+ * - **It stays one row in portrait, where it scrolls and fades at an end with more beyond.** A second
+ *   row of bottom chrome was built twice and rejected on sight — *"its not like how it was at all"* —
+ *   because it pushes history and zoom up onto the paper, where the page's edge cuts them in half.
+ * - **The dock and the record chip abut in portrait and do not overlap.** Two fixes were built and
+ *   reverted: siblings in a `Row` moved the dock 63 dp in landscape, and reserving the chip's width
+ *   pushed `RULER` off the end of the bar. The requirement was that landscape stay exactly as shipped.
+ *
+ * Each of those was a trade made *for* the user. All three can now be made *by* them instead: the page
+ * bar can go somewhere it fits, and a dock that is crowded in portrait can be made smaller.
  */
 @Composable
-private fun BoxScope.TopChrome(
+private fun BoxScope.Chrome(
     ui: InkUiState,
     objects: ObjectToolState,
     actions: InkToolbarActions,
     objectActions: ObjectActions,
-    onSummon: (PanelKind, Rect) -> Unit,
-    recording: RecordingUiState,
-    onToggleRecording: () -> Unit,
+    editor: NoteEditorViewModel,
+    element: ElementDone,
+    wiring: ChromeWiring,
 ) {
-    val edge = InkDims.EdgePadding
-    val contextual = ContextBars(
-        ui = ui,
-        objects = objects,
-        actions = actions,
-        objectActions = objectActions,
-        onSummon = onSummon,
-    )
-    EditorDock(
-        state = ui,
-        objects = objects,
-        actions = actions,
-        objectActions = objectActions,
-        onSummon = onSummon,
-        secondarySuppressed = contextual,
-        modifier = Modifier.align(Alignment.TopCenter).padding(edge),
-    )
-    // ⭐ M12 §10 — the design's *"Global Utilities (Top Right)"* zone, away from the pen tools
-    // because it is not one.
-    RecordButton(recording, onToggleRecording, Modifier.align(Alignment.TopEnd).padding(edge))
+    val geometry = remember { ChromeGeometry() }
+    val deps = ChromeDeps(ui, objects, actions, objectActions, wiring, geometry, elementEditor = element.bar != null)
+    val contextual = if (ui.editingLayout) false else ContextBars(ui, objects, actions, objectActions, wiring.onSummon)
+    if (ui.editingLayout) LayoutEditorScrim()
+    ChromeHost(ui, geometry) {
+        ChromeBarFrame(DockBarId, ui, geometry) { ChromeContainer(DockBarId, deps) }
+        ChromeBarFrame(BarId.Stock(ChromeBar.DRAW), ui, geometry) { DockSecondary(deps, suppressed = contextual) }
+        ChromeBarFrame(BarId.Stock(ChromeBar.HISTORY), ui, geometry) {
+            ChromeContainer(BarId.Stock(ChromeBar.HISTORY), deps)
+        }
+        ChromeBarFrame(BarId.Stock(ChromeBar.PAGES), ui, geometry) {
+            val centre = element.bar
+            if (centre != null) centre() else ChromeContainer(BarId.Stock(ChromeBar.PAGES), deps)
+        }
+        ChromeBarFrame(BarId.Stock(ChromeBar.ZOOM), ui, geometry) { ChromeContainer(BarId.Stock(ChromeBar.ZOOM), deps) }
+        // ⭐ The bars the user made by dropping a chip on the page — each exactly as long as it holds one.
+        ui.layout.floating.forEach { id ->
+            key(id.n) { ChromeBarFrame(id, ui, geometry) { ChromeContainer(id, deps) } }
+        }
+        // ⭐ The Element editor's corner says what is being edited. Recording a lecture into an
+        // Element, and a calculator over one, are both meaningless there, so the note's corners are
+        // not shown.
+        val label = element.label
+        if (label != null) {
+            label(Modifier.layoutId(LabelSlot))
+        } else {
+            // ⭐ M12 §10 — the design's *"Global Utilities (Top Right)"* zone, away from the pen tools
+            // because it is not one; and the calculator in the one corner the design leaves empty.
+            val recording by editor.recording.collectAsState()
+            ChromeBarFrame(BarId.Stock(ChromeBar.RECORD), ui, geometry) {
+                RecordButton(recording, { editor.toggleRecording() })
+            }
+            ChromeBarFrame(BarId.Stock(ChromeBar.CALCULATOR), ui, geometry) { CalculatorChip() }
+        }
+    }
 }
+
+private val DockBarId = BarId.Stock(ChromeBar.DOCK)
 
 /**
  * Pressing the control that opened a panel closes it; pressing a *different* one swaps.
@@ -437,24 +528,39 @@ private class OpenPanels(
 private fun BoxScope.SidePanels(
     ui: InkUiState,
     objects: ObjectToolState,
+    editor: NoteEditorViewModel,
     actions: InkToolbarActions,
     objectActions: ObjectActions,
     open: OpenPanels,
 ) {
+    // ⭐ The Elements panel first, so the summoned panels below can still sit over it — but after the
+    // contextual bars, so a selection's bar never covers its rows. See [ElementPanelLayer].
+    ElementPanelLayer(ui, objects, editor, objectActions)
+    // ⭐ The panels' own size (`ChromeLayout.panelScale`) on top of the overall one. The alignment is
+    // built outside the scaled scope so it is measured against the screen, not against itself.
+    val layout = ui.layout
     if (open.diagnostics) {
-        DiagnosticsPanel(
-            state = ui,
-            actions = actions,
-            revision = open.revision,
-            onClose = open.onCloseDiagnostics,
-            modifier = Modifier
-                .align(Alignment.BottomEnd)
-                .padding(bottom = SIDE_PANEL_BOTTOM.dp, end = InkDims.EdgePadding),
-        )
+        val corner = Modifier
+            .align(Alignment.BottomEnd)
+            .padding(bottom = SIDE_PANEL_BOTTOM.dp, end = InkDims.EdgePadding)
+        ScaledChrome(layout.panelScale(ChromePanel.MORE)) {
+            DiagnosticsPanel(
+                state = ui,
+                actions = actions,
+                revision = open.revision,
+                onClose = open.onCloseDiagnostics,
+                modifier = corner,
+            )
+        }
     }
     when (open.panel?.kind) {
-        PanelKind.COLOUR -> ColourPopover(open.panel.anchor, ui, objects, actions, open.onClosePanel, objectActions)
-        PanelKind.SIZE -> SizePopover(open.panel.anchor, ui, open.onClosePanel)
+        PanelKind.COLOUR -> {
+            val scale = layout.panelScale(ChromePanel.COLOUR)
+            ColourPopover(open.panel.anchor, ui, objects, actions, open.onClosePanel, objectActions, scale)
+        }
+
+        PanelKind.SIZE -> SizePopover(open.panel.anchor, ui, open.onClosePanel, layout.panelScale(ChromePanel.WIDTH))
+
         null -> Unit
     }
 }
@@ -503,6 +609,7 @@ private fun BoxScope.ColourPopover(
     actions: InkToolbarActions,
     onDismiss: () -> Unit,
     objectActions: ObjectActions,
+    scale: Float,
 ) {
     val editing = objects.editing
     val argb = if (editing != null) objects.style.colorArgb else ui.pen.colorArgb
@@ -523,21 +630,23 @@ private fun BoxScope.ColourPopover(
             .pointerInput(Unit) { detectTapGestures { onDismiss() } },
     )
     AnchoredPanel(anchor = anchor) {
-        ColorPanel(
-            argb = argb,
-            slots = ui.slots,
-            // ⭐ Every change writes the chosen slot as well as applying the colour, which is what
-            // makes the wheel *edit a swatch*. `updateChosenSlot` is a no-op until a slot has been
-            // tapped, so mixing a colour without choosing one still leaves the palette alone.
-            onColorChange = { next ->
-                ui.updateChosenSlot(next)
-                onColorChange(next)
-            },
-            onChooseSlot = ui::chooseSlot,
-            onClose = onDismiss,
-            drag = ui.colorDrag,
-            onDropped = ui::swapSlots,
-        )
+        ScaledChrome(scale) {
+            ColorPanel(
+                argb = argb,
+                slots = ui.slots,
+                // ⭐ Every change writes the chosen slot as well as applying the colour, which is what
+                // makes the wheel *edit a swatch*. `updateChosenSlot` is a no-op until a slot has been
+                // tapped, so mixing a colour without choosing one still leaves the palette alone.
+                onColorChange = { next ->
+                    ui.updateChosenSlot(next)
+                    onColorChange(next)
+                },
+                onChooseSlot = ui::chooseSlot,
+                onClose = onDismiss,
+                drag = ui.colorDrag,
+                onDropped = ui::swapSlots,
+            )
+        }
     }
 }
 
@@ -554,7 +663,7 @@ private fun BoxScope.ColourPopover(
  * on the paper — a regression in the thing this round was asked to preserve.
  */
 @Composable
-private fun BoxScope.SizePopover(anchor: Rect, ui: InkUiState, onDismiss: () -> Unit) {
+private fun BoxScope.SizePopover(anchor: Rect, ui: InkUiState, onDismiss: () -> Unit, scale: Float) {
     Box(
         modifier = Modifier
             .matchParentSize()
@@ -565,23 +674,25 @@ private fun BoxScope.SizePopover(anchor: Rect, ui: InkUiState, onDismiss: () -> 
     // possibly unsorted, see `InkUiState.editingWidthSlot`) behind a closed panel.
     DisposableEffect(ui) { onDispose { ui.finishWidthEdit() } }
     AnchoredPanel(anchor = anchor) {
-        SizePanel(
-            widthDp = ui.pen.widthDp,
-            slots = ui.widthSlots,
-            editingIndex = ui.editingWidthSlot,
-            defaultWidthDp = ui.defaultWidthDp,
-            maxWidthDp = ui.maxWidthDp,
-            edits = SizeEdits(
-                onWidthChange = ui::editWidth,
-                onChoose = ui::chooseWidthSlot,
-                onForget = ui::removeWidthSlot,
-                onAdd = ui::addWidthSlot,
-                onDelete = ui::deleteEditedWidthSlot,
-                onMakeDefault = ui::makeDefaultWidth,
-                onMaxChange = ui::setMaxWidth,
-            ),
-            onClose = onDismiss,
-        )
+        ScaledChrome(scale) {
+            SizePanel(
+                widthDp = ui.pen.widthDp,
+                slots = ui.widthSlots,
+                editingIndex = ui.editingWidthSlot,
+                defaultWidthDp = ui.defaultWidthDp,
+                maxWidthDp = ui.maxWidthDp,
+                edits = SizeEdits(
+                    onWidthChange = ui::editWidth,
+                    onChoose = ui::chooseWidthSlot,
+                    onForget = ui::removeWidthSlot,
+                    onAdd = ui::addWidthSlot,
+                    onDelete = ui::deleteEditedWidthSlot,
+                    onMakeDefault = ui::makeDefaultWidth,
+                    onMaxChange = ui::setMaxWidth,
+                ),
+                onClose = onDismiss,
+            )
+        }
     }
 }
 
@@ -622,9 +733,9 @@ private fun AnchoredPanel(anchor: Rect, content: @Composable () -> Unit) {
  * Beside [SurfaceEffects] and for the same reason, and each is a bug that would otherwise be
  * silent:
  *
- * 1. **The asset cache has to be refreshed and handed over**, or every image on the page draws the
- *    missing-asset placeholder. A cache that is correct and never reaches the surface is M6's
- *    inert-feature shape exactly (`PageAssets`).
+ * 1. **The asset cache has to be handed over, and allowed to say when it has new pictures**, or
+ *    every image on the page draws a placeholder. A cache that is correct and never reaches the
+ *    surface is M6's inert-feature shape exactly (`PageAssets`).
  * 2. **Turning a page, or picking another tool, commits and then drops everything transient.** The
  *    commit is the data-loss half — a user who types and turns the page has left before the
  *    debounce fired. The drop is the honesty half: crop handles drawn over page 2 for an image on
@@ -639,14 +750,28 @@ private fun ObjectEffects(
     editor: NoteEditorViewModel,
     actions: ObjectActions,
 ) {
-    // Keyed on the revision as well as the page: an image merged from a peer arrives as a revision
-    // bump, and without that key its bytes would sit in the bundle undecoded until the next page
-    // turn (SPEC §13.2 row 10 — the peer's edit has to be visible *now*).
-    LaunchedEffect(surface, note.pageIndex, note.localRev) {
-        val view = surface ?: return@LaunchedEffect
-        if (editor.assetCache.refresh()) view.setPageAssets(editor.assetCache)
+    // ⭐ The cache decodes what the painter asks for and tells the surface when a batch lands, so a
+    // picture inserted, undone or merged in appears without this effect having to notice it. The
+    // page-load hook only gets a page's pictures decoding *while* its strokes are built. Both are
+    // dropped when the surface goes, so a cache outliving this screen holds no view.
+    DisposableEffect(surface) {
+        val view = surface
+        if (view != null) {
+            editor.assetCache.onChanged = { view.setPageAssets(editor.assetCache) }
+            view.onPagePictures = { pictures -> editor.assetCache.beginPage(pictures) }
+            view.setPageAssets(editor.assetCache)
+        }
+        onDispose {
+            if (view != null) {
+                editor.assetCache.onChanged = null
+                view.onPagePictures = null
+            }
+        }
     }
-    LaunchedEffect(surface) { surface?.setPageAssets(editor.assetCache) }
+    // Keyed on the revision: an image merged from a peer arrives as an object one poll before its
+    // bytes, and a revision bump is when they can have turned up (SPEC §13.2 row 10 — the peer's
+    // edit has to be visible *now*). Free unless a picture is actually missing.
+    LaunchedEffect(note.localRev) { editor.assetCache.retryMissing() }
 
     // ⚠️ **Commit, then reset — in that order, and keyed on both.** Turning a page or picking
     // another tool is a user leaving a text box, and the debounce has not fired yet: without the
@@ -693,6 +818,11 @@ private fun rememberObjectActions(
     }
 
     val pickImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { insert(it) }
+    // ⭐ The Element editor is a second NoteActivity; when it comes back after a save, the panel's
+    // picture of that Element is stale under the same id, so the library is re-read.
+    val editElement = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == android.app.Activity.RESULT_OK) objects.libraryChanged()
+    }
     val takePhoto = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { taken ->
         if (taken) insert(cameraTarget)
     }
@@ -725,24 +855,98 @@ private fun rememberObjectActions(
         // `RulerController`; writing the mirror alone would draw a ruler here that guided nothing.
         onRulerEnabled = { on -> surface?.ruler?.enabled = on },
         onRulerAngle = { degrees -> surface?.ruler?.angleDegrees = degrees },
-        onSaveElement = { name, collection ->
-            val area = objects.capturedArea
-            objects.capturedArea = null
-            if (area != null) {
-                scope.launch {
-                    val saved = editor.saveElement(name, collection, area)
-                    editor.report(if (saved == null) NOTHING_TO_SAVE else "Saved “${saved.name}” to Elements")
-                    // ⚠️ Both, and in this order. `elementsOpen = true` shows the panel, but it is
-                    // a no-op when the panel is **already** open — which is the case whenever
-                    // somebody is looking at the library while filing into it — so on its own it
-                    // reloads nothing and the new element never appears. `libraryChanged` is what
-                    // says the index on disk has moved; see `ObjectToolState.libraryRevision`.
-                    objects.elementsOpen = true
-                    if (saved != null) objects.libraryChanged()
-                }
-            }
+        onSaveElement = { name, collection -> saveCapture(scope, editor, objects, name, collection) },
+        captureArea = { box -> captureArea(surface, editor, box) },
+        onEditElement = { element ->
+            editElement.launch(
+                android.content.Intent(context, dev.inkstone.app.note.NoteActivity::class.java)
+                    .putExtra(dev.inkstone.app.note.NoteActivity.EXTRA_ELEMENT_ID, element.id.value)
+                    // The note's own lattice, so the Element is drawn on the grid its copies snap to.
+                    .putExtra(dev.inkstone.app.note.NoteActivity.EXTRA_GRID_PT, surface?.paperGrid.editorSpacing()),
+            )
         },
+        onPlaceElement = { element, centre, selectAfter ->
+            scope.launch { placeElement(surface, editor, ui, element, centre, selectAfter) }
+        },
+        elementEditor = editor.editingElement?.let { ElementEditorActions({ surface }, editor, ui) },
     )
+}
+
+/** Save [ObjectToolState.capture] under a name and a collection, then show it in the panel. */
+private fun saveCapture(
+    scope: CoroutineScope,
+    editor: NoteEditorViewModel,
+    objects: ObjectToolState,
+    name: String,
+    collection: String,
+) {
+    val capture = objects.capture ?: return
+    objects.capture = null
+    scope.launch {
+        val saved = editor.saveElement(name, collection, capture.ids, capture.bounds)
+        editor.report(if (saved == null) NOTHING_TO_SAVE else "Saved “${saved.name}” to Elements")
+        // ⚠️ Both, and in this order. `elementsOpen = true` shows the panel, but it is a no-op when
+        // the panel is **already** open — which is the case whenever somebody is looking at the
+        // library while filing into it — so on its own it reloads nothing and the new element never
+        // appears. `libraryChanged` is what says the index on disk has moved; see
+        // `ObjectToolState.libraryRevision`.
+        objects.elementsOpen = true
+        if (saved != null) objects.libraryChanged()
+    }
+}
+
+/**
+ * The square lattice the Element editor should draw for a note with this grid: the note's own
+ * spacing on whichever axis it has one. Ruled paper has rules every 24 pt and a free x axis, and an
+ * Element drawn on 24 pt squares lands its pivot on a rule; 18 pt squares would not.
+ */
+private fun SnapGrid?.editorSpacing(): Float {
+    val grid = this ?: return SnapGrid.DEFAULT_SPACING_PT
+    return maxOf(grid.spacingXPt, grid.spacingYPt).takeIf { it >= SnapGrid.MIN_SPACING_PT }
+        ?: SnapGrid.DEFAULT_SPACING_PT
+}
+
+/** A box dragged with the Elements tool, as what the surface finds inside it — handwriting included. */
+private fun captureArea(surface: InkSurfaceView?, editor: NoteEditorViewModel, box: PageRect): ElementCapture? {
+    val ids = surface?.objectsWithin(box).orEmpty()
+    if (ids.isEmpty()) {
+        editor.report(NOTHING_TO_SAVE)
+        return null
+    }
+    // ⭐ With the grid on, an Element is saved with its bounds widened onto the paper's own lattice,
+    // so its corner — the point a copy snaps by — sits on a line exactly as the ink did here. The
+    // content's own box is a corner nobody chose (*"when creating an element it's not very correct"*).
+    val measured = surface?.boundsOf(ids)
+    return ElementCapture(ids, measured?.let { surface.snapGrid.enclosing(it) })
+}
+
+/** Stamp [element] centred on [centre]; after a drop, select it and hand over the Select tool. */
+@Suppress("LongParameterList") // Where it lands, and the three things that change after it does.
+private suspend fun placeElement(
+    surface: InkSurfaceView?,
+    editor: NoteEditorViewModel,
+    ui: InkUiState,
+    element: Element,
+    centre: PagePoint,
+    selectAfter: Boolean,
+) {
+    val dropped = PagePoint(centre.x - element.widthPt / 2f, centre.y - element.heightPt / 2f)
+    // ⭐ With the grid on, the drop lands the Element's pivot — or its bounds' corner — on the lattice,
+    // exactly as dragging it there afterwards would (SPEC §4.9.7).
+    val pivot = element.pivot ?: PagePoint(0f, 0f)
+    val snapped = surface?.snapGrid?.snap(PagePoint(dropped.x + pivot.x, dropped.y + pivot.y))
+    val topLeft = snapped?.let { PagePoint(it.x - pivot.x, it.y - pivot.y) } ?: dropped
+    val placed = editor.stampElement(element, topLeft)
+    if (placed.isEmpty()) {
+        editor.report(NOTHING_TO_STAMP)
+    } else if (selectAfter) {
+        // ⭐ Selected, then handed the Select tool — the snapped-shape order, and for the reason
+        // `InkSurfaceView.select` gives. *"Drag it on something"* is the next thing a person does
+        // with an Element they just put down, so the handles have to be there already rather than
+        // behind a lasso.
+        surface?.select(placed)
+        ui.tool = EditorTool.SELECT
+    }
 }
 
 /**
@@ -793,6 +997,10 @@ private fun applySelection(count: Int, ui: InkUiState, objects: ObjectToolState,
     ui.selectedArrowable = counts.arrowable
     ui.selectedArrowed = counts.arrowed
     ui.selectedKind = counts.soleKind
+    val knockout = selection.knockoutCounts
+    ui.selectedKnockoutEligible = knockout.eligible
+    ui.selectedKnockoutOn = knockout.on
+    ui.selectionPivot = selection.pivot
     val picture = selection.soleImage
     objects.focusImage(
         picture?.let { ImageFocus(it.id, it.bounds, it.widthPt, it.heightPt, it.transform) },
@@ -829,13 +1037,16 @@ private const val KB = 1024
 private const val IMAGE_FAILED = "That file could not be read as a picture."
 private const val CAMERA_FAILED = "There was nowhere to save the photo. Free some space and try again."
 private const val NOTHING_TO_SAVE =
-    "Nothing in that box could be saved yet — Elements hold pictures, text and shapes, not handwriting."
+    "There is nothing inside that box to save — draw it right round what you want to keep."
+private const val NOTHING_TO_STAMP = "That Element has nothing in it this version can draw."
+private const val EMPTY_ELEMENT = "An Element needs something in it — draw something, or press Cancel."
 
 /** The M1 toolbar's wiring — kept beside [pageBarActions] rather than inline, for the same reason. */
 private fun inkToolbarActions(
     surface: InkSurfaceView?,
     editor: NoteEditorViewModel,
     ui: InkUiState,
+    objects: ObjectToolState,
     scope: CoroutineScope,
 ) = InkToolbarActions(
     onFit = { mode -> surface?.resetCamera(mode) },
@@ -864,6 +1075,12 @@ private fun inkToolbarActions(
     onRouteSelection = { route -> surface?.selection?.setRoute(route) },
     onRegulariseSelection = { surface?.selection?.makeRegular() },
     onArrowSelection = { shown -> surface?.selection?.setArrowHead(shown) },
+    onKnockoutSelection = { on -> surface?.selection?.setKnockout(on) },
+    onSaveSelectionAsElement = {
+        surface?.selection?.let { selection ->
+            if (selection.size > 0) objects.capture = ElementCapture(selection.ids, selection.bounds)
+        }
+    },
 )
 
 /**
@@ -1204,6 +1421,3 @@ private const val DRAG_PREVIEW_PX = 68f
 private val LoadingSpinner = 14.dp
 
 private val LoadingSpinnerStroke = 2.dp
-
-/** The gutter between the history, page and zoom zones. See `BottomWidgets`. */
-private const val ZONE_GAP = 28

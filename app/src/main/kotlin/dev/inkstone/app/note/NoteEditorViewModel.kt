@@ -6,10 +6,8 @@ import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dev.inkstone.app.audio.RecordingController
 import dev.inkstone.app.audio.RecordingUiState
-import dev.inkstone.app.elements.CapturedObject
-import dev.inkstone.app.elements.Element
-import dev.inkstone.app.elements.ElementLibrary
-import dev.inkstone.app.elements.objectsWithin
+import dev.inkstone.app.elements.ElementPreviews
+import dev.inkstone.app.elements.ElementShelf
 import dev.inkstone.app.library.LibraryRepository
 import dev.inkstone.app.library.Thumbnails
 import dev.inkstone.app.search.NoteRecogniser
@@ -58,7 +56,7 @@ import javax.inject.Inject
 // caller per feature. Same judgement `NoteEditor` and `LibraryRepository` already carry.
 @Suppress("LongParameterList", "TooManyFunctions")
 class NoteEditorViewModel @Inject constructor(
-    fs: FileSystem,
+    private val fs: FileSystem,
     clock: Clock,
     private val library: LibraryRepository,
     private val sourcePages: SourcePages,
@@ -69,7 +67,9 @@ class NoteEditorViewModel @Inject constructor(
      */
     private val sessions: NoteSessionHost,
     /** ⭐ M8c — the Element library (SPEC §4.9.4). Read by the panel, written by a capture. */
-    private val elements: ElementLibrary,
+    private val elements: ElementShelf,
+    /** The panel's pictures of each Element, and the ghost a drag carries. */
+    private val elementPreviews: ElementPreviews,
     /** For reading the bytes behind a picked image Uri. The resolver stops at `:app` (M4). */
     private val resolver: android.content.ContentResolver,
     /**
@@ -89,50 +89,295 @@ class NoteEditorViewModel @Inject constructor(
 ) : ViewModel() {
 
     /**
-     * M10 — what the toolbar looked like last time, once it has been read.
-     *
-     * Null until `EditorPreferences.warm()` completes. `InkScreen` waits for the first non-null
-     * value and then stops looking: this is a **seed**, not state, and re-adopting it mid-session
-     * would fight the drag the user is in the middle of.
+     * M10 — non-null once the stored toolbar has been read. ⚠️ A readiness signal: its value is the
+     * store **at launch**, so seed from [currentEditorPrefs] instead (see `EditorPreferences`).
      */
     val editorPrefs = preferences.snapshot
+
+    /** The newest toolbar any editor in this process has reported — what to seed from now. */
+    fun currentEditorPrefs(): dev.inkstone.app.ink.EditorPrefs? = preferences.current()
 
     /** Record a change. Debounced by `EditorPreferences`; see why it is not per gesture there. */
     fun editorPrefsChanged(prefs: dev.inkstone.app.ink.EditorPrefs) = preferences.changed(prefs)
 
     private val noteId = savedState.get<String>(ARG_NOTE_ID)?.let(::DocumentId)
 
+    // -----------------------------------------------------------------------
+    // ⭐ The Element editor (SPEC §4.9.7)
+    // -----------------------------------------------------------------------
+
+    /**
+     * The Element this screen is editing, or null for an ordinary note.
+     *
+     * The Element editor **is** the note editor — every tool, every gesture, the same undo — pointed
+     * at a scratch note in a private corner of storage ([ScopedFileSystem]) and given no library, no
+     * publisher and no recogniser. That is the whole of why it cannot reach the library, the PDF or
+     * the server: those are the three things that make a note a note, and this one is handed none.
+     */
+    val editingElement: dev.inkstone.core.model.ElementId? =
+        savedState.get<String>(ARG_ELEMENT_ID)?.let { dev.inkstone.core.model.ElementId(it) }
+
+    /**
+     * One scratch folder per editing session, kept in the saved state so that a process death mid-edit
+     * reopens the same scratch note rather than starting the Element again from its saved version.
+     */
+    private val editSession: String = savedState.get<String>(ARG_EDIT_SESSION)
+        ?: dev.inkstone.core.model.IdFactory(clock).newObjectId().value.also { savedState[ARG_EDIT_SESSION] = it }
+
+    private val editorFs: FileSystem =
+        if (editingElement == null) fs else dev.inkstone.app.elements.ScopedFileSystem(fs, "$EDITING_DIR/$editSession")
+
+    /**
+     * The Element editor's lattice: the spacing of the note it was opened from, so an Element is
+     * drawn on the grid its copies snap to (SPEC §4.9.7).
+     */
+    val elementGridPt: Float = savedState.get<Float>(ARG_GRID_PT)
+        ?.takeIf { it >= dev.inkstone.core.model.SnapGrid.MIN_SPACING_PT }
+        ?: dev.inkstone.core.model.SnapGrid.DEFAULT_SPACING_PT
+
+    private val scratchIds = dev.inkstone.core.model.IdFactory(clock)
+    private val scratchClock: Clock = clock
+
+    private val _elementName = kotlinx.coroutines.flow.MutableStateFlow<String?>(null)
+
+    /** The Element's name, for the editor's banner. */
+    val elementName: StateFlow<String?> = _elementName
+
+    private val _elementFrame = kotlinx.coroutines.flow.MutableStateFlow<PageRect?>(null)
+
+    /** The Element's box on the editor's canvas, so the screen can open framed on it. */
+    val elementFrame: StateFlow<PageRect?> = _elementFrame
+
+    /** Where the Element's origin was placed on the scratch page — what [ElementRevision.originMoved] is measured from. */
+    private var scratchOrigin = dev.inkstone.core.model.PagePoint(0f, 0f)
+
+    /**
+     * Move the pivot — the editor's Pivot tool. An op on the bounds object, so it is undone with
+     * everything else (`NoteEditor.setElementPivot`).
+     */
+    suspend fun setElementPivot(at: dev.inkstone.core.model.PagePoint, content: PageRect?): Boolean =
+        editor.editShownPage { page, session ->
+            dev.inkstone.core.storage.ElementEditing.pivotEditOps(
+                page,
+                at,
+                content,
+                scratchIds.newObjectId(),
+                session::nextOpId,
+                session::nextClock,
+            )
+        }
+
+    /** The editor's *Fit*: bounds made [box] — the content's, already widened to the grid. */
+    suspend fun fitElementFrame(box: PageRect): Boolean = editor.editShownPage { page, session ->
+        dev.inkstone.core.storage.ElementEditing.fitEditOps(
+            page,
+            box,
+            scratchIds.newObjectId(),
+            session::nextOpId,
+            session::nextClock,
+        )
+    }
+
+    /** Every piece on the editor's canvas — everything but its bounds — for measuring a *Fit*. */
+    suspend fun elementPieces(): List<dev.inkstone.core.model.ObjectId> =
+        editor.savedFold()?.let { dev.inkstone.core.storage.ElementEditing.pieces(it) }.orEmpty()
+
+    /**
+     * The scratch note: the Element's pieces in the middle of a page far larger than any screen, so
+     * there is nowhere a stroke can begin off the paper (the pen refuses one that does — SPEC §4.5).
+     *
+     * Applied with `replay`, so the seed is not an undo entry: the first press of undo in the editor
+     * takes back the first thing *the user* did, never the Element itself.
+     *
+     * ⭐ The seed includes the Element's **bounds** as an object of their own, carrying the pivot
+     * (`ElementEditing`), so moving, resizing, snapping and undoing them are the gestures every
+     * object already has. The origin sits on the grid, so the bounds start on the lines the backdrop
+     * draws and a snapped edit lands where the user aimed.
+     */
+    private suspend fun seedScratchNote(
+        store: dev.inkstone.core.storage.NoteStore,
+        device: String,
+        id: dev.inkstone.core.model.ElementId,
+    ): DocumentId {
+        val element = elements.find(id)
+        _elementName.value = element?.name
+        val centre = EDITOR_PAGE_PT / 2f
+        val lattice = elementGridPt
+        scratchOrigin = dev.inkstone.core.model.PagePoint(
+            kotlin.math.round((centre - (element?.widthPt ?: 0f) / 2f) / lattice) * lattice,
+            kotlin.math.round((centre - (element?.heightPt ?: 0f) / 2f) / lattice) * lattice,
+        )
+        _elementFrame.value = PageRect(
+            scratchOrigin.x,
+            scratchOrigin.y,
+            scratchOrigin.x + maxOf(element?.widthPt ?: 0f, MIN_FRAME_PT),
+            scratchOrigin.y + maxOf(element?.heightPt ?: 0f, MIN_FRAME_PT),
+        )
+        retireOldScratch()
+        // A scratch note from before a process death is the edit in progress — reopen it.
+        editorFs.list(dev.inkstone.core.storage.NoteLayout.NOTES_DIR).firstOrNull()?.let { return DocumentId(it) }
+
+        val note = store.create(title = element?.name ?: "Element", deviceId = device, background = Background.Blank)
+        val session = dev.inkstone.core.storage.NoteSession.open(store, scratchIds, scratchClock, note, device)
+        val page = session.document.livePages.first().id
+        val ops = mutableListOf<dev.inkstone.core.model.PageOp>(
+            dev.inkstone.core.model.PageOp.SetPageMeta(
+                session.nextOpId(),
+                session.nextClock(),
+                size = PageSize(EDITOR_PAGE_PT, EDITOR_PAGE_PT),
+            ),
+        )
+        var assets = emptyMap<String, ByteArray>()
+        if (element != null) {
+            val frameZ = dev.inkstone.core.model.FractionalKey.Initial
+            ops += dev.inkstone.core.storage.ElementEditing.frameOps(
+                id = scratchIds.newObjectId(),
+                box = PageRect(
+                    scratchOrigin.x,
+                    scratchOrigin.y,
+                    scratchOrigin.x + element.widthPt,
+                    scratchOrigin.y + element.heightPt,
+                ),
+                pivot = element.pivot?.let { pivotOnCanvas(element) },
+                z = frameZ,
+                nextOpId = session::nextOpId,
+                nextClock = session::nextClock,
+            )
+            val stamp = elements.stamp(
+                element = element,
+                topLeft = scratchOrigin,
+                topZ = frameZ,
+                newObjectId = scratchIds::newObjectId,
+                nextOpId = session::nextOpId,
+                nextClock = session::nextClock,
+            )
+            ops += stamp.ops
+            assets = stamp.assets
+        }
+        session.replay(page, ops)
+        session.materialize(extraCarried = assets)
+        return note.document.id
+    }
+
+    /**
+     * Every earlier editing session's scratch folder, moved to the Elements trash — **moved, never
+     * deleted** (CLAUDE.md rule 1: a cancelled edit is still something the user drew).
+     *
+     * Done here, when a *new* session starts, rather than when the old one ends: a session's editor
+     * autosaves into its folder until its view model is cleared, and moving the folder out from under
+     * a live session is exactly how `NoteSessionHost`'s trash path once lost a note (the next autosave
+     * recreates the directory with a journal and no bundle). By the time another Element is opened,
+     * the previous editor is gone.
+     */
+    private suspend fun retireOldScratch() {
+        val finished = fs.list(EDITING_DIR).filter { it != editSession }
+        if (finished.isEmpty()) return
+        fs.createDirectories(SCRATCH_TRASH_DIR)
+        for (name in finished) fs.move("$EDITING_DIR/$name", "$SCRATCH_TRASH_DIR/$name")
+    }
+
+    private fun pivotOnCanvas(element: dev.inkstone.core.storage.Element): dev.inkstone.core.model.PagePoint {
+        val pivot = element.pivot
+            ?: dev.inkstone.core.model.PagePoint(element.widthPt / 2f, element.heightPt / 2f)
+        return dev.inkstone.core.model.PagePoint(scratchOrigin.x + pivot.x, scratchOrigin.y + pivot.y)
+    }
+
+    /**
+     * ⭐ The editor's Done: save the canvas back over the Element (its previous version to trash
+     * first) and count the copies that could now be updated.
+     *
+     * @param measure the surface's measurement of the pieces — handwriting included — which becomes
+     *   the Element's origin, exactly as a capture's box does.
+     */
+    suspend fun saveElementEdit(measure: (List<dev.inkstone.core.model.ObjectId>) -> PageRect?): ElementEditOutcome {
+        val id = editingElement
+        val original = id?.let { elements.find(it) }
+        val fold = original?.let { editor.savedFold() }
+        if (id == null || original == null || fold == null) return ElementEditOutcome.Gone
+        // Everything but the bounds, which are the editor's guide and not part of the Element.
+        val pieces = dev.inkstone.core.storage.ElementEditing.pieces(fold)
+        val frame = dev.inkstone.core.storage.ElementEditing.frameOf(fold)
+        // The bounds the user set; the content's own box only for a canvas whose bounds were deleted.
+        val box = if (pieces.isEmpty()) null else frame?.bounds ?: measure(pieces)
+        val revised = if (pieces.isEmpty()) {
+            null
+        } else {
+            elements.revise(
+                original,
+                fold,
+                pieces,
+                editor.assets(),
+                box,
+                frame?.takeIf { it.hasPivot }?.pivot,
+            )
+        }
+        if (revised == null) return ElementEditOutcome.Empty
+        val moved = box?.let { dev.inkstone.core.model.PagePoint(it.left - scratchOrigin.x, it.top - scratchOrigin.y) }
+            ?: dev.inkstone.core.model.PagePoint(0f, 0f)
+        val holding = elements.uses(id)
+            .map { note -> note to sessions.countElementCopies(note, id) }
+            .filter { (_, copies) -> copies > 0 }
+        return ElementEditOutcome.Saved(
+            dev.inkstone.app.elements.ElementRevision(revised, moved),
+            holding.sumOf { it.second },
+            holding.map { it.first },
+        )
+    }
+
+    /** Replace every copy in [notes] with [revision] — the answer *"Update them all"*. */
+    suspend fun updateElementCopies(
+        revision: dev.inkstone.app.elements.ElementRevision,
+        notes: List<DocumentId>,
+    ): Int = notes.sumOf { sessions.updateElementCopies(it, revision) }
+
+    /** A knockout area drawn with the editor's area tool. */
+    suspend fun insertCutter(
+        kind: dev.inkstone.core.model.ShapeKind,
+        box: PageRect,
+    ): dev.inkstone.core.model.ObjectId? {
+        val id = scratchIds.newObjectId()
+        val placed = editor.editShownPage { page, session ->
+            dev.inkstone.core.storage.ElementEditing.areaOps(page, id, kind, box, session::nextOpId, session::nextClock)
+        }
+        return id.takeIf { placed }
+    }
+
+    private val libraryUpdates = object : NoteEditor.LibraryUpdates {
+        override suspend fun onSaved(id: DocumentId, localRev: Long, pageCount: Int) =
+            library.noteSaved(id, localRev, pageCount)
+
+        override suspend fun onMaterialized(id: DocumentId, localRev: Long, pageCount: Int, cover: FoldedPage) =
+            library.noteMaterialized(id, localRev, pageCount, cover)
+
+        // SPEC §4.7 — compaction must refuse a note with ops the server has not seen.
+        // The index owns sync_state, so the editor has to ask.
+        override suspend fun syncStateOf(id: DocumentId) = library.syncStateOf(id)
+
+        // SPEC §7.7 layer 2 — the note's own title register was stamped; the index and the
+        // remote path are the library's half.
+        override suspend fun onRenamed(id: DocumentId, title: String, localRev: Long, pageCount: Int) =
+            library.noteRenamed(id, title, localRev, pageCount)
+
+        // M6 — a merge, not a save. Never `noteSaved`: that ends in `SyncEngine.noteChanged`,
+        // which uploads unconditionally and makes two devices trade ETags forever.
+        override suspend fun onPulled(id: DocumentId, localRev: Long, pageCount: Int, title: String) =
+            library.notePulled(id, localRev, pageCount, title)
+
+        // SPEC §4.7's horizon, non-null for the first time in M6 (see the interface).
+        override suspend fun oldestAckedCounter(id: DocumentId) = library.oldestAckedCounter(id)
+    }
+
     private val editor = NoteEditor(
-        fs = fs,
+        fs = editorFs,
         clock = clock,
         scope = viewModelScope,
         documentId = noteId,
-        library = object : NoteEditor.LibraryUpdates {
-            override suspend fun onSaved(id: DocumentId, localRev: Long, pageCount: Int) =
-                library.noteSaved(id, localRev, pageCount)
-
-            override suspend fun onMaterialized(id: DocumentId, localRev: Long, pageCount: Int, cover: FoldedPage) =
-                library.noteMaterialized(id, localRev, pageCount, cover)
-
-            // SPEC §4.7 — compaction must refuse a note with ops the server has not seen.
-            // The index owns sync_state, so the editor has to ask.
-            override suspend fun syncStateOf(id: DocumentId) = library.syncStateOf(id)
-
-            // SPEC §7.7 layer 2 — the note's own title register was stamped; the index and the
-            // remote path are the library's half.
-            override suspend fun onRenamed(id: DocumentId, title: String, localRev: Long, pageCount: Int) =
-                library.noteRenamed(id, title, localRev, pageCount)
-
-            // M6 — a merge, not a save. Never `noteSaved`: that ends in `SyncEngine.noteChanged`,
-            // which uploads unconditionally and makes two devices trade ETags forever.
-            override suspend fun onPulled(id: DocumentId, localRev: Long, pageCount: Int, title: String) =
-                library.notePulled(id, localRev, pageCount, title)
-
-            // SPEC §4.7's horizon, non-null for the first time in M6 (see the interface).
-            override suspend fun oldestAckedCounter(id: DocumentId) = library.oldestAckedCounter(id)
-        },
-        publisher = publisher,
-        recogniser = recogniser,
+        // ⚠️ All three null for the Element editor — see [editingElement]. The scratch note must not
+        // be indexed, published or read for search.
+        library = libraryUpdates.takeIf { editingElement == null },
+        publisher = publisher.takeIf { editingElement == null },
+        recogniser = recogniser.takeIf { editingElement == null },
+        prepare = editingElement?.let { id -> { store, device -> seedScratchNote(store, device, id) } },
     )
 
     /**
@@ -169,6 +414,13 @@ class NoteEditorViewModel @Inject constructor(
         // editor's own session for the same reason a merge is: two sessions over one note each
         // hold their own pending ops, and whichever materializes second drops the other's work.
         override suspend fun recognise() = editor.recogniseInSession()
+
+        // ⭐ SPEC §4.9.7 — an Element was revised elsewhere and this note holds copies of it.
+        override suspend fun countElementCopies(elementId: dev.inkstone.core.model.ElementId) =
+            editor.countElementCopies(elementId)
+
+        override suspend fun updateElementCopies(revision: dev.inkstone.app.elements.ElementRevision) =
+            editor.updateElementCopies(elements, revision)
     }
 
     /**
@@ -374,41 +626,54 @@ class NoteEditorViewModel @Inject constructor(
     fun report(message: String) = editor.showMessage(message)
 
     /** Every saved Element, for the panel. */
-    suspend fun elements() = elements.list()
+    suspend fun elements(): List<dev.inkstone.core.storage.Element> = elements.list()
 
-    suspend fun deleteElement(id: String) = elements.delete(id)
+    suspend fun deleteElement(id: dev.inkstone.core.model.ElementId) = elements.delete(id)
 
-    suspend fun stampElement(element: Element, at: dev.inkstone.core.model.PagePoint): Int =
-        editor.stampElement(elements, element, at)
+    /** A picture of [element] for the panel, or null. See [ElementPreviews]. */
+    suspend fun elementPreview(element: dev.inkstone.core.storage.Element, widthPx: Int): ByteArray? =
+        elementPreviews.render(element, widthPx)
 
     /**
-     * ⭐ Save everything inside [area] as a named Element.
+     * Stamp [element] with its top-left at [topLeft].
      *
-     * ⚠️ **Text boxes, images and shapes only.** A stroke's geometry is an opaque blob that only
-     * `:android:ink` can decode (SPEC §5.4), so `:app` cannot measure one to decide it is inside
-     * the area — and `InkSelection` exposes a count rather than its object ids, so the lasso cannot
-     * answer the question either. `ElementLibrary`'s KDoc records the seam; the toolbar's own label
-     * tells the user, because a capture that silently left the handwriting behind would be
-     * discovered by stamping it.
-     *
-     * @return the element, or null when there was nothing capturable in the area.
+     * @return the new objects' ids, so the screen can select what it just dropped.
      */
-    suspend fun saveElement(name: String, collection: String, area: dev.inkstone.core.model.PageRect): Element? {
-        val fold = editor.currentFold() ?: return null
-        val assets = editor.assets()
-        val captured = objectsWithin(fold.objects, area).map { obj ->
-            CapturedObject(
-                obj = obj,
-                text = fold.textOf(obj.id),
-                format = fold.formatOf(obj.id),
-                assetBytes = (obj as? dev.inkstone.core.model.ImageObject)?.let { assets[it.asset] },
-            )
-        }
-        return elements.save(name, collection, captured)
+    suspend fun stampElement(
+        element: dev.inkstone.core.storage.Element,
+        topLeft: dev.inkstone.core.model.PagePoint,
+    ): List<dev.inkstone.core.model.ObjectId> {
+        val placed = editor.stampElement(elements, element, topLeft)
+        // ⭐ So an edit of this Element can find this note again (SPEC §4.9.7).
+        if (placed.isNotEmpty()) noteId?.let { elements.recordUse(element.id, it) }
+        return placed
     }
 
-    /** The decoded pictures the ink surface draws, cached by asset name. See [PageAssetCache]. */
-    val assetCache: PageAssetCache = PageAssetCache { editor.assets() }
+    /**
+     * ⭐ Save [ids] as a named Element — handwriting included.
+     *
+     * ⚠️ It used to take an *area* and capture only text boxes, images and shapes, because `:app`
+     * cannot measure a stroke (SPEC §5.4) and the lasso gave out a count rather than ids. The surface
+     * answers both now (`InkSurfaceView.objectsWithin`, `boundsOf`, `InkSelection.ids`), so the
+     * caller hands over exactly what was enclosed and the box it was drawn at.
+     *
+     * @return the element, or null when none of [ids] is on the page.
+     */
+    suspend fun saveElement(
+        name: String,
+        collection: String,
+        ids: List<dev.inkstone.core.model.ObjectId>,
+        measured: dev.inkstone.core.model.PageRect?,
+    ): dev.inkstone.core.storage.Element? {
+        val fold = editor.currentFold() ?: return null
+        return elements.save(name, collection, fold, ids, editor.assets(), measured)
+    }
+
+    /**
+     * The decoded pictures the ink surface draws, cached by asset name. See [PageAssetCache] — it
+     * reads only the pictures asked for, never the note's whole `assets/` family.
+     */
+    val assetCache: PageAssetCache = PageAssetCache(viewModelScope, source = { names -> editor.assets(names) })
 
     fun dismissMessage() = editor.showMessage(null)
 
@@ -424,11 +689,42 @@ class NoteEditorViewModel @Inject constructor(
     }
 
     /**
-     * SPEC §5.1 — fold the journal into the bundle. Called from `Activity.onStop`, which is the
-     * last point Android guarantees the process is alive.
+     * Called from `Activity.onStop`, the last point Android guarantees the process is alive. It
+     * makes the last strokes durable every time, and it materializes (SPEC §5.1) **only when
+     * [finishing]**, i.e. when the note is being closed.
+     *
+     * ⛔ **It materialized on every stop until 2026-10, and on a big note that got the note's own
+     * screen destroyed.** A stop is also the Element editor opening on top, a switch to another app
+     * and the screen timing out. Encoding the physics note's bundle allocates 250–325 MB (see
+     * `NoteStore.materialize`). Whenever a collection leaves the heap above three quarters of its
+     * limit, ActivityThread's GC watcher asks the system to destroy this app's stopped activities,
+     * and a materialize-on-stop ran at the very moment the note's activity had become one. So the
+     * note's activity was destroyed (`wm_destroy_activity … low-mem`, Tab S9 FE+, 2026-10-10),
+     * this view model was cleared and its editor closed. Coming back from the Element editor or from
+     * another app then reloaded the whole note, and once it ran out of memory doing so beside
+     * `NoteSessionHost`'s own session over the same note. `docs/NOTE-STAYS-LOADED.md`.
+     *
+     * Saving alone loses nothing. Everything the save drains is in `journal.ops`, and a kill before
+     * the note is closed costs a replay on the next open, which is the trade SPEC §5.1 makes for
+     * every autosave. The published file is still at most one editing session stale, because the
+     * session has not ended. An upload does not wait for this either: `OutboxDrainer` materializes
+     * through the gate before every PUT.
      */
-    fun materialize() {
-        viewModelScope.launch { editor.materializeNow() }
+    fun onStopped(finishing: Boolean) {
+        // ⛔ Not `viewModelScope`: Back runs `onStop` and then clears this view model, which cancelled
+        // the save at its first suspension and threw away the strokes it had just drained. The
+        // host's scope outlives the screen — see `NoteSessionHost.saveOnLeaving`. Only a note with
+        // no id (M2's open-the-latest fallback, and the Element editor's scratch note) has no host
+        // registration, and keeps the old path.
+        val id = noteId ?: run {
+            viewModelScope.launch { stopWork(finishing) }
+            return
+        }
+        sessions.saveOnLeaving(id) { stopWork(finishing) }
+    }
+
+    private suspend fun stopWork(finishing: Boolean) {
+        if (finishing) editor.materializeIfChanged() else editor.save()
     }
 
     /**
@@ -470,10 +766,13 @@ class NoteEditorViewModel @Inject constructor(
         editor.openDocumentId?.let { sourcePages.render(it, background, size) }
 
     override fun onCleared() {
-        // Before `editor.close()`, and synchronously: a pull that reached the registry after the
-        // editor's scope was cancelled would hand the merge to a session that can no longer run it,
-        // and `mergeRemoteBundle` would never return.
-        noteId?.let { sessions.unregister(it, handle) }
+        // Unregister and close together, under the note's mutex, and only once the close-time save
+        // queued by `onStop` has run — see `NoteSessionHost.retire`. Closing first would cancel the
+        // editor's scope under that save; unregistering first would let the drainer publish the
+        // note while the save rewrites it. Doing both in one step still keeps the old guarantee: a
+        // pull cannot reach the registry between them and hand a merge to a closed session.
+        val id = noteId
+        if (id != null) sessions.retire(id, handle) { editor.close() }
         // ⭐ **This is "the user left the note"**, and it is the only callback that means it.
         // `onStop` fires for a screen timeout, a lock and a glance at a message; rotation fires
         // nothing at all, because `NoteActivity` declares `configChanges` for it. Hanging the
@@ -485,11 +784,33 @@ class NoteEditorViewModel @Inject constructor(
         // finalising an Ogg container is I/O. The controller has its own scope for exactly this.
         noteId?.let { recordings.noteLeft(it) }
         sourcePages.clear()
-        // Ends the autosave loop. Not a substitute for `materialize()` from the Activity —
+        // Ends the autosave loop. Not a substitute for `onStopped` from the Activity —
         // `onCleared` is not guaranteed to run before the process dies, which is why the journal
-        // exists at all (SPEC §5.1).
-        editor.close()
+        // exists at all (SPEC §5.1). With an id it is [NoteSessionHost.retire]'s to do, above.
+        //
+        // ⚠️ And deliberately not a materialize either. If the activity finished, `onStopped` has
+        // already queued one and `retire` runs after it. If it did not, this is the system
+        // destroying a stopped screen to get memory back — the worst moment in the process's life
+        // to allocate a whole bundle. The journal holds every stroke, and the next close of the
+        // note folds it in.
+        if (id == null) editor.close()
         super.onCleared()
+    }
+
+    /** What the Element editor's Done came to. */
+    sealed interface ElementEditOutcome {
+        /** Saved; [copies] copies across [notes] could now be updated. */
+        class Saved(
+            val revision: dev.inkstone.app.elements.ElementRevision,
+            val copies: Int,
+            val notes: List<DocumentId>,
+        ) : ElementEditOutcome
+
+        /** Nothing on the canvas — an Element of nothing is not saved over a real one. */
+        data object Empty : ElementEditOutcome
+
+        /** The Element was removed while it was being edited, or the editor never opened. */
+        data object Gone : ElementEditOutcome
     }
 
     /**
@@ -510,6 +831,26 @@ class NoteEditorViewModel @Inject constructor(
     companion object {
         /** The note to open, as a [SavedStateHandle] key. */
         const val ARG_NOTE_ID: String = "noteId"
+
+        /** ⭐ The Element to edit instead of a note (SPEC §4.9.7). */
+        const val ARG_ELEMENT_ID: String = "elementId"
+
+        /** See [elementGridPt]. */
+        const val ARG_GRID_PT: String = "elementGridPt"
+
+        private const val ARG_EDIT_SESSION: String = "elementEditSession"
+
+        /** Where scratch notes live — beside the Element files, never under `notes/`. */
+        private const val EDITING_DIR: String = "elements/editing"
+
+        /** Where a finished session's scratch folder goes — see [retireOldScratch]. */
+        private const val SCRATCH_TRASH_DIR: String = "elements/trash/editing"
+
+        /** The Element editor's page: far larger than any screen at any zoom a person uses. */
+        private const val EDITOR_PAGE_PT: Float = 3000f
+
+        /** The smallest box the editor frames — an Element of a dot still opens at a usable zoom. */
+        private const val MIN_FRAME_PT: Float = 120f
 
         /** SPEC §8.4 — the page a search hit is on. */
         const val ARG_PAGE_ID: String = "pageId"

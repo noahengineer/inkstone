@@ -12,12 +12,9 @@ import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PagePoint
-import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.ShapeKind
 import dev.inkstone.core.model.ShapeObject
 import dev.inkstone.core.model.ShapeRecord
-import dev.inkstone.core.model.StrokeGeometry
-import dev.inkstone.core.model.StrokeObject
 import dev.inkstone.core.model.TextBoxObject
 import dev.inkstone.core.storage.Bundle
 import kotlinx.coroutines.test.runTest
@@ -38,7 +35,7 @@ import kotlin.test.assertTrue
  * copy would visibly vanish. That failure is defined, non-crashing and silent, which is exactly the
  * kind this suite exists to make impossible.
  */
-class ElementLibraryTest {
+class LegacyElementLibraryTest {
 
     @Test
     fun `stamping the same element twice gives two independent copies`() = runTest {
@@ -127,21 +124,21 @@ class ElementLibraryTest {
     @Test
     fun `an element survives a round trip through the index`() = runTest {
         val fs = InMemoryFileSystem()
-        val saved = ElementLibrary(fs, FixedClock()).save("Kept", "Shelf", listOf(textBox()))
+        val saved = LegacyElementLibrary(fs, FixedClock()).save("Kept", "Shelf", listOf(textBox()))
         assertTrue(saved != null)
 
-        val reopened = ElementLibrary(fs, FixedClock()).list()
+        val reopened = LegacyElementLibrary(fs, FixedClock()).list()
         assertEquals(1, reopened.size)
         assertEquals("Kept", reopened.single().name)
         assertEquals("Shelf", reopened.single().collection)
-        assertEquals(listOf("Shelf"), ElementLibrary(fs, FixedClock()).collections())
+        assertEquals(listOf("Shelf"), LegacyElementLibrary(fs, FixedClock()).collections())
     }
 
     @Test
     fun `an unreadable index answers empty rather than throwing`() = runTest {
         val fs = InMemoryFileSystem()
         fs.writeBytesAtomically("elements/index.json", "not json".encodeToByteArray())
-        assertEquals(emptyList(), ElementLibrary(fs, FixedClock()).list())
+        assertEquals(emptyList(), LegacyElementLibrary(fs, FixedClock()).list())
     }
 
     @Test
@@ -149,37 +146,9 @@ class ElementLibraryTest {
         assertNull(library().save("Empty", "Shelf", emptyList()))
     }
 
-    // --- the capture rule ---------------------------------------------------
-
-    /**
-     * ⚠️ **A stroke cannot be captured, and this test is where that limitation is written down.**
-     *
-     * A `StrokeObject`'s geometry is an opaque blob only `:android:ink` can decode (SPEC §5.4), so
-     * `:app` cannot measure one to decide it is inside the area — `InkObject.pageBounds` answers
-     * null and [objectsWithin] therefore skips it. The Elements row says so in the UI, because a
-     * capture that silently left the handwriting behind would be discovered by stamping it.
-     */
-    @Test
-    fun `capture takes the measurable objects inside the area and skips strokes`() {
-        val inside = shape(Matrix3.translate(10f, 10f)).obj
-        val outside = shape(Matrix3.translate(500f, 500f)).obj
-        val stroke = StrokeObject(
-            id = ObjectId("018f0000-0000-7000-8000-0000000000ff"),
-            geometry = StrokeGeometry(ByteArray(4)),
-        )
-        val taken = objectsWithin(listOf(inside, outside, stroke), PageRect(0f, 0f, 200f, 200f))
-        assertEquals(listOf(inside.id), taken.map { it.id })
-    }
-
-    @Test
-    fun `an object straddling the edge of the area is not taken`() {
-        val straddling = shape(Matrix3.translate(150f, 10f)).obj
-        assertTrue(objectsWithin(listOf(straddling), PageRect(0f, 0f, 200f, 200f)).isEmpty())
-    }
-
     // --- fixtures -----------------------------------------------------------
 
-    private fun library() = ElementLibrary(InMemoryFileSystem(), FixedClock())
+    private fun library() = LegacyElementLibrary(InMemoryFileSystem(), FixedClock())
 
     private fun shape(transform: Matrix3 = Matrix3.translate(10f, 10f)) = CapturedObject(
         obj = ShapeObject(

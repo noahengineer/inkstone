@@ -1,9 +1,34 @@
 <#
-    Build the debug APK and copy it to the tablet's Download folder over MTP.
+    Build the APK and copy it to the tablet's Download folder over MTP.
 
         powershell -ExecutionPolicy Bypass -File tools\send-to-tablet.ps1
         powershell -ExecutionPolicy Bypass -File tools\send-to-tablet.ps1 -NoBuild
         powershell -ExecutionPolicy Bypass -File tools\send-to-tablet.ps1 -Device 'Galaxy Tab S9'
+        powershell -ExecutionPolicy Bypass -File tools\send-to-tablet.ps1 -DebugBuild
+
+    RELEASE BY DEFAULT, AND WHY (2026-09-25)
+    ----------------------------------------
+    This used to send the debug APK, so the tablet only ever ran a DEBUGGABLE
+    build -- which Android never compiles ahead of time and runs partly in its
+    slowest interpreter. Measured on the emulator with the user's own chemistry
+    and physics notes: the library took 16.6 s to appear on debug and 4.6 s on
+    release, and a cover thumbnail 182 s against 51 s, with nothing else changed.
+    A tablet used for real notes should run the build a user would run.
+
+    The release APK is signed with the SAME key as the debug one (the SDK's
+    debug.keystore, injected on the Gradle command line -- the build files still
+    have no release signing config, which is ROADMAP M10's decision to make). So
+    either build installs over the other and every note survives the switch.
+    Minify stays off, as `inkstone.android-application` already has it.
+
+    -DebugBuild sends the debuggable build instead. Use it when you need
+    `adb shell run-as dev.inkstone ...` on the tablet itself -- to read the
+    database or a note's files -- because a release build refuses run-as.
+
+    With adb available, compile the app ahead of time once it is installed, or it
+    runs interpreted until the next idle-maintenance window:
+
+        adb shell cmd package compile -m speed -f dev.inkstone
 
     Then on the tablet: My Files -> Download -> tap the APK. Android asks once
     for permission to install unknown apps from My Files.
@@ -40,13 +65,15 @@
 
 param(
     [string]$Device = '',
-    [switch]$NoBuild
+    [switch]$NoBuild,
+    [switch]$DebugBuild
 )
 
 $ErrorActionPreference = 'Stop'
 
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-$Apk = Join-Path $RepoRoot 'app\build\outputs\apk\debug\app-debug.apk'
+$Variant = if ($DebugBuild) { 'debug' } else { 'release' }
+$Apk = Join-Path $RepoRoot "app\build\outputs\apk\$Variant\app-$Variant.apk"
 # ---------------------------------------------------------------------------
 # The destination name carries the commit, and that is a safety property
 # ---------------------------------------------------------------------------
@@ -87,10 +114,26 @@ if (-not $NoBuild) {
         }
     }
 
-    Write-Host '== Building :app:assembleDebug ==' -ForegroundColor Cyan
     Push-Location $RepoRoot
     try {
-        & .\gradlew.bat :app:assembleDebug --console=plain
+        if ($DebugBuild) {
+            Write-Host '== Building :app:assembleDebug ==' -ForegroundColor Cyan
+            & .\gradlew.bat :app:assembleDebug --console=plain
+        } else {
+            # Signed with the debug keystore so it upgrades the debug install in
+            # place -- see "RELEASE BY DEFAULT" above. The password is the SDK's
+            # published default for that keystore, not a secret.
+            $keystore = Join-Path $env:USERPROFILE '.android\debug.keystore'
+            if (-not (Test-Path $keystore)) {
+                throw "No debug keystore at $keystore. Build once with -DebugBuild and the SDK creates it."
+            }
+            Write-Host '== Building :app:assembleRelease (debug-key signed) ==' -ForegroundColor Cyan
+            & .\gradlew.bat :app:assembleRelease --console=plain `
+                "-Pandroid.injected.signing.store.file=$keystore" `
+                '-Pandroid.injected.signing.store.password=android' `
+                '-Pandroid.injected.signing.key.alias=androiddebugkey' `
+                '-Pandroid.injected.signing.key.password=android'
+        }
         if ($LASTEXITCODE -ne 0) { throw "Gradle failed with exit code $LASTEXITCODE" }
     } finally {
         Pop-Location
@@ -120,7 +163,9 @@ Write-Host "APK: $expectedBytes bytes, built $((Get-Item $Apk).LastWriteTime)" -
 # bytes do -- which makes the skip correct by construction rather than by luck,
 # and lets you tell two dirty builds apart on the tablet's own file list.
 $stamp = if ($dirty) { '-' + (Get-FileHash $Apk -Algorithm SHA256).Hash.Substring(0, 8).ToLower() } else { '' }
-$DestName = "inkstone-$sha$dirty$stamp.apk"
+# The variant is in the name as well, so the tablet's Download list says which kind of build each is.
+$suffix = if ($DebugBuild) { '' } else { '-release' }
+$DestName = "inkstone-$sha$dirty$stamp$suffix.apk"
 
 # ---------------------------------------------------------------------------
 # 2. Find the tablet
@@ -217,7 +262,7 @@ while ((Get-Date) -lt $deadline) {
             # sha, optionally `-dirty`. A hand-named keepsake like `inkstone-m1.apk`
             # is not this script's to delete, and `-like 'inkstone-*.apk'` would
             # have taken it.
-            $mine = '^inkstone-[0-9a-f]{7,40}(-dirty(-[0-9a-f]{8})?)?\.apk$'
+            $mine = '^inkstone-[0-9a-f]{7,40}(-dirty(-[0-9a-f]{8})?)?(-release)?\.apk$'
             foreach ($old in @($dest.Items() | Where-Object { $_.Name -match $mine -and $_.Name -ne $DestName })) {
                 Write-Host "  removing older build $($old.Name)" -ForegroundColor DarkGray
                 $old.InvokeVerb('delete')

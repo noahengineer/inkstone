@@ -201,6 +201,24 @@ class ElementLibraryTest {
     }
 
     @Test
+    fun `a measured box makes ink-only Elements land where they are stamped`() = runTest {
+        // ⭐ The platform measured the squiggle at (40, 50)–(100, 80). With that as the origin the
+        // stroke's stored transform is relative to it, so a stamp at (500, 500) puts the ink's
+        // top-left at (500, 500) and not at (540, 550) — and the panel has a real size to show.
+        val measured = dev.inkstone.core.model.PageRect(40f, 50f, 100f, 80f)
+        val element = library.save("Squiggle", "Chemistry", diagram(), setOf(INK), emptyMap(), measured)
+
+        assertEquals(60f, element.widthPt)
+        assertEquals(30f, element.heightPt)
+        val stroke = element.objects.single()
+        assertEquals(-40f, stroke.transform.m02)
+        assertEquals(-50f, stroke.transform.m12)
+        val placed = foldPage(PAGE, stamp(element, Matrix3.translate(500f, 500f)).ops).objects.single()
+        assertEquals(460f, placed.transform.m02)
+        assertEquals(450f, placed.transform.m12)
+    }
+
+    @Test
     fun `an image whose bytes were not supplied is dropped rather than saved empty`() = runTest {
         val element = library.save("Picture", "Chemistry", diagram(), setOf(PICTURE), emptyMap())
 

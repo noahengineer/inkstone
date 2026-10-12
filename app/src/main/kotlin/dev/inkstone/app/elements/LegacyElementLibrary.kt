@@ -3,6 +3,7 @@ package dev.inkstone.app.elements
 import dev.inkstone.app.note.pageBounds
 import dev.inkstone.core.model.Clock
 import dev.inkstone.core.model.FileSystem
+import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.ImageEdit
 import dev.inkstone.core.model.ImageObject
@@ -12,6 +13,7 @@ import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
+import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.PageRect
@@ -23,43 +25,28 @@ import dev.inkstone.core.model.ShapePlacement
 import dev.inkstone.core.model.ShapeRecord
 import dev.inkstone.core.model.TextBoxEdit
 import dev.inkstone.core.model.TextBoxObject
+import dev.inkstone.core.model.foldPage
 import dev.inkstone.core.storage.Bundle
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
-import javax.inject.Inject
-import javax.inject.Singleton
 
 /**
- * ⭐ ROADMAP M8c — *"save a selection as a reusable Element, with a name and a collection"*.
+ * ⛔ **Superseded — read only so that what it saved can be migrated.** M8c's stand-in Element
+ * library, kept for its on-disk format and nothing else.
  *
- * ## An Element is a template, never a recording of ops
+ * It was written in `:app` because `:core:storage`'s `ElementLibrary` was being built in parallel and
+ * was not on the classpath; the plan was that *"moving this is a change of import"*. The move never
+ * happened, and the stand-in shipped — with the one limitation that made Elements feel broken: it
+ * could not hold **pen strokes**. `:app` cannot measure a stroke (SPEC §5.4) and `InkSelection` gave
+ * out a count rather than ids, so a hand-drawn icon saved as *"Nothing in that box could be saved"*.
+ * `:core:storage`'s version holds every kind, and the surface now measures and enumerates ink for it
+ * (`InkSurfaceView.objectsWithin` / `boundsOf`). See `docs/M8-ELEMENTS-KNOCKOUT.md` §2.
  *
- * SPEC §4.9.4 is explicit and the reason is worth restating, because the obvious implementation is
- * the broken one: storing the `AddObject` ops and replaying them would stamp the **same
- * `ObjectId`** twice, and `PageFolder.absorb` is first-write-wins on the payload — so the second
- * insertion would produce *one* object carrying the first stamp's payload at the second stamp's
- * transform, and the first copy would visibly vanish. That is SPEC §5.6's duplicate-id corruption
- * arriving from the other direction.
- *
- * So an Element holds payloads, geometry **relative to its own top-left**, style, the two record
- * registers, and its own copy of any image bytes. [stamp] mints a fresh UUIDv7 per object and a
- * fresh `assets/img-<newId>.webp` per asset, every time.
- *
- * ## ⚠️ What an Element can hold, and the one thing it cannot
- *
- * Text boxes, images and shapes. **Not pen strokes** — and that is a seam, not a decision. A
- * stroke's geometry is an opaque blob that only `:android:ink` can decode or re-encode (SPEC
- * §5.4), so `:app` can neither measure a stroke's bounds to decide it is inside the capture area
- * nor copy its payload into a template. `InkSelection` exposes a *count* and not its ids
- * (`SelectionController`), so the lasso cannot supply the answer either. `ElementCapture` takes an
- * **area** for that reason, and this limitation is stated in the UI rather than discovered.
- *
- * ## Why this lives in `:app`
- *
- * It should not, and this is a stand-in: `:core:storage` is where an `ElementLibrary` belongs, so
- * that the iOS target inherits it. It is here because that module was being written in parallel
- * with this one and the type was not on the classpath. The seam is [ElementStamp], which is the
- * shape `:core:storage`'s is specified to return, so moving this is a change of import.
+ * [ElementShelf] reads this index once, turns each row into a real `:core:storage` Element through
+ * [asPage], saves that, and then removes the row — leaving the row's image files on disk, for
+ * CLAUDE.md rule 1's reason. [save] and [stamp] survive because the migration's own tests build their
+ * fixtures with them and the migration re-uses [LegacyElementMember.opsFor] to rebuild each object
+ * exactly as this class would have stamped it; nothing in production calls either.
  *
  * ## On disk
  *
@@ -67,14 +54,8 @@ import javax.inject.Singleton
  * elements/index.json                  every element's metadata and its members
  * elements/<elementId>/<assetName>     one file per image the element carries
  * ```
- *
- * A **sibling of `notes/`**, for `NoteLayout.RECORDINGS_DIR`'s reason: a note directory is
- * something this app moves and copies as a unit — trash, duplicate, orphan-stub — and an Element
- * belongs to the user, not to whichever note it was cut from. Trashing that note must not take the
- * library with it.
  */
-@Singleton
-class ElementLibrary @Inject constructor(private val fs: FileSystem, private val clock: Clock) {
+class LegacyElementLibrary(private val fs: FileSystem, private val clock: Clock) {
 
     /**
      * Every saved element, newest first.
@@ -84,7 +65,7 @@ class ElementLibrary @Inject constructor(private val fs: FileSystem, private val
      * must never be able to stop a note from opening, which is what an exception escaping a
      * composable's `LaunchedEffect` would do.
      */
-    suspend fun list(): List<Element> = readIndex().elements.sortedByDescending { it.createdEpochMillis }
+    suspend fun list(): List<LegacyElement> = readIndex().elements.sortedByDescending { it.createdEpochMillis }
 
     /** The collections that exist, in first-use order, so the panel's grouping is stable. */
     suspend fun collections(): List<String> = list().map { it.collection }.distinct()
@@ -102,7 +83,7 @@ class ElementLibrary @Inject constructor(private val fs: FileSystem, private val
      * @return null when there is nothing capturable in the area. The caller says so; an element
      *   with no members would sit in the panel stamping nothing.
      */
-    suspend fun save(name: String, collection: String, objects: List<CapturedObject>): Element? {
+    suspend fun save(name: String, collection: String, objects: List<CapturedObject>): LegacyElement? {
         if (objects.isEmpty()) return null
         val bounds = objects.mapNotNull { it.obj.pageBounds() }
             .reduceOrNull { a, b -> a.union(b) } ?: return null
@@ -120,7 +101,7 @@ class ElementLibrary @Inject constructor(private val fs: FileSystem, private val
             captured.assetBytes?.let { fs.writeBytesAtomically("$ELEMENTS_DIR/$id/$index$ASSET_EXTENSION", it) }
         }
 
-        val element = Element(
+        val element = LegacyElement(
             id = id,
             name = name.ifBlank { DEFAULT_NAME },
             collection = collection.ifBlank { DEFAULT_COLLECTION },
@@ -129,7 +110,7 @@ class ElementLibrary @Inject constructor(private val fs: FileSystem, private val
             heightPt = bounds.height,
             members = members,
         )
-        writeIndex(ElementIndex(readIndex().elements + element))
+        writeIndex(LegacyElementIndex(readIndex().elements + element))
         return element
     }
 
@@ -142,7 +123,53 @@ class ElementLibrary @Inject constructor(private val fs: FileSystem, private val
      * directory is orphaned, not overwritten, so a future undelete has something to find.
      */
     suspend fun delete(id: String) {
-        writeIndex(ElementIndex(readIndex().elements.filterNot { it.id == id }))
+        writeIndex(LegacyElementIndex(readIndex().elements.filterNot { it.id == id }))
+    }
+
+    /**
+     * ⭐ [element] rebuilt as the page it was cut from — every member as a real object at its
+     * stored relative position, with both registers and the image bytes — which is exactly what
+     * `:core:storage`'s `ElementLibrary.save` takes.
+     *
+     * Each member keeps its **original** id (`sourceId`), so a connector's attachment, which names
+     * those ids, still points at the boxes it was drawn between; the core library re-identifies on
+     * every stamp anyway. Built through [LegacyElementMember.opsFor] — the same path a stamp took —
+     * so the migrated Element is the one this library would have stamped, not a re-interpretation.
+     *
+     * @return null when nothing in the row could be rebuilt, which [ElementShelf] reports by
+     *   leaving the row where it is.
+     */
+    suspend fun asPage(element: LegacyElement): MigratedElement? {
+        val ids = element.members.associate { it.sourceId to ObjectId(it.sourceId) }
+        val keys = SelectionEdit.keysAbove(null, element.members.size)
+        var counter = 0
+        val ops = ArrayList<PageOp>()
+        val assets = LinkedHashMap<String, ByteArray>()
+        element.members.forEachIndexed { index, member ->
+            val id = ids.getValue(member.sourceId)
+            val asset = member.asset?.let { source ->
+                val name = Bundle.imageAsset(id)
+                readAsset(element.id, source)?.let { assets[name] = it } ?: return@forEachIndexed
+                name
+            }
+            ops += member.opsFor(
+                id = id,
+                transform = member.transform(),
+                z = keys[index],
+                asset = asset,
+                remap = ids,
+                nextOpId = { "migrate-${counter++}" },
+                nextClock = { LamportClock((++counter).toLong(), MIGRATION_DEVICE) },
+            )
+        }
+        val page = foldPage(PageId(MIGRATION_PAGE), ops)
+        if (page.objects.isEmpty()) return null
+        return MigratedElement(
+            page = page,
+            ids = page.objects.map { it.id }.toSet(),
+            assets = assets,
+            bounds = PageRect(0f, 0f, element.widthPt, element.heightPt),
+        )
     }
 
     /**
@@ -160,13 +187,13 @@ class ElementLibrary @Inject constructor(private val fs: FileSystem, private val
      */
     @Suppress("LongParameterList") // The placement and the note's four generators; see the KDoc.
     suspend fun stamp(
-        element: Element,
+        element: LegacyElement,
         at: PagePoint,
         topZ: FractionalKey?,
         newObjectId: () -> ObjectId,
         nextOpId: () -> String,
         nextClock: () -> LamportClock,
-    ): ElementStamp {
+    ): LegacyElementStamp {
         val ops = ArrayList<PageOp>(element.members.size * OPS_PER_MEMBER)
         val assets = LinkedHashMap<String, ByteArray>()
         val keys = SelectionEdit.keysAbove(topZ, element.members.size)
@@ -186,7 +213,7 @@ class ElementLibrary @Inject constructor(private val fs: FileSystem, private val
             }
             ops += member.opsFor(id, place * member.transform(), keys[index], asset, remap, nextOpId, nextClock)
         }
-        return ElementStamp(ops, assets)
+        return LegacyElementStamp(ops, assets)
     }
 
     private suspend fun readAsset(elementId: String, name: String): ByteArray? {
@@ -197,23 +224,26 @@ class ElementLibrary @Inject constructor(private val fs: FileSystem, private val
         return if (fs.exists(path)) fs.readBytes(path) else null
     }
 
-    private suspend fun readIndex(): ElementIndex = runCatching {
-        if (!fs.exists(INDEX_PATH)) return@runCatching ElementIndex(emptyList())
-        json.decodeFromString(ElementIndex.serializer(), fs.readBytes(INDEX_PATH).decodeToString())
-    }.getOrElse { ElementIndex(emptyList()) }
+    private suspend fun readIndex(): LegacyElementIndex = runCatching {
+        if (!fs.exists(INDEX_PATH)) return@runCatching LegacyElementIndex(emptyList())
+        json.decodeFromString(LegacyElementIndex.serializer(), fs.readBytes(INDEX_PATH).decodeToString())
+    }.getOrElse { LegacyElementIndex(emptyList()) }
 
-    private suspend fun writeIndex(index: ElementIndex) {
-        fs.writeBytesAtomically(INDEX_PATH, json.encodeToString(ElementIndex.serializer(), index).encodeToByteArray())
+    private suspend fun writeIndex(index: LegacyElementIndex) {
+        fs.writeBytesAtomically(
+            INDEX_PATH,
+            json.encodeToString(LegacyElementIndex.serializer(), index).encodeToByteArray(),
+        )
     }
 
-    private fun memberOf(captured: CapturedObject, origin: Matrix3, assetName: String?): ElementMember? {
+    private fun memberOf(captured: CapturedObject, origin: Matrix3, assetName: String?): LegacyElementMember? {
         val obj = captured.obj
         val style = obj.style ?: DEFAULT_STYLE
         val relative = origin * obj.transform
         val kind = when (obj) {
-            is TextBoxObject -> ElementKind.TEXT_BOX
-            is ImageObject -> ElementKind.IMAGE
-            is ShapeObject -> ElementKind.SHAPE
+            is TextBoxObject -> LegacyElementKind.TEXT_BOX
+            is ImageObject -> LegacyElementKind.IMAGE
+            is ShapeObject -> LegacyElementKind.SHAPE
             else -> return null
         }
         val extents = when (obj) {
@@ -222,7 +252,7 @@ class ElementLibrary @Inject constructor(private val fs: FileSystem, private val
             is ShapeObject -> obj.widthPt to obj.heightPt
             else -> return null
         }
-        return ElementMember(
+        return LegacyElementMember(
             sourceId = obj.id.value,
             kind = kind,
             widthPt = extents.first,
@@ -246,6 +276,8 @@ class ElementLibrary @Inject constructor(private val fs: FileSystem, private val
         const val RADIX = 36
         const val DEFAULT_NAME = "Element"
         const val DEFAULT_COLLECTION = "My elements"
+        const val MIGRATION_PAGE = "legacy-element"
+        const val MIGRATION_DEVICE = "legacy-element"
 
         /** `AddObject`, plus at most a text register and a format register. */
         const val OPS_PER_MEMBER = 3
@@ -284,23 +316,32 @@ class CapturedObject(
  * is a blank rectangle, bytes with no ops is dead weight nothing will ever delete (SPEC §4.9.4 —
  * asset lifetime is refcount-free).
  */
-class ElementStamp(val ops: List<PageOp>, val assets: Map<String, ByteArray>)
+class LegacyElementStamp(val ops: List<PageOp>, val assets: Map<String, ByteArray>)
+
+/** One legacy row, as the input `:core:storage`'s `ElementLibrary.save` takes. See [LegacyElementLibrary.asPage]. */
+class MigratedElement(
+    val page: FoldedPage,
+    val ids: Set<ObjectId>,
+    val assets: Map<String, ByteArray>,
+    /** The row's own extent, which is where its members' relative transforms were measured from. */
+    val bounds: PageRect,
+)
 
 @Serializable
-data class ElementIndex(val elements: List<Element> = emptyList())
+data class LegacyElementIndex(val elements: List<LegacyElement> = emptyList())
 
 @Serializable
-data class Element(
+data class LegacyElement(
     val id: String,
     val name: String,
     val collection: String,
     val createdEpochMillis: Long,
     val widthPt: Float,
     val heightPt: Float,
-    val members: List<ElementMember> = emptyList(),
+    val members: List<LegacyElementMember> = emptyList(),
 )
 
-enum class ElementKind { TEXT_BOX, IMAGE, SHAPE }
+enum class LegacyElementKind { TEXT_BOX, IMAGE, SHAPE }
 
 /**
  * One object inside an element.
@@ -310,10 +351,10 @@ enum class ElementKind { TEXT_BOX, IMAGE, SHAPE }
  * whatever page size — which is the property a stored page-space matrix would not have.
  */
 @Serializable
-data class ElementMember(
+data class LegacyElementMember(
     /** The `ObjectId` this member was cut from — the key the connector remap is built on. */
     val sourceId: String,
-    val kind: ElementKind,
+    val kind: LegacyElementKind,
     val widthPt: Float,
     val heightPt: Float,
     val matrix: List<Float>,
@@ -360,7 +401,7 @@ data class ElementMember(
     ): List<PageOp> {
         val style = ObjectStyle(colorArgb, strokeWidthPt, opacity)
         return when (kind) {
-            ElementKind.TEXT_BOX -> TextBoxEdit.create(
+            LegacyElementKind.TEXT_BOX -> TextBoxEdit.create(
                 id = id,
                 text = text.orEmpty(),
                 widthPt = widthPt,
@@ -373,7 +414,7 @@ data class ElementMember(
                 nextClock = nextClock,
             )
 
-            ElementKind.IMAGE -> asset?.let {
+            LegacyElementKind.IMAGE -> asset?.let {
                 ImageEdit.create(
                     id = id,
                     asset = it,
@@ -388,7 +429,7 @@ data class ElementMember(
                 )
             }.orEmpty()
 
-            ElementKind.SHAPE -> ShapeKind.entries.firstOrNull { it.name == shape }?.let { kind ->
+            LegacyElementKind.SHAPE -> ShapeKind.entries.firstOrNull { it.name == shape }?.let { kind ->
                 ShapeEdit.create(
                     id = id,
                     placement = ShapePlacement(kind, widthPt, heightPt, transform),
@@ -415,18 +456,4 @@ data class ElementMember(
         const val M11 = 4
         const val M12 = 5
     }
-}
-
-/**
- * The objects inside [area], from a folded page — what *"save this as an Element"* captures.
- *
- * A pure function so the rule is testable without a page, a surface or a database. Containment is
- * by **whole bounding box**, not by overlap: a diagram half inside the box would be saved as a
- * broken diagram, and the user's own drag is the affordance for saying "include this too".
- *
- * ⚠️ Objects with no measurable bounds — every pen stroke — are skipped. See [ElementLibrary].
- */
-fun objectsWithin(objects: List<InkObject>, area: PageRect): List<InkObject> = objects.filter { obj ->
-    val box = obj.pageBounds() ?: return@filter false
-    box.left >= area.left && box.right <= area.right && box.top >= area.top && box.bottom <= area.bottom
 }

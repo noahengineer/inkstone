@@ -1,7 +1,6 @@
 package dev.inkstone.app.note
 
 import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.width
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -13,96 +12,94 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import dev.inkstone.app.ui.ChipDivider
+import dev.inkstone.app.ink.ChromeItem
 import dev.inkstone.app.ui.ChipKind
-import dev.inkstone.app.ui.GlassBar
 import dev.inkstone.app.ui.MicroLabel
 import dev.inkstone.app.ui.Readout
 import dev.inkstone.app.ui.TextChip
 import dev.inkstone.core.model.PageTemplate
 
 /**
- * ⭐ ROADMAP M10 — the design's *"Bottom Center (Page Bar)"* zone.
+ * ⭐ ROADMAP M10 — the design's *"Bottom Center (Page Bar)"* zone, one chip at a time.
  *
  * > *"Paging controls `‹ Page 1 of 5 ›`, `ADD`, `DUPLICATE`, `SHARE`, and template toggles."*
  *
  * ROADMAP M2 built this as *"the plainest thing that makes every acceptance criterion reachable"*,
- * under the same *"don't design the toolbar here — M10 owns it"* rule as M1's. This is M10 owning
- * it: four groups behind dividers — where you are, what pages there are, what they look like, and
- * how one leaves the app.
+ * and M10 gave it four groups behind dividers — where you are, what pages there are, what they look
+ * like, and how one leaves the app. Since the layout editor, each chip can live in any bar, so the
+ * page bar is only where these start out (`ChromeLayout`); whichever bar holds one draws it from here.
  *
  * ⚠️ **It has to fit between the history and zoom widgets, and it did not.** Eleven chips plus a
- * revision readout ran about 120 dp past the space `InkScreen.BottomWidgets` leaves it, so the bar
- * scrolled and its last chip sat clipped flush against the pill's rounded end — which reads as
- * broken rather than as scrollable. Two things left: the page-*move* arrows, to the page overview
- * that exists for reordering, and `local_rev`, to the diagnostics panel with the rest of the
- * instrumentation. Nothing became unreachable and the bar now matches the brief's own chip list.
+ * revision readout ran about 120 dp past the space between them, so the bar scrolled and its last chip
+ * sat clipped flush against the pill's rounded end. Two things left: the page-*move* arrows, to the
+ * page overview that exists for reordering, and `local_rev`, to the diagnostics panel.
+ *
+ * @param exporting whether an export is in flight. UI-local rather than part of [NoteEditorState]:
+ *   the export is driven from the composition, because handing a Uri to another app needs a
+ *   `Context` and a chooser, and neither belongs in the editor.
  */
 @Composable
-fun PageBar(
-    state: NoteEditorState,
-    actions: PageBarActions,
-    modifier: Modifier = Modifier,
-    /**
-     * Whether an export is in flight. UI-local rather than part of [NoteEditorState]: the export is
-     * driven from the composition, because handing a Uri to another app needs a `Context` and a
-     * chooser, and neither belongs in the editor.
-     */
-    exporting: Boolean = false,
-) {
-    var templateMenuOpen by remember { mutableStateOf(false) }
+internal fun PageChip(item: ChromeItem, state: NoteEditorState, actions: PageBarActions, exporting: Boolean) {
+    when (item) {
+        ChromeItem.PAGE_PREVIOUS, ChromeItem.PAGE_COUNTER, ChromeItem.PAGE_NEXT -> Paging(item, state, actions)
 
-    GlassBar(modifier = modifier) {
-        Paging(state, actions)
+        ChromeItem.PAGE_ADD -> TextChip(label = "Add", onClick = actions.onAddPage)
 
-        ChipDivider()
-        Structure(actions)
+        ChromeItem.PAGE_DUPLICATE -> TextChip(label = "Duplicate", onClick = actions.onDuplicatePage)
 
-        ChipDivider()
-        TemplateChip(
-            template = state.template,
-            infinite = state.infiniteCanvas,
-            open = templateMenuOpen,
-            onOpen = { templateMenuOpen = true },
-            onDismiss = { templateMenuOpen = false },
-            onPick = actions.onTemplate,
-            onToggleInfinite = actions.onToggleInfiniteCanvas,
-        )
+        ChromeItem.PAGE_DELETE -> TextChip(label = "Delete", danger = true, onClick = actions.onDeletePage)
 
-        ChipDivider()
-        ShareChip(exporting = exporting, actions = actions)
+        ChromeItem.PAGE_TEMPLATE -> {
+            var open by remember { mutableStateOf(false) }
+            TemplateChip(
+                template = state.template,
+                infinite = state.infiniteCanvas,
+                open = open,
+                onOpen = { open = true },
+                onDismiss = { open = false },
+                onPick = actions.onTemplate,
+                onToggleInfinite = actions.onToggleInfiniteCanvas,
+            )
+        }
+
+        else -> ShareChip(exporting = exporting, actions = actions)
     }
 }
 
 /** Where you are: `‹ 3 of 12 ›`. The counter is also the overview's handle. */
 @Composable
-private fun RowScope.Paging(state: NoteEditorState, actions: PageBarActions) {
-    TextChip(
-        label = "‹",
-        kind = ChipKind.GLYPH,
-        contentDescription = "Previous page",
-        enabled = state.pageIndex > 0,
-        onClick = actions.onPrevious,
-    )
-    // M3 gave the overview sheet thumbnails, and "tap the page number to see the pages" needs no
-    // extra button to explain.
-    TextChip(
-        label = "${state.pageIndex + 1} of ${state.pageCount}",
-        kind = ChipKind.VALUE,
-        onClick = actions.onShowPages,
-        modifier = Modifier.width(CounterWidth),
-    )
-    TextChip(
-        label = "›",
-        kind = ChipKind.GLYPH,
-        contentDescription = "Next page",
-        enabled = state.pageIndex < state.pageCount - 1,
-        onClick = actions.onNext,
-    )
+private fun Paging(item: ChromeItem, state: NoteEditorState, actions: PageBarActions) {
+    when (item) {
+        ChromeItem.PAGE_PREVIOUS -> TextChip(
+            label = "‹",
+            kind = ChipKind.GLYPH,
+            contentDescription = "Previous page",
+            enabled = state.pageIndex > 0,
+            onClick = actions.onPrevious,
+        )
+
+        // M3 gave the overview sheet thumbnails, and "tap the page number to see the pages" needs no
+        // extra button to explain.
+        ChromeItem.PAGE_COUNTER -> TextChip(
+            label = "${state.pageIndex + 1} of ${state.pageCount}",
+            kind = ChipKind.VALUE,
+            onClick = actions.onShowPages,
+            modifier = Modifier.width(CounterWidth),
+        )
+
+        else -> TextChip(
+            label = "›",
+            kind = ChipKind.GLYPH,
+            contentDescription = "Next page",
+            enabled = state.pageIndex < state.pageCount - 1,
+            onClick = actions.onNext,
+        )
+    }
 }
 
-/**
- * What pages there are: add, duplicate, delete.
+/*
+ * What pages there are: add, duplicate, delete — the three `PAGE_ADD`/`PAGE_DUPLICATE`/`PAGE_DELETE`
+ * chips in `PageBar` above.
  *
  * ⚠️ **The two page-*move* chips are not here, and reordering is not lost.** They were, and between
  * them and the revision readout the bar was about 120 dp wider than the space between the history
@@ -115,12 +112,6 @@ private fun RowScope.Paging(state: NoteEditorState, actions: PageBarActions) {
  * session when it is the last one rather than hidden here, so the reason arrives as a message
  * instead of as a greyed-out chip with no explanation.
  */
-@Composable
-private fun RowScope.Structure(actions: PageBarActions) {
-    TextChip(label = "Add", onClick = actions.onAddPage)
-    TextChip(label = "Duplicate", onClick = actions.onDuplicatePage)
-    TextChip(label = "Delete", danger = true, onClick = actions.onDeletePage)
-}
 
 /**
  * ⭐ ROADMAP M10 — the two exports behind one `SHARE`, which is what the design's chip list names.

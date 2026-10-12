@@ -40,4 +40,16 @@ import android.graphics.Bitmap
  */
 public fun interface PageAssets {
     public fun bitmap(asset: String): Bitmap?
+
+    /**
+     * True when a null from [bitmap] means *"being decoded — ask again shortly"* rather than *"not
+     * here"*.
+     *
+     * ⚠️ **The two nulls must look different on the glass.** The missing-asset placeholder is a
+     * crossed box precisely so that it reads as a fault; a cache that decodes on request answers
+     * null for every picture until its first batch lands, and drawing a page of crosses for the
+     * second that takes is a page that reports eleven faults it does not have. The default is
+     * false, so an implementation that cannot tell keeps the old honest-but-alarming picture.
+     */
+    public fun isPending(asset: String): Boolean = false
 }

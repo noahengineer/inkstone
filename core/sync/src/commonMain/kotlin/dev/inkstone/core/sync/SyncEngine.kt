@@ -191,6 +191,24 @@ public class SyncEngine(
      */
     public suspend fun accountOf(accountId: String): SyncAccount? = accounts.find(accountId)
 
+    /**
+     * Every account, read-only, for the same reason [accountOf] is read-only.
+     *
+     * The library needs it to mirror remote directories back into folders after a reinstall
+     * (`LibraryRepository.mirrorRemoteFolders`), which is a question about *all* accounts rather
+     * than one note's.
+     */
+    public suspend fun allAccounts(): List<SyncAccount> = accounts.all()
+
+    /**
+     * Every binding on one account — the paths that say where each note lives on the server.
+     *
+     * Read-only, and the caller may not write through it: a binding is changed by [bind],
+     * [bindPulled], [bindAdopted] and [notePathChanged] and nothing else, so that the outbox
+     * stays the only route to a remote write (CLAUDE.md rule 4).
+     */
+    public suspend fun bindingsFor(accountId: String): List<RemoteBinding> = bindings.forAccount(accountId)
+
     // -----------------------------------------------------------------------
     // What the rest of the app reports
     // -----------------------------------------------------------------------

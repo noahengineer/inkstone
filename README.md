@@ -491,6 +491,7 @@ It plants a real violation for each (an `android.content.Context` import in `:co
 :core:database    KMP  SQLDelight schema + queries.
 :core:sync        KMP  Nextcloud client (Ktor), outbox, reconciler, merge engine.
 :core:search      KMP  Tokenizer + FTS index over recognised text.
+:core:calc        KMP  fx-991ZA PLUS II calculator engine: keys in, LCD frame out.
 
 :android:ink      AND  androidx.ink, MotionEvent handling, renderer.
 :android:pdf      AND  PDF import, render, materialize.

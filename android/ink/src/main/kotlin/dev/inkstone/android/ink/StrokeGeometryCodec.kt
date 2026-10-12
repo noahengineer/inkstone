@@ -106,29 +106,54 @@ internal object StrokeGeometryCodec {
      *   does not draw; an exception here would be a note that does not open, and one
      *   unreadable stroke must not cost the other 4,999.
      */
-    // Every return is a different way the blob is unreadable, and they all mean the same thing
-    // to the caller: a stroke that does not draw. See the KDoc on why that is not an exception.
-    @Suppress("ReturnCount")
     fun decode(geometry: StrokeGeometry, brushes: InkBrushFactory, style: ObjectStyle? = null): DecodedStroke? {
+        // Header validation and the input batch — one implementation, shared with [decodeInputs].
+        val decoded = decodeInputs(geometry) ?: return null
+        val bytes = geometry.bytes
+        val colorArgb = bytes.readInt(COLOR_OFFSET)
+        val sizePt = Float.fromBits(bytes.readInt(SIZE_OFFSET))
+        val epsilonPt = Float.fromBits(bytes.readInt(EPSILON_OFFSET))
+
+        // The style register's brush, when the caller has one — tessellation is the decode's
+        // whole cost, and building the captured brush only to restyle over it paid that cost
+        // twice for every restyled stroke on every page load.
+        val brush = brushes.brushFor(decoded.kind, colorArgb, sizePt, epsilonPt, decoded.inputModel, style)
+        return DecodedStroke(Stroke(brush, decoded.inputs), decoded.kind, decoded.inputModel)
+    }
+
+    /**
+     * ⭐ The blob's inputs and brush kind **without building a `Stroke`** — no brush, no native
+     * tessellation.
+     *
+     * For the one reader that wants the samples and not the ink: the recogniser's sampler
+     * (`InkStrokeSampler`), which used to build a whole `StrokeStore` — decode, brush, mesh, erased
+     * region — for every stroke on the page, three seconds after every burst of writing, to read
+     * `stroke.inputs` and throw the rest away. On B (2,097 objects) that is a full-page
+     * tessellation per recognition pass, on a note where opening the page is already the largest
+     * cost in the app (`PreparedPage`).
+     *
+     * **The same header validation as [decode], and the same null-on-damage contract** — [decode]
+     * is written on top of this, so the two cannot come to disagree about which blobs are readable.
+     * What this does *not* do is build a `Brush` from the header's colour, size and epsilon, so a
+     * blob whose size or epsilon `Brush` would refuse — which [decode] turns into an exception, not
+     * a null — decodes here. Nothing this app writes has one.
+     */
+    // Every return is a different way the blob is unreadable, and they all mean the same thing
+    // to the caller: a stroke that does not draw. See [decode]'s KDoc on why that is not an
+    // exception.
+    @Suppress("ReturnCount")
+    fun decodeInputs(geometry: StrokeGeometry): DecodedInputs? {
         val bytes = geometry.bytes
         if (bytes.size < HEADER_SIZE || !bytes.startsWithMagic()) return null
         if (bytes[VERSION_OFFSET] > FORMAT_VERSION) return null
 
         val kind = InkBrushKind.entries.getOrNull(bytes[KIND_OFFSET].toInt()) ?: return null
         val inputModel = InkInputModel.entries.getOrNull(bytes[MODEL_OFFSET].toInt()) ?: return null
-        val colorArgb = bytes.readInt(COLOR_OFFSET)
-        val sizePt = Float.fromBits(bytes.readInt(SIZE_OFFSET))
-        val epsilonPt = Float.fromBits(bytes.readInt(EPSILON_OFFSET))
 
         val inputs = runCatching {
             StrokeInputBatchSerializer.decode(ByteArrayInputStream(bytes, HEADER_SIZE, bytes.size - HEADER_SIZE))
         }.getOrNull() ?: return null
-
-        // The style register's brush, when the caller has one — tessellation is the decode's
-        // whole cost, and building the captured brush only to restyle over it paid that cost
-        // twice for every restyled stroke on every page load.
-        val brush = brushes.brushFor(kind, colorArgb, sizePt, epsilonPt, inputModel, style)
-        return DecodedStroke(Stroke(brush, inputs), kind, inputModel)
+        return DecodedInputs(inputs, kind, inputModel)
     }
 
     private fun ByteArrayOutputStream.writeInt(value: Int) {
@@ -169,6 +194,18 @@ internal object StrokeGeometryCodec {
  * it a recolour would quietly re-shape a stroke captured with the other smoothing model.
  */
 internal class DecodedStroke(val stroke: Stroke, val kind: InkBrushKind, val inputModel: InkInputModel)
+
+/**
+ * A blob's input batch and header, with no `Stroke` built — see [StrokeGeometryCodec.decodeInputs].
+ *
+ * [inputs] is the same immutable batch [StrokeGeometryCodec.decode] hands to `Stroke(brush, inputs)`,
+ * so anything read off it here is exactly what `stroke.inputs` would have answered.
+ */
+internal class DecodedInputs(
+    val inputs: ImmutableStrokeInputBatch,
+    val kind: InkBrushKind,
+    val inputModel: InkInputModel,
+)
 
 /**
  * The two `ink-storage` calls, in one place.

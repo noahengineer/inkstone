@@ -1,5 +1,6 @@
 package dev.inkstone.app.ink
 
+import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageRect
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -15,9 +16,9 @@ import kotlin.test.assertNull
  * should at least prove the decision it hands over. The gesture end of it was checked by driving
  * the emulator: capture, save with the panel open, and read the row back out of the panel.
  *
- * The bug this covers is an ordering one. `onSaveElement` clears [ObjectToolState.capturedArea] on
+ * The bug this covers is an ordering one. `onSaveElement` clears [ObjectToolState.capture] on
  * its first line and writes `elements/index.json` from a coroutine afterwards, so a reload keyed on
- * `capturedArea` ran **before** the file existed — and then nothing moved again, because the other
+ * the capture ran **before** the file existed — and then nothing moved again, because the other
  * half of the key, `elementsOpen`, was already true. The panel went on saying *"Nothing saved yet"*,
  * which left nothing to arm and therefore nothing to stamp.
  */
@@ -33,11 +34,12 @@ class ElementPanelRefreshTest {
     fun `clearing the captured area does not reload the panel`() {
         val state = ObjectToolState()
         state.elementsOpen = true
-        state.capturedArea = PageRect(10f, 10f, 120f, 60f)
+        state.capture =
+            ElementCapture(listOf(ObjectId("018f0000-0000-7000-8000-000000000001")), PageRect(10f, 10f, 120f, 60f))
         val before = state.reloadKey()
 
         // The first line of `onSaveElement`, before the save coroutine has written anything.
-        state.capturedArea = null
+        state.capture = null
 
         assertEquals(before, state.reloadKey(), "a reload here reads the index the save has not written yet")
     }
@@ -46,10 +48,11 @@ class ElementPanelRefreshTest {
     fun `a completed save reloads a panel that is already open`() {
         val state = ObjectToolState()
         state.elementsOpen = true
-        state.capturedArea = PageRect(10f, 10f, 120f, 60f)
+        state.capture =
+            ElementCapture(listOf(ObjectId("018f0000-0000-7000-8000-000000000001")), PageRect(10f, 10f, 120f, 60f))
         val before = state.reloadKey()
 
-        state.capturedArea = null
+        state.capture = null
         // What the save coroutine does once `saveElement` has returned.
         state.elementsOpen = true
         state.libraryChanged()

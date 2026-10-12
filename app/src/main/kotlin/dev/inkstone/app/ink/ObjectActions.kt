@@ -4,6 +4,9 @@ import androidx.compose.runtime.Immutable
 import dev.inkstone.core.model.ImageCrop
 import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
+import dev.inkstone.core.model.PagePoint
+import dev.inkstone.core.model.PageRect
+import dev.inkstone.core.storage.Element
 
 /**
  * ⭐ ROADMAP M8c — everything the toolbar can do to a text box, an image or an Element.
@@ -16,6 +19,7 @@ import dev.inkstone.core.model.ObjectId
  * no reason to be stamped from the UI thread the way a lasso move does (`SelectionController`).
  */
 @Immutable
+@Suppress("LongParameterList") // A parameter object: one field per thing the toolbar can do, by design.
 class ObjectActions(
     /** The words. Debounced and on focus loss — see [TextBoxLayer]. */
     val onTextChanged: (ObjectId?, String) -> Unit,
@@ -40,8 +44,27 @@ class ObjectActions(
     /** Rotate and flip in one call, because they are one register: `SetTransform`, absolute. */
     val onTurn: (ObjectId, Float, Boolean, Boolean) -> Unit,
     val onCrop: (ObjectId, ImageCrop?) -> Unit,
-    /** Save the captured area as an Element, under a name and a collection. */
+    /** Save [ObjectToolState.capture] as an Element, under a name and a collection. */
     val onSaveElement: (String, String) -> Unit,
+    /**
+     * ⭐ A box dragged with the Elements tool, as the objects it encloses — handwriting included.
+     *
+     * Answered by the ink surface, the one thing that can measure a stroke (SPEC §5.4). Null when
+     * the box encloses nothing, so the name dialog never opens for an Element of nothing.
+     */
+    val captureArea: (PageRect) -> ElementCapture?,
+    /**
+     * ⭐ Put [Element] on the page **centred** on a page-space point — a tap with one armed, or a
+     * drop from the panel.
+     *
+     * The flag says whether to select what landed and hand over the Select tool. A **drop** does: the
+     * next thing a person does with an Element they just dragged in is move it. A **tap** does not:
+     * arming is M8c's way of stamping one Element four times in a row, and taking the tool away after
+     * the first would make that four trips back to the dock.
+     */
+    val onPlaceElement: (Element, PagePoint, Boolean) -> Unit,
+    /** ⭐ Open [Element] in the Element editor — a double-tap in the panel (SPEC §4.9.7). */
+    val onEditElement: (Element) -> Unit,
     /**
      * ⚠️ Straight to `InkSurfaceView.ruler`, which owns the edge and the snap.
      *
@@ -51,6 +74,8 @@ class ObjectActions(
      */
     val onRulerEnabled: (Boolean) -> Unit,
     val onRulerAngle: (Float) -> Unit,
+    /** ⭐ The Element editor's area, pivot and *Fit* tools (SPEC §4.9.7). Null on a note. */
+    val elementEditor: ElementEditorActions? = null,
 )
 
 /** Where an inserted picture comes from. See [ObjectActions.onInsertImage]. */

@@ -19,6 +19,7 @@ import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.Camera
 import dev.inkstone.core.model.FitMode
 import dev.inkstone.core.model.FoldedPage
+import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
@@ -181,10 +182,21 @@ public class InkSurfaceView @JvmOverloads constructor(
      */
     private var activeStrokeIsStylus = true
 
-    private val eraser = EraserController(strokes, displayMetrics.density) {
+    private val eraser = EraserController(strokes, displayMetrics.density) { gestureEnded ->
         // An erase can take the outermost ink off an infinite page, and the paper follows it back
         // down — the derivation is honest in both directions (SPEC §4.5).
-        recomputeCanvas()
+        //
+        // ⚠️ **At the end of the gesture only**, exactly as the selection's `onChanged` does it
+        // below. This ran on every eraser sample that touched anything, and `contentBounds` walks
+        // the whole page allocating two `PageRect`s per object — ~2,286 allocations per sample on
+        // a 1,143-object note, ~18 MB/s at 240 Hz on the UI thread — to recompute a value an
+        // area erase **cannot change**: a partial erase grows a region beside an object and never
+        // moves its `pageBounds`. The two things that can shrink the paper are a whole-stroke
+        // erase and the pen-up prune, and both are settled by the time `gestureEnded` is true.
+        // Deferring it is also the better behaviour for the whole-stroke mode: `recomputeCanvas`'s
+        // leash would otherwise move the camera — and with it the eraser's own page mapping —
+        // while the pen is still down.
+        if (gestureEnded) recomputeCanvas()
         dryView.onStoreChanged()
         // A flipped pen tip erases whatever the toolbar says, so it can delete a *selected*
         // stroke (WHOLE_STROKE, or the end-of-gesture prune) with the selection standing.
@@ -442,10 +454,13 @@ public class InkSurfaceView @JvmOverloads constructor(
      */
     public var pageCanvas: PageCanvas = PageCanvas.fixed(PageSize.Letter)
         private set(value) {
+            val moved = field.rect.left != value.rect.left || field.rect.top != value.rect.top
             field = value
             dryView.pageCanvas = value
             overlay.pageSize = value.size
             toolOverlay.pageCanvas = value
+            // The paper's lines start from its corner, so the lattice moves when the corner does.
+            if (moved) refreshSnapGrid()
         }
 
     /**
@@ -495,6 +510,45 @@ public class InkSurfaceView @JvmOverloads constructor(
     public fun setPageAssets(assets: PageAssets?) {
         dryView.pageAssets = assets
     }
+
+    /**
+     * ⭐ The Element editor's canvas (SPEC §4.9.7): a grid instead of paper, and every invisible
+     * knockout area drawn dashed. Null — the default — is an ordinary note.
+     */
+    public var elementBackdrop: ElementBackdrop?
+        get() = dryView.backdrop
+        set(value) {
+            dryView.backdrop = value
+            refreshSnapGrid()
+        }
+
+    /**
+     * The lattice a drag lands on right now, or [SnapGrid.None] with the setting off — for `:app`'s
+     * Element-editor tools, which place areas and the pivot outside any selection gesture and must
+     * land them on the same points a drag would.
+     */
+    public val snapGrid: SnapGrid
+        get() = selectionController.grid
+
+    /**
+     * The lattice the paper on screen draws, whether or not snapping is switched on — what the
+     * Element editor is opened at, so an Element is made on the grid it will be placed on.
+     */
+    public val paperGrid: SnapGrid
+        get() = SnapGrid.forBackground(pageBackground, pageCanvas.rect.left, pageCanvas.rect.top)
+
+    /**
+     * ⭐ The Element editor's lattice spacing (SPEC §4.9.7) — the note's it was opened from, so the
+     * grid an Element is drawn on is the grid its copies snap to. Drawn by the backdrop and snapped
+     * to by every tool, from zero on both axes.
+     */
+    public var elementGridPt: Float = SnapGrid.DEFAULT_SPACING_PT
+        set(value) {
+            if (field == value || value < SnapGrid.MIN_SPACING_PT) return
+            field = value
+            dryView.backdropCellPt = value
+            refreshSnapGrid()
+        }
 
     /**
      * ⭐ M8a — how many objects are selected, so the toolbar can offer the actions that need
@@ -609,6 +663,17 @@ public class InkSurfaceView @JvmOverloads constructor(
     /** Told when [pageLoading] flips, so `:app` can say so rather than showing bare paper. */
     public var onPageLoadingChanged: ((Boolean) -> Unit)? = null
 
+    /**
+     * ⭐ Told, as a page load **begins**, which pictures (asset names) the page draws — so `:app` can
+     * decode them while the strokes are still being built, instead of after the first frame asks.
+     *
+     * An optimisation only: the asset cache also decodes whatever the painter asks it for, which is
+     * what makes a picture inserted, undone or merged in later appear without this. What this buys
+     * is the open — on the physics note the eleven photographs' decode overlaps a multi-second
+     * stroke build rather than starting when it ends.
+     */
+    public var onPagePictures: ((Set<String>) -> Unit)? = null
+
     /** Bumped per load, so a build that finishes after a newer one started is discarded. */
     private var pageLoadGeneration: Int = 0
 
@@ -632,7 +697,8 @@ public class InkSurfaceView @JvmOverloads constructor(
         val generation = beginPageLoad(page)
         // ⭐ **The whole cost of opening a note, off the UI thread.** See [PreparedPage] — both for
         // the measurement and for why building a `Stroke` here is safe rather than hopeful.
-        val prepared = withContext(dispatcher) { PreparedPage.of(page, brushFactory) }
+        // `build`, not `of`: the objects are built across the dispatcher's threads (see [PreparedPage.build]).
+        val prepared = withContext(dispatcher) { PreparedPage.build(page, brushFactory) }
         // ⚠️ A newer load has started while this one was building, so this one's objects belong to
         // a page that is no longer on screen. Installing them would put the previous page's ink on
         // the current page's paper — and `NoteEditor.serial` does *not* rule it out: the editor
@@ -666,12 +732,13 @@ public class InkSurfaceView @JvmOverloads constructor(
         adoptCanvas(page.canvas)
         // Explicit, because the setter above no longer does it. A page *switch* should fit the new
         // page — it is a different piece of paper and the old camera means nothing on it.
-        resetCamera(FitMode.FIT_WIDTH)
+        fitOrFrame()
         dryView.pageBackground = page.background
         refreshSnapGrid()
         // Cleared, not kept: the next page's paper is not this one's, and leaving the
         // old bitmap up means an imported page briefly shows the previous page's scan.
         dryView.sourcePage = null
+        onPagePictures?.let { tell -> tell(page.objects.mapNotNullTo(HashSet()) { (it as? ImageObject)?.asset }) }
         pageLoading = true
         dryView.onStoreChanged()
         return ++pageLoadGeneration
@@ -683,10 +750,14 @@ public class InkSurfaceView @JvmOverloads constructor(
         // `SetErasedRegion` is an absolute register (SPEC §3.5) and a fully erased stroke is not
         // deleted — the op says its whole area is gone, which is the correct and lossless record.
         // So the fold re-inserts it, `buildDryStroke` restores its region, and every frame after
-        // that it pays a `saveLayer`, a mesh draw and a `DST_OUT` `drawPath` to render *nothing*.
-        // The only other caller of this is `EraserController.end`, so before this line the cost
-        // was only ever reclaimed if the user happened to erase again in the same session — a
-        // page rubbed out and reopened carried it for the rest of its life.
+        // that it would pay a `saveLayer`, a mesh draw and a `DST_OUT` `drawPath` to render
+        // *nothing*.
+        //
+        // ⭐ `PreparedPage.of` now decides that **off this thread** and `install` parks those
+        // strokes without drawing them, so this line normally finds an empty queue. It stays for
+        // the page that exhausted the load budget: whatever that left undecided is queued with its
+        // progress, and this is the first bounded pass over it. (This line used to *be* the load
+        // prune, and on a real note it reached two to six of ~555 — see `PruneBudgets`.)
         strokes.pruneFullyErased()
         // ⚠️ After the objects, not before: the canvas is derived from the ink, and until
         // `install` runs the store is empty — so a page opened without this line would show an
@@ -750,7 +821,13 @@ public class InkSurfaceView @JvmOverloads constructor(
      * drawn — a snap with no line, arrived at by a route nobody would look down.
      */
     private fun refreshSnapGrid() {
-        val grid = if (gridSnapEnabled) SnapGrid.forBackground(pageBackground) else SnapGrid.None
+        // The Element editor draws its own grid (`PagePainter.BACKDROP_CELL_PT`, the same lattice), so
+        // the chrome grid would be a second copy of the same lines on top of it.
+        val grid = when {
+            !gridSnapEnabled -> SnapGrid.None
+            elementBackdrop != null -> SnapGrid(elementGridPt, elementGridPt, drawnByThePaper = true)
+            else -> paperGrid
+        }
         snap.grid = grid
         selectionController.grid = grid
         toolOverlay.snapGrid = grid
@@ -806,6 +883,12 @@ public class InkSurfaceView @JvmOverloads constructor(
     public fun applyOps(ops: List<PageOp>, record: Boolean = true) {
         if (ops.isEmpty()) return
         strokes.applyOps(ops, brushFactory, record)
+        // ⭐ A redo of a full erase, a peer's erase, or an undo's re-add of an erased stroke can
+        // leave a stroke on the page that is covered completely — invisible, and paying a layer on
+        // every re-record. The store queued each one; this is the bounded pass over them, and with
+        // nothing queued — the usual case — it is a size check. Before `recomputeCanvas`, because
+        // a stroke leaving the page can shrink an infinite one.
+        strokes.pruneFullyErased()
         // ⭐ The door a peer's merged strokes, an undo and every object insert come through — so
         // it is the one place an infinite page has to re-derive its paper for work it did not
         // watch being made.
@@ -840,6 +923,38 @@ public class InkSurfaceView @JvmOverloads constructor(
      * interface is what `:app` holds so the controller itself stays internal to this module.
      */
     public val selection: InkSelection get() = selectionController
+
+    /**
+     * ⭐ The objects a dragged rectangle encloses, strokes included — what an Element capture saves.
+     *
+     * The marquee's own rule (`Lasso.rectangle`), so a capture box and a selection box drawn round
+     * the same diagram take the same objects. `:app` used to answer this itself from the fold and
+     * could only see objects with a payload extent, which is why a hand-drawn icon saved as nothing.
+     */
+    public fun objectsWithin(area: dev.inkstone.core.model.PageRect): List<ObjectId> = strokes.objectsIn(
+        dev.inkstone.core.model.Lasso.rectangle(
+            dev.inkstone.core.model.PagePoint(area.left, area.top),
+            dev.inkstone.core.model.PagePoint(area.right, area.bottom),
+        ),
+    )
+
+    /**
+     * The page-space box round [ids] as drawn — a stroke's tessellated extent included, which only
+     * this module can measure (SPEC §5.4). Null when none of them is on the page.
+     */
+    public fun boundsOf(ids: Collection<ObjectId>): dev.inkstone.core.model.PageRect? = strokes.pageBoundsOf(ids)
+
+    /**
+     * Select exactly [ids] — what a freshly stamped Element does, so it can be dragged at once.
+     *
+     * ⚠️ The tool is not changed here; the caller moves to Select **after** this, exactly as a
+     * snapped shape does, because [tool]'s setter drops the selection when it leaves Select and an
+     * order the other way round is a no-op on a tool that was already there.
+     */
+    public fun select(ids: List<ObjectId>) {
+        selectionController.select(ids.filter { strokes.objectOf(it) != null })
+        overlay.invalidate()
+    }
 
     /**
      * ⭐ ROADMAP M8a — the rectangular half of *"freehand AND rectangular"*. When on, the select
@@ -962,7 +1077,7 @@ public class InkSurfaceView @JvmOverloads constructor(
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
         if (oldw == 0 && oldh == 0) {
-            resetCamera(FitMode.FIT_WIDTH)
+            fitOrFrame()
         } else if (width > 0 && height > 0) {
             camera = camera.leashed()
         }
@@ -975,6 +1090,41 @@ public class InkSurfaceView @JvmOverloads constructor(
     public fun resetCamera(mode: FitMode) {
         if (width == 0 || height == 0) return
         camera = cameraFor(mode, pageCanvas, Viewport(width.toFloat(), height.toFloat()), pixelsPerPoint, zoomLimits)
+    }
+
+    /**
+     * ⭐ Centre [box] in the view with room round it — how the Element editor opens on an Element in
+     * the middle of a page far larger than the screen (SPEC §4.9.7). Fit-width there would show the
+     * Element as a speck.
+     *
+     * @return false before layout, when there is no view to fit into; the caller tries again.
+     */
+    public fun frame(box: dev.inkstone.core.model.PageRect): Boolean {
+        val laidOut = width > 0 && height > 0
+        if (!laidOut || box.width <= 0f || box.height <= 0f) return false
+        val scale = minOf(width / (box.width * FRAME_ROOM), height / (box.height * FRAME_ROOM))
+            .let(zoomLimits::clamp)
+        val centreX = (box.left + box.right) / 2f
+        val centreY = (box.top + box.bottom) / 2f
+        camera = Camera(Offset(width / 2f - centreX * scale, height / 2f - centreY * scale), scale)
+        return true
+    }
+
+    /**
+     * ⭐ What a page load and the first layout frame the camera on instead of fitting the page's width,
+     * or null for every note. The Element editor sets it to the Element's box (SPEC §4.9.7): its page
+     * is far larger than the screen, and the load's own refit — which runs whenever the load finishes,
+     * after anything a caller could do first — would otherwise leave the Element a speck at 19 %.
+     */
+    public var preferredFrame: dev.inkstone.core.model.PageRect? = null
+        set(value) {
+            field = value
+            value?.let(::frame)
+        }
+
+    private fun fitOrFrame() {
+        val box = preferredFrame
+        if (box == null || !frame(box)) resetCamera(FitMode.FIT_WIDTH)
     }
 
     /** Double-tap zoom: toggle between fit-width and 200% of it, around [focus]. */
@@ -1727,6 +1877,9 @@ public class InkSurfaceView @JvmOverloads constructor(
         const val DOUBLE_TAP_ZOOM = 2f
 
         const val ZOOM_TOGGLE_THRESHOLD = 1.2f
+
+        /** How much bigger than the framed box the view is, so the Element has room round it. */
+        const val FRAME_ROOM = 1.8f
 
         /**
          * How close a snapped line's end must come to a shape to attach to it (ROADMAP M8b).

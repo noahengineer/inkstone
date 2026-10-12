@@ -8,6 +8,9 @@ import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.ShapeObject
 import dev.inkstone.core.model.StrokeObject
 import dev.inkstone.core.model.TextBoxObject
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 
 /**
  * ⭐ A page's render state, built **off the main thread**.
@@ -42,7 +45,10 @@ import dev.inkstone.core.model.TextBoxObject
  * KDoc and is being drawn from while this is built.
  */
 internal class PreparedPage private constructor(
-    /** The page's objects, decoded and tessellated, in the order the ops named them. */
+    /**
+     * The page's objects, decoded and tessellated, in the order the ops named them — **less**
+     * [erasedAway], which are not drawn.
+     */
     val objects: List<DryObject>,
     /**
      * Everything that is not an `AddObject`, in order.
@@ -51,6 +57,27 @@ internal class PreparedPage private constructor(
      * is not on the page until [StrokeStore.install] has put it there.
      */
     val registers: List<PageOp>,
+    /**
+     * ⭐ Strokes whose erased region covers them completely, **decided here, off the main thread**.
+     * [StrokeStore.install] parks them for an un-erase rather than drawing them.
+     *
+     * This decision used to be `StrokeStore.pruneFullyErased` on the UI thread right after the
+     * install, rationed by an estimate 56–101× the real work — so on a real note (B: 653 erased
+     * strokes) it pruned two to six and left ~555 invisible strokes each paying a `saveLayer` +
+     * `DST_OUT` on every full re-record for as long as the note stayed open. Here it is measured
+     * work ([PruneBudgets.LOAD]) on the thread that is already tessellating those very strokes,
+     * and it is safe here for the same reason the tessellation is: the coverage test only reads the
+     * immutable mesh and input batch, plus the region this build made. And it is **final** here —
+     * [loadOps] only adds `SetTextContent` and `SetFormat` after the adds, neither of which moves a
+     * stroke's mesh or its region.
+     */
+    val erasedAway: List<DryObject>,
+    /**
+     * Erased objects the load budget ran out on — drawn (they are in [objects]) and queued by
+     * [StrokeStore.install] for the UI prune to finish, **keeping the progress made here**.
+     * Empty on any page like the ones measured.
+     */
+    val undecided: List<DryObject>,
 ) {
 
     companion object {
@@ -62,11 +89,66 @@ internal class PreparedPage private constructor(
         private val LOAD_CLOCK = LamportClock(0, "load")
 
         /**
-         * Decode and tessellate a page — **the expensive half of a load, and the whole of it.**
+         * Decode and tessellate a page — **the expensive half of a load, and the whole of it** — on
+         * the calling thread, one object after another. See [build] for what a page load uses.
          *
          * @param page the page to build, as the editor last folded it.
          */
-        fun of(page: FoldedPage, brushes: InkBrushFactory): PreparedPage = of(loadOps(page), brushes)
+        fun of(page: FoldedPage, brushes: InkBrushFactory): PreparedPage {
+            val (adds, registers) = split(loadOps(page))
+            return assemble(adds.map { buildDryObject(it.obj, brushes) }, registers)
+        }
+
+        /**
+         * ⭐ [of], with the objects built **in parallel** on the caller's dispatcher — what
+         * `InkSurfaceView.loadPage` runs, on `Dispatchers.Default`.
+         *
+         * ## Why
+         *
+         * Building the objects is most of an open: on the physics note (3,903 strokes) it was 66% of
+         * the loader thread's samples, almost all of it `StrokeGeometryCodec.decode` — the input
+         * batch decode and the native tessellation — one stroke at a time on one core of eight. Each
+         * object is independent of every other, so the page is cut into [CHUNK]-object runs and
+         * built concurrently.
+         *
+         * ## Why that is safe
+         *
+         * The same argument the class KDoc makes for building off the main thread, applied across
+         * threads: [buildDryObject] reads its payload and the brush factory and touches no shared
+         * state — every scratch object it uses belongs to the object being built. The one shared
+         * mutable thing on the path was `InkBrushFactory`'s cache of historical brush families,
+         * which is concurrent now. And concurrent tessellation is not new: the library's thumbnail
+         * renderer has always built strokes on `Dispatchers.Default` while an editor was loading.
+         *
+         * Order is preserved — the runs are rejoined in sequence — so [objects], [registers] and the
+         * prune queue come out exactly as [of] makes them, which is what keeps the `(z, id)` order
+         * and the erase decisions independent of how the work was split. A single-threaded test
+         * dispatcher runs the runs one after another and gets the same answer.
+         */
+        suspend fun build(page: FoldedPage, brushes: InkBrushFactory): PreparedPage {
+            val (adds, registers) = split(loadOps(page))
+            val built = if (adds.size < PARALLEL_FROM) {
+                adds.map { buildDryObject(it.obj, brushes) }
+            } else {
+                coroutineScope {
+                    adds.chunked(CHUNK)
+                        .map { run -> async { run.map { buildDryObject(it.obj, brushes) } } }
+                        .awaitAll()
+                        .flatten()
+                }
+            }
+            return assemble(built, registers)
+        }
+
+        /** Below this many objects a page builds in well under a frame, and fanning out costs more than it saves. */
+        private const val PARALLEL_FROM = 256
+
+        /**
+         * Objects per concurrent run. Small enough that a page of ~4,000 is ~30 runs over eight
+         * cores — so one run full of long strokes does not hold the open up — and large enough that
+         * scheduling them is noise.
+         */
+        private const val CHUNK = 128
 
         /**
          * A folded page as the ops that build it — synthetic, never journaled.
@@ -95,20 +177,38 @@ internal class PreparedPage private constructor(
             return ops
         }
 
-        private fun of(ops: List<PageOp>, brushes: InkBrushFactory): PreparedPage {
-            val objects = ArrayList<DryObject>(ops.size)
+        /** The adds — built into objects — and everything else, which is kept as ops; each in order. */
+        private fun split(ops: List<PageOp>): Pair<List<PageOp.AddObject>, List<PageOp>> {
+            val adds = ArrayList<PageOp.AddObject>(ops.size)
             val registers = ArrayList<PageOp>()
-            for (op in ops) {
-                if (op is PageOp.AddObject) {
-                    // Null is a stroke whose blob this build cannot read — held out of the page
-                    // exactly as `StrokeStore.addObject` holds it out, rather than crashing a load
-                    // on a note written by a newer build (SPEC §5.8).
-                    buildDryObject(op.obj, brushes)?.let { objects += it }
-                } else {
-                    registers += op
-                }
+            for (op in ops) if (op is PageOp.AddObject) adds += op else registers += op
+            return adds to registers
+        }
+
+        /**
+         * The page from its built objects — one per add, in order — and its registers.
+         *
+         * Null is a stroke whose blob this build cannot read — held out of the page exactly as
+         * `StrokeStore.addObject` holds it out, rather than crashing a load on a note written by a
+         * newer build (SPEC §5.8).
+         */
+        private fun assemble(built: List<DryObject?>, registers: List<PageOp>): PreparedPage {
+            val objects = ArrayList<DryObject>(built.size)
+            val candidates = PruneQueue<DryObject>()
+            for (dry in built) {
+                if (dry == null) continue
+                objects += dry
+                if (dry.erased != null) candidates.offer(dry)
             }
-            return PreparedPage(objects, registers)
+            // The same probe, the same queue and the same meter as the UI pass — only the budget
+            // differs, because this thread is not the one drawing. See [erasedAway].
+            val erasedAway = candidates.drain(PruneBudgets.LOAD) { dry, meter ->
+                val region = dry.erased
+                if (region == null) PruneVerdict.VISIBLE else dry.probeErasedAway(region, meter)
+            }
+            // One pass, by identity — `ArrayList.remove` per stroke would be a scan each.
+            if (erasedAway.isNotEmpty()) objects.removeAll(erasedAway.toHashSet())
+            return PreparedPage(objects, registers, erasedAway, candidates.snapshot())
         }
     }
 }
