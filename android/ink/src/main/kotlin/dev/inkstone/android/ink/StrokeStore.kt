@@ -435,6 +435,14 @@ internal class StrokeStore {
      */
     var guidesShown: Boolean = false
 
+    /**
+     * ⭐ True on the Element editor's canvas with its guides switched off (`PagePainter.guidesVisible`):
+     * an area or the bounds is then neither drawn nor hit by a tap or a lasso, so what a selection
+     * takes is only the Element's own pieces. A note never sets it — an area carried into a note is
+     * still a piece of its copy there, and a tap inside it selects the copy.
+     */
+    var guidesHidden: Boolean = false
+
     /** Which input model finished strokes were captured with, for the geometry blob. */
     var inputModel: InkInputModel = InkInputModel.SPRING
 

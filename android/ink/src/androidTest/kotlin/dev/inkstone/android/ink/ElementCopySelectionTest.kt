@@ -86,6 +86,23 @@ class ElementCopySelectionTest {
     }
 
     @Test
+    fun aTapSelectsEveryPieceOfACopyWhosePiecesDisagreeAboutWhereItIs() {
+        // *"When you try to select an element it does not select the individual parts and instead the
+        // whole element."* An Element made in the editor: a stroke is never re-based, so each piece's
+        // member moves it ~1,500 pt, and one was resized there — a scale its tag writes as `0.833`. So
+        // the two recover the copy's placement half a point apart, and matched to a hundredth of a
+        // point, a tap on one selected only that one.
+        val origin = Matrix3.translate(-1464f, -1440f)
+        val resized = Matrix3.translate(1500f, 1500f) * Matrix3.scale(0.8333333f) * Matrix3.translate(-1500f, -1500f)
+        val at = Matrix3.translate(1700.345f, 1650.678f)
+        // On the page: the first at (236, 211)–(336, 311), the resized one at (486, 461)–(570, 544).
+        store.applyOps(copyPiece(THIRD, at, origin) + copyPiece(FOURTH, at, origin * resized), factory)
+
+        tap(286f, 260f)
+        assertEquals(setOf(ObjectId(THIRD), ObjectId(FOURTH)), controller.selection.toSet())
+    }
+
+    @Test
     fun aSelectedCopyIsFramedByItsBoundsAndNotOnlyItsPieces() {
         tap(180f, 180f)
         // The pieces cover (130, 130)–(400, 230); the Element's bounds are what the frame shows.
@@ -116,6 +133,13 @@ class ElementCopySelectionTest {
         val tag =
             ElementInstance(ELEMENT, INSTANCE, member, pivot = PagePoint(120f, 120f), size = PagePoint(360f, 240f))
         return box(id, Matrix3.translate(100f, 100f) * member) +
+            PageOp.SetFormat("", LamportClock(clocks++, "seed"), ObjectId(id), ObjectFormat(instance = tag).encode())
+    }
+
+    /** A piece of a second drop, of another Element, at [at] — tagged through the register. */
+    private fun copyPiece(id: String, at: Matrix3, member: Matrix3): List<PageOp> {
+        val tag = ElementInstance("element-2", "drop-2", member, size = PagePoint(400f, 400f))
+        return box(id, at * member) +
             PageOp.SetFormat("", LamportClock(clocks++, "seed"), ObjectId(id), ObjectFormat(instance = tag).encode())
     }
 
@@ -154,6 +178,8 @@ class ElementCopySelectionTest {
         const val INSTANCE = "drop-1"
         const val FIRST = "a"
         const val SECOND = "b"
+        const val THIRD = "c"
+        const val FOURTH = "d"
         const val STRAY = "s"
         const val GRID = 18f
         const val POINTS_PER_INCH = 72f

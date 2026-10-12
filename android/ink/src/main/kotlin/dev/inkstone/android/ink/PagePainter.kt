@@ -178,8 +178,15 @@ internal class PagePainter(textureStore: TextureBitmapStore = NoTextures) {
     /** The editor's grid cell, in page points — the lattice it snaps to (`InkSurfaceView.elementGridPt`). */
     var backdropCellPt: Float = BACKDROP_CELL_PT
 
-    /** Whether invisible knockout areas are drawn — only on the Element editor's canvas. */
-    val showCutters: Boolean get() = backdrop != null
+    /**
+     * ⭐ Whether the editor's guides — the areas, the bounds and the pivot — are drawn. *"I would like
+     * it so that you can hide those gizmos."* Off shows the Element as a copy of it will look; it
+     * changes nothing saved, and an area still hides what is beneath it.
+     */
+    var guidesVisible: Boolean = true
+
+    /** Whether invisible knockout areas are drawn — only on the Element editor's canvas, guides on. */
+    val showCutters: Boolean get() = backdrop != null && guidesVisible
 
     private fun paintBackdrop(canvas: Canvas, page: PageCanvas, backdrop: ElementBackdrop) {
         backdropPaint.color = backdrop.groundArgb

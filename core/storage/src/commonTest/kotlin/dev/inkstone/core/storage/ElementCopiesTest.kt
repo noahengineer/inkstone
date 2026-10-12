@@ -89,6 +89,32 @@ class ElementCopiesTest {
     }
 
     @Test
+    fun `pieces whose tags were rounded on the way in are still one copy and are replaced once`() = runTest {
+        // *"When you try to select an element it does not select the individual parts."* A stroke is
+        // never re-based, so a piece of an Element made in the editor carries a member that moves it
+        // ~1,500 pt; one resized there carries a scale too, which its tag writes to three decimals.
+        // Rounded and matched, the four pieces below were four copies — and Update all put four
+        // replacements down.
+        val element = save(box(A, 0f), box(B, 60f))
+        val origin = Matrix3.translate(-1464f, -1440f)
+        val members = listOf(
+            origin,
+            origin * Matrix3.translate(3.217f, -1.371f),
+            origin * Matrix3.translate(250.123f, 240.456f) * Matrix3.scale(0.8333333f),
+            Matrix3.rotate(0.3f) * origin,
+        )
+        val at = Matrix3.translate(412.34567f, 233.45678f)
+        val page = taggedPage(element, members.map { at * it to it })
+
+        val copy = ElementCopies.on(page, element.id).single()
+        assertEquals(4, copy.pieces.size)
+        assertEquals(412.34567f, copy.placement.m02, 0.01f, "read from the piece whose tag is exact")
+        assertEquals(233.45678f, copy.placement.m12, 0.01f)
+        val update = library.replaceCopies(page, element, ::newId, ::opId, ::clock)!!
+        assertEquals(element.objects.size, update.ops.count { it is PageOp.AddObject }, "one replacement")
+    }
+
+    @Test
     fun `replacing a copy puts the revised Element where the old one is and tombstones the old pieces`() = runTest {
         val original = save(box(A, 0f))
         val placed = stamp(original, Matrix3.translate(100f, 100f), INSTANCE)
@@ -187,6 +213,22 @@ class ElementCopiesTest {
         ::clock,
         instanceId = instance,
     )
+
+    /**
+     * A page of [pieces] — each a transform and the member its tag says it has — tagged as one drop
+     * of [element], through the format register as `ElementLibrary.stamp` writes it.
+     */
+    private fun taggedPage(element: Element, pieces: List<Pair<Matrix3, Matrix3>>): FoldedPage {
+        val ops = pieces.flatMap { (transform, member) ->
+            val shape = box(newId().value, 0f).copy(transform = transform)
+            val tag = dev.inkstone.core.model.ElementInstance(element.id.value, INSTANCE, member)
+            listOf(
+                PageOp.AddObject(opId(), clock(), shape),
+                PageOp.SetFormat(opId(), clock(), shape.id, ObjectFormat(instance = tag).encode()),
+            )
+        }
+        return fold(ops)
+    }
 
     /** A folded page's own adds, as ops, so a later fold can be built on top of the same ids. */
     private fun stampedOps(page: FoldedPage): List<PageOp> =

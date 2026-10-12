@@ -523,6 +523,20 @@ public class InkSurfaceView @JvmOverloads constructor(
         }
 
     /**
+     * ⭐ Whether the Element editor's guides — areas, bounds, pivot — are drawn and can be tapped or
+     * lassoed. Ignored on a note.
+     */
+    public var elementGuidesVisible: Boolean
+        get() = dryView.guidesVisible
+        set(value) {
+            if (dryView.guidesVisible == value) return
+            dryView.guidesVisible = value
+            // A selected guide that is hidden lets go, rather than keep grips round nothing drawn.
+            val kept = selectionController.selection.filter { strokes.objectOf(it)?.isGuide != true }
+            if (kept.size != selectionController.selection.size) select(kept)
+        }
+
+    /**
      * The lattice a drag lands on right now, or [SnapGrid.None] with the setting off — for `:app`'s
      * Element-editor tools, which place areas and the pivot outside any selection gesture and must
      * land them on the same points a drag would.

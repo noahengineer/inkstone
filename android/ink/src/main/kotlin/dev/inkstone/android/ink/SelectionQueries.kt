@@ -4,6 +4,7 @@ import androidx.ink.geometry.ImmutableParallelogram
 import androidx.ink.geometry.ImmutableSegment
 import androidx.ink.geometry.ImmutableVec
 import androidx.ink.geometry.MutableVec
+import dev.inkstone.core.model.CopyPlacement
 import dev.inkstone.core.model.Lasso
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PagePoint
@@ -45,7 +46,7 @@ internal fun StrokeStore.objectsIn(lasso: Lasso): List<ObjectId> {
     val scratch = MutableVec()
     val points = ArrayList<PagePoint>()
     forEachInRenderOrder(visibleBounds = null) { dry ->
-        if (!dry.pageBounds.overlaps(box)) return@forEachInRenderOrder
+        if (!dry.pageBounds.overlaps(box) || dry.hiddenGuide(this)) return@forEachInRenderOrder
         points.clear()
         dry.forEachPagePoint(scratch) { x, y -> points += PagePoint(x, y) }
         if (lasso.selects(points)) hits += dry.id
@@ -64,11 +65,11 @@ internal fun StrokeStore.objectsIn(lasso: Lasso): List<ObjectId> {
  *   broken; the caller converts from dp through the camera.
  */
 internal fun StrokeStore.objectAt(x: Float, y: Float, slopPageUnits: Float): ObjectId? {
-    if (guidesShown) return objectAtWithGuides(x, y, slopPageUnits)
+    if (guidesShown && !guidesHidden) return objectAtWithGuides(x, y, slopPageUnits)
     var hit: ObjectId? = null
     val local = PagePointF()
     forEachInRenderOrder(visibleBounds = null) { dry ->
-        if (!dry.reachedBy(x, y, slopPageUnits, local)) return@forEachInRenderOrder
+        if (dry.hiddenGuide(this) || !dry.reachedBy(x, y, slopPageUnits, local)) return@forEachInRenderOrder
         // [DryObject.tappedAt] rather than `hitBy`: a tap and an eraser disagree about the inside
         // of a hollow shape, and only about that. See its KDoc — sharing one predicate is what made
         // a snapped rectangle need an 8 dp landing on a hairline.
@@ -76,6 +77,12 @@ internal fun StrokeStore.objectAt(x: Float, y: Float, slopPageUnits: Float): Obj
     }
     return hit
 }
+
+/**
+ * ⭐ An area or the bounds on the Element editor's canvas with its guides switched off — not drawn,
+ * so not something a tap or a lasso may take (`StrokeStore.guidesHidden`).
+ */
+private fun DryObject.hiddenGuide(store: StrokeStore): Boolean = store.guidesHidden && isGuide
 
 /** Cheap bounds test, the map into [dry]'s space, and the erased-hole check — every tap's preamble. */
 private fun DryObject.reachedBy(x: Float, y: Float, slopPageUnits: Float, local: PagePointF): Boolean {
@@ -213,13 +220,27 @@ internal fun StrokeStore.allSelected(): List<SelectedObject> {
  */
 internal fun StrokeStore.pageBoundsOf(ids: Collection<ObjectId>): PageRect? {
     var union: PageRect? = null
-    for (dry in ids.mapNotNull { objectOf(it) }) {
-        dry.pageBounds?.let { union = union.unionOrNull(it.asRect()) }
-        // ⭐ An Element copy's own bounds as well (SPEC §4.9.7): the box set in the editor, which may
-        // be larger than what its pieces cover — a margin, or a corner placed on the grid.
-        dry.copyBoundsOnPage?.let { union = union.unionOrNull(it) }
-    }
+    val dries = ids.mapNotNull { objectOf(it) }
+    for (dry in dries) dry.pageBounds?.let { union = union.unionOrNull(it.asRect()) }
+    // ⭐ An Element copy's own bounds as well (SPEC §4.9.7): the box set in the editor, which may be
+    // larger than what its pieces cover — a margin, or a corner placed on the grid. Once per copy,
+    // from its surest piece, so the frame is not widened by every piece's rounding.
+    for (dry in surestPieceOfEachCopy(dries)) dry.copyBoundsOnPage?.let { union = union.unionOrNull(it) }
     return union
+}
+
+/** ⭐ The pivot a selection of Element copies snaps by — read from the surest piece. SPEC §4.9.7. */
+internal fun StrokeStore.copyPivotOf(ids: Collection<ObjectId>): PagePoint? =
+    surestPieceOfEachCopy(ids.mapNotNull { objectOf(it) }).firstNotNullOfOrNull { it.pivotOnPage }
+
+/**
+ * One piece per Element copy among [pieces] — the one whose tag says most exactly where the copy is
+ * (`CopyPlacement.errorPt`). Every piece can say where its copy's pivot and bounds are, each a little
+ * differently; a pivot read off a resized stroke could land a grid snap most of a point off a line.
+ */
+private fun surestPieceOfEachCopy(pieces: List<DryObject>): List<DryObject> {
+    val placed = pieces.mapNotNull { dry -> dry.copyPlacement?.let { dry to it } }
+    return CopyPlacement.group(placed) { it.second }.map { copy -> copy.minBy { it.second.errorPt }.first }
 }
 
 /**
@@ -229,11 +250,13 @@ internal fun StrokeStore.pageBoundsOf(ids: Collection<ObjectId>): PageRect? {
  * copy's pivot was half of *"the pivot does not work"*.
  */
 internal fun StrokeStore.withWholeCopies(ids: List<ObjectId>): List<ObjectId> {
-    val copies = ids.mapNotNullTo(HashSet()) { objectOf(it)?.copyKey }
+    // One placement per copy hit, so a lasso across a few copies compares each object a few times.
+    val copies = CopyPlacement.group(ids.mapNotNull { objectOf(it)?.copyPlacement }) { it }.map { it.first() }
     if (copies.isEmpty()) return ids
     val result = LinkedHashSet(ids)
     forEachInRenderOrder(visibleBounds = null) { dry ->
-        if (dry.copyKey in copies) result += dry.id
+        val placed = dry.copyPlacement ?: return@forEachInRenderOrder
+        if (copies.any { it.sameCopyAs(placed) }) result += dry.id
     }
     return result.toList()
 }

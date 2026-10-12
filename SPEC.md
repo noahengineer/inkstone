@@ -1433,9 +1433,10 @@ areas … and a pivot point, so it snaps to a grid when you move it."*
 recogniser — so it cannot be indexed, published or synced, and it has **no note id**, so nothing it
 does — undo included — can reach the note it was opened from (checked on the emulator: six undos in
 the editor left the note's `undo.json` byte-identical). Paper is replaced by a grid
-(`ElementBackdrop`, dark by default, light for near-black ink) drawn at **the snap lattice's own
+(`ElementBackdrop`: **white** by default, black on the bar's *White / Black* switch — it was dark first,
+which hid the default near-black ink) drawn at **the snap lattice's own
 spacing** (`SnapGrid.DEFAULT_SPACING_PT`, 18 pt), so what is drawn is what things snap to; the bar
-offers knockout areas, the pivot, *Fit*, Cancel and Done. The scratch page is 3000 pt square with the Element in the middle, framed on
+offers knockout areas, the pivot, *Fit*, *Guides*, the backdrop switch, Cancel and Done. The scratch page is 3000 pt square with the Element in the middle, framed on
 open, so a stroke can begin anywhere. Earlier sessions' scratch folders are **moved** to
 `elements/trash/editing/` when the next edit starts, never deleted and never while in use.
 
@@ -1457,6 +1458,12 @@ write — and `NoteEditor.editShownPage` applies it as one undoable edit. On the
 - the bounds are grabbed by their **edge** only, resize by the selection frame's grips rather than by
   corner points, are never erased, never a knockout, and never saved or published.
 
+**The guides can be hidden.** *Guides* on the bar turns all three off (`InkSurfaceView.elementGuidesVisible`,
+`StrokeStore.guidesHidden`): nothing dashed is drawn, and an area or the bounds can be neither tapped
+nor lassoed — a selection is only the Element's own pieces, and the canvas shows the Element as a placed
+copy will look. A guide that was selected is let go. Arming the area or pivot tool, or *Fit*, turns
+them back on, since each writes a guide. Like the backdrop it is a viewing choice, saved nowhere.
+
 The area tool lands its box on the lattice (`SnapGrid.snappedBox`) and leaves the new area selected
 with the Select tool; the Pivot tool lands on an intersection; *Fit* makes the bounds the content's box
 widened outward to whole cells (`SnapGrid.enclosing`), keeping a placed pivot where it is, and brings
@@ -1473,7 +1480,15 @@ were deleted), and its pivot is theirs. How far the origin moved in the edit is 
 the Element's id, an instance id per drop, the piece's transform *inside the Element*, and the pivot.
 A copy's placement is recovered from any piece as `transform × member⁻¹`, so a copy that was dragged,
 scaled or rotated is found where it is now; pieces are grouped by instance id **and** placement, so a
-duplicated copy is a second copy. Each Element keeps `elements/uses/<id>.uses`, the notes this device
+duplicated copy is a second copy. ⚠️ **Placements are compared within each piece's own error, never
+rounded and matched** (`ElementInstance.locate` → `CopyPlacement.sameCopyAs`). The member is written to
+three decimals and a stroke is never re-based, so a piece's member carries a ~1,500 pt translation and
+any rounding of its scale is multiplied by it: one copy's pieces disagree by up to a point or two (more
+on a copy scaled up), and rounded to a hundredth they were several copies — a tap selected one part,
+and *Update all* stamped a replacement per part. The bound is capped at 8 pt per piece so a duplicate,
+18 pt away, is never taken for its original; past about 6× scale with resized pieces a copy can still
+split, which more decimals in new tags would fix. A copy's position, pivot and bounds are read from its
+most exact piece (`CopyPlacement.errorPt`). Each Element keeps `elements/uses/<id>.uses`, the notes this device
 placed it in. On Done, if those notes hold copies, the user is asked once: **update them all** or keep
 them. Updating goes through `NoteSessionHost` — the live editor if the note is open, else the host's
 own session, then materialize and `noteSaved` — and replaces each copy with tombstones plus a fresh

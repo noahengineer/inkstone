@@ -1,5 +1,6 @@
 package dev.inkstone.core.storage
 
+import dev.inkstone.core.model.CopyPlacement
 import dev.inkstone.core.model.ElementId
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.FractionalKey
@@ -37,29 +38,24 @@ public object ElementCopies {
      * placed copy copies its format register — tag included — so two copies can share an instance
      * id at two different places. Grouped by id alone they would be "one copy" whose replacement
      * lands at one of the two places, and the other would vanish.
+     *
+     * ⛔ Placement is compared within each piece's own error (`CopyPlacement.sameCopyAs`), not
+     * rounded and matched: rounding cut one copy into several, so *"Update copies?"* counted them
+     * all and *Update all* put a whole replacement down for each part. A copy's placement is read
+     * from its most precise piece, so a replacement lands where the copy is.
      */
     public fun on(page: FoldedPage, elementId: ElementId): List<ElementCopy> {
-        val groups = LinkedHashMap<String, MutableList<Pair<ObjectId, FractionalKey>>>()
-        val placements = HashMap<String, Matrix3>()
-        val instances = HashMap<String, String>()
         val pieces = page.objects.mapNotNull { obj ->
             val tag = ObjectFormat.decode(page.formatOf(obj.id)).instance?.takeIf { it.elementId == elementId.value }
-            val placement = tag?.placementOf(obj.transform)
-            val key = tag?.copyKey(obj.transform)
-            if (placement == null || key == null) null else Triple(obj, tag, placement to key)
+            tag?.locate(obj.transform)?.let { obj to it }
         }
-        for ((obj, tag, placed) in pieces) {
-            val (placement, key) = placed
-            groups.getOrPut(key) { ArrayList() } += obj.id to obj.z
-            placements.getOrPut(key) { placement }
-            instances[key] = tag.instanceId
-        }
-        return groups.map { (key, pieces) ->
+        return CopyPlacement.group(pieces) { it.second }.map { copy ->
+            val surest = copy.minBy { it.second.errorPt }.second
             ElementCopy(
-                instanceId = instances.getValue(key),
-                placement = placements.getValue(key),
-                pieces = pieces.map { it.first },
-                lowest = pieces.minOf { it.second },
+                instanceId = surest.instanceId,
+                placement = surest.placement,
+                pieces = copy.map { it.first.id },
+                lowest = copy.minOf { it.first.z },
             )
         }
     }

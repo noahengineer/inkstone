@@ -89,8 +89,14 @@ class ObjectToolState {
     /** ⭐ The Element editor's armed tool — an area to drag out, or the pivot to place — or null. */
     var elementTool by mutableStateOf<ElementEditorTool?>(null)
 
-    /** ⭐ The Element editor's canvas. Dark, as asked; light for checking near-black ink. */
-    var backdrop by mutableStateOf(dev.inkstone.android.ink.ElementBackdrop.DARK)
+    /** ⭐ The Element editor's canvas — white, and black on the bar's switch. See `ElementBackdrop`. */
+    var backdrop by mutableStateOf(dev.inkstone.android.ink.ElementBackdrop.LIGHT)
+
+    /**
+     * ⭐ Whether the Element editor shows its guides — the knockout areas, the bounds and the pivot.
+     * Off, they are neither drawn nor selectable, and the Element looks as a placed copy of it will.
+     */
+    var guidesVisible by mutableStateOf(true)
 
     /** The Element a tap with the Element tool will stamp, or null when the next drag captures one. */
     var pendingElement by mutableStateOf<Element?>(null)

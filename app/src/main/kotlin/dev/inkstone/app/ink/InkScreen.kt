@@ -197,10 +197,11 @@ private fun ElementEditorEffects(
     scope: CoroutineScope,
 ): ElementDone {
     val editing = editor.editingElement != null
-    LaunchedEffect(surface, objects.backdrop, editing) {
+    LaunchedEffect(surface, objects.backdrop, objects.guidesVisible, editing) {
         // The lattice first, so the backdrop's first frame is drawn at the right spacing.
         if (editing) surface?.elementGridPt = editor.elementGridPt
         surface?.elementBackdrop = if (editing) objects.backdrop else null
+        surface?.elementGuidesVisible = !editing || objects.guidesVisible
     }
     // Framed on the Element rather than fitted to the page's width — the page itself is 3000 pt wide.
     val elementFrame by editor.elementFrame.collectAsState()
@@ -264,7 +265,11 @@ private fun rememberElementDone(
         {
             ElementEditorBar(
                 objects,
-                onFit = { tools?.let { scope.launch { it.fit() } } },
+                onFit = {
+                    // Fit writes the bounds, so they are shown — a change nobody can see is no change.
+                    objects.guidesVisible = true
+                    tools?.let { scope.launch { it.fit() } }
+                },
                 onCancel = cancel,
                 onDone = done,
             )

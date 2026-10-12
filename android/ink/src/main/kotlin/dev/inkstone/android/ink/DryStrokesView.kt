@@ -134,9 +134,22 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
             if (painter.backdrop == value) return
             painter.backdrop = value
             store.guidesShown = value != null
+            store.guidesHidden = value != null && !painter.guidesVisible
             invalidate()
         }
     private var recordedBackdrop: ElementBackdrop? = null
+
+    /** ⭐ The Element editor's guides on or off — see [PagePainter.guidesVisible]. */
+    var guidesVisible: Boolean
+        get() = painter.guidesVisible
+        set(value) {
+            if (painter.guidesVisible == value) return
+            painter.guidesVisible = value
+            // Only on the editor's canvas: a note's areas are pieces of their copies, and stay tappable.
+            store.guidesHidden = painter.backdrop != null && !value
+            invalidate()
+        }
+    private var recordedGuidesVisible: Boolean = true
 
     /** The Element editor's grid cell — see `InkSurfaceView.elementGridPt`. */
     var backdropCellPt: Float
@@ -299,6 +312,7 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
         recordedPageCanvas == pageCanvas &&
         recordedBackground == pageBackground &&
         recordedBackdrop == painter.backdrop &&
+        recordedGuidesVisible == painter.guidesVisible &&
         recordedSourcePage === sourcePage &&
         viewportInsideRecordedRegion()
 
@@ -479,6 +493,7 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
         recordedPageCanvas = pageCanvas
         recordedBackground = pageBackground
         recordedBackdrop = painter.backdrop
+        recordedGuidesVisible = painter.guidesVisible
         recordedSourcePage = sourcePage
     }
 

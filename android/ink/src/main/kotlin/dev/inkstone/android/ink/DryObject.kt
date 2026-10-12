@@ -183,8 +183,8 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
      */
     val copyBoundsOnPage: dev.inkstone.core.model.PageRect? get() = decodedFormat.instance?.boundsOn(transform)
 
-    /** Which Element copy this piece belongs to — `ElementInstance.copyKey` — or null for none. */
-    val copyKey: String? get() = decodedFormat.instance?.copyKey(transform)
+    /** Which Element copy this piece belongs to — `ElementInstance.locate` — or null for none. */
+    val copyPlacement: dev.inkstone.core.model.CopyPlacement? get() = decodedFormat.instance?.locate(transform)
 
     /**
      * The filled silhouette [PagePainter] built for [knockout], in this object's **own** space, or

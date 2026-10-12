@@ -9,6 +9,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.FractionalKey
 import dev.inkstone.core.model.LamportClock
+import dev.inkstone.core.model.Lasso
 import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
@@ -102,14 +103,39 @@ class ElementGuidesTest {
     }
 
     @Test
+    fun withTheGuidesHiddenATapNeverTakesOne() {
+        // *"I would like it so that you can hide those gizmos"* — and a hidden gizmo is not selected.
+        val store = page(editing = true, guidesHidden = true)
+        assertEquals("inside the area: the ring over it", ObjectId(RING), store.objectAt(100f, 100f, SLOP))
+        assertNull("on the bounds' edge: nothing", store.objectAt(20f, 120f, SLOP))
+    }
+
+    @Test
+    fun withTheGuidesHiddenALassoTakesOnlyTheElement() {
+        val store = page(editing = true, guidesHidden = true)
+        val all = Lasso.rectangle(PagePoint(0f, 0f), PagePoint(SIZE.toFloat(), SIZE.toFloat()))
+        assertEquals(listOf(ObjectId(RING)), store.objectsIn(all))
+        // And with them shown, the same lasso takes the area and the bounds too.
+        val shown = page(editing = true).objectsIn(all).toSet()
+        assertEquals(setOf(ObjectId(FRAME), ObjectId(AREA), ObjectId(RING)), shown)
+    }
+
+    @Test
+    fun withTheGuidesHiddenNoneIsDrawn() {
+        val hidden = render(page(editing = true), ElementBackdrop.LIGHT, guidesVisible = false)
+        assertEquals("no bounds and no pivot", 0, hidden.count { isAmber(it) })
+    }
+
+    @Test
     fun theBoundsPublishNothing() = runBlocking {
         val outlines = InkStrokeOutliner(brushes).outline(foldPage(PageId("guides"), ops()))
         assertTrue(outlines.none { it.objectId == ObjectId(FRAME) })
     }
 
-    private fun page(editing: Boolean): StrokeStore = StrokeStore().apply {
+    private fun page(editing: Boolean, guidesHidden: Boolean = false): StrokeStore = StrokeStore().apply {
         applyOps(ops(), brushes, record = false)
         guidesShown = editing
+        this.guidesHidden = guidesHidden
     }
 
     private fun ops(): List<PageOp> {
@@ -147,10 +173,13 @@ class ElementGuidesTest {
         )
     }
 
-    private fun render(store: StrokeStore, backdrop: ElementBackdrop?): IntArray {
+    private fun render(store: StrokeStore, backdrop: ElementBackdrop?, guidesVisible: Boolean = true): IntArray {
         val paper = PageCanvas.fixed(PageSize(SIZE.toFloat(), SIZE.toFloat()))
         val bitmap = Bitmap.createBitmap(SIZE, SIZE, Bitmap.Config.ARGB_8888)
-        val painter = PagePainter().apply { this.backdrop = backdrop }
+        val painter = PagePainter().apply {
+            this.backdrop = backdrop
+            this.guidesVisible = guidesVisible
+        }
         val canvas = Canvas(bitmap)
         painter.paintBackground(canvas, paper, Background.Blank)
         painter.paintObjects(canvas, store, Matrix(), visibleBounds = null, paper = paper)

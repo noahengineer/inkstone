@@ -33,7 +33,7 @@ import dev.inkstone.core.model.pageToView
 
 /**
  * *"Just make it so you know you are editing an Element."* — the bar that replaces the page bar while
- * an Element is open: its name, its tools, the backdrop, and the way out.
+ * an Element is open: its tools, the guides switch, the backdrop, and the way out.
  *
  * ⚠️ **Done and Cancel are words, not icons**: they are the two consequential presses on this
  * screen, and one of them can update copies in other notes.
@@ -52,15 +52,29 @@ fun ElementEditorBar(
                 SegmentChip(
                     label = tool.label(),
                     selected = objects.elementTool == tool,
-                    onClick = { objects.elementTool = if (objects.elementTool == tool) null else tool },
+                    onClick = {
+                        val arming = objects.elementTool != tool
+                        objects.elementTool = if (arming) tool else null
+                        // An area or a pivot put down where it cannot be seen is one placed blind.
+                        if (arming) objects.guidesVisible = true
+                    },
                 )
             }
         }
         // ⭐ The bounds made the content's own box, on the grid — and the way back after deleting them.
         TextChip(label = "Fit", onClick = onFit)
         ChipDivider()
+        // ⭐ *"Hide those gizmos like the pivot point, border and non-destructible areas."* Lit while
+        // they are shown; off, the Element looks as a placed copy will, and none of them can be selected.
         TextChip(
-            label = if (objects.backdrop == ElementBackdrop.DARK) "Dark" else "Light",
+            label = "Guides",
+            selected = objects.guidesVisible,
+            onClick = { objects.guidesVisible = !objects.guidesVisible },
+        )
+        // *"Better white, or make it so you can switch between black and white."* Names the canvas
+        // it is showing, as the chip did when it said Dark / Light.
+        TextChip(
+            label = if (objects.backdrop == ElementBackdrop.DARK) "Black" else "White",
             onClick = {
                 objects.backdrop =
                     if (objects.backdrop == ElementBackdrop.DARK) ElementBackdrop.LIGHT else ElementBackdrop.DARK

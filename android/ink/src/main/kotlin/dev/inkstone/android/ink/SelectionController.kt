@@ -1342,7 +1342,7 @@ internal class SelectionController(
     override val ids: List<ObjectId> get() = selection
 
     override val pivot: PagePoint?
-        get() = selection.firstNotNullOfOrNull { store.objectOf(it)?.pivotOnPage }
+        get() = store.copyPivotOf(selection)
 
     override val knockoutCounts: KnockoutCounts
         get() {
