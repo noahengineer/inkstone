@@ -95,6 +95,39 @@ class SelectionTest {
         assertTrue(abs(turned.y - 60f) < TOLERANCE, "expected a quarter turn, got $turned")
     }
 
+    /** Near a multiple of 15° the drag is pulled onto it; between them it is left alone. */
+    @Test
+    fun `a rotation snaps to a round angle only when it is close to one`() {
+        val degree = (PI / 180).toFloat()
+
+        assertNear(90f * degree, SelectionGesture.snappedRotation(0f, 87f * degree), "87° should settle on 90°")
+        assertNear(-45f * degree, SelectionGesture.snappedRotation(0f, -48f * degree), "-48° should settle on -45°")
+        assertNear(8f * degree, SelectionGesture.snappedRotation(0f, 8f * degree), "8° is between steps and must stay")
+    }
+
+    /** What snaps is the angle the object ends at, so a crooked picture can be made level. */
+    @Test
+    fun `a rotation snaps the result and not the drag`() {
+        val degree = (PI / 180).toFloat()
+        val crooked = 7f * degree
+
+        // Dragging back by 9° would leave it at -2°; it lands level instead, i.e. a turn of -7°.
+        assertNear(-7f * degree, SelectionGesture.snappedRotation(crooked, -9f * degree), "should level the picture")
+    }
+
+    @Test
+    fun `the shared angle is the selection own one or none when the objects disagree`() {
+        val degree = (PI / 180).toFloat()
+        val tilted = SelectionGesture.rotate(10f, 20f, 30f * degree) * Matrix3.scale(2f)
+
+        assertNear(30f * degree, SelectionGesture.sharedRotation(listOf(tilted, tilted)), "one angle shared")
+        assertNear(0f, SelectionGesture.sharedRotation(listOf(tilted, Matrix3.Identity)), "two angles")
+        assertNear(0f, SelectionGesture.sharedRotation(emptyList()), "nothing selected")
+    }
+
+    private fun assertNear(expected: Float, actual: Float, message: String) =
+        assertTrue(abs(expected - actual) < 1e-4f, "$message — expected $expected, got $actual")
+
     /**
      * ⚠️ A gesture that collapses the selection writes **nothing**.
      *
