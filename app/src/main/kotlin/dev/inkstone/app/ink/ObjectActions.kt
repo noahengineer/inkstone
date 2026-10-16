@@ -76,6 +76,12 @@ class ObjectActions(
     val onRulerAngle: (Float) -> Unit,
     /** ⭐ The Element editor's area, pivot and *Fit* tools (SPEC §4.9.7). Null on a note. */
     val elementEditor: ElementEditorActions? = null,
+    /**
+     * ⭐ Select what was just written and hand over the Select tool — what a dropped phrase does, as a
+     * dropped Element does (docs/HANDWRITING-SYNTHESIS.md §6.2). Through the surface, which is the
+     * one thing that holds a selection.
+     */
+    val onSelectPlaced: (List<dev.inkstone.core.model.ObjectId>) -> Unit = {},
 )
 
 /** Where an inserted picture comes from. See [ObjectActions.onInsertImage]. */

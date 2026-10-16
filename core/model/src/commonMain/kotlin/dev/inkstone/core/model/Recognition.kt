@@ -186,15 +186,15 @@ public data class PageText(
 /**
  * Why a region of a page was **not** recognised.
  *
- * SPEC §8.2: *"Multi-column and rotated text are out of scope for v1 — detect and skip
- * rather than emitting nonsense."* Skipping silently would be indistinguishable from a
- * page with no writing on it, and the difference matters to anyone wondering why their
- * lecture notes are not searchable — so the reason is carried, counted, and logged.
+ * SPEC §8.2: rotated text is out of scope, so it is detected and skipped rather than emitted as
+ * nonsense. Skipping silently would be indistinguishable from a page with no writing on it, and the
+ * difference matters to anyone wondering why their lecture notes are not searchable, so the reason is
+ * carried, counted, and logged.
+ *
+ * There was a `MULTI_COLUMN` too, until `LineSegmenter` version 2 learned to read columns instead of
+ * skipping the whole page (SPEC §8.2).
  */
 public enum class SkipReason {
-    /** Strokes fell into two or more horizontally separated blocks. */
-    MULTI_COLUMN,
-
     /** The line's baseline is too far from horizontal to be read as one line. */
     ROTATED,
 
@@ -212,8 +212,9 @@ public data class SkippedRegion(val bounds: PageRect, val reason: SkipReason, va
  *   line rather than the page is the single biggest accuracy lever in M7** (SPEC §8.1):
  *   the recogniser assumes one line of text, and a page-sized area tells it the writing
  *   is a hundredth of the height it really is.
- * @property strokes in reading order — left to right. Out-of-order strokes degrade the
- *   result, which is why this is a list and not a set.
+ * @property strokes in the order they were written, which is what the recogniser was trained on
+ *   (SPEC §8.2, corrected in M7). Out-of-order strokes degrade the result, which is why this is a
+ *   list and not a set.
  */
 public data class TextLine(val strokes: List<SampledStroke>, val writingArea: PageRect) {
     public val isEmpty: Boolean get() = strokes.isEmpty()

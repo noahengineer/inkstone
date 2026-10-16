@@ -11,6 +11,10 @@ import dev.inkstone.app.platform.SystemClock
 import dev.inkstone.core.database.AndroidDatabaseDriverFactory
 import dev.inkstone.core.database.createDatabase
 import dev.inkstone.core.database.sync.SqlOutboxStore
+import dev.inkstone.core.handwriting.HandwritingLayout
+import dev.inkstone.core.handwriting.Personaliser
+import dev.inkstone.core.handwriting.neural.Fitter
+import dev.inkstone.core.handwriting.neural.TrainableNetwork
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FileSystem
@@ -76,9 +80,22 @@ class CrashPointService : Service() {
         val context = ScratchContext(this, dir)
         when (scenario) {
             CrashPoint.STROKE_CAPTURE -> strokeCapture(context, dir, noteId)
+
             CrashPoint.JOURNAL_FLUSH -> journalFlush(context, dir, noteId)
+
             CrashPoint.MATERIALIZE -> materialize(context, dir, noteId)
+
             CrashPoint.UPLOAD -> upload(context, dir, noteId)
+
+            CrashPoint.PERSONALISE -> personalise(AndroidFileSystem(context), dir)
+
+            CrashPoint.PERSONALISE_WRITE -> personalise(
+                StopWrite(AndroidFileSystem(context), HandwritingLayout.checkpoint(PersonaliseCrash.KEY), nth = 2) {
+                    killNow(dir)
+                },
+                dir,
+            )
+
             else -> Unit
         }
     }
@@ -179,6 +196,32 @@ class CrashPointService : Service() {
         killNow(dir)
     }
 
+    /**
+     * docs/HANDWRITING-SYNTHESIS.md §8.1 — a personalisation fit (P2, the full backward pass) killed
+     * mid-run. [CrashPoint.PERSONALISE] dies **between** checkpoints, as iteration
+     * [PersonaliseCrash.KILL_AT_CALL] is about to start; [CrashPoint.PERSONALISE_WRITE] dies **inside**
+     * the second checkpoint's write. The documented bound: at most [dev.inkstone.core.handwriting.neural.FitPlan.checkpointEvery]
+     * iterations lost, the checkpoint on disk always whole, and a resumed fit ending exactly where an
+     * unbroken one does — the test resumes it and checks all three.
+     */
+    private suspend fun personalise(fs: FileSystem, dir: File) {
+        val weights = PersonaliseCrash.weights(this)
+        val trainer = TrainableNetwork(weights)
+        val words = PersonaliseCrash.words(weights, trainer)
+        val fitter = Fitter(trainer, weights.modelId)
+        var calls = 0
+        fitter.run(
+            fitter.start(PersonaliseCrash.PLAN, words, words.take(1)),
+            words.associateBy { it.sampleId },
+            null,
+            outOfTime = {
+                if (++calls == PersonaliseCrash.KILL_AT_CALL) killNow(dir)
+                false
+            },
+        ) { checkpoint -> Personaliser.saveCheckpoint(fs, PersonaliseCrash.KEY, checkpoint) }
+        killNow(dir)
+    }
+
     // -----------------------------------------------------------------------
     // Machinery
     // -----------------------------------------------------------------------
@@ -203,6 +246,13 @@ class CrashPointService : Service() {
 
     private fun killNow(dir: File) {
         File(dir, CrashPoint.ARMED).writeBytes(ByteArray(0))
+        // ⚠️ A started service killed mid-`onStartCommand` is *restarted* by the system, with a back-off
+        // that multiplies with every crash (1 s, 4 s, 16 s, 64 s…) — and the next scenario's start
+        // waits behind it. Six kills in a row (H5 added two) pushed one test past its 60 s wait,
+        // looking exactly like a scenario that never reached its kill point. Stopped first, there is
+        // nothing to restart. The disk is untouched in between: this process does nothing else now.
+        stopSelf()
+        Thread.sleep(STOP_SETTLE_MILLIS)
         Process.killProcess(Process.myPid())
         // Only reachable if the kill did not happen. Two seconds is long enough that a signal
         // still in flight cannot produce a false accusation.
@@ -213,6 +263,9 @@ class CrashPointService : Service() {
     private companion object {
         const val DEVICE_ID = "crashpoint-device"
         const val SURVIVAL_PROOF_MILLIS = 2_000L
+
+        /** Long enough for the system to take the service off its started list before the kill. */
+        const val STOP_SETTLE_MILLIS = 200L
         const val OWED_REV = 7L
         val BLANK_PAGE = NewPage(PageSize.Letter, Background.Blank)
     }

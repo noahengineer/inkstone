@@ -21,6 +21,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -51,8 +52,10 @@ import androidx.lifecycle.compose.LifecycleStartEffect
 import dev.inkstone.android.ink.InkSelection
 import dev.inkstone.android.ink.InkSurfaceView
 import dev.inkstone.android.ink.SyntheticInk
+import dev.inkstone.app.calculator.AnswerTarget
 import dev.inkstone.app.calculator.CalculatorChip
 import dev.inkstone.app.calculator.CalculatorLayer
+import dev.inkstone.app.calculator.rememberAnswerTarget
 import dev.inkstone.app.note.CameraCapture
 import dev.inkstone.app.note.NoteEditor
 import dev.inkstone.app.note.NoteEditorState
@@ -107,16 +110,13 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
     var panel by remember { mutableStateOf<SummonedPanel?>(null) }
     var diagnosticsOpen by remember { mutableStateOf(false) }
     var origin by remember { mutableStateOf(Offset.Zero) }
+    val geometry = remember { ChromeGeometry() } // ⭐ Also read beside the rails: docs/UI-RAILS.md §3.
     val objectActions = rememberObjectActions(ui, objects, editor, surface)
 
     SurfaceEffects(ui = ui, note = note, surface = surface)
     ObjectEffects(ui, objects, note, surface, editor, objectActions)
     val elementDone = ElementEditorEffects(editor, objects, objectActions, surface, scope)
-
-    DisposableEffect(surface) {
-        surface?.let { editor.onSurfaceAttached(it.asNoteSurface(scope, editor)) }
-        onDispose { editor.onSurfaceDetached() }
-    }
+    SurfaceAttachment(surface, editor, scope)
 
     val actions = inkToolbarActions(surface, editor, ui, objects, scope)
 
@@ -127,7 +127,7 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
             .onGloballyPositioned { origin = it.positionInRoot() },
     ) {
         EditorCanvas(ui, objects, editor, objectActions) { surface = it }
-        CalculatorLayer() // ⭐ Above every page layer, below the chrome: docs/CALCULATOR.md D2.
+        DockedCalculator(geometry, rememberAnswerTarget(ui, objects, editor, surface)) // ⭐ docs/CALCULATOR.md D2, §6.
 
         val exports = Exports(exporting, { exporting = it }, scope, LocalContext.current, editor)
         Chrome(
@@ -144,6 +144,7 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
                 exporting = exporting,
                 diagnosticsOpen = diagnosticsOpen,
                 onToggleDiagnostics = { diagnosticsOpen = !diagnosticsOpen },
+                geometry = geometry,
             ),
         )
 
@@ -153,13 +154,36 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
             diagnosticsOpen,
             note.localRev,
         ) { diagnosticsOpen = false }
-        SidePanels(ui, objects, editor, actions, objectActions, panels)
+        SidePanels(ui, objects, editor, actions, objectActions, panels, geometry)
         if (ui.editingLayout) LayoutEditorPanel(ui)
         ItemDragGhost(ui.itemDrag, origin)
         ui.colorDrag.colorArgb?.let { DragPreview(it, ui.colorDrag.position - origin) }
     }
 
     if (pageOverviewOpen) PageOverview(note, editor) { pageOverviewOpen = false }
+}
+
+/**
+ * Hands the editor the surface while there is one, and takes it back when it goes. Its own composable
+ * only because [InkScreen] is at detekt's `LongMethod` limit.
+ */
+@Composable
+private fun SurfaceAttachment(surface: InkSurfaceView?, editor: NoteEditorViewModel, scope: CoroutineScope) {
+    DisposableEffect(surface) {
+        surface?.let { editor.onSurfaceAttached(it.asNoteSurface(scope, editor)) }
+        onDispose { editor.onSurfaceDetached() }
+    }
+}
+
+/**
+ * The calculator, in the right-hand column with the other panels until it is dragged out of it
+ * (`PanelDock`, docs/UI-RAILS.md §3), and kept below the top row of chrome rather than the two rows
+ * the library has (`CalculatorWindow`'s `safeTop`). Above every page layer and below the chrome (D2);
+ * its answer can be dragged onto the page ([answers], docs/CALCULATOR.md §6).
+ */
+@Composable
+private fun BoxScope.DockedCalculator(geometry: ChromeGeometry, answers: AnswerTarget) {
+    CalculatorLayer(dock = geometry.dock, safeTop = EditorWindowSafeTop, target = answers)
 }
 
 /** The Element editor's label, read from the view model. See [ElementEditorLabel]. */
@@ -456,11 +480,18 @@ private fun BoxScope.Chrome(
     element: ElementDone,
     wiring: ChromeWiring,
 ) {
-    val geometry = remember { ChromeGeometry() }
+    val geometry = wiring.geometry
     val deps = ChromeDeps(ui, objects, actions, objectActions, wiring, geometry, elementEditor = element.bar != null)
-    val contextual = if (ui.editingLayout) false else ContextBars(ui, objects, actions, objectActions, wiring.onSummon)
+    val contextual = if (ui.editingLayout) {
+        false
+    } else {
+        ContextBars(ui, objects, actions, objectActions, wiring.onSummon, geometry)
+    }
     if (ui.editingLayout) LayoutEditorScrim()
-    ChromeHost(ui, geometry) {
+    // ⚠️ The Element editor's Done bar stands in the page bar's place and is a row whatever the page
+    // bar's own shape is, so it is measured into the bottom edge between history and zoom.
+    val pagesInRow = element.bar != null || ui.layout.arrangement(BarId.Stock(ChromeBar.PAGES)) == ChromeArrangement.ROW
+    ChromeHost(ui, geometry, pagesInRow = pagesInRow) {
         ChromeBarFrame(DockBarId, ui, geometry) { ChromeContainer(DockBarId, deps) }
         ChromeBarFrame(BarId.Stock(ChromeBar.DRAW), ui, geometry) { DockSecondary(deps, suppressed = contextual) }
         ChromeBarFrame(BarId.Stock(ChromeBar.HISTORY), ui, geometry) {
@@ -523,7 +554,14 @@ private class OpenPanels(
     val onCloseDiagnostics: () -> Unit,
 )
 
-/** The two panels that are summoned rather than resident, and nothing else. */
+/**
+ * ⭐ Every panel that opens beside the page — the Elements library, the colour and size panels, the
+ * diagnostics — in the right-hand column (`PanelDock`, docs/UI-RAILS.md §3): one under the other, a new
+ * column to the left when one is full, and never on top of each other or of a bar. The calculator joins
+ * the same column from its own layer (`DockedCalculator`).
+ *
+ * > *"there is just so much overlapping still and that is what i wanted to avoid"*
+ */
 @Composable
 private fun BoxScope.SidePanels(
     ui: InkUiState,
@@ -532,84 +570,72 @@ private fun BoxScope.SidePanels(
     actions: InkToolbarActions,
     objectActions: ObjectActions,
     open: OpenPanels,
+    geometry: ChromeGeometry,
 ) {
-    // ⭐ The Elements panel first, so the summoned panels below can still sit over it — but after the
-    // contextual bars, so a selection's bar never covers its rows. See [ElementPanelLayer].
-    ElementPanelLayer(ui, objects, editor, objectActions)
-    // ⭐ The panels' own size (`ChromeLayout.panelScale`) on top of the overall one. The alignment is
-    // built outside the scaled scope so it is measured against the screen, not against itself.
-    val layout = ui.layout
+    // ⭐ The column follows the layout: which side, and in what order (docs/LAYOUTS.md).
+    // ⚠️ Read here, in composition, and only handed over in the effect: read inside the effect, nothing
+    // recomposed when the layout changed, the effect never ran again, and choosing *Left* in the editor
+    // moved nothing (found on the emulator).
+    val side = ui.layout.panelSide
+    val order = ui.layout.orderedPanels
+    SideEffect {
+        geometry.dock.side = side
+        geometry.dock.order = order
+    }
+    // ⭐ After the contextual bars, so a selection's bar never covers the library's rows. See
+    // [ElementPanelLayer].
+    ElementPanelLayer(ui, objects, editor, objectActions, geometry = geometry)
+    dev.inkstone.app.handwriting.WritePanelLayer(ui, objects, editor, objectActions, geometry) // ⭐ §6.2.
+    // ⭐ Each panel is a `PanelWindow`: in the column until dragged out, at its own size
+    // (`ChromeLayout.panelScale`) inside its slot, so the column is laid out in the screen's px.
     if (open.diagnostics) {
-        val corner = Modifier
-            .align(Alignment.BottomEnd)
-            .padding(bottom = SIDE_PANEL_BOTTOM.dp, end = InkDims.EdgePadding)
-        ScaledChrome(layout.panelScale(ChromePanel.MORE)) {
+        PanelWindow(DockSlot.DIAGNOSTICS, ui, geometry) {
             DiagnosticsPanel(
                 state = ui,
                 actions = actions,
                 revision = open.revision,
                 onClose = open.onCloseDiagnostics,
-                modifier = corner,
             )
         }
     }
     when (open.panel?.kind) {
-        PanelKind.COLOUR -> {
-            val scale = layout.panelScale(ChromePanel.COLOUR)
-            ColourPopover(open.panel.anchor, ui, objects, actions, open.onClosePanel, objectActions, scale)
-        }
-
-        PanelKind.SIZE -> SizePopover(open.panel.anchor, ui, open.onClosePanel, layout.panelScale(ChromePanel.WIDTH))
-
+        PanelKind.COLOUR -> DockedColourPanel(geometry, ui, objects, actions, open.onClosePanel, objectActions)
+        PanelKind.SIZE -> DockedSizePanel(geometry, ui, open.onClosePanel)
         null -> Unit
     }
+    SnapGuides(geometry)
 }
 
 /**
- * ⭐ ROADMAP M10 — the extended colour panel, under the `+` that opened it.
+ * ⭐ ROADMAP M10 — the extended colour panel, in the right-hand column.
  *
- * ## Why the open state is an anchor and not a boolean
+ * ## In the column, not under the `+`
  *
- * The design says the `+` *"summons a side-panel"*, and a panel that appears in a corner has to be
- * found; one under the control you just pressed does not. So [InkScreen] holds the `+`'s bounds
- * rather than a flag — the two carry the same information, and only one of them can also say
- * *where*. There is never more than one `+` on screen to be ambiguous about: row two collapses
- * whenever a contextual toolbar is up.
+ * It used to open under the `+` that summoned it, behind a full-screen scrim that closed it on the next
+ * press anywhere. Under a `+` it landed wherever there was room, which was over the dock, over the
+ * selection that opened it, or over another panel — each placement reasonable alone, and together the
+ * pile-up the user asked to be rid of (docs/UI-RAILS.md §3). In the column it has a place of its own.
  *
- * ⚠️ Those bounds arrive in **root** coordinates and [InkScreen]'s Box is inset by the Scaffold's
- * status-bar padding, so they are rebased against its `positionInRoot` before they get here. Skip
- * that and the panel opens one status bar too low, which looks like a rounding error rather than
- * like a missing subtraction.
- *
- * ## Why a scrim, and why it eats the tap
- *
- * The panel closes when you press **anything else — including the paper**. That is a full-screen
- * transparent layer under it, and the tap that dismisses it does not reach the page. Letting it
- * through would mean a stroke drawn by the same press that put the panel away, which is the one
- * thing somebody adjusting a colour is not trying to do.
- *
- * ⚠️ **Not a `Popup`.** A popup is a second window, and this screen's wet ink is a front-buffered
- * `SurfaceView` that SurfaceFlinger composites over the app's window (SPEC §3.2) — window ordering
- * against it is exactly the thing this codebase has been bitten by twice. An in-window layer is
- * ordered by composition, which is a rule with no platform in it.
+ * It **stays open while you write**, which a scrim could not allow: a colour can be adjusted between
+ * strokes without opening it again. The `+` that opened it closes it (`SummonedPanel.toggled`), and
+ * so does its `✕`.
  *
  * ## Which colour it edits
  *
- * The same `when` `ContextBars` uses, and it has to be: there is only ever one `+` on screen, because
- * row two collapses whenever a contextual toolbar is up. So a text box being typed into takes the
- * text colour, a selection takes a recolour of the selection, and otherwise it is the pen. Deriving
- * it here rather than threading three different callbacks down is what stops the two disagreeing
- * about which control the open panel belongs to.
+ * The same `when` `ContextBars` uses, and it has to be: a text box being typed into takes the text
+ * colour, a selection takes a recolour of the selection, and otherwise it is the pen. Deriving it here
+ * rather than threading three different callbacks down is what stops the two disagreeing about which
+ * control the open panel belongs to — and, now that it stays open, what lets it follow a selection
+ * made after it was opened.
  */
 @Composable
-private fun BoxScope.ColourPopover(
-    anchor: Rect,
+private fun DockedColourPanel(
+    geometry: ChromeGeometry,
     ui: InkUiState,
     objects: ObjectToolState,
     actions: InkToolbarActions,
     onDismiss: () -> Unit,
     objectActions: ObjectActions,
-    scale: Float,
 ) {
     val editing = objects.editing
     val argb = if (editing != null) objects.style.colorArgb else ui.pen.colorArgb
@@ -623,107 +649,53 @@ private fun BoxScope.ColourPopover(
 
         else -> ui::setColor
     }
-
-    Box(
-        modifier = Modifier
-            .matchParentSize()
-            .pointerInput(Unit) { detectTapGestures { onDismiss() } },
-    )
-    AnchoredPanel(anchor = anchor) {
-        ScaledChrome(scale) {
-            ColorPanel(
-                argb = argb,
-                slots = ui.slots,
-                // ⭐ Every change writes the chosen slot as well as applying the colour, which is what
-                // makes the wheel *edit a swatch*. `updateChosenSlot` is a no-op until a slot has been
-                // tapped, so mixing a colour without choosing one still leaves the palette alone.
-                onColorChange = { next ->
-                    ui.updateChosenSlot(next)
-                    onColorChange(next)
-                },
-                onChooseSlot = ui::chooseSlot,
-                onClose = onDismiss,
-                drag = ui.colorDrag,
-                onDropped = ui::swapSlots,
-            )
-        }
+    PanelWindow(DockSlot.COLOUR, ui, geometry) {
+        ColorPanel(
+            argb = argb,
+            slots = ui.slots,
+            // ⭐ Every change writes the chosen slot as well as applying the colour, which is what
+            // makes the wheel *edit a swatch*. `updateChosenSlot` is a no-op until a slot has been
+            // tapped, so mixing a colour without choosing one still leaves the palette alone.
+            onColorChange = { next ->
+                ui.updateChosenSlot(next)
+                onColorChange(next)
+            },
+            onChooseSlot = ui::chooseSlot,
+            onClose = onDismiss,
+            drag = ui.colorDrag,
+            onDropped = ui::swapSlots,
+        )
     }
 }
 
 /**
- * ⭐ ROADMAP M10 — the saved-sizes panel, under the number that opened it.
- *
- * *"hold down on the number to bring up a menu like the color menu"* — so it is deliberately the
- * same shape as [ColourPopover]: the same anchor arithmetic, the same full-screen scrim that eats a
- * tap anywhere (including on the paper) and closes.
- *
- * ⚠️ **Its own scrim rather than one hoisted into [AnchoredPanel].** Hoisting is tidier and would
- * have edited a shipped, working dismissal path for no behavioural gain; composition order in a
- * `Box` is hit-test order, so getting it subtly wrong stops the *colour* panel dismissing on a tap
- * on the paper — a regression in the thing this round was asked to preserve.
+ * ⭐ ROADMAP M10 — the saved-sizes panel, in the right-hand column with the colour panel (see
+ * [DockedColourPanel] on why there and not under the number that opened it).
  */
 @Composable
-private fun BoxScope.SizePopover(anchor: Rect, ui: InkUiState, onDismiss: () -> Unit, scale: Float) {
-    Box(
-        modifier = Modifier
-            .matchParentSize()
-            .pointerInput(Unit) { detectTapGestures { onDismiss() } },
-    )
-    // ⚠️ Every route that takes this panel off screen — the scrim, `✕`, pressing the readout again,
-    // opening a different panel — ends the edit here, so the ladder is never left mid-edit (and so
-    // possibly unsorted, see `InkUiState.editingWidthSlot`) behind a closed panel.
+private fun DockedSizePanel(geometry: ChromeGeometry, ui: InkUiState, onDismiss: () -> Unit) {
+    // ⚠️ Every route that takes this panel off screen — `✕`, pressing the readout again, opening a
+    // different panel — ends the edit here, so the ladder is never left mid-edit (and so possibly
+    // unsorted, see `InkUiState.editingWidthSlot`) behind a closed panel.
     DisposableEffect(ui) { onDispose { ui.finishWidthEdit() } }
-    AnchoredPanel(anchor = anchor) {
-        ScaledChrome(scale) {
-            SizePanel(
-                widthDp = ui.pen.widthDp,
-                slots = ui.widthSlots,
-                editingIndex = ui.editingWidthSlot,
-                defaultWidthDp = ui.defaultWidthDp,
-                maxWidthDp = ui.maxWidthDp,
-                edits = SizeEdits(
-                    onWidthChange = ui::editWidth,
-                    onChoose = ui::chooseWidthSlot,
-                    onForget = ui::removeWidthSlot,
-                    onAdd = ui::addWidthSlot,
-                    onDelete = ui::deleteEditedWidthSlot,
-                    onMakeDefault = ui::makeDefaultWidth,
-                    onMaxChange = ui::setMaxWidth,
-                ),
-                onClose = onDismiss,
-            )
-        }
-    }
-}
-
-/**
- * Places a panel under [anchor], centred on it, flipped above when it will not fit below.
- *
- * The same arithmetic `ContextBars.AnchoredBar` does for a toolbar, and separate for the reason it is
- * separate there: it has to be measured before it can be centred, so it is invisible for one frame
- * rather than visibly jumping in from the corner.
- */
-@Composable
-private fun AnchoredPanel(anchor: Rect, content: @Composable () -> Unit) {
-    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
-        var size by remember { mutableStateOf(IntSize.Zero) }
-        val density = LocalDensity.current
-        val gap = with(density) { InkDims.ChipGap.toPx() }
-        val pad = with(density) { InkDims.EdgePadding.toPx() }
-
-        val maxX = (constraints.maxWidth - size.width - pad).coerceAtLeast(pad)
-        val maxY = (constraints.maxHeight - size.height - pad).coerceAtLeast(pad)
-        val below = anchor.bottom + gap
-        val fits = below + size.height <= constraints.maxHeight - pad
-        val x = (anchor.center.x - size.width / 2f).coerceIn(pad, maxX)
-        val y = (if (fits) below else anchor.top - size.height - gap).coerceIn(pad, maxY)
-
-        Box(
-            modifier = Modifier
-                .offset { IntOffset(x.roundToInt(), y.roundToInt()) }
-                .onSizeChanged { size = it }
-                .alpha(if (size == IntSize.Zero) 0f else 1f),
-        ) { content() }
+    PanelWindow(DockSlot.SIZE, ui, geometry) {
+        SizePanel(
+            widthDp = ui.pen.widthDp,
+            slots = ui.widthSlots,
+            editingIndex = ui.editingWidthSlot,
+            defaultWidthDp = ui.defaultWidthDp,
+            maxWidthDp = ui.maxWidthDp,
+            edits = SizeEdits(
+                onWidthChange = ui::editWidth,
+                onChoose = ui::chooseWidthSlot,
+                onForget = ui::removeWidthSlot,
+                onAdd = ui::addWidthSlot,
+                onDelete = ui::deleteEditedWidthSlot,
+                onMakeDefault = ui::makeDefaultWidth,
+                onMaxChange = ui::setMaxWidth,
+            ),
+            onClose = onDismiss,
+        )
     }
 }
 
@@ -868,6 +840,8 @@ private fun rememberObjectActions(
         onPlaceElement = { element, centre, selectAfter ->
             scope.launch { placeElement(surface, editor, ui, element, centre, selectAfter) }
         },
+        // ⭐ docs/HANDWRITING-SYNTHESIS.md §6.2 — a written phrase is selected, as a dropped Element is.
+        onSelectPlaced = { ids -> placedSelect(surface, ui, ids) },
         elementEditor = editor.editingElement?.let { ElementEditorActions({ surface }, editor, ui) },
     )
 }
@@ -949,6 +923,13 @@ private suspend fun placeElement(
     }
 }
 
+/** Select [ids] first, then the tool — the order `InkSurfaceView.select`'s KDoc asks for. */
+private fun placedSelect(surface: InkSurfaceView?, ui: InkUiState, ids: List<ObjectId>) {
+    if (ids.isEmpty()) return
+    surface?.select(ids)
+    ui.tool = EditorTool.SELECT
+}
+
 /**
  * Decode, downscale, insert, and say what it cost.
  *
@@ -1008,6 +989,7 @@ private fun applySelection(count: Int, ui: InkUiState, objects: ObjectToolState,
     )
     val box = selection.soleTextBox
     objects.focusText(box?.let { TextFocus(it.id, it.bounds, it.widthPt, it.heightPt, it.text, it.format, it.style) })
+    objects.write.phrase = selection.phrase // ⭐ Write again / Edit text: docs/HANDWRITING-SYNTHESIS.md §6.2.
 }
 
 /**
@@ -1287,7 +1269,7 @@ private fun InkSurface(
                 // ⭐ M12 §3 — the timeline's only input. Fired on the UI thread in the frame the
                 // dry layer redraws, so the view model does one subtraction and one enqueue and
                 // returns (CLAUDE.md rule 7); the file append rides the journal's own rhythm.
-                onStrokeCaptured = { objectId, atElapsed -> editor.strokeCaptured(objectId, atElapsed) }
+                onStrokeCaptured = { objectId, atElapsed, ruled -> editor.strokeCaptured(objectId, atElapsed, ruled) }
                 onCreated(this)
             }
         },
@@ -1403,13 +1385,11 @@ private fun loadSyntheticPage(scope: CoroutineScope, surface: InkSurfaceView?, u
 private const val LATENCY_POLL_MS = 500L
 
 /**
- * How far the diagnostics panel sits above the zoom widget that summons it.
- *
- * ⚠️ Its sibling `SIDE_PANEL_TOP` is gone with the colour panel's corner. That panel is placed under
- * the `+` that opened it now (`ColourPopover`), so it has no fixed inset at all — which is the point:
- * a panel parked in a corner has to be *found*, and one under the control you just pressed does not.
+ * The calculator's top line in the editor: under the one row of chrome along the top edge. The library
+ * has two rows there and keeps `WindowSafeTop`.
  */
-private const val SIDE_PANEL_BOTTOM = 76
+private val EditorWindowSafeTop =
+    InkDims.EdgePadding + InkDims.ChipMinHeight + InkDims.BarPadding * 2 + InkDims.GroupGap
 
 /** The dragged-colour blob. Bigger than a swatch so a fingertip does not hide it entirely. */
 private const val DRAG_PREVIEW = 34

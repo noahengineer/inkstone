@@ -2,6 +2,7 @@ package dev.inkstone.app.search
 
 import dev.inkstone.core.model.HandwritingRecogniser
 import dev.inkstone.core.model.PageId
+import dev.inkstone.core.model.PageText
 import dev.inkstone.core.model.RecognitionOutcome
 import dev.inkstone.core.model.RecognitionUnavailable
 import dev.inkstone.core.model.StrokeSampler
@@ -96,7 +97,11 @@ class NoteRecogniser @Inject constructor(
             // ⚠️ Skipping a page whose text is already current is not an optimisation, it is what
             // stops the batch pass rewriting the bundle — and therefore re-uploading the note —
             // every night for a notebook nobody has touched.
-            if (session.recognisedText(pageId) != null) null else session.page(pageId)
+            //
+            // Current means the same ink *and* the same recogniser. Text read by another model,
+            // language or line segmentation is read once more (HandwritingRecogniser.id). That is
+            // how LineSegmenter version 2's columns reach notes recognised before it.
+            if (session.recognisedText(pageId)?.let(::isCurrent) == true) null else session.page(pageId)
         } ?: return PageOutcome.Nothing
         // ⭐ Sampled **outside** the gate. The fold is immutable, so nothing the lock protects is
         // read here — and sampling rebuilds every stroke on the page from its blob, which for the
@@ -135,6 +140,9 @@ class NoteRecogniser @Inject constructor(
             is RecognitionOutcome.Unavailable -> PageOutcome.Unavailable(outcome.reason)
         }
     }
+
+    /** Read by this recogniser, or by one that declares no id ([HandwritingRecogniser.id]). */
+    private fun isCurrent(text: PageText): Boolean = recogniser.id.isEmpty() || text.recogniser == recogniser.id
 
     private sealed interface PageOutcome {
         data class Read(val words: Int) : PageOutcome

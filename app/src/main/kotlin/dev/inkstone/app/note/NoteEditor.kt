@@ -410,6 +410,10 @@ class NoteEditor(
          * recording fake made every test true of the editor and false of the app. A method
          * with no body here would make "search finds it and nothing happens" the shipped
          * behaviour, and the test suite would agree it worked.
+         *
+         * ⚠️ **And a body that runs too early is the same bug.** Until the surface held the hit
+         * and centred it after the page load's fit, the camera move came first and the fit undid
+         * it: search found the word and opened the note somewhere else (`InkSurfaceView.highlight`).
          */
         fun highlight(box: PageRect?)
 
@@ -1259,10 +1263,28 @@ class NoteEditor(
     // Pages
     // -----------------------------------------------------------------------
 
-    fun showPage(pageId: PageId) {
-        withPage(pageId) { session, page ->
+    /**
+     * Turn to [pageId].
+     *
+     * ⚠️ **Queued behind the open, never dropped by it** — which is why this does not go through
+     * [withPage]. That reads `session` *before* it queues, which is right for a press on the page on
+     * screen (a press made before there is one has nothing to act on) and was wrong here: SPEC §8.4's
+     * search hit asks for its page from `NoteEditorViewModel`'s `init`, which is always before the
+     * note has opened, so the turn was dropped every time and the hit's box was drawn on whichever
+     * page the note opened at. A one-page note cannot show that; a 37-page one on the tablet did.
+     *
+     * A page that is not in the note — a stale search index, or a page deleted on the other tablet
+     * since — leaves the page where it is, as does the page already on screen, which would otherwise
+     * be loaded and tessellated a second time.
+     *
+     * @return the turn, so a caller that must act once the page is on screen can wait for it.
+     */
+    fun showPage(pageId: PageId): Job = work.launch {
+        serial.withLock {
+            val session = session ?: return@withLock
+            if (currentPage == pageId || session.document.livePages.none { it.id == pageId }) return@withLock
             saveLocked()
-            display(session, page)
+            display(session, pageId)
             publish()
         }
     }
@@ -1559,15 +1581,23 @@ class NoteEditor(
      * Through `apply`, so it is one entry on **this** editor's undo stack, in the order it happened —
      * which is the whole answer to *"no undo"* for the editor's guides. [build] returning null or
      * nothing is no edit and no entry.
+     *
+     * @param readAgain the edit added ink to be read — a written phrase (docs/HANDWRITING-SYNTHESIS.md
+     *   §6.3) — so the page is marked unread, as the pen's own strokes are in [drainLocked].
      */
-    suspend fun editShownPage(build: (FoldedPage, NoteSession) -> List<PageOp>?): Boolean = onPage { session, page ->
-        saveLocked()
-        val before = session.page(page)
-        val ops = build(before, session)?.takeIf { it.isNotEmpty() } ?: return@onPage false
-        session.apply(page, ops)
-        afterEdit(session, page, before)
-        true
-    } ?: false
+    suspend fun editShownPage(readAgain: Boolean = false, build: (FoldedPage, NoteSession) -> List<PageOp>?): Boolean =
+        onPage { session, page ->
+            saveLocked()
+            val before = session.page(page)
+            val ops = build(before, session)?.takeIf { it.isNotEmpty() } ?: return@onPage false
+            session.apply(page, ops)
+            afterEdit(session, page, before)
+            if (readAgain) {
+                unreadPages += page
+                lastStrokeAtMs = clock.nowEpochMillis()
+            }
+            true
+        } ?: false
 
     /** How many copies of [elementId] this note holds, on every page. SPEC §4.9.7. */
     suspend fun countElementCopies(elementId: ElementId): Int = onPage { session, _ ->

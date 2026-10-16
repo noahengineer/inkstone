@@ -266,6 +266,41 @@ picking a paper and pressing undo left the page **pixel-identical** to before (0
 pixels differing) while 8.3% differed with the new paper up. A reader that is not the writer, which
 is the fourth of CLAUDE.md's four checks.
 
+**To run a background job now** rather than when the device is charging and idle — recognition, the
+handwriting learner, a sync — force it by its job id. WorkManager's jobs live in a job namespace, and
+without `-n` the answer is *"Could not find job"*:
+
+```bash
+adb shell dumpsys jobscheduler | grep "androidx.work.systemjobscheduler:u0a"
+adb shell cmd jobscheduler run -f -n androidx.work.systemjobscheduler dev.inkstone <job id>
+```
+
+**To measure line segmentation on a device's own notes**, a debug build has two broadcast tools
+(`docs/LINE-SEGMENTATION-V2.md` §3). Both queue a job, so they work on a locked tablet:
+
+```bash
+adb shell am broadcast -n dev.inkstone/.app.debug.InkExportReceiver
+adb shell am broadcast -n dev.inkstone/.app.debug.LineReadReceiver --es plan segmenter
+```
+
+The first writes `files/debug/ink-export.json`, which `RealInkSegmentationReport` reads on the JVM
+(set `INKSTONE_INK_CORPUS` and `INKSTONE_INK_OUT`). The second reads every line with ML Kit into
+`files/debug/segmenter.out.json`. ⚠️ **Work a receiver runs in its own coroutine is frozen** by the
+cached-apps freezer a few seconds after the broadcast returns. That is why these queue a job. It
+presents as a hang with every thread in `do_freezer_trap`.
+
+**To walk the recognition model's download panel** (`docs/M7-RECOGNITION.md` §5.1), put the device
+back into a fresh install's state first. This is ML Kit's own delete (it took 37 s on an AVD), and it
+never downloads — that is a press in the app, and a ~20 MB transfer:
+
+```bash
+adb shell am broadcast -n dev.inkstone/.app.debug.RecognitionModelReceiver --es action delete
+adb shell am broadcast -n dev.inkstone/.app.debug.RecognitionModelReceiver --es action status
+```
+
+Both log under `ModelDebug`. ⚠️ The AVDs here run at animator scale 0, so the *downloading* bar
+shows only its track there; that is the reduced-motion case, not a bug.
+
 ### Two emulators as two sync peers
 
 Rows about two devices need two *installs*, and `applicationId` has no debug suffix — so a second
@@ -311,6 +346,31 @@ connectivity on one of the two AVDs — long enough that a check run straight af
 offline*, which is exactly the wrong conclusion in a test about going back online. Poll for the
 network rather than sleeping a fixed amount, and `adb shell settings get global airplane_mode_on` to
 confirm the setting itself landed.
+
+⚠️ **A serial is a port, not an AVD.** `emulator-5554` is whichever AVD booted first. On
+2026-10-13, Test_Tablet had gone down overnight and Test_Tablet_B, another session's peer, had come
+back up as 5554. A command aimed at "Test_Tablet's" serial took B out of airplane mode for 91
+seconds. Resolve the serial by name before **every** command, and refuse to run when the name is
+wrong:
+
+```bash
+adb -s emulator-5554 emu avd name            # or: adb -s … shell getprop ro.boot.qemu.avd_name
+```
+
+⚠️ **A second AVD may get no Wi-Fi at all.** Emulator 37 runs Wi-Fi through a shared `netsimd`. The
+second instance found the access point and timed out associating, again and again, through Wi-Fi
+toggles and a guest reboot. Launching it with the built-in Wi-Fi instead fixed it:
+`emulator -avd Test_Tablet -feature -WiFiPacketStream`. Two related things are not the fix. `ping`
+is not a connectivity test on the built-in Wi-Fi, because its NAT drops ICMP. Ask Android instead:
+`adb shell dumpsys connectivity | grep VALIDATED`.
+
+⚠️ **A quick boot restores the last snapshot the emulator saved, disk included.** An AVD that went
+down without saving can come back days old, with an older APK and none of the walk's data. Check
+`dumpsys package dev.inkstone | grep lastUpdateTime` after any restart. Restored snapshots can also
+leave the guest's clock and vsync confused. The symptoms are `Frame time is … in the future`, taps
+that land but never redraw, and a `monkey` launch whose window stays `Surface: shown=false`. A cold
+boot (`-no-snapshot-load`) cleared all three. Until then, `am start -n dev.inkstone/.app.MainActivity`
+showed the window where `monkey` did not.
 
 ⚠️ **First launch on a fresh AVD can ANR.** `Reason: No response to onStartJob` — WorkManager's job
 service, arriving while the app is still doing its first-run work at ~118% CPU on a shared host. The
@@ -492,6 +552,7 @@ It plants a real violation for each (an `android.content.Context` import in `:co
 :core:sync        KMP  Nextcloud client (Ktor), outbox, reconciler, merge engine.
 :core:search      KMP  Tokenizer + FTS index over recognised text.
 :core:calc        KMP  fx-991ZA PLUS II calculator engine: keys in, LCD frame out.
+:core:handwriting KMP  Handwriting synthesis: learns the user's hand from their pen strokes.
 
 :android:ink      AND  androidx.ink, MotionEvent handling, renderer.
 :android:pdf      AND  PDF import, render, materialize.

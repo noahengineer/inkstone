@@ -5,10 +5,10 @@ import android.net.Uri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
-import dev.inkstone.android.ocr.MlKitRecogniser
 import dev.inkstone.android.pdf.PdfOpenResult
 import dev.inkstone.app.audio.AutoRecordFolders
-import dev.inkstone.app.platform.WorkManagerScheduler
+import dev.inkstone.app.search.ModelPanel
+import dev.inkstone.app.search.RecognitionModelController
 import dev.inkstone.app.sync.NoteSessionHost
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.Folder
@@ -18,9 +18,7 @@ import dev.inkstone.core.model.FolderId
 import dev.inkstone.core.model.FolderTree
 import dev.inkstone.core.model.LibraryLayout
 import dev.inkstone.core.model.LibrarySort
-import dev.inkstone.core.model.ModelDownload
 import dev.inkstone.core.model.NoteSummary
-import dev.inkstone.core.model.RecognitionModels
 import dev.inkstone.core.search.SearchHit
 import dev.inkstone.core.search.SearchIndex
 import dev.inkstone.core.storage.PdfOpenMode
@@ -85,15 +83,14 @@ class LibraryViewModel @Inject constructor(
     /** M12 §10's per-folder setting — read for the folder menu, written by it. */
     private val autoRecord: AutoRecordFolders,
     /**
-     * SPEC §8.1's downloadable language models (M7).
+     * SPEC §8.1's downloadable language model (M7), and the first read of the library after it.
      *
      * Offered from the search box rather than buried in a settings screen, because the moment
      * a user wants handwriting search is the moment they type into it and find only titles —
      * and *"nothing matched"* with no explanation is the outcome ROADMAP M7 asks not to ship.
+     * The process's, not this screen's: see its KDoc for what dying with the activity cost.
      */
-    private val models: RecognitionModels,
-    /** SPEC §8.3 — reading a library's backlog once the model arrives. */
-    private val scheduler: WorkManagerScheduler,
+    private val recognitionModel: RecognitionModelController,
     /**
      * Read here and nowhere deeper. A `Uri` is only readable while this process holds
      * the grant the picker made, and neither `:core:storage` nor `:android:pdf` may
@@ -148,8 +145,6 @@ class LibraryViewModel @Inject constructor(
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), emptyList())
 
-    private val modelState = MutableStateFlow(RecognitionModelState())
-
     /**
      * ⭐ M12 §10 — turn auto-record on, off, or back to inheriting for one folder.
      *
@@ -163,42 +158,11 @@ class LibraryViewModel @Inject constructor(
         }
     }
 
-    /**
-     * ⚠️ **Asked once, not polled.** `isModelDownloaded` is a Play Services round trip; putting
-     * it in the state combine would fire one per emission of every library flow.
-     */
-    private fun refreshModel() {
-        viewModelScope.launch {
-            // Suspends, so it is resolved before the update rather than inside it — the
-            // update lambda is not a coroutine body.
-            val downloaded = models.isDownloaded(MlKitRecogniser.DEFAULT_LANGUAGE)
-            modelState.value = modelState.value.copy(downloaded = downloaded)
-        }
-    }
+    /** SPEC §8.1 — only ever from a press. See [RecognitionModelController.download]. */
+    fun downloadRecognitionModel() = recognitionModel.download()
 
-    /**
-     * SPEC §8.1 — the user asked for the model, so it is fetched. Never called on their behalf:
-     * it is tens of megabytes on a connection they may be paying for, and ML Kit reports
-     * anonymous usage metrics to Google, which is a thing to say before the download and not
-     * after.
-     */
-    fun downloadRecognitionModel() {
-        if (modelState.value.downloading) return
-        modelState.value = modelState.value.copy(downloading = true, error = null)
-        viewModelScope.launch {
-            val outcome = models.download(MlKitRecogniser.DEFAULT_LANGUAGE, unmeteredOnly = false)
-            modelState.value = modelState.value.copy(
-                downloading = false,
-                downloaded = outcome is ModelDownload.Done,
-                error = (outcome as? ModelDownload.Failed)?.message,
-            )
-            // Everything already written is unread. One pass now, rather than waiting for the
-            // device to be idle and charging — the user just said they want this.
-            if (outcome is ModelDownload.Done) {
-                repository.allNoteIdsForRecognition().forEach(scheduler::enqueueRecognition)
-            }
-        }
-    }
+    /** The user's OK on the model panel's *Ready*, or on a failed download's error. */
+    fun dismissModelPanel() = recognitionModel.dismiss()
 
     val state: StateFlow<LibraryUiState> = combine(
         repository.folders,
@@ -208,7 +172,9 @@ class LibraryViewModel @Inject constructor(
         // ⚠️ Combined into one flow rather than passed as a sixth: `combine` has typed
         // overloads up to five, and the six-flow form is `Array<Any?>` with every element
         // cast by hand — which compiles for the wrong arrangement just as happily.
-        combine(overlay, handwritingHits, modelState) { overlay, hits, model -> Triple(overlay, hits, model) },
+        combine(overlay, handwritingHits, recognitionModel.panel) { overlay, hits, model ->
+            Triple(overlay, hits, model)
+        },
     ) { folders, notes, controls, message, (overlay, hits, model) ->
         uiStateOf(folders, notes, controls, message, overlay, hits, model)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(STOP_TIMEOUT_MS), LibraryUiState())
@@ -225,7 +191,6 @@ class LibraryViewModel @Inject constructor(
         // cache. All three are I/O and none of them blocks the first frame — the library
         // renders from whatever the index already says and corrects itself a moment later.
         viewModelScope.launch { repository.startup() }
-        refreshModel()
     }
 
     // -----------------------------------------------------------------------
@@ -496,7 +461,7 @@ private fun uiStateOf(
     message: String?,
     overlay: SyncOverlay,
     handwritingHits: List<SearchHit>,
-    model: RecognitionModelState,
+    modelPanel: ModelPanel?,
 ): LibraryUiState {
     val searching = controls.query.isNotBlank()
     val visibleNotes = LibraryFiltering.visibleNotes(
@@ -530,7 +495,7 @@ private fun uiStateOf(
         favouritesOnly = controls.favouritesOnly,
         searching = searching,
         handwritingHits = handwritingHits,
-        model = model,
+        modelPanel = modelPanel,
         // A selected note that has since been trashed or moved out of view must not stay
         // selected, or "Trash 3 notes" would act on a note the user can no longer see.
         selection = controls.selection intersect visibleNotes.mapTo(HashSet()) { it.id },
@@ -542,25 +507,12 @@ private fun uiStateOf(
 private fun notesWord(count: Int) = if (count == 1) "note" else "notes"
 
 /**
- * ⚠️ There is deliberately only **one** of these. A sibling for `RecognitionModelState` looks
- * obvious and does not compile: generics erase, so both would be
- * `update(MutableStateFlow, Function1)` on the JVM. The model state assigns `.value` directly.
+ * ⚠️ There is deliberately only **one** of these: generics erase, so a sibling for another state type
+ * would also be `update(MutableStateFlow, Function1)` on the JVM, and would not compile.
  */
 private fun MutableStateFlow<LibraryControls>.update(transform: (LibraryControls) -> LibraryControls) {
     value = transform(value)
 }
-
-/**
- * SPEC §8.1's language model, as the search box needs to talk about it.
- *
- * @property downloaded false is the ordinary state of a fresh install and is **not** an error.
- *   ROADMAP M7: the app works fully without it and search degrades to titles.
- */
-data class RecognitionModelState(
-    val downloaded: Boolean = true,
-    val downloading: Boolean = false,
-    val error: String? = null,
-)
 
 /** Long enough to survive a rotation without re-subscribing to the database. */
 private const val STOP_TIMEOUT_MS = 5_000L
@@ -643,8 +595,12 @@ data class LibraryUiState(
      * indistinguishable from "no page says that" on purpose: both mean there is nothing to show.
      */
     val handwritingHits: List<SearchHit> = emptyList(),
-    /** SPEC §8.1's model, so the search box can say why it is only finding titles. */
-    val model: RecognitionModelState = RecognitionModelState(),
+    /**
+     * SPEC §8.1's model, so the search box can say why it is only finding titles — and, once the user
+     * has pressed *Download*, how far it has got. Null says nothing. Not-downloaded is the ordinary
+     * state of a fresh install and is **not** an error: ROADMAP M7, the app works fully without it.
+     */
+    val modelPanel: ModelPanel? = null,
     val selection: Set<DocumentId> = emptySet(),
     val message: String? = null,
     /** False until the first database emission, so "no notes yet" is not shown to a full library. */

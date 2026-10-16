@@ -68,7 +68,7 @@ object LineEditor {
         val cursor = frame.cursor
         if (cursor == null || !state.wrapPending || cursorShape(state) != CursorShape.INSERT) return frame
         val bar = cursor.copy(width = minOf(WRAP_BAR, LcdFrame.WIDTH - cursor.x))
-        return LcdFrame(frame.pixels, frame.indicators, bar, frame.off, frame.text, frame.contrast)
+        return LcdFrame(frame.pixels, frame.indicators, bar, frame.off, frame.text, frame.contrast, frame.answer)
     }
 
     /** [next], unless it is a Natural line taller than [MAX_NATURAL_HEIGHT]; then [state] itself. */

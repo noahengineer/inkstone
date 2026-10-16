@@ -150,7 +150,15 @@ class Machine(
     private fun render(): LcdFrame {
         if (off) return LcdFrame.OFF
         val drawn = top().render()
-        return LcdFrame(drawn.pixels, drawn.indicators, drawn.cursor, drawn.off, drawn.text, setup.contrast)
+        return LcdFrame(
+            drawn.pixels,
+            drawn.indicators,
+            drawn.cursor,
+            drawn.off,
+            drawn.text,
+            setup.contrast,
+            drawn.answer,
+        )
     }
 
     /** A controller's [ModeController.enter] and [ModeController.home] must leave a screen up. */

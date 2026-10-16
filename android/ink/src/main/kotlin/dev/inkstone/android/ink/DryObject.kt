@@ -7,6 +7,7 @@ import androidx.ink.geometry.ImmutableVec
 import androidx.ink.geometry.MutableVec
 import androidx.ink.geometry.Parallelogram
 import dev.inkstone.core.model.FractionalKey
+import dev.inkstone.core.model.GeneratedInk
 import dev.inkstone.core.model.Matrix3
 import dev.inkstone.core.model.ObjectFormat
 import dev.inkstone.core.model.ObjectId
@@ -183,8 +184,19 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
      */
     val copyBoundsOnPage: dev.inkstone.core.model.PageRect? get() = decodedFormat.instance?.boundsOn(transform)
 
-    /** Which Element copy this piece belongs to — `ElementInstance.copyKey` — or null for none. */
-    val copyKey: String? get() = decodedFormat.instance?.copyKey(transform)
+    /**
+     * ⭐ The generated phrase this stroke belongs to (`hw`, docs/HANDWRITING-SYNTHESIS.md D2), or null
+     * for ink the user wrote. Decoded once per format write, like [decodedFormat].
+     */
+    var generated: GeneratedInk? = null
+        private set
+
+    /**
+     * Which Element copy — `ElementInstance.copyKey` — or which generated phrase —
+     * `GeneratedInk.copyKey` — this piece belongs to, or null for neither. Either way a tap on any
+     * piece selects the whole thing ([withWholeCopies]), and a duplicate at another place is another.
+     */
+    val copyKey: String? get() = decodedFormat.instance?.copyKey(transform) ?: generated?.copyKey(transform)
 
     /**
      * The filled silhouette [PagePainter] built for [knockout], in this object's **own** space, or
@@ -217,6 +229,7 @@ internal sealed class DryObject(transform: Matrix3, style: ObjectStyle?, z: Frac
         if (format == record) return false
         format = record
         decodedFormat = ObjectFormat.decode(record)
+        generated = GeneratedInk.of(decodedFormat)
         invalidateSilhouette()
         onFormatChanged()
         return true

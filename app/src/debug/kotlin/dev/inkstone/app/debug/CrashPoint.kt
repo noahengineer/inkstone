@@ -19,6 +19,12 @@ object CrashPoint {
     const val MATERIALIZE: String = "MATERIALIZE"
     const val UPLOAD: String = "UPLOAD"
 
+    /** docs/HANDWRITING-SYNTHESIS.md §8.1: a personalisation fit killed between checkpoints. */
+    const val PERSONALISE: String = "PERSONALISE"
+
+    /** The same fit killed inside a checkpoint's atomic write. */
+    const val PERSONALISE_WRITE: String = "PERSONALISE_WRITE"
+
     /** Written immediately before the kill, so the test knows the moment was reached. */
     const val ARMED: String = "armed"
 

@@ -5,7 +5,10 @@
       M5. The only outbound traffic is the user's own Nextcloud (SPEC §14: "note content
       goes nowhere except the user's own server"), and every remote *mutation* goes
       through the outbox (CLAUDE.md rule 4). ACCESS_NETWORK_STATE is WorkManager's, for
-      the CONNECTED constraint that keeps the drainer from being woken with no network.
+      the CONNECTED constraint that keeps the drainer from being woken with no network —
+      and NetworkStatus's, so the recognition model's panel can say a download is waiting
+      for a connection rather than drawing progress that is not happening. It never gates
+      a request.
     -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -116,6 +119,16 @@
             android:name=".audio.RecordingService"
             android:exported="false"
             android:foregroundServiceType="microphone" />
+
+        <!--
+          docs/HANDWRITING-SYNTHESIS.md H5 — one personalisation pass now, from adb only. Guarded by
+          DUMP, which the shell holds and no installed app can be granted, so nothing on the device can
+          send it: see PersonaliseNowReceiver for why a release build needs it at all.
+        -->
+        <receiver
+            android:name=".handwriting.PersonaliseNowReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
 
         <provider
             android:name="androidx.core.content.FileProvider"

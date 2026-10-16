@@ -103,6 +103,12 @@ internal data class PdfPagePlan(
     val outlines: List<StrokeOutline>,
     val words: List<InvisibleWord> = emptyList(),
     val objects: List<PdfPageObject> = emptyList(),
+    /**
+     * ⭐ Strokes handwriting synthesis wrote (`hw`, docs/HANDWRITING-SYNTHESIS.md D11): each of their
+     * annotations carries [PdfPageKeys.GENERATED], so a generated mark can always be told from a
+     * written one in the file. A flattened page has no annotations to carry it; see its KDoc.
+     */
+    val generated: Set<ObjectId> = emptySet(),
 ) {
 
     /**
@@ -304,4 +310,12 @@ internal object PdfPageKeys {
 
     /** Set on a page written with [PageAnnotationMode.FLATTENED], so recovery can say so. */
     const val FLATTENED = "INKS_Flattened"
+
+    /**
+     * Set on an `/Ink` annotation whose stroke handwriting synthesis generated (D11). Ignored by every
+     * viewer, which still draws the ink; present so that *"it looks just like you did it"* never
+     * becomes *"no file can tell"*. ⚠️ A page dense enough to be flattened (SPEC §6.4) has no
+     * annotations, so there the mark is only in the note's own `hw` keys.
+     */
+    const val GENERATED = "INKS_Generated"
 }

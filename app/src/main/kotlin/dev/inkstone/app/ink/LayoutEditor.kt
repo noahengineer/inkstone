@@ -1,6 +1,7 @@
 package dev.inkstone.app.ink
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -9,11 +10,13 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -29,7 +32,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import dev.inkstone.app.ui.ChipDividerAcross
+import dev.inkstone.app.ui.CardRule
 import dev.inkstone.app.ui.GlassPanel
 import dev.inkstone.app.ui.Ink
 import dev.inkstone.app.ui.InkDims
@@ -67,17 +70,20 @@ import kotlin.math.roundToInt
 internal fun BoxScope.LayoutEditorPanel(ui: InkUiState) {
     BackHandler { ui.editingLayout = false }
     var moved by remember { mutableStateOf(Offset.Zero) }
-    var popups by remember { mutableStateOf(false) }
+    var tab by remember { mutableStateOf(EditorTab.LAYOUTS) }
+    // Tapping a bar is a question about that bar, so its controls come forward.
+    LaunchedEffect(ui.selectedBar) { if (ui.selectedBar != null) tab = EditorTab.BARS }
     GlassPanel(
         modifier = Modifier
             .align(Alignment.Center)
-            .offset { IntOffset(moved.x.roundToInt(), moved.y.roundToInt()) },
+            .offset { IntOffset(moved.x.roundToInt(), moved.y.roundToInt()) }
+            .width(EditorWidth),
     ) {
         MicroLabel(
-            "Customise layout",
+            "Customise layout · ${ui.savedLayouts.activeName}",
             color = Ink.TextNormal,
             modifier = Modifier
-                .width(CaptionWidth)
+                .fillMaxWidth()
                 .semantics { contentDescription = "Move the layout panel" }
                 .pointerInput(Unit) {
                     detectDragGestures { change, delta ->
@@ -86,23 +92,54 @@ internal fun BoxScope.LayoutEditorPanel(ui: InkUiState) {
                     }
                 },
         )
-        ChosenBar(ui)
-        ChipDividerAcross()
-        ScaleRow("UI size", ui.layout.uiScale, ChromeLayout.UI_SCALE) { ui.layout = ui.layout.withUiScale(it) }
-        if (popups) {
-            ChromePanel.entries.forEach { panel ->
-                val own = ui.layout.panelScales[panel] ?: 1f
-                ScaleRow(panel.label, own, ChromeLayout.PANEL_SCALE) { scale ->
-                    ui.layout = ui.layout.withPanelScale(panel, scale)
-                }
+        Segmented(Modifier.fillMaxWidth()) {
+            EditorTab.entries.forEach { each ->
+                SegmentChip(each.label, selected = tab == each, onClick = {
+                    tab = each
+                }, modifier = Modifier.weight(1f))
             }
         }
+        when (tab) {
+            EditorTab.LAYOUTS -> LayoutsTab(ui)
+            EditorTab.BARS -> BarsTab(ui)
+            EditorTab.PANELS -> PanelsTab(ui)
+            EditorTab.STYLE -> StyleTab(ui)
+        }
+        CardRule()
         Row(horizontalArrangement = Arrangement.spacedBy(InkDims.ChipGap)) {
-            TextChip(label = "Pop-up sizes", selected = popups, onClick = { popups = !popups })
             TextChip(label = "Reset all", enabled = ui.layout != ChromeLayout(), onClick = {
                 ui.layout = ChromeLayout()
             })
             TextChip(label = "Done", selected = true, onClick = { ui.editingLayout = false })
+        }
+    }
+}
+
+/** The editor's four pages: which layout, the bars, the panels, and the two style switches. */
+internal enum class EditorTab(val label: String) {
+    LAYOUTS("Layouts"),
+    BARS("Bars"),
+    PANELS("Panels"),
+    STYLE("Style"),
+}
+
+/**
+ * The bar tapped, the overall size, and — folded away, because the panels are not on screen to tap
+ * while the editor is — each pop-up panel's own size.
+ */
+@Composable
+private fun BarsTab(ui: InkUiState) {
+    var popups by remember { mutableStateOf(false) }
+    ChosenBar(ui)
+    CardRule()
+    ScaleRow("UI size", ui.layout.uiScale, ChromeLayout.UI_SCALE) { ui.layout = ui.layout.withUiScale(it) }
+    TextChip(label = "Pop-up sizes", selected = popups, onClick = { popups = !popups })
+    if (popups) {
+        ChromePanel.entries.forEach { panel ->
+            val own = ui.layout.panelScales[panel] ?: 1f
+            ScaleRow(panel.label, own, ChromeLayout.PANEL_SCALE) { scale ->
+                ui.layout = ui.layout.withPanelScale(panel, scale)
+            }
         }
     }
 }
@@ -126,7 +163,7 @@ private fun ChosenBar(ui: InkUiState) {
             ChromeArrangement.entries.forEach { shape ->
                 SegmentChip(
                     label = shape.label,
-                    selected = bar.arrangement == shape,
+                    selected = ui.layout.arrangement(id) == shape,
                     onClick = { ui.layout = ui.layout.arranged(id, shape) },
                 )
             }
@@ -145,7 +182,7 @@ private fun ScaleRow(label: String, value: Float, range: ClosedFloatingPointRang
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(InkDims.GroupGap),
     ) {
-        MicroLabel(label, modifier = Modifier.width(LabelWidth))
+        MicroLabel(label, modifier = Modifier.width(EditorLabelWidth))
         SlimSlider(
             value = value,
             valueRange = range,
@@ -159,6 +196,21 @@ private fun ScaleRow(label: String, value: Float, range: ClosedFloatingPointRang
             modifier = Modifier.width(ReadoutWidth),
             textAlign = TextAlign.End,
         )
+    }
+}
+
+/**
+ * The line a bar or panel being dragged has lined up on (`BarSnap`, `ChromeGeometry.snapGuide`) — so
+ * a jump of a few pixels has a reason on screen. Drawn only while something is being dragged, and read
+ * in the draw phase, so a frame of a drag redraws this and recomposes nothing.
+ */
+@Composable
+internal fun BoxScope.SnapGuides(geometry: ChromeGeometry) {
+    Canvas(Modifier.matchParentSize()) {
+        val guide = geometry.snapGuide ?: return@Canvas
+        val stroke = GuideStroke.toPx()
+        guide.x?.let { drawLine(Ink.Focus, Offset(it, 0f), Offset(it, size.height), stroke) }
+        guide.y?.let { drawLine(Ink.Focus, Offset(0f, it), Offset(size.width, it), stroke) }
     }
 }
 
@@ -217,7 +269,9 @@ internal fun BoxScope.ItemDragGhost(drag: ItemDrag, origin: Offset) {
 }
 
 private val Scrim = Color(0x8C000000)
-private val LabelWidth = 112.dp
+private val GuideStroke = 1.dp
+private val EditorWidth = 420.dp
+internal val EditorLabelWidth = 112.dp
 private val CaptionWidth = 320.dp
 private val SliderWidth = 180.dp
 private val ReadoutWidth = 48.dp

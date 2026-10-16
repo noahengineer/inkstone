@@ -67,6 +67,14 @@ public enum class RecognitionUnavailable {
  */
 public fun interface HandwritingRecogniser {
     public suspend fun recognise(strokes: List<SampledStroke>): RecognitionOutcome
+
+    /**
+     * What this recogniser writes into `PageText.recogniser`. Text written under a different id is
+     * read again, because a different model, language or line segmentation reads a page
+     * differently. Empty means unversioned, and then any text that still matches the ink counts as
+     * current.
+     */
+    public val id: String get() = ""
 }
 
 /** One downloadable language model, as the settings screen needs to show it. */

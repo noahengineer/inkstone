@@ -44,6 +44,7 @@ One milestone per session. A half-built ink engine sitting next to a half-built 
 | M9 | Performance + hardening | Fast on a 500-page notebook, on mid-range hardware | Medium |
 | M10 | Polish | The details that make it feel finished | Low |
 | M11 | iPad readiness | Core links for iOS | Low |
+| M13 | Handwriting synthesis | Typed text dropped onto a page, in your own hand | 🟡 Synthetic pretraining is untried — see below |
 
 *(M8 was originally one milestone. Connectors that reroute on move are a diagramming engine; text boxes are layout + IME + PDF text export; Elements is its own storage feature. Three milestones is honest.)*
 
@@ -900,7 +901,9 @@ them passing.
       itself is not installable here; run with **Xpdf's `pdftotext` (the engine `pdfgrep` is built
       on) and `pypdf`**, both against the app's own `document.pdf`. See `docs/M7-RECOGNITION.md` §2
 - [x] Line segmentation measurably beats whole-page-as-one-blob on a 20-page sample — **both
-      numbers: CER 0.272 vs 0.848, word recall 0.714 vs 0.071**, 20 writers, IAMonDo
+      numbers: CER 0.272 vs 0.848, word recall 0.714 vs 0.071**, 20 writers, IAMonDo. That was
+      `LineSegmenter` version 1. Version 2 (2026-10, columns and mind maps read) was measured on the
+      user's own notes, not re-run on IAMonDo: `docs/LINE-SEGMENTATION-V2.md` §3 and §7
 - [ ] *(Optional, environment-dependent)* Nextcloud full-text search finds it — **not attempted**;
       needs `fulltextsearch` + a search backend + a PDF extractor, none in a default install
 - [ ] ⚠️ **Definition of done #4 — the Galaxy Tab — is NOT met.** Everything above is an x86_64
@@ -1649,6 +1652,44 @@ lecture. Ogg/Opus, not MP4: an MP4 killed mid-lecture is unplayable.
 "Stops when you leave the note" means leaving the note, not the Activity
 stopping. If it hangs off onStop, the first screen timeout mid-lecture costs
 the rest of the lecture and says nothing.
+```
+
+---
+
+## M13 — Handwriting synthesis 🟡
+
+*Added 2026-10-12, at the user's request:* typed text dragged onto a page appears as ordinary ink in the
+user's own hand, matching the note it lands in, never identical twice, never a signature, fully offline.
+**The design, the decisions (D1–D15) and every phase's acceptance list are in
+`docs/HANDWRITING-SYNTHESIS.md` §12** — this entry is the pointer, not a second copy.
+
+| Phase | Ships | Status |
+|---|---|---|
+| H1 | The design | ✅ accepted 2026-10-12 |
+| H2 | Learning the user's hand: the pen ledger, normalisation, word labelling, letter cutting, *My handwriting* | 🟡 Built, tested, and walked on the emulator, including a harvest of real notes (doc §16.5). Owed: the tablet, and a decision on recall (doc §16.3). |
+| H3 | Glyph assembly + the Write panel (drag-and-drop text, matching the note) | — |
+| H4 | The model: synthetic, commercially clean pretraining; Kotlin inference; the 4.0 speed spike first | ✅ accepted 2026-10-14, by the user, with the H5 brief. Built, tested, and walked on the emulator and on the tablet's release build (doc §19). The shipped model, epoch 15 (`a6a191cb`), passes the gate on 112/120 samples unprimed and 110/120 primed. On the tablet it wrote the user's missing `b` words: first word in 204–261 ms, a drop in 200 ms. A corrupt asset falls back to assembly. Open findings are in doc §19.10. |
+| H5 | Personalisation, the reliability gate, fidelity, switching | 🟡 Complete, awaiting the user's review (doc §20). The gate is calibrated per token class on the tablet's real ML Kit: words `PUNCTUATION` 0.966, formulas `EXACT` 0.958, numbers `CASE_ALIKE` 0.933; every negative control 1.000. Numbers and formulas rest on a biased control until the maths prompts are recorded. Fidelity F is built for both backends: assembly 0.43–0.45 held out (0.72 cross-validated), the network 0.04. The ladder was measured on the tablet over two rounds. P1, P2 and P3 are all **not shipped**: P3 raises F by +0.28 but drops the first-pass gate rate from 0.90 to 0.46, and at a quarter strength still costs 0.10. Switching (the policy, per-word routing of 8 characters, and *Auto / My letters / Model*) is seen on the emulator and on the tablet itself: *Model* gave 11 network strokes, *Auto* 10 of the user's own (doc §20.13). The worker runs only while charging and idle, and resumes bit for bit after a kill in another process (`CrashSafetyTest` 6/6). A maths-weighted v2 base model was trained on the user's PC (15 epochs, 47 min) and **not shipped**: its letters pass the gate 95–96/120 against v1's 112/120, numbers are level, and ML Kit cannot read any maths symbol it draws (doc §20.6.4). Open findings are in doc §20.10. |
+| H6 | The visual harness and the per-claim table | 🟡 Complete, awaiting the user's review (doc §21). The SVG contact sheet is a test in every `:core:handwriting` run (one sentence ×12 per backend and neatness, read back by the JDK's XML parser). The debug screen draws the same sheet through `TrajectoryInk` → `PhraseOps` → `PagePainter`, and on `Test_Tablet` all six block fingerprints matched the SVG's. `GateMlKitTest` runs the gate against real ML Kit on licensed synthetic ink: 37/40 words pass, 40/40 wrong labels and 20/20 scribbles are refused, and an illegible word is refused by name. **It found that the gate passed a wrong digit 5/24 and a gained decimal point 6/10.** At the user's decision (2026-10-16) a token with a digit is now judged on its first reading that holds a digit, which refuses all 34. It costs 2 of the fixture's 24 right numbers; on the user's own writing, numbers drop from 14/15 to 13/15 and formulas from 23/24 to 21/24, and both stay judgeable. Holding digits to the top reading alone was tried first and refused the user's lone `1` and `5`, which ML Kit reads as `l` and `s` (doc §21.4.1–§21.4.2, HANDWRITING-MATHS §5.4). Doc §21.8 sorts every claim of H2–H6 by the evidence it reached. |
+| Maths | Two-dimensional maths in the user's hand: stacked fractions, square, cube and nth roots, exponents and subscripts, stretched brackets and bars | 🟡 Built, awaiting the user's review (`docs/HANDWRITING-MATHS.md`). A *Maths* switch and eight template keys in the Write panel; every run written by the ladder and read back, the structure laid out in x-heights and drawn from the user's own `-`, `√` and brackets where they exist. 19 of 20 expressions written from the tablet's profile (the quadratic formula needs a `±`). Walked on `Test_Tablet` with real ML Kit: drop, *Write again* and *Edit text* keep it maths. Not yet on the Galaxy Tab. |
+
+**Risk:** the neural model's base is pretrained on synthetic handwriting (every public online-handwriting
+dataset forbids commercial use), which no one has shipped before. Assembly from the user's own letters does
+not depend on it and is the day-one experience either way (doc §13).
+
+### Prompt
+
+```
+Read docs/HANDWRITING-SYNTHESIS.md in full, then CLAUDE.md. Do the next phase
+in its §12 table whose status is not ✅, and only that phase. Stop for review
+at the end of it, as the doc asks.
+
+Start by running `adb devices` (CLAUDE.md, Testing). The Test_Tablet AVD holds
+a copy of the physics note — walks that write go there, never on the tablet's
+synced notes. Every acceptance item that says "on the emulator" or "on the
+tablet" is part of the phase, not a follow-up.
+
+Nothing may be trained on data whose licence forbids commercial use (D13).
 ```
 
 ---

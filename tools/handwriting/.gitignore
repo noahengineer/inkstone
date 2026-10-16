@@ -1,0 +1,7 @@
+# The venv, generated corpora, checkpoints and sheets are large and re-derivable (§7.3).
+.venv/
+.venv-pc/
+data/
+runs/
+__pycache__/
+transfer/

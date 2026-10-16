@@ -6,6 +6,11 @@
 
 Two things, and the bug came first.
 
+> ⭐ Since docs/UI-RAILS.md the **stock** layout is no longer M10's top dock: each stock bar has a
+> shape of its own (the tools a column in the top-left corner), and `BarLayout.arrangement` is null
+> for "the bar's stock shape". Tables written before that carry no `ui.version` and are migrated on
+> read — see that doc §5. A new arrangement, *Panel* (a line per group), is offered for every bar.
+
 ## 1. ⛔ The palette and the pen size reverted — on every note but the first
 
 `EditorPreferences` is a process-wide singleton. It read the `setting` table once, at launch, into

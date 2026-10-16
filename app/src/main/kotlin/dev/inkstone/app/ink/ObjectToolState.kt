@@ -86,6 +86,13 @@ class ObjectToolState {
     /** Whether the Elements panel is open. */
     var elementsOpen by mutableStateOf(false)
 
+    /**
+     * ⭐ The Write tool (docs/HANDWRITING-SYNTHESIS.md §6.2). Here so the page tap, the selection bar
+     * and the selection callback can reach it; see [dev.inkstone.app.handwriting.WriteToolState].
+     * Not cleared by [reset], for the reason [elementsOpen] is not.
+     */
+    val write = dev.inkstone.app.handwriting.WriteToolState()
+
     /** ⭐ The Element editor's armed tool — an area to drag out, or the pivot to place — or null. */
     var elementTool by mutableStateOf<ElementEditorTool?>(null)
 

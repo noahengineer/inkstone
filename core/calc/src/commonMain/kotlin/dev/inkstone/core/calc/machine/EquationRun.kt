@@ -343,6 +343,7 @@ internal class EquationRun(
                     LabelledValue(LEFT_MINUS_RIGHT, valueExpr(decimal(now.leftMinusRight))),
                 ),
                 natural = host.naturalInput,
+                answer = 1,
             )
 
             is Phase.Unfinished -> Screens.labelValue(icons, CONTINUE, valueExpr(now.current))
@@ -370,7 +371,9 @@ internal class EquationRun(
     private fun answered(now: Phase.Answered): LcdFrame {
         val laidOut = host.formatter.show(now.presentation, host.setupFor(now.complex), host.mode, DEC)
         val icons = host.indicators(if (now.statement < now.statements - 1) setOf(Indicator.DISP) else emptySet())
-        if (laidOut.parts.isNotEmpty()) return Screens.stacked(icons, expr, laidOut.parts, host.naturalInput)
+        if (laidOut.parts.isNotEmpty()) {
+            return Screens.stacked(icons, expr, laidOut.parts, host.naturalInput, answer = laidOut.parts.size)
+        }
         return Screens.calculation(
             icons,
             expr,

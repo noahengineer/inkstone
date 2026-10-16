@@ -136,8 +136,12 @@ private fun WidthReadoutChip(state: InkUiState, onSummon: (PanelKind, Rect) -> U
 
 @Composable
 private fun QuickSwatches(state: InkUiState, onSummon: (PanelKind, Rect) -> Unit) {
+    // ⭐ A panel line is the panel's full width, and three swatches in it were a long empty track with
+    // a few dots in the middle. Six fill it and are three more colours one tap away. They are the
+    // palette's first six slots, so a drag onto one is still a drop on that slot (`ColorDragState`).
+    val quick = if (LocalBarArrangement.current == ChromeArrangement.PANEL) PANEL_QUICK_SLOTS else QUICK_SLOTS
     SwatchStrip(
-        colors = state.slots.take(QUICK_SLOTS),
+        colors = state.slots.take(quick),
         selectedArgb = state.pen.colorArgb,
         // A tap on a quick swatch also *chooses* that slot, so opening the panel straight after
         // edits the one you just picked rather than nothing.
@@ -317,4 +321,7 @@ internal const val MIN_WIDTH_DP = 0.5f
 
 /** The design's *"3–4 quick-access circular color slots"*. Three, plus the `+`. */
 private const val QUICK_SLOTS = 3
+
+/** The same strip in a panel, which is wide enough for half the palette. */
+private const val PANEL_QUICK_SLOTS = 6
 private const val WIDTH_LABEL = "Stroke width"

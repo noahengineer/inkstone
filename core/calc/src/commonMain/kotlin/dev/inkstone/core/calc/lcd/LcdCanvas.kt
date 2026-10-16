@@ -74,8 +74,8 @@ internal class LcdCanvas {
         }
     }
 
-    fun freeze(indicators: Set<Indicator>, cursor: LcdCursor?, text: String): LcdFrame =
-        LcdFrame(pixels.copyOf(), indicators, cursor, text = text)
+    fun freeze(indicators: Set<Indicator>, cursor: LcdCursor?, text: String, answer: String? = null): LcdFrame =
+        LcdFrame(pixels.copyOf(), indicators, cursor, text = text, answer = answer)
 
     private data class Clip(val left: Int, val top: Int, val right: Int, val bottom: Int) {
         fun contains(x: Int, y: Int): Boolean = x in left until right && y in top until bottom

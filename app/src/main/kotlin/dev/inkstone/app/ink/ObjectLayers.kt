@@ -133,13 +133,17 @@ fun ObjectLayers(
  *
  * Fills the screen with no input of its own, so everything outside the panel still reaches the ink
  * surface; its origin is the surface's, which is what the drop converts window positions into.
+ *
+ * @param geometry ⭐ the chrome, whose panel column (`PanelDock`, docs/UI-RAILS.md §3) the panel takes
+ *   its place in — under nothing and over nothing — until it is dragged out (`PanelWindow`).
  */
 @Composable
-fun ElementPanelLayer(
+internal fun ElementPanelLayer(
     ui: InkUiState,
     objects: ObjectToolState,
     editor: NoteEditorViewModel,
     actions: ObjectActions,
+    geometry: ChromeGeometry,
     modifier: Modifier = Modifier,
 ) {
     val scope = rememberCoroutineScope()
@@ -161,28 +165,27 @@ fun ElementPanelLayer(
 
     Box(modifier = modifier.fillMaxSize().onGloballyPositioned { drop.layer = it }) {
         if (objects.elementsOpen) {
-            ElementPanel(
-                elements = elements,
-                armed = objects.pendingElement,
-                previews = previews,
-                onArm = { objects.pendingElement = it },
-                onDelete = { id ->
-                    scope.launch {
-                        editor.deleteElement(id)
-                        // A removed element must not stay armed: the next tap would stamp
-                        // something the panel no longer offers.
-                        if (objects.pendingElement?.id == id) objects.pendingElement = null
-                        objects.libraryChanged()
-                    }
-                },
-                onClose = { objects.elementsOpen = false },
-                onEdit = actions.onEditElement,
-                drag = drag,
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .padding(top = PANEL_TOP_DP.dp, end = 12.dp)
-                    .onGloballyPositioned { drop.panelBounds = it.boundsInWindow() },
-            )
+            PanelWindow(DockSlot.ELEMENTS, ui, geometry) {
+                ElementPanel(
+                    elements = elements,
+                    armed = objects.pendingElement,
+                    previews = previews,
+                    onArm = { objects.pendingElement = it },
+                    onDelete = { id ->
+                        scope.launch {
+                            editor.deleteElement(id)
+                            // A removed element must not stay armed: the next tap would stamp
+                            // something the panel no longer offers.
+                            if (objects.pendingElement?.id == id) objects.pendingElement = null
+                            objects.libraryChanged()
+                        }
+                    },
+                    onClose = { objects.elementsOpen = false },
+                    onEdit = actions.onEditElement,
+                    drag = drag,
+                    modifier = Modifier.onGloballyPositioned { drop.panelBounds = it.boundsInWindow() },
+                )
+            }
         }
         drop.dragging?.let { held ->
             val local = drop.layer?.windowToLocal(held.window)
@@ -234,6 +237,11 @@ private suspend fun onTap(
         // Centred on the tap, exactly as a drop is centred on the finger — the two ways of placing
         // one Element must not put it in two different places for the same point.
         EditorTool.ELEMENT -> objects.pendingElement?.let { actions.onPlaceElement(it, point, false) }
+
+        // ⭐ docs/HANDWRITING-SYNTHESIS.md §6.2 — written by the panel's layer, which holds the writer.
+        EditorTool.WRITE -> objects.write.send(
+            dev.inkstone.app.handwriting.WriteCommand.Place(point, dev.inkstone.core.handwriting.PlaceMode.TAP),
+        )
 
         else -> Unit
     }
@@ -417,9 +425,6 @@ fun visiblePage(camera: Camera, widthPx: Int, heightPx: Int, page: PageCanvas): 
 /** A default label: wide enough for a sentence, tall enough for two lines at the default size. */
 private const val NEW_BOX_WIDTH_PT = 220f
 private const val NEW_BOX_HEIGHT_PT = 44f
-
-/** Clear of the toolbar card, which is anchored to the same corner region. */
-private const val PANEL_TOP_DP = 76
 
 /** The panel's tile, and how many times its pixel size the preview is drawn at — crisp, and reused for the ghost. */
 private const val PREVIEW_DP = 52

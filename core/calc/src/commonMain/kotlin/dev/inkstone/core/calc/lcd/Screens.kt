@@ -58,12 +58,10 @@ object Screens {
             val font = LcdFont.SMALL
             canvas.text(font, it, LcdGeometry.WIDTH - font.width(it), resultTop - font.height - BASE_LABEL_GAP)
         }
-        val text = listOfNotNull(
-            (prefix ?: "") + MathLayout.plainText(input),
-            baseLabel,
-            result?.let { MathLayout.plainText(it) },
-        )
-        return canvas.freeze(indicators, lcdCursor, text.joinToString("\n"))
+        val shown = result?.let { MathLayout.plainText(it) }
+        val text = listOfNotNull((prefix ?: "") + MathLayout.plainText(input), baseLabel, shown)
+        // A result with no cursor is an answer; one under a cursor is BASE-N's resting 0 while typing.
+        return canvas.freeze(indicators, lcdCursor, text.joinToString("\n"), answer = shown.takeIf { cursor == null })
     }
 
     /**
@@ -75,6 +73,9 @@ object Screens {
      * The row above the first value line stays blank, so an input taller than rows 1–10 rises to
      * row 0: SOLVE's `X²−6X=0` sits on rows 0–10 (SA slide 14). Hyphens in labels and the title are
      * drawn as the firmware's five-dot bar ([firmwareText]), so `L-R=` may be passed as typed.
+     *
+     * @param answer how many of the lines shown, from the first, are the result ([LcdFrame.answer]); 0 for
+     *   none. SOLVE's `X=` is its answer and `L-R=` is not.
      */
     fun stacked(
         indicators: Set<Indicator>,
@@ -84,6 +85,7 @@ object Screens {
         title: String? = null,
         cursor: Cursor? = null,
         inputScroll: Int = 0,
+        answer: Int = 0,
     ): LcdFrame {
         val canvas = LcdCanvas()
         val shown = lines.takeLast(2)
@@ -99,9 +101,10 @@ object Screens {
             lcdCursor = LineRenderer.input(canvas, line, cursor, inputScroll, LcdGeometry.INPUT_TOP, inputBottom)
         }
         shown.forEachIndexed { i, line -> labelled(canvas, line, bottoms[i], natural) }
-        val text = listOfNotNull(title ?: input?.let { MathLayout.plainText(it) }) +
-            shown.map { it.label + MathLayout.plainText(it.value) }
-        return canvas.freeze(indicators, lcdCursor, text.joinToString("\n"))
+        val values = shown.map { it.label + MathLayout.plainText(it.value) }
+        val text = listOfNotNull(title ?: input?.let { MathLayout.plainText(it) }) + values
+        val result = values.take(answer).joinToString("\n").ifEmpty { null }
+        return canvas.freeze(indicators, lcdCursor, text.joinToString("\n"), result)
     }
 
     /**

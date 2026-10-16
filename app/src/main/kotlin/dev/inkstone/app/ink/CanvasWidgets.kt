@@ -17,6 +17,7 @@ import dev.inkstone.app.ui.ChipKind
 import dev.inkstone.app.ui.GlassPanel
 import dev.inkstone.app.ui.Ink
 import dev.inkstone.app.ui.MicroLabel
+import dev.inkstone.app.ui.PanelHeader
 import dev.inkstone.app.ui.Readout
 import dev.inkstone.app.ui.TextChip
 import dev.inkstone.core.model.FitMode
@@ -109,14 +110,7 @@ fun DiagnosticsPanel(
     }
 
     GlassPanel(modifier = modifier.width(PanelWidth)) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-            modifier = Modifier.width(PanelWidth - PanelInset),
-        ) {
-            MicroLabel("Diagnostics", color = Ink.TextNormal)
-            TextChip(label = "✕", kind = ChipKind.GLYPH, onClick = onClose, contentDescription = "Close")
-        }
+        PanelHeader("Diagnostics", onClose, Modifier.width(PanelWidth - PanelInset))
 
         // ⭐ The layout editor's front door, behind the one chip that can never be hidden. A long
         // press on any bar's background opens it too; this is the route that needs no discovering.
@@ -262,7 +256,9 @@ private fun pressureLine(state: InkUiState): String {
 }
 
 private val ZoomReadout = 54.dp
-private val PanelWidth = 380.dp
+
+/** 320 rather than 380 so it fits beside the other panels in the right-hand column (docs/UI-RAILS.md §3). */
+private val PanelWidth = 320.dp
 private val PanelInset = 28.dp
 private val DiagnosticSize = 11.sp
 private val ChipGap = 4.dp

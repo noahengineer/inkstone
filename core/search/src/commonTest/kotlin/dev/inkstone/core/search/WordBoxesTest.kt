@@ -166,6 +166,34 @@ class WordBoxesTest {
     // -----------------------------------------------------------------------
 
     /** One word of [letters] 12 pt-high boxes 8 pt wide on a 10 pt pitch — a 2 pt letter gap. */
+    @Test
+    fun `strokesOfWords hands each word the strokes that made it in drawing order`() {
+        // docs/HANDWRITING-SYNTHESIS.md §5.3 — the grouping assign throws away, kept. The line is
+        // given in DRAWING order with the second word's first letter drawn last (a dot, a crossbar
+        // added afterwards), and that order has to survive: a trajectory's time runs forwards.
+        val hi = word("hi", startX = 100f, letters = 3)
+        val there = word("there", startX = 140f, letters = 2)
+        val line = textLine(hi + there.drop(1) + there.first())
+
+        val words = WordBoxes.strokesOfWords(line, "hi there")
+
+        assertEquals(listOf("hi", "there"), words?.map { it.text })
+        assertEquals(hi.map { it.id }, words?.get(0)?.strokes?.map { it.id })
+        assertEquals((there.drop(1) + there.first()).map { it.id }, words?.get(1)?.strokes?.map { it.id })
+        assertEquals(WordBoxes.assign(line, "hi there").words.map { it.bounds }, words?.map { it.bounds })
+    }
+
+    @Test
+    fun `strokesOfWords refuses rather than apportions when the counts disagree`() {
+        // assign falls back to slicing the line by characters, which says where a word is and
+        // nothing about which strokes it is. Learning a word from the wrong strokes is worse than
+        // not learning it, so there is no fallback here.
+        val line = textLine(word("how", startX = 100f, letters = 3) + word("areyou", startX = 140f, letters = 2))
+
+        assertEquals(null, WordBoxes.strokesOfWords(line, "how are you"))
+        assertEquals(null, WordBoxes.strokesOfWords(line, "   "))
+    }
+
     private fun word(id: String, startX: Float, letters: Int): List<SampledStroke> = (0 until letters).map { index ->
         val left = startX + index * 10f
         stroke("$id-$index", PageRect(left = left, top = 100f, right = left + 8f, bottom = 112f))

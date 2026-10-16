@@ -25,6 +25,7 @@ class CalculatorViewModel @Inject constructor(private val controller: Calculator
     val frame: StateFlow<LcdFrame> = controller.frame
     val open: StateFlow<Boolean> = controller.open
     val position: StateFlow<WindowPosition?> = controller.position
+    val face: StateFlow<Float?> = controller.face
 
     /**
      * Where this screen's `CALC` chip is, in the Compose root's coordinates (`boundsInRoot`), for the
@@ -43,4 +44,8 @@ class CalculatorViewModel @Inject constructor(private val controller: Calculator
     fun close() = controller.close()
 
     fun moveTo(position: WindowPosition) = controller.moveTo(position)
+
+    fun dock() = controller.dock()
+
+    fun resizeTo(face: Float) = controller.resizeTo(face)
 }

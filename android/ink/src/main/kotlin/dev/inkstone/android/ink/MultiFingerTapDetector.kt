@@ -41,8 +41,12 @@ import android.view.ViewConfiguration
  *
  * Deliberately not a `GestureDetector`: that has no notion of "how many fingers
  * were involved", which is the entire signal here.
+ *
+ * Public so that every surface the pen writes on undoes the same way — the note
+ * editor and the handwriting quick start — rather than a second detector
+ * relearning the id-not-index and last-finger-timeout lessons above.
  */
-internal class MultiFingerTapDetector(context: Context) {
+class MultiFingerTapDetector(context: Context) {
 
     private val touchSlopPx = ViewConfiguration.get(context).scaledTouchSlop.toFloat()
 
@@ -133,14 +137,20 @@ internal class MultiFingerTapDetector(context: Context) {
         candidate = false
     }
 
-    private companion object {
+    companion object {
+        /** Two fingers tapped together: undo. */
+        const val UNDO_FINGERS = 2
+
+        /** Three fingers tapped together: redo. */
+        const val REDO_FINGERS = 3
+
         /**
          * From the last finger's DOWN to the last finger's UP. Generous on
          * purpose: a tap that has to be quick is a tap that fails, and the slop
          * test is what rejects pans — this only has to reject a resting hand.
          */
-        const val TAP_TIMEOUT_MS = 400L
+        private const val TAP_TIMEOUT_MS = 400L
 
-        const val MAX_TRACKED = 3
+        private const val MAX_TRACKED = 3
     }
 }

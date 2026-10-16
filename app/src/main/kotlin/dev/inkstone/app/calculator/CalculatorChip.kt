@@ -13,9 +13,10 @@ import dev.inkstone.app.ui.TextChip
 /**
  * ⭐ The `CALC` pill that opens and closes the calculator (docs/CALCULATOR.md D2).
  *
- * A one-chip `GlassBar`, the `RecordButton` shape. In the editor it sits at `TopStart` — the one
- * zone the M10 design leaves empty, so no shipped control moves (research 08 §3.2 option G) — and in
- * the library at `BottomStart`, beside a create bar that is capped at three chips.
+ * A one-chip `GlassBar`, the `RecordButton` shape. In the editor it takes the top-right corner with
+ * the record chip beside it — the design's *"Global Utilities"* zone, now that the tools are a rail
+ * down the left (docs/UI-RAILS.md) — and in the library at `BottomStart`, beside a create bar that is
+ * capped at three chips.
  *
  * `selected` while the window is up, so the chip says what pressing it will do. It reports where it
  * is so the window can hang from it on first open (`CalculatorViewModel.chipBounds`).

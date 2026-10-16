@@ -60,8 +60,15 @@ data class EditorPrefs(
     val shapeSnapEnabled: Boolean = true,
     val arrowHeads: Boolean = false,
     val gridSnapEnabled: Boolean = false,
+    /**
+     * ⭐ The Write panel's *neatness* (docs/HANDWRITING-SYNTHESIS.md §6.2): `0` loose, `1` neat; how
+     * much a written phrase varies (`Variation.forNeatness`).
+     */
+    val handwritingNeatness: Float = DEFAULT_NEATNESS,
     /** Where the chrome sits, how big it is, and which chips it shows — see [ChromeLayout]. */
     val layout: ChromeLayout = ChromeLayout(),
+    /** The layouts the user has kept, and which one [layout] is — see [SavedLayouts]. */
+    val savedLayouts: SavedLayouts = SavedLayouts(),
 ) {
 
     companion object {
@@ -82,6 +89,9 @@ data class EditorPrefs(
         val DEFAULT_WIDTH_SLOTS: List<Float> = listOf(1f, 2f, 3f, 4f, 8f, 16f)
 
         const val DEFAULT_WIDTH_DP: Float = 3f
+
+        /** The middle of the slider: §6.1's variation table exactly as it stands. */
+        const val DEFAULT_NEATNESS: Float = 0.5f
 
         /** Where the width sliders stop on a fresh install — the range they had before it was settable. */
         const val DEFAULT_MAX_WIDTH_DP: Float = 32f

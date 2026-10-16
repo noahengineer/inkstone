@@ -8,9 +8,20 @@ package dev.inkstone.app.calculator
  *   is switched off. Null means "nothing loaded yet", never "empty"; see [CalculatorPrefsCodec].
  * @param open whether the window was up. One calculator for the whole app (D3), so one flag.
  * @param window where the user last dragged it, unclamped. Null until the first drag, which is what
- *   makes the window hang from the chip that opened it (D2).
+ *   makes the window hang from the chip that opened it (D2) — or, in the editor, sit in the right-hand
+ *   panel column (docs/UI-RAILS.md §3).
+ * @param face ⭐ the face's width in dp, as the user last sized it from the window's corner. Null is the
+ *   default size. *"the calculator should be resizable by like dragin in the corner"*.
+ * @param docked true once the user has put the window back in the panel column, which outranks any
+ *   remembered [window]. Null means "not chosen in this write" — see the codec on absent keys.
  */
-data class CalculatorPrefs(val snapshot: String? = null, val open: Boolean = false, val window: WindowPosition? = null)
+data class CalculatorPrefs(
+    val snapshot: String? = null,
+    val open: Boolean = false,
+    val window: WindowPosition? = null,
+    val face: Float? = null,
+    val docked: Boolean? = null,
+)
 
 /**
  * ⭐ [CalculatorPrefs] as the opaque strings `SettingStore` moves — `EditorPrefsCodec`'s shape, under
@@ -44,9 +55,11 @@ internal object CalculatorPrefsCodec {
     const val WINDOW_X = "calc.window.x"
     const val WINDOW_Y = "calc.window.y"
     const val OPEN = "calc.open"
+    const val FACE = "calc.window.face"
+    const val DOCKED = "calc.window.docked"
 
     /** Every key this codec can write. The space is closed; nothing else may start with `calc.`. */
-    val KEYS: Set<String> = setOf(SNAPSHOT, WINDOW_X, WINDOW_Y, OPEN)
+    val KEYS: Set<String> = setOf(SNAPSHOT, WINDOW_X, WINDOW_Y, OPEN, FACE, DOCKED)
 
     fun encode(prefs: CalculatorPrefs): Map<String, String> = buildMap {
         prefs.snapshot?.let { put(SNAPSHOT, it) }
@@ -55,13 +68,26 @@ internal object CalculatorPrefsCodec {
             put(WINDOW_X, window.x.toString())
             put(WINDOW_Y, window.y.toString())
         }
+        prefs.face?.let { put(FACE, it.toString()) }
+        prefs.docked?.let { put(DOCKED, it.toString()) }
     }
 
-    fun decode(stored: Map<String, String>): CalculatorPrefs = CalculatorPrefs(
-        snapshot = stored[SNAPSHOT],
-        open = stored[OPEN]?.trim()?.toBooleanStrictOrNull() ?: false,
-        window = stored.window(),
-    )
+    /**
+     * ⚠️ **A docked window has no position, whatever `x` and `y` say.** Putting the window back in the
+     * column cannot delete its old coordinates — `putAll` leaves a key it is not given alone — so the
+     * docked flag is what outranks them, rather than an empty value that a write made before the seed
+     * was read would also produce.
+     */
+    fun decode(stored: Map<String, String>): CalculatorPrefs {
+        val docked = stored[DOCKED]?.trim()?.toBooleanStrictOrNull()
+        return CalculatorPrefs(
+            snapshot = stored[SNAPSHOT],
+            open = stored[OPEN]?.trim()?.toBooleanStrictOrNull() ?: false,
+            window = if (docked == true) null else stored.window(),
+            face = stored.coordinate(FACE)?.takeIf { it > 0f },
+            docked = docked,
+        )
+    }
 
     private fun Map<String, String>.window(): WindowPosition? {
         val x = coordinate(WINDOW_X) ?: return null

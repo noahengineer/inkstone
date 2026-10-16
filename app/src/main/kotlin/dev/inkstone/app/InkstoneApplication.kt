@@ -49,5 +49,11 @@ class InkstoneApplication : Application() {
         // registration that only happens when someone opens the library is a registration that
         // does not happen on the device that most needs it.
         scheduler.ensurePeriodicRecognition()
+        // docs/HANDWRITING-SYNTHESIS.md §5.6 — learning the user's hand, overnight. Here for the same
+        // reason: a registration that waits for a screen to be opened does not happen on the device
+        // that most needs it.
+        scheduler.ensurePeriodicHandwriting()
+        // §8: personalising it, while charging and idle — the only schedule that job has.
+        scheduler.ensurePeriodicPersonalisation()
     }
 }

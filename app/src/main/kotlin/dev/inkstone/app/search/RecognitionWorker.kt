@@ -2,6 +2,7 @@ package dev.inkstone.app.search
 
 import android.content.Context
 import androidx.work.CoroutineWorker
+import androidx.work.Data
 import androidx.work.WorkerParameters
 import dagger.hilt.EntryPoint
 import dagger.hilt.InstallIn
@@ -44,8 +45,10 @@ internal class RecognitionWorker(context: Context, parameters: WorkerParameters)
             ?.let { listOf(DocumentId(it)) }
             ?: entryPoint.library().allNoteIdsForRecognition()
 
+        var pagesRead = 0
         for (noteId in notes) {
             val report = sessions.recognise(noteId)
+            pagesRead += report.pagesRead
             when (report.unavailable) {
                 // ⚠️ `success`, not `retry`, and for the same reason a 401 does not retry
                 // (CLAUDE.md rule 5): the backoff would *be* the retry loop, and there is
@@ -53,20 +56,33 @@ internal class RecognitionWorker(context: Context, parameters: WorkerParameters)
                 // pressing a button, not by asking again in thirty seconds.
                 RecognitionUnavailable.MODEL_NOT_DOWNLOADED,
                 RecognitionUnavailable.PLAY_SERVICES_MISSING,
-                -> return Result.success()
+                -> return Result.success(outputOf(pagesRead, unread = true))
 
                 // Transient. The next scheduled batch tries again; retrying now would burn the
                 // charge this job was scheduled to be polite about.
-                RecognitionUnavailable.RECOGNISER_FAILED -> return Result.success()
+                RecognitionUnavailable.RECOGNISER_FAILED -> return Result.success(outputOf(pagesRead, unread = true))
 
                 null -> Unit
             }
         }
-        return Result.success()
+        return Result.success(outputOf(pagesRead, unread = false))
     }
+
+    /**
+     * What the pass did, for the model panel's *Ready* (`RecognitionJob.of`). `success` alone cannot
+     * say it, because every outcome above is a `success`.
+     */
+    private fun outputOf(pagesRead: Int, unread: Boolean): Data =
+        Data.Builder().putInt(KEY_PAGES_READ, pagesRead).putBoolean(KEY_UNREAD, unread).build()
 
     internal companion object {
         const val KEY_NOTE_ID: String = "noteId"
+
+        /** How many pages this pass read for the first time. Zero for a note already read. */
+        const val KEY_PAGES_READ: String = "pagesRead"
+
+        /** True when the pass stopped before the end — see the `when` above for why that is a success. */
+        const val KEY_UNREAD: String = "unread"
     }
 }
 

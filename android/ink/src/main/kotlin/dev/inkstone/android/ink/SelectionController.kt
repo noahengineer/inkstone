@@ -182,6 +182,16 @@ public interface InkSelection {
     public val soleTextBox: SelectedText?
 
     /**
+     * ⭐ The generated phrase the selection is (docs/HANDWRITING-SYNTHESIS.md §6.2), or null when the
+     * selection is anything else — ink the user wrote, two phrases, a phrase and something beside it.
+     *
+     * What *Write again* and *Edit text* key off. Exactly one phrase, for [soleTextBox]'s reason: both
+     * act on one set of words, and a bar offering them for a mixed selection would rewrite one of
+     * them at random.
+     */
+    public val phrase: SelectedPhrase?
+
+    /**
      * ⭐ ROADMAP M10 — the page-space box round the selection, or null when nothing is selected.
      *
      * Exposed because the redesign's contextual toolbars *float beside the object they act on*
@@ -266,6 +276,15 @@ public data class SelectedText(
     val format: ObjectFormat,
     val style: ObjectStyle,
 )
+
+/**
+ * A selected generated phrase: its `hw` group and the strokes selected, all of which carry it.
+ *
+ * The words it was written from are on one stroke's content register (`PhraseRecord`), which the
+ * surface does not hold — strokes have no content register on the render side — so `:app` reads
+ * them from the fold by these ids.
+ */
+public data class SelectedPhrase(val group: String, val ids: List<ObjectId>, val bounds: PageRect)
 
 /**
  * What the selection's shapes can *have done to them*, so the toolbar offers only what applies.
@@ -1387,6 +1406,16 @@ internal class SelectionController(
     /** Exactly one, for [soleImage]'s reason — a field can only be opened over one paragraph. */
     override val soleTextBox: SelectedText?
         get() = selectedTextOf(selection.singleOrNull()?.let { store.objectOf(it) })
+
+    override val phrase: SelectedPhrase?
+        get() {
+            if (selection.isEmpty()) return null
+            val keys = selection.mapTo(HashSet()) { id ->
+                store.objectOf(id)?.takeIf { it.generated != null }?.copyKey
+            }
+            val group = (keys.singleOrNull() ?: return null).substringBefore('@')
+            return SelectedPhrase(group, selection, bounds ?: return null)
+        }
 
     override fun setFill(colorArgb: Int?, opacity: Float) = editRecords { shape, record ->
         // A line has no interior. Refused here rather than written and ignored by the painter,

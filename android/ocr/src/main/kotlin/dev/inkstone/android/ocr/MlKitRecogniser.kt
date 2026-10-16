@@ -18,6 +18,7 @@ import dev.inkstone.core.search.WordBoxes
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.IdentityHashMap
 
 /**
  * SPEC §8 — ML Kit Digital Ink Recognition, one line at a time.
@@ -50,8 +51,13 @@ public class MlKitRecogniser(
     private val models: MlKitModels = MlKitModels(),
 ) : HandwritingRecogniser {
 
-    /** Named in every `text/<pageId>.json` this produces, so a model change can invalidate it. */
-    public val id: String get() = "$RECOGNISER_ID/$languageTag"
+    /**
+     * Named in every `text/<pageId>.json` this produces, and compared by `NoteRecogniser`, so text
+     * read by a different model, language or line segmentation is read again. Until
+     * `LineSegmenter.VERSION` became part of it, nothing compared it, and its KDoc's promise that a
+     * model change would invalidate old text was not kept.
+     */
+    override val id: String get() = "$RECOGNISER_ID/$languageTag/lines-${LineSegmenter.VERSION}"
 
     override suspend fun recognise(strokes: List<SampledStroke>): RecognitionOutcome =
         // SPEC §8.3: never on the ink path and never on the UI thread. Hopped here rather
@@ -64,6 +70,15 @@ public class MlKitRecogniser(
             }
             recogniseLines(segmentation)
         }
+
+    /**
+     * Reads lines somebody else drew, skipping [LineSegmenter]. The debug build's `LineReadReceiver`
+     * uses it to compare line segmentations by what ML Kit makes of each one. Production does not
+     * call it: [recognise] is the only path that guarantees the lines are this build's.
+     */
+    public suspend fun recogniseSegmented(segmentation: Segmentation): RecognitionOutcome = withContext(dispatcher) {
+        if (segmentation.isEmpty) RecognitionOutcome.NothingToRead else recogniseLines(segmentation)
+    }
 
     private suspend fun recogniseLines(segmentation: Segmentation): RecognitionOutcome {
         // Null here is "this device cannot supply the model at all", which leads somewhere
@@ -100,15 +115,20 @@ public class MlKitRecogniser(
 
     private suspend fun readAll(recogniser: DigitalInkRecognizer, lines: List<TextLine>): List<RecognisedLine> {
         val read = ArrayList<RecognisedLine>(lines.size)
-        var preContext: String? = null
+        // The text each line was read as, so a later line can take it as its context. By identity:
+        // a TextLine is a data class over every sample on the line, too much to hash per lookup.
+        val readAs = IdentityHashMap<TextLine, String>(lines.size)
         for (line in lines) {
+            // ⚠️ The line *above in the same column*, not the previous line in page order. On a page
+            // with columns that is usually the line beside this one, across the gutter.
+            val preContext = LineSegmenter.contextLineFor(line, lines)?.let { readAs[it] }
             val text = recognise(recogniser, line, preContext)
             if (text.isNotEmpty()) {
                 read += WordBoxes.assign(line, text)
                 // The line as read, not as it should have been: preContext is a hint about
                 // what the model has just been shown, and lying to it about that is worse
                 // than a short context.
-                preContext = text
+                readAs[line] = text
             }
         }
         return read

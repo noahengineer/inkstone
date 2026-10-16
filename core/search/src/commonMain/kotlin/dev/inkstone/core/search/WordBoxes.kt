@@ -1,10 +1,19 @@
 package dev.inkstone.core.search
 
+import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.RecognisedLine
 import dev.inkstone.core.model.RecognisedWord
 import dev.inkstone.core.model.SampledStroke
 import dev.inkstone.core.model.TextLine
+
+/**
+ * One recognised word and the strokes that made it — [WordBoxes.strokesOfWords].
+ *
+ * @property strokes in the order they were drawn, not left to right: a `t` crossed after the word
+ *   was finished is last, as it was on the page.
+ */
+public data class WordStrokes(val text: String, val bounds: PageRect, val strokes: List<SampledStroke>)
 
 /**
  * ⭐ SPEC §5.5 — put each recognised word back on the ink that produced it.
@@ -38,11 +47,42 @@ public object WordBoxes {
 
         val clusters = clustersOf(line.strokes)
         val placed = if (clusters.size == words.size) {
-            words.mapIndexed { index, word -> RecognisedWord(word, clusters[index]) }
+            words.mapIndexed { index, word -> RecognisedWord(word, clusters[index].bounds) }
         } else {
             apportion(words, box)
         }
         return RecognisedLine(text = text.trim(), bounds = box, words = placed)
+    }
+
+    /**
+     * ⭐ Each word **and the strokes that made it** — docs/HANDWRITING-SYNTHESIS.md §5.3.
+     *
+     * [assign] keeps only boxes, which is all search and the PDF's text layer need. Learning
+     * someone's handwriting needs the strokes themselves, and the grouping that produced the boxes
+     * is exactly that information — computed here and, until now, thrown away.
+     *
+     * ⚠️ **Null whenever the gaps and the recogniser disagree about how many words there are.**
+     * [assign] then falls back to slicing the line's box by character count, which is honest about
+     * *where* a word is and says nothing about *which strokes* it is — so there is no fallback here.
+     * A word learned from the wrong strokes is worse than a word not learned.
+     *
+     * @return one entry per whitespace-separated token, in reading order, each with its strokes in
+     *   the order they were **drawn** — the order [line] holds them in, which is what makes a
+     *   trajectory's time run forwards.
+     */
+    public fun strokesOfWords(line: TextLine, text: String): List<WordStrokes>? {
+        val words = text.trim().split(WHITESPACE).filter { it.isNotEmpty() }
+        if (words.isEmpty() || line.isEmpty) return null
+        val clusters = clustersOf(line.strokes)
+        if (clusters.size != words.size) return null
+        return words.mapIndexed { index, word ->
+            val members = clusters[index].ids
+            WordStrokes(
+                text = word,
+                bounds = clusters[index].bounds,
+                strokes = line.strokes.filter { it.id in members },
+            )
+        }
     }
 
     /**
@@ -63,25 +103,29 @@ public object WordBoxes {
      * from a diagram sharing the page"*), and the two files measuring a line differently was the
      * kind of disagreement that stays invisible until someone writes an `f`.
      */
-    private fun clustersOf(strokes: List<SampledStroke>): List<PageRect> {
+    private fun clustersOf(strokes: List<SampledStroke>): List<Cluster> {
         val ordered = strokes.sortedBy { it.bounds.left }
         val heights = ordered.map { it.bounds.height }.sorted()
         val height = heights[heights.size / 2].coerceAtLeast(MIN_HEIGHT_PT)
         val gap = height * WORD_GAP_FACTOR
 
-        val clusters = ArrayList<PageRect>()
-        var current = ordered.first().bounds
+        val clusters = ArrayList<Cluster>()
+        var current = Cluster(ordered.first().bounds, hashSetOf(ordered.first().id))
         for (stroke in ordered.drop(1)) {
-            current = if (stroke.bounds.left - current.right > gap) {
+            current = if (stroke.bounds.left - current.bounds.right > gap) {
                 clusters += current
-                stroke.bounds
+                Cluster(stroke.bounds, hashSetOf(stroke.id))
             } else {
-                current.union(stroke.bounds)
+                current.ids += stroke.id
+                Cluster(current.bounds.union(stroke.bounds), current.ids)
             }
         }
         clusters += current
         return clusters
     }
+
+    /** One word's worth of strokes: their box, and which they were. */
+    private class Cluster(val bounds: PageRect, val ids: HashSet<ObjectId>)
 
     /**
      * Share the line's box out by character count, spaces included.

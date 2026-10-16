@@ -51,6 +51,12 @@ enum class EditorTool(val ink: InkTool) {
     ELEMENT(InkTool.SELECT),
 
     /**
+     * ⭐ docs/HANDWRITING-SYNTHESIS.md §6.2 — type words, and they are written in the user's own hand:
+     * drag the panel's preview onto the page, or tap the page to write there.
+     */
+    WRITE(InkTool.SELECT),
+
+    /**
      * ROADMAP M8c — the laser pointer. **Writes nothing to the document**: no op, no journal
      * record, no undo entry.
      *
@@ -81,5 +87,5 @@ enum class EditorTool(val ink: InkTool) {
      * open, so the one gesture that genuinely needs to be captured says so where it happens
      * instead of making the whole tool modal.
      */
-    val ownsTouch: Boolean get() = this == TEXT || this == ELEMENT
+    val ownsTouch: Boolean get() = this == TEXT || this == ELEMENT || this == WRITE
 }

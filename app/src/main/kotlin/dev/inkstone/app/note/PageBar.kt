@@ -66,7 +66,9 @@ internal fun PageChip(item: ChromeItem, state: NoteEditorState, actions: PageBar
     }
 }
 
-/** Where you are: `‹ 3 of 12 ›`. The counter is also the overview's handle. */
+/**
+ * Where you are: `‹ 3 of 12 ›`. The counter is also the overview's handle.
+ */
 @Composable
 private fun Paging(item: ChromeItem, state: NoteEditorState, actions: PageBarActions) {
     when (item) {
@@ -134,7 +136,7 @@ private fun Paging(item: ChromeItem, state: NoteEditorState, actions: PageBarAct
 @Composable
 private fun ShareChip(exporting: Boolean, actions: PageBarActions) {
     var open by remember { mutableStateOf(false) }
-    Box {
+    Box(propagateMinConstraints = true) {
         TextChip(
             label = if (exporting) "Exporting…" else "Share",
             selected = open,
@@ -181,7 +183,7 @@ private fun TemplateChip(
     onPick: (PageTemplate) -> Unit,
     onToggleInfinite: () -> Unit,
 ) {
-    Box {
+    Box(propagateMinConstraints = true) {
         TextChip(
             label = if (infinite) "${template.label()} ∞" else template.label(),
             selected = open,

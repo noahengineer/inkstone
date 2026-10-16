@@ -130,6 +130,7 @@ internal val ChromeItem.tool: EditorTool?
         ChromeItem.TOOL_TEXT -> EditorTool.TEXT
         ChromeItem.TOOL_IMAGE -> EditorTool.IMAGE
         ChromeItem.TOOL_ELEMENTS -> EditorTool.ELEMENT
+        ChromeItem.TOOL_WRITE -> EditorTool.WRITE
         else -> null
     }
 

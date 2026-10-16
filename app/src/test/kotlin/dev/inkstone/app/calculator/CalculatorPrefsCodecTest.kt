@@ -25,8 +25,38 @@ class CalculatorPrefsCodecTest {
             snapshot = "mode=COMP\nA=1,25;B=-3\nAns=√2·π ×10^-3\n",
             open = true,
             window = WindowPosition(412.5f, 78f),
+            face = 260.5f,
+            docked = false,
         )
         assertEquals(prefs, CalculatorPrefsCodec.decode(CalculatorPrefsCodec.encode(prefs)))
+    }
+
+    @Test
+    fun `a docked window has no position even though its old one is still in the table`() {
+        // `putAll` cannot delete the old x and y when the window goes back in the panel column, so the
+        // docked flag is what outranks them (docs/UI-RAILS.md §3).
+        val dragged = CalculatorPrefsCodec.encode(
+            CalculatorPrefs(open = true, window = WindowPosition(300f, 200f), docked = false),
+        )
+        val docked = dragged + CalculatorPrefsCodec.encode(CalculatorPrefs(open = true, docked = true))
+        val read = CalculatorPrefsCodec.decode(docked)
+        assertNull(read.window)
+        assertEquals(true, read.docked)
+        // And dragged out again, the new position is the one read.
+        val again =
+            docked +
+                CalculatorPrefsCodec.encode(
+                    CalculatorPrefs(open = true, window = WindowPosition(9f, 8f), docked = false),
+                )
+        assertEquals(WindowPosition(9f, 8f), CalculatorPrefsCodec.decode(again).window)
+    }
+
+    @Test
+    fun `no size and no dock choice are left out rather than written`() {
+        val encoded = CalculatorPrefsCodec.encode(CalculatorPrefs(open = true))
+        assertFalse(CalculatorPrefsCodec.FACE in encoded)
+        assertFalse(CalculatorPrefsCodec.DOCKED in encoded)
+        assertNull(CalculatorPrefsCodec.decode(mapOf(CalculatorPrefsCodec.FACE to "-4")).face)
     }
 
     @Test
@@ -41,8 +71,10 @@ class CalculatorPrefsCodecTest {
     }
 
     @Test
-    fun `every key written is one of the four calc keys`() {
-        val encoded = CalculatorPrefsCodec.encode(CalculatorPrefs("s", open = false, window = WindowPosition(1f, 2f)))
+    fun `every key written is one of the calc keys`() {
+        val encoded = CalculatorPrefsCodec.encode(
+            CalculatorPrefs("s", open = false, window = WindowPosition(1f, 2f), face = 200f, docked = false),
+        )
         assertEquals(CalculatorPrefsCodec.KEYS, encoded.keys)
         assertTrue(CalculatorPrefsCodec.KEYS.all { it.startsWith("calc.") })
     }

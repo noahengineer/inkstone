@@ -61,9 +61,15 @@ import dev.inkstone.core.calc.lcd.LcdFrame
  * take no pointer input; a real tap still lands on the handler above.
  */
 @Composable
-internal fun CalculatorFace(frame: LcdFrame, onKey: (Key) -> Unit, modifier: Modifier = Modifier) {
+internal fun CalculatorFace(
+    frame: LcdFrame,
+    onKey: (Key) -> Unit,
+    modifier: Modifier = Modifier,
+    answers: AnswerDrag? = null,
+) {
     val pressed = remember { mutableStateOf(emptySet<Key>()) }
     val press = rememberUpdatedState(onKey)
+    val answer = rememberUpdatedState(frame.answer)
     val measurer = rememberTextMeasurer()
     BoxWithConstraints(modifier.keypadInput(pressed, press)) {
         val mm = maxWidth / FaceMm.WIDTH
@@ -78,7 +84,9 @@ internal fun CalculatorFace(frame: LcdFrame, onKey: (Key) -> Unit, modifier: Mod
                 },
         )
         val glass = FaceMm.GLASS
-        CalculatorLcd(frame, Modifier.offset(mm * glass.left, mm * glass.top).size(mm * glass.width, mm * glass.height))
+        // ⭐ The glass is where an answer is dragged from, onto the page (docs/CALCULATOR.md §6).
+        val lcd = Modifier.offset(mm * glass.left, mm * glass.top).size(mm * glass.width, mm * glass.height)
+        CalculatorLcd(frame, answers?.let { lcd.answerDragSource(it, answer) } ?: lcd)
         KeyTargets(mm, press)
     }
 }

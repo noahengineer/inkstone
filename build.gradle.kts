@@ -31,6 +31,7 @@ val coreModules = listOf(
     ":core:sync",
     ":core:search",
     ":core:calc",
+    ":core:handwriting",
 )
 
 // ---------------------------------------------------------------------------

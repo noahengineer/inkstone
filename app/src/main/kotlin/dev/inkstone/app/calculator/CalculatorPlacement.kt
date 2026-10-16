@@ -68,16 +68,44 @@ internal object CalculatorPlacement {
     const val MIN_FACE_WIDTH_DP = 160f
 
     /**
-     * The face's width in dp: as tall as the space between the dock and the bottom zone allows,
-     * with the body's aspect locked (D7), and never wider than [MAX_FACE_WIDTH_DP] or the screen.
+     * ⭐ The face's width before the user has sized it, in the editor's panel column (docs/UI-RAILS.md §3).
+     * Filling the height between the chrome made it the tallest thing on the screen, with no room
+     * beside it in the column and no room to move up or down — *"it should also not be locked to the
+     * center"*. At 200 dp a landscape tablet leaves it about 130 dp of travel; the corner makes it bigger.
+     */
+    const val DEFAULT_FACE_WIDTH_DP = 200f
+
+    /** The widest a user can drag the face, before the screen's own limit applies. */
+    const val MAX_RESIZED_FACE_WIDTH_DP = 480f
+
+    /**
+     * The face's width in dp: [preferred] — the user's own size from the corner grip — or, with none, as
+     * tall as the space between the top chrome and the bottom zone allows and never wider than
+     * [MAX_FACE_WIDTH_DP]. Either way the body's aspect is locked (D7) and it fits [viewport].
      *
      * @param chromeWidth the window's frame either side of the face.
      * @param chromeHeight the frame plus the drag strip above the face.
      */
-    fun faceWidth(viewport: Viewport, chromeWidth: Float, chromeHeight: Float): Float {
+    fun faceWidth(viewport: Viewport, chromeWidth: Float, chromeHeight: Float, preferred: Float? = null): Float {
         val byHeight = (viewport.height - viewport.safeTop - viewport.bottomReserve - chromeHeight) / ASPECT
         val byWidth = viewport.width - 2 * viewport.edge - chromeWidth
-        return minOf(byHeight, byWidth, MAX_FACE_WIDTH_DP).coerceAtLeast(MIN_FACE_WIDTH_DP)
+        val wanted = preferred?.coerceIn(MIN_FACE_WIDTH_DP, MAX_RESIZED_FACE_WIDTH_DP) ?: MAX_FACE_WIDTH_DP
+        return minOf(byHeight, byWidth, wanted).coerceAtLeast(MIN_FACE_WIDTH_DP)
+    }
+
+    /**
+     * ⭐ The face's width after its corner has been dragged by ([dx], [dy]) dp from where it was [start]
+     * dp wide — *"resizable by like dragin in the corner"*.
+     *
+     * The drag is projected onto the window's own diagonal, because the aspect is locked (D7): a finger
+     * moving straight down a corner has to grow the window as surely as one moving along the diagonal,
+     * and one moving across the diagonal should do nothing much. [fromLeft] is the bottom-*left* grip of a
+     * window in the right-hand column, which grows leftwards — dragging that one left makes it bigger.
+     */
+    fun resized(start: Float, dx: Float, dy: Float, fromLeft: Boolean): Float {
+        val across = if (fromLeft) -dx else dx
+        val grow = (across + dy * ASPECT) / (1f + ASPECT * ASPECT)
+        return (start + grow).coerceIn(MIN_FACE_WIDTH_DP, MAX_RESIZED_FACE_WIDTH_DP)
     }
 
     /** The window's outer size for a face of [faceWidth] — the aspect is the face's, not the frame's. */
@@ -104,6 +132,9 @@ internal object CalculatorPlacement {
      * The user's two words were *"drop down or movable window"*; this is the drop-down half, and the
      * first drag is the movable half (docs/CALCULATOR.md D2). With no anchor yet (the chip has not
      * been laid out) the window starts at the top-left of the free space rather than not at all.
+     *
+     * The library's window. The editor's goes in its panel column until it is first dragged
+     * (docs/UI-RAILS.md §3).
      */
     fun hangFrom(anchor: Anchor?, size: WindowSize, viewport: Viewport, gap: Float): WindowPosition {
         val wanted = if (anchor == null) {

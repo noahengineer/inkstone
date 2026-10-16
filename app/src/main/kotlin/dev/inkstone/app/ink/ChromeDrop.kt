@@ -187,6 +187,6 @@ class ItemDrag {
     /** Every bar on screen, as [ChromeDrop.resolve] wants them. */
     internal fun bars(layout: ChromeLayout): List<DropBar> = containers.map { (id, entry) ->
         val inBar = layout.itemsOf(id).mapNotNull { item -> slots[item]?.let { item to it.second } }
-        DropBar(id, entry.second, layout.bar(id).arrangement, inBar)
+        DropBar(id, entry.second, layout.arrangement(id), inBar)
     }
 }

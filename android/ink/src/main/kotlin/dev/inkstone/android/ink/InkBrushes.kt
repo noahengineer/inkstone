@@ -170,6 +170,9 @@ public class InkBrushFactory(
             }
         }
 
+    /** [config]'s width in page points — what a stroke drawn with it records as its size. */
+    internal fun sizePtOf(config: PenConfig): Float = config.widthDp * displayDensity / pixelsPerPoint
+
     /**
      * @return a [Brush] whose size is in **page points**, because strokes are
      *   authored directly in page space (SPEC §4.4 rule 1). A 3 dp pen is 3 dp
@@ -177,7 +180,7 @@ public class InkBrushFactory(
      *   what a pen drawing on paper does.
      */
     internal fun brushFor(config: PenConfig): Brush {
-        val widthPt = config.widthDp * displayDensity / pixelsPerPoint
+        val widthPt = sizePtOf(config)
         return Brush.createWithColorIntArgb(
             family = families.getValue(config.kind),
             colorIntArgb = config.colorArgb,

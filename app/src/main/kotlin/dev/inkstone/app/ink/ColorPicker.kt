@@ -31,6 +31,7 @@ import dev.inkstone.app.ui.GlassPanel
 import dev.inkstone.app.ui.Ink
 import dev.inkstone.app.ui.InkDims
 import dev.inkstone.app.ui.MicroLabel
+import dev.inkstone.app.ui.PanelHeader
 import dev.inkstone.app.ui.Readout
 import dev.inkstone.app.ui.SlimSlider
 import dev.inkstone.app.ui.TextChip
@@ -74,14 +75,7 @@ fun ColorPanel(
     val alpha = (argb ushr ALPHA_SHIFT) and BYTE_MASK
 
     GlassPanel(modifier = modifier.width(PanelWidth)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            MicroLabel("Colour", color = Ink.TextNormal)
-            TextChip(label = "✕", kind = ChipKind.GLYPH, onClick = onClose, contentDescription = "Close")
-        }
+        PanelHeader("Colour", onClose)
 
         SlotGrid(
             slots = slots,

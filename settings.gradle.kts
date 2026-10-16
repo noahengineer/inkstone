@@ -36,6 +36,7 @@ include(":core:database")
 include(":core:sync")
 include(":core:search")
 include(":core:calc")
+include(":core:handwriting")
 
 include(":android:ink")
 include(":android:pdf")

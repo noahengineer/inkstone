@@ -41,6 +41,7 @@ dependencies {
     implementation(project(":core:sync"))
     implementation(project(":core:search"))
     implementation(project(":core:calc"))
+    implementation(project(":core:handwriting"))
     implementation(project(":android:ink"))
     implementation(project(":android:pdf"))
     implementation(project(":android:ocr"))

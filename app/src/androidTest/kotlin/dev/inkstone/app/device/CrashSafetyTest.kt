@@ -7,11 +7,17 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.inkstone.app.debug.CrashPoint
 import dev.inkstone.app.debug.CrashPointService
+import dev.inkstone.app.debug.PersonaliseCrash
 import dev.inkstone.app.platform.AndroidFileSystem
 import dev.inkstone.app.platform.SystemClock
 import dev.inkstone.core.database.AndroidDatabaseDriverFactory
 import dev.inkstone.core.database.createDatabase
 import dev.inkstone.core.database.sync.SqlOutboxStore
+import dev.inkstone.core.handwriting.Personaliser
+import dev.inkstone.core.handwriting.neural.FitCheckpoint
+import dev.inkstone.core.handwriting.neural.FitPlan
+import dev.inkstone.core.handwriting.neural.Fitter
+import dev.inkstone.core.handwriting.neural.TrainableNetwork
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.IdFactory
 import dev.inkstone.core.model.StrokeObject
@@ -25,6 +31,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.runner.RunWith
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
@@ -137,6 +144,55 @@ class CrashSafetyTest {
             "the complete previous bytes, never a torn file",
         )
     }
+
+    /**
+     * docs/HANDWRITING-SYNTHESIS.md §8.1 — the personalisation worker's fit, killed between two
+     * checkpoints. The bound: at most [FitPlan.checkpointEvery] iterations lost, and the fit, resumed
+     * from what is on disk, ends **bit for bit** where an unbroken one does.
+     */
+    @Test
+    fun `a kill during a personalisation fit loses at most one checkpoint interval`() {
+        val (_, scratch) = crash(CrashPoint.PERSONALISE)
+        val saved = assertNotNull(runBlocking { Personaliser.loadCheckpoint(fsIn(scratch), PersonaliseCrash.KEY) })
+        val done = PersonaliseCrash.KILL_AT_CALL - 1
+        assertTrue(saved.iteration in 1..done, "a checkpoint from before the kill: ${saved.iteration}")
+        assertTrue(
+            done - saved.iteration <= PersonaliseCrash.PLAN.checkpointEvery,
+            "lost ${done - saved.iteration} iterations",
+        )
+        resumesExactly(saved)
+    }
+
+    /** The same fit, killed **inside** a checkpoint's write: the previous checkpoint is whole and resumes. */
+    @Test
+    fun `a kill while a checkpoint is written leaves the previous one whole`() {
+        val (_, scratch) = crash(CrashPoint.PERSONALISE_WRITE)
+        val saved = assertNotNull(
+            runBlocking { Personaliser.loadCheckpoint(fsIn(scratch), PersonaliseCrash.KEY) },
+            "the first checkpoint must still decode",
+        )
+        assertEquals(PersonaliseCrash.PLAN.checkpointEvery, saved.iteration, "the one before the torn write")
+        resumesExactly(saved)
+    }
+
+    private fun resumesExactly(saved: FitCheckpoint) = runBlocking {
+        val weights = PersonaliseCrash.weights(app)
+        val trainer = TrainableNetwork(weights)
+        val words = PersonaliseCrash.words(weights, trainer)
+        val byId = words.associateBy { it.sampleId }
+        val fitter = Fitter(trainer, weights.modelId)
+        val resumed = fitter.run(saved, byId, null, { false }) { } as Fitter.Progress.Done
+        val unbroken = fitter.run(fitter.start(PersonaliseCrash.PLAN, words, words.take(1)), byId, null, { false }) { }
+            as Fitter.Progress.Done
+        assertEquals(unbroken.checkpoint.history, resumed.checkpoint.history, "the same validation curve")
+        assertContentEquals(
+            unbroken.checkpoint.best.single(),
+            resumed.checkpoint.best.single(),
+            "the same style, bit for bit",
+        )
+    }
+
+    private fun fsIn(scratch: File) = AndroidFileSystem(RootedAt(app, scratch))
 
     // -----------------------------------------------------------------------
     // Driving the victim

@@ -1,0 +1,169 @@
+{
+  "_comment": [
+    "docs/HANDWRITING-SYNTHESIS.md §7.2 and D13: every source font, its licence and its attribution.",
+    "synth.py refuses to read a font file that is not listed here with a commercial-use licence, and",
+    "copies each entry it used into the corpus manifest, which export.py writes into the .ihwm header.",
+    "Downloaded 2026-10-14 with the user's approval. sha256 is of the file as downloaded.",
+    "Not legal advice: §7.2 asks for a proper legal read of these licences before a commercial release."
+  ],
+  "fonts": [
+    {
+      "id": "hershey-futural",
+      "file": "hershey/futural.jhf",
+      "format": "jhf",
+      "style": "sans",
+      "sha256": "4958a1d06ea04709feb530deaab53d1efa1285d0d3e92a4a3edd74d279871ced",
+      "licence": "LicenseRef-Hershey",
+      "licence_file": "hershey/ATTRIBUTION.txt",
+      "source": "https://raw.githubusercontent.com/kamalmostafa/hershey-fonts/master/hershey-fonts/futural.jhf",
+      "attribution": "The Hershey Fonts were originally created by Dr. A. V. Hershey while working at the U. S. National Bureau of Standards. The format of the Font data in this distribution was originally created by James Hurt, Cognition, Inc., 900 Technology Park Drive, Billerica, MA 01821 (mit-eddie!ci-dandelion!hurt)."
+    },
+    {
+      "id": "hershey-scripts",
+      "file": "hershey/scripts.jhf",
+      "format": "jhf",
+      "style": "script",
+      "sha256": "6b391b2ea3a0771cf18caff0ed111db3d05681fa586d423a740cc0b2b155a873",
+      "licence": "LicenseRef-Hershey",
+      "licence_file": "hershey/ATTRIBUTION.txt",
+      "source": "https://raw.githubusercontent.com/kamalmostafa/hershey-fonts/master/hershey-fonts/scripts.jhf",
+      "attribution": "The Hershey Fonts were originally created by Dr. A. V. Hershey while working at the U. S. National Bureau of Standards. The format of the Font data in this distribution was originally created by James Hurt, Cognition, Inc., 900 Technology Park Drive, Billerica, MA 01821 (mit-eddie!ci-dandelion!hurt)."
+    },
+    {
+      "id": "hershey-cursive",
+      "file": "hershey/cursive.jhf",
+      "format": "jhf",
+      "style": "script",
+      "sha256": "9667a2c6424bc89f992738ff97de204a8580d92ef353e32b8014d9d7b106cd0b",
+      "licence": "LicenseRef-Hershey",
+      "licence_file": "hershey/ATTRIBUTION.txt",
+      "source": "https://raw.githubusercontent.com/kamalmostafa/hershey-fonts/master/hershey-fonts/cursive.jhf",
+      "attribution": "The Hershey Fonts were originally created by Dr. A. V. Hershey while working at the U. S. National Bureau of Standards. The format of the Font data in this distribution was originally created by James Hurt, Cognition, Inc., 900 Technology Park Drive, Billerica, MA 01821 (mit-eddie!ci-dandelion!hurt)."
+    },
+    {
+      "id": "relief-singleline",
+      "file": "relief-singleline/ReliefSingleLineSVG-Regular.svg",
+      "format": "svg",
+      "style": "sans",
+      "sha256": "75f05a5b64ed6039c9816628ee051d98e16c19148a8268c63f5eccf8382479e2",
+      "licence": "OFL-1.1",
+      "licence_file": "relief-singleline/OFL.txt",
+      "source": "https://raw.githubusercontent.com/isdat-type/Relief-SingleLine/main/fonts/open_svg/ReliefSingleLineSVG-Regular.svg",
+      "attribution": "Copyright 2022 The Relief SingleLine Project Authors (https://github.com/isdat-type/Relief-SingleLine)"
+    },
+    {
+      "id": "ems-casualhand",
+      "file": "ems-casualhand/EMSCasualHand.svg",
+      "format": "svg",
+      "style": "print",
+      "sha256": "5662a9717abf6efe0f1969eafe5a94be51f7886ae90bb4521102f0622f74f25d",
+      "licence": "OFL-1.1",
+      "licence_file": "ems-casualhand/OFL.txt",
+      "source": "https://raw.githubusercontent.com/svenhb/GRBL-Plotter/master/GRBL-Plotter/data/fonts/svg/EMSCasualHand.svg (copy of gitlab.com/oskay/svg-fonts, which did not answer)",
+      "attribution": "EMS Casual Hand by Sheldon B. Michaels, SVG conversion by Windell H. Oskay; a derivative of Covered By Your Grace, Copyright (c) 2010, Kimberly Geswein (kimberlygeswein.com kimberlygeswein@gmail.com)"
+    },
+    {
+      "id": "ems-tech",
+      "file": "ems-tech/EMSTech.svg",
+      "format": "svg",
+      "style": "print",
+      "sha256": "3413e7627b17c43baf763e5f807aa769a321c7ca323265f49de101dc06939bec",
+      "licence": "OFL-1.1",
+      "licence_file": "ems-tech/OFL.txt",
+      "source": "https://raw.githubusercontent.com/svenhb/GRBL-Plotter/master/GRBL-Plotter/data/fonts/svg/EMSTech.svg (copy of gitlab.com/oskay/svg-fonts, which did not answer)",
+      "attribution": "EMS Tech by Sheldon B. Michaels, SVG conversion by Windell H. Oskay; a derivative of Architects Daughter, Copyright (c) 2010, Kimberly Geswein (kimberlygeswein.com)"
+    },
+    {
+      "id": "ems-pancakes",
+      "file": "ems-pancakes/EMSPancakes.svg",
+      "format": "svg",
+      "style": "print",
+      "sha256": "49be6c6acb684765dac84d80824abfc3d5272cd8404bdacde701a65eb9786742",
+      "licence": "OFL-1.1",
+      "licence_file": "ems-pancakes/OFL.txt",
+      "source": "https://raw.githubusercontent.com/svenhb/GRBL-Plotter/master/GRBL-Plotter/data/fonts/svg/EMSPancakes.svg (copy of gitlab.com/oskay/svg-fonts, which did not answer)",
+      "attribution": "EMS Pancakes by Sheldon B. Michaels, SVG conversion by Windell H. Oskay; a derivative of Short Stack, Copyright (c) 2011, Sorkin Type Co (www.sorkintype.com eben@eyebytes.com), with Reserved Font Name 'Short Stack'"
+    },
+    {
+      "id": "ems-delight",
+      "file": "ems-delight/EMSDelight.svg",
+      "format": "svg",
+      "style": "print",
+      "sha256": "fc4bb65562e19174264c80a1d1a9db978232c4a407202cc0f636b0337c733508",
+      "licence": "OFL-1.1",
+      "licence_file": "ems-delight/OFL.txt",
+      "source": "https://raw.githubusercontent.com/svenhb/GRBL-Plotter/master/GRBL-Plotter/data/fonts/svg/EMSDelight.svg (copy of gitlab.com/oskay/svg-fonts, which did not answer)",
+      "attribution": "EMS Delight by Sheldon B. Michaels, SVG conversion by Windell H. Oskay; a derivative of Delius, Copyright (c) 2010 by Natalia Raices (nraices@gmail.com). All rights reserved."
+    },
+    {
+      "id": "ems-neato",
+      "file": "ems-neato/EMSNeato.svg",
+      "format": "svg",
+      "style": "print",
+      "sha256": "e909b61deeff21ba8f057dfa149574bf41565ccaf3c013edd4f82eb5d01f2ea1",
+      "licence": "OFL-1.1",
+      "licence_file": "ems-neato/OFL.txt",
+      "source": "https://raw.githubusercontent.com/svenhb/GRBL-Plotter/master/GRBL-Plotter/data/fonts/svg/EMSNeato.svg (copy of gitlab.com/oskay/svg-fonts, which did not answer)",
+      "attribution": "EMS Neato by Sheldon B. Michaels, SVG conversion by Windell H. Oskay; a derivative of Bad Script, Copyright 2011 The Bad Script Project Authors (https://github.com/alexeiva/badscript)"
+    },
+    {
+      "id": "ems-felix",
+      "file": "ems-felix/EMSFelix.svg",
+      "format": "svg",
+      "style": "print",
+      "sha256": "40816fed4a953f17fc8b8710137c61faa8a28ea5152682230edb9530cdfe9502",
+      "licence": "OFL-1.1",
+      "licence_file": "ems-felix/OFL.txt",
+      "source": "https://raw.githubusercontent.com/svenhb/GRBL-Plotter/master/GRBL-Plotter/data/fonts/svg/EMSFelix.svg (copy of gitlab.com/oskay/svg-fonts, which did not answer)",
+      "attribution": "EMS Felix by Sheldon B. Michaels, SVG conversion by Windell H. Oskay; a derivative of Felipa, Copyright (c) 2011 Fontstage (info@fontstage.com), with Reserved Font Name 'Felipa'"
+    },
+    {
+      "id": "ems-capitol",
+      "file": "ems-capitol/EMSCapitol.svg",
+      "format": "svg",
+      "style": "script",
+      "sha256": "5be6336f5626f17bb13fb40600de4e02aaca77ea820cd043197ee84b37d0b219",
+      "licence": "OFL-1.1",
+      "licence_file": "ems-capitol/OFL.txt",
+      "source": "https://raw.githubusercontent.com/svenhb/GRBL-Plotter/master/GRBL-Plotter/data/fonts/svg/EMSCapitol.svg (copy of gitlab.com/oskay/svg-fonts, which did not answer)",
+      "attribution": "EMS Capitol by Sheldon B. Michaels, SVG conversion by Windell H. Oskay; a derivative of Sacramento, Copyright (c) 2012 by Brian J. Bonislawsky DBA Astigmatic (AOETI) (astigma@astigmatic.com), with Reserved Font Name 'Sacramento'"
+    },
+    {
+      "id": "hershey-mathlow",
+      "file": "hershey/mathlow.jhf",
+      "format": "jhf",
+      "style": "sans",
+      "role": "symbols",
+      "_charmap_note": "Each slot read off a rendered sheet of the file (docs/HANDWRITING-SYNTHESIS.md, corpus v2). The A-Z slots hold the simplex lowercase letters, which is what the set's x-height is measured on.",
+      "charmap": {
+        "A": "a", "B": "b", "C": "c", "D": "d", "E": "e", "F": "f", "G": "g", "H": "h", "I": "i", "J": "j", "K": "k", "L": "l", "M": "m",
+        "N": "n", "O": "o", "P": "p", "Q": "q", "R": "r", "S": "s", "T": "t", "U": "u", "V": "v", "W": "w", "X": "x", "Y": "y", "Z": "z",
+        "0": "0", "1": "1", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6", "7": "7", "8": "8", "9": "9",
+        "!": "±", "#": "×", "&": "≤", "'": "≥", "?": "≠", "_": "∞", "`": "°", "b": "√", "x": "÷"
+      },
+      "sha256": "746f23a6dfd61adee3a33819e8d57df3a9f42421e5d2337b9ed0efa2d70e87a1",
+      "licence": "LicenseRef-Hershey",
+      "licence_file": "hershey/ATTRIBUTION.txt",
+      "source": "https://raw.githubusercontent.com/kamalmostafa/hershey-fonts/master/hershey-fonts/mathlow.jhf",
+      "attribution": "The Hershey Fonts were originally created by Dr. A. V. Hershey while working at the U. S. National Bureau of Standards. The format of the Font data in this distribution was originally created by James Hurt, Cognition, Inc., 900 Technology Park Drive, Billerica, MA 01821 (mit-eddie!ci-dandelion!hurt)."
+    },
+    {
+      "id": "hershey-greeks",
+      "file": "hershey/greeks.jhf",
+      "format": "jhf",
+      "style": "sans",
+      "role": "symbols",
+      "metrics_from": "hershey-mathlow",
+      "_charmap_note": "Each slot read off a rendered sheet of the file, which also carries Hershey's own glyph numbers (Delta 530, Theta 534, Omega 550, vartheta 634, lambda 637, mu 638, pi 642). Slot h is the script theta (U+03D1), not the closed theta most school notes use; corpus v2 derives its theta from Theta instead (mathglyphs.py).",
+      "charmap": {
+        "0": "0", "1": "1", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6", "7": "7", "8": "8", "9": "9",
+        "D": "Δ", "H": "Θ", "X": "Ω", "h": "ϑ", "k": "λ", "l": "μ", "p": "π"
+      },
+      "sha256": "309298debb0e472047f8329d31f849b14a98108a706d0f4f684e40d1eb023a76",
+      "licence": "LicenseRef-Hershey",
+      "licence_file": "hershey/ATTRIBUTION.txt",
+      "source": "https://raw.githubusercontent.com/kamalmostafa/hershey-fonts/master/hershey-fonts/greeks.jhf",
+      "attribution": "The Hershey Fonts were originally created by Dr. A. V. Hershey while working at the U. S. National Bureau of Standards. The format of the Font data in this distribution was originally created by James Hurt, Cognition, Inc., 900 Technology Park Drive, Billerica, MA 01821 (mit-eddie!ci-dandelion!hurt)."
+    }
+  ]
+}

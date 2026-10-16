@@ -4,20 +4,22 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
@@ -47,6 +49,7 @@ import dev.inkstone.app.ui.Ink
 import dev.inkstone.app.ui.InkDims
 import dev.inkstone.app.ui.InkType
 import dev.inkstone.app.ui.MicroLabel
+import dev.inkstone.app.ui.PanelHeader
 import dev.inkstone.app.ui.TextChip
 import dev.inkstone.core.model.ElementId
 import dev.inkstone.core.storage.Element
@@ -66,18 +69,19 @@ import kotlin.math.roundToInt
  * reports **window** positions and `ObjectLayers` turns them into page space with the camera it
  * already holds. Both stay — the drag for *"put this there"*, the arm for *"put four of these down"*.
  *
- * Two ways to start a drag, because the list scrolls:
+ * Two ways to start a drag, because the grid scrolls:
  *
- * - **from the picture**, immediately — the tile is the obvious thing to pick up, and it is small
- *   enough that grabbing it is never an attempt to scroll;
- * - **from anywhere on the row**, after a long press — the convention every tablet list uses for
- *   "pick this up", which leaves a plain drag on the row free to scroll the panel.
+ * - **from the picture, sideways**, immediately — toward the page, which is beside the panel. Only
+ *   sideways, because in a grid the pictures are most of the panel and a vertical drag on one has to
+ *   stay a scroll (the list this replaced could take any direction: its pictures were small);
+ * - **from anywhere on the tile**, after a long press — the convention every tablet list uses for
+ *   "pick this up", in any direction.
  *
  * ## A picture rather than a name
  *
- * Each row shows the Element drawn by [ElementPreviews] — the same painter the page uses, so what you
- * pick up is what lands. M8c listed names on the grounds that drawing one *"means rendering its
- * members"*, which is exactly what makes it cheap: an Element is a small page.
+ * Each tile is the Element drawn by [ElementPreviews] — the same painter the page uses, so what you
+ * pick up is what lands — two across (docs/UI-RAILS.md). M8c listed names on the grounds that drawing
+ * one *"means rendering its members"*, which is exactly what makes it cheap: an Element is a small page.
  */
 @Composable
 @Suppress("LongParameterList") // What the panel shows, and the three things a row can do.
@@ -93,45 +97,71 @@ fun ElementPanel(
     modifier: Modifier = Modifier,
 ) {
     GlassPanel(modifier = modifier.width(PanelWidth)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.SpaceBetween,
-        ) {
-            MicroLabel("Elements")
-            // ✕ rather than the word: close is the one control here whose meaning survives being a
-            // symbol. `ChipKind.GLYPH` sets it larger and in the normal face, and the
-            // `contentDescription` is what stops it reaching the a11y tree as a bare codepoint.
-            TextChip(label = "✕", kind = ChipKind.GLYPH, onClick = onClose, contentDescription = "Close")
-        }
+        PanelHeader("Elements", onClose)
         if (elements.isEmpty()) {
             Hint(EMPTY_HINT)
-        } else {
-            Hint(DRAG_HINT)
-            LazyColumn(
-                modifier = Modifier.heightIn(max = ListMaxHeight),
-                verticalArrangement = Arrangement.spacedBy(RowGap),
-            ) {
-                // Grouped by collection, in the library's own order (collection, then name), so the
-                // panel does not reshuffle itself when an element is added.
-                elements.groupBy { it.collection }.forEach { (collection, inGroup) ->
-                    item(key = "collection-$collection") {
-                        MicroLabel(collection, modifier = Modifier.padding(top = HeadingTopGap))
-                    }
-                    items(inGroup, key = { it.id.value }) { element ->
-                        ElementRow(
-                            element = element,
-                            armed = armed?.id == element.id,
-                            preview = previews[element.id],
-                            onArm = onArm,
-                            onDelete = onDelete,
-                            onEdit = onEdit,
-                            drag = drag,
-                        )
-                    }
+            return@GlassPanel
+        }
+        // ⭐ A grid of pictures, not a list of rows (docs/UI-RAILS.md): what tells one Element from
+        // another is what it looks like, and a row spent most of its width on a name, a size and a red
+        // `REMOVE` repeated once per Element. What can be done to one is said once, under the grid,
+        // for the one that is armed.
+        LazyVerticalGrid(
+            columns = GridCells.Fixed(GRID_COLUMNS),
+            modifier = Modifier.heightIn(max = ListMaxHeight),
+            verticalArrangement = Arrangement.spacedBy(TileGap),
+            horizontalArrangement = Arrangement.spacedBy(TileGap),
+        ) {
+            // Grouped by collection, in the library's own order (collection, then name), so the
+            // panel does not reshuffle itself when an element is added.
+            elements.groupBy { it.collection }.forEach { (collection, inGroup) ->
+                item(key = "collection-$collection", span = { GridItemSpan(maxLineSpan) }) {
+                    MicroLabel(collection, modifier = Modifier.padding(top = HeadingTopGap))
+                }
+                items(inGroup, key = { it.id.value }) { element ->
+                    ElementTile(
+                        element = element,
+                        armed = armed?.id == element.id,
+                        preview = previews[element.id],
+                        onArm = onArm,
+                        onEdit = onEdit,
+                        drag = drag,
+                    )
                 }
             }
         }
+        armed?.let { held -> ArmedLine(held, onEdit, onDelete) }
+    }
+}
+
+/**
+ * The armed Element's name and size, and the two things that can be done to it.
+ *
+ * ⚠️ `Edit` is the double-tap made visible — that gesture is still there, but it was the one thing the
+ * panel could do that nothing on screen offered. `Remove` moves the Element to `elements/trash/`
+ * (`ElementLibrary.delete`), so it is not the irreversible kind CLAUDE.md rule 1 is about and needs no
+ * question; `danger` is still right, because the chip *does* the thing.
+ */
+@Composable
+private fun ArmedLine(element: Element, onEdit: (Element) -> Unit, onDelete: (ElementId) -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(TileGap),
+    ) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(RowTextGap)) {
+            Text(
+                text = element.name,
+                color = Ink.TextStrong,
+                fontSize = InkType.ChipSize,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            MicroLabel(element.summary())
+        }
+        TextChip(label = "Edit", onClick = { onEdit(element) })
+        TextChip(label = "Remove", danger = true, onClick = { onDelete(element.id) })
     }
 }
 
@@ -150,85 +180,84 @@ class ElementDrag(
 )
 
 /**
- * A line of guidance under the heading.
+ * What an empty library says.
  *
- * Left as a sentence rather than made a [MicroLabel]: both gestures — capturing and dragging — are
- * undiscoverable, so this is the one place they are explained, and a tracked-out uppercase single
- * line cannot hold either.
+ * Left as a sentence rather than made a [MicroLabel]: an empty panel has nothing to tap, so it is the
+ * one place the two ways of making an Element can be told — and a tracked-out uppercase single line
+ * cannot hold either. Once there is something to tap, the grid needs no sentence: a tile is the obvious
+ * thing to pick up, and tapping one says what else it can do ([ArmedLine]).
  */
 @Composable
 private fun Hint(text: String) {
     Text(text = text, color = Ink.TextMuted, fontSize = InkType.ChipSize, lineHeight = HintLineHeight)
 }
 
+/**
+ * One Element: its picture on paper and its name under it.
+ *
+ * ⭐ **Tap arms; double-tap opens the Element editor** (SPEC §4.9.7) — one detector for both, so a
+ * double-tap never arms and disarms on its way to opening. **Drag it sideways** and it comes off the
+ * panel at once; **hold, then drag** picks it up in any direction. Sideways rather than any direction,
+ * because the grid scrolls up and down and a tile is most of the grid: a vertical drag on a picture is
+ * a scroll, and one toward the page beside the panel is a pick-up.
+ */
 @Composable
 @Suppress("LongParameterList")
-private fun ElementRow(
+private fun ElementTile(
     element: Element,
     armed: Boolean,
     preview: ImageBitmap?,
     onArm: (Element?) -> Unit,
-    onDelete: (ElementId) -> Unit,
     onEdit: (Element) -> Unit,
     drag: ElementDrag,
 ) {
     val current by rememberUpdatedState(element)
     val isArmed by rememberUpdatedState(armed)
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(RowContentGap),
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(RowTextGap),
         modifier = Modifier
             .fillMaxWidth()
             .clip(InkDims.ChipCorner)
             .background(if (armed) Ink.PanelRaised else Color.Transparent)
-            .dragsElement(element, drag, afterLongPress = true)
-            // ⭐ Tap arms; **double-tap opens the Element editor** (SPEC §4.9.7). One detector for
-            // both, so a double-tap never arms and disarms on its way to opening.
+            .dragsElement(element, drag, DragStart.AFTER_LONG_PRESS)
             .pointerInput(element.id) {
                 detectTapGestures(
                     onTap = { onArm(if (isArmed) null else current) },
                     onDoubleTap = { onEdit(current) },
                 )
             }
-            .padding(horizontal = RowPaddingH, vertical = RowPaddingV),
+            .padding(TilePadding),
     ) {
-        Tile(element, preview, drag)
-        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(RowTextGap)) {
-            Text(
-                text = element.name,
-                color = Ink.TextStrong,
-                fontSize = InkType.ChipSize,
-                fontWeight = FontWeight.Medium,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            MicroLabel(element.summary())
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(1f)
+                .clip(InkDims.ChipCorner)
+                .background(Ink.Paper)
+                // The armed tile is ringed in the focus colour — the one sign on screen that the next
+                // tap on the page will stamp it.
+                .border(if (armed) TileRing else TileBorder, if (armed) Ink.Focus else Ink.Hairline, InkDims.ChipCorner)
+                .dragsElement(element, drag, DragStart.SIDEWAYS),
+        ) {
+            if (preview != null) {
+                Image(bitmap = preview, contentDescription = element.name, contentScale = ContentScale.Fit)
+            }
         }
-        // Deliberately not a confirmation dialog: this moves the Element to `elements/trash/`
-        // (see `ElementLibrary.delete`), so nothing here is irreversible in the way CLAUDE.md
-        // rule 1 is about. `danger` is still right — the chip *does* the thing rather than opening
-        // a question about it, which is exactly the case that colour is reserved for.
-        TextChip(label = "Remove", danger = true, onClick = { onDelete(element.id) })
+        Text(
+            text = element.name,
+            color = if (armed) Ink.TextStrong else Ink.TextNormal,
+            fontSize = InkType.MicroSize,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }
 
-/** The Element on paper — a white square, because that is what it is drawn on when it lands. */
-@Composable
-private fun Tile(element: Element, preview: ImageBitmap?, drag: ElementDrag) {
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = Modifier
-            .size(TileSize)
-            .clip(InkDims.ChipCorner)
-            .background(Ink.Paper)
-            .border(TileBorder, Ink.Hairline, InkDims.ChipCorner)
-            .dragsElement(element, drag, afterLongPress = false),
-    ) {
-        if (preview != null) {
-            Image(bitmap = preview, contentDescription = element.name, contentScale = ContentScale.Fit)
-        }
-    }
-}
+/** How a drag out of the panel begins — see [ElementTile]. */
+private enum class DragStart { SIDEWAYS, AFTER_LONG_PRESS }
 
 /**
  * Picks [element] up on a drag and reports where it is, in window space.
@@ -238,19 +267,19 @@ private fun Tile(element: Element, preview: ImageBitmap?, drag: ElementDrag) {
  * them off a parent would be off by the parent's padding — a ghost that hangs a few millimetres away
  * from the finger, and an Element that lands there too.
  */
-private fun Modifier.dragsElement(element: Element, drag: ElementDrag, afterLongPress: Boolean): Modifier = composed {
+private fun Modifier.dragsElement(element: Element, drag: ElementDrag, start: DragStart): Modifier = composed {
     var coordinates by remember { mutableStateOf<LayoutCoordinates?>(null) }
     val current by rememberUpdatedState(element)
     val callbacks by rememberUpdatedState(drag)
     fun window(local: Offset): Offset = coordinates?.localToWindow(local) ?: local
     Modifier
         .onGloballyPositioned { coordinates = it }
-        .pointerInput(element.id, afterLongPress) {
+        .pointerInput(element.id, start) {
             val onStart: (Offset) -> Unit = { callbacks.onStart(current, window(it)) }
             val onEnd: () -> Unit = { callbacks.onEnd() }
             val onCancel: () -> Unit = { callbacks.onCancel() }
-            if (afterLongPress) {
-                detectDragGesturesAfterLongPress(
+            when (start) {
+                DragStart.AFTER_LONG_PRESS -> detectDragGesturesAfterLongPress(
                     onDragStart = onStart,
                     onDragEnd = onEnd,
                     onDragCancel = onCancel,
@@ -259,12 +288,14 @@ private fun Modifier.dragsElement(element: Element, drag: ElementDrag, afterLong
                         callbacks.onMove(window(change.position))
                     },
                 )
-            } else {
-                detectDragGestures(
+
+                // ⚠️ Only the *start* is sideways. After the slop the pointer is followed wherever it
+                // goes — `change.position` is the whole position, not the horizontal part.
+                DragStart.SIDEWAYS -> detectHorizontalDragGestures(
                     onDragStart = onStart,
                     onDragEnd = onEnd,
                     onDragCancel = onCancel,
-                    onDrag = { change, _ ->
+                    onHorizontalDrag = { change, _ ->
                         change.consume()
                         callbacks.onMove(window(change.position))
                     },
@@ -285,21 +316,27 @@ private fun Element.summary(): String = "${objects.size} · ${widthPt.roundToInt
 
 private const val EMPTY_HINT =
     "Nothing saved yet. Select something and press Save as Element, or drag a box round it with this tool."
-private const val DRAG_HINT =
-    "Drag one onto the page, or tap to arm it and tap the page. Double-tap one to edit it."
 
-/** The reference design's side-panel width. */
-private val PanelWidth = 280.dp
+/**
+ * Narrower than the reference design's 280 dp side panel, so that the library, the colour panel, the
+ * calculator and the diagnostics all fit side by side in the right-hand column on a landscape tablet
+ * without reaching the tool column (docs/UI-RAILS.md §3).
+ */
+private val PanelWidth = 240.dp
 
-/** Tall enough for about six rows, and clear of the dock on a portrait tablet. */
+/**
+ * Two ~100 dp pictures across the panel. Three made ~74 dp tiles whose names were cut at ten letters
+ * (*"DiagonalLi…"*), and a picture you have to squint at is not a library.
+ */
+private const val GRID_COLUMNS = 2
+
+/** Tall enough for four rows of tiles, and clear of the dock on a portrait tablet. */
 private val ListMaxHeight = 420.dp
 
-private val TileSize = 52.dp
 private val TileBorder = 1.dp
-private val RowGap = 4.dp
-private val RowContentGap = 10.dp
+private val TileRing = 2.dp
+private val TileGap = 8.dp
+private val TilePadding = 4.dp
 private val HeadingTopGap = 6.dp
-private val RowPaddingH = 8.dp
-private val RowPaddingV = 6.dp
 private val RowTextGap = 2.dp
 private val HintLineHeight = 18.sp

@@ -172,7 +172,13 @@ public class InkSurfaceView @JvmOverloads constructor(
     // --- Input state --------------------------------------------------------
     private var strokePointerId = MotionEvent.INVALID_POINTER_ID
     private var activeStrokeId: InProgressStrokeId? = null
-    private var activeStrokeKind = InkBrushKind.FOUNTAIN
+
+    /**
+     * Each stroke's pen kind, start time and ruler flag, from its down event until ink reports it
+     * finished. Per stroke, because a stroke is reported after the next one may have begun. See
+     * [StrokeStarts].
+     */
+    private val strokeStarts = StrokeStarts<InkBrushKind>()
 
     /**
      * Whether the live stroke is being drawn by a stylus. With finger drawing on, a *finger*
@@ -584,15 +590,7 @@ public class InkSurfaceView @JvmOverloads constructor(
      * thousand entries in a lecture's timeline in one frame. Page loads, undo-of-delete and a
      * peer's merged strokes all arrive through `applyOps` and never touch this path at all.
      */
-    public var onStrokeCaptured: ((ObjectId, Long) -> Unit)? = null
-
-    /**
-     * When the live stroke's `ACTION_DOWN` arrived, on `SystemClock.elapsedRealtime`.
-     *
-     * One field is enough because [beginStroke] returns early while a stroke is already live —
-     * this surface never has two at once.
-     */
-    private var strokeStartedAtElapsed: Long = 0L
+    public var onStrokeCaptured: ((objectId: ObjectId, atElapsedRealtime: Long, ruled: Boolean) -> Unit)? = null
 
     /** Fired after any edit, so a toolbar can refresh its state and autosave can run. */
     public var onHistoryChanged: (() -> Unit)? = null
@@ -730,6 +728,8 @@ public class InkSurfaceView @JvmOverloads constructor(
         selectionController.clear()
         strokes.reset()
         adoptCanvas(page.canvas)
+        // Before the refit below, which is what draws and centres a search hit on this page.
+        searchHit.pageLoading(page.pageId)
         // Explicit, because the setter above no longer does it. A page *switch* should fit the new
         // page — it is a different piece of paper and the old camera means nothing on it.
         fitOrFrame()
@@ -834,21 +834,37 @@ public class InkSurfaceView @JvmOverloads constructor(
     }
 
     /**
-     * SPEC §8.4 — mark where a search hit landed, and bring it into view.
+     * SPEC §8.4 — mark where a search hit landed on the page being shown, and bring it into view.
      *
-     * ⚠️ **The camera move goes through the existing leash, not through a fresh `resetCamera`.**
-     * `Camera.leashedTo` builds a `coerceIn` range from the viewport extent and a zero viewport
-     * inverts that range and throws, which is why every camera move in this class is guarded on
-     * having been laid out. A search hit can perfectly well arrive before the surface has a
-     * size — the note opens *because* of the hit — so it is the one caller most likely to be
-     * early.
+     * ⚠️ **Held, and centred after the page's own fit.** A hit arrives while its note is still
+     * opening — the note opens *because* of the hit — and both things that happen next refit the
+     * camera: the first layout and the page load ([fitOrFrame]). This used to move the camera at
+     * once and return, so the refit always came second: tapping a search hit opened the right note,
+     * fitted to its width at the top, with the word off screen and its amber box drawn where nobody
+     * was looking. Found on the emulator, on the chemistry and physics notes alike. Now [fitOrFrame]
+     * ends by centring the hit, so whichever refit is last puts it in view.
+     *
+     * Which page the hit belongs to, and so when its box goes, is [SearchHitTracker]'s to decide.
+     *
+     * The camera move is guarded on having been laid out, like every other here: `Camera.leashedTo`
+     * builds a `coerceIn` range from the viewport and a zero viewport inverts it and throws.
      *
      * @param box null clears the highlight.
      */
     public fun highlight(box: dev.inkstone.core.model.PageRect?) {
+        searchHit.hit(box)
+        showHit()
+    }
+
+    private val searchHit = SearchHitTracker()
+
+    /** Draw the search hit if it belongs on this page, and centre it once there is a view to centre it in. */
+    private fun showHit() {
+        val box = searchHit.drawn
         dryView.highlight = box
         if (box == null || width <= 0 || height <= 0) return
         camera = camera.centredOn(box.centreX, box.centreY, width.toFloat(), height.toFloat())
+        searchHit.centred()
     }
 
     /**
@@ -1122,9 +1138,11 @@ public class InkSurfaceView @JvmOverloads constructor(
             value?.let(::frame)
         }
 
+    /** Every refit ends here, so a search hit is centred after it rather than undone by it. */
     private fun fitOrFrame() {
         val box = preferredFrame
         if (box == null || !frame(box)) resetCamera(FitMode.FIT_WIDTH)
+        showHit()
     }
 
     /** Double-tap zoom: toggle between fit-width and 200% of it, around [focus]. */
@@ -1147,12 +1165,18 @@ public class InkSurfaceView @JvmOverloads constructor(
      */
     private inner class FinishedStrokes : InProgressStrokesFinishedListener {
         override fun onStrokesFinished(strokes: Map<InProgressStrokeId, Stroke>) {
-            val startedAt = strokeStartedAtElapsed
-            for (stroke in strokes.values) {
-                val objectId = this@InkSurfaceView.strokes.add(stroke, activeStrokeKind)
+            for ((id, stroke) in strokes) {
+                // Each stroke's own start, never "the latest one's": this call can come after the
+                // next stroke has begun, and can report more than one stroke (StrokeStarts).
+                val slot = strokeStarts.find(id)
+                val kind = if (slot >= 0) strokeStarts.kind(slot) else pen.kind
+                val objectId = this@InkSurfaceView.strokes.add(stroke, kind)
                 // M12 — null only for the unbound fallback id, which never reaches disk and must
                 // never reach a timeline either.
-                if (objectId != null && startedAt != 0L) onStrokeCaptured?.invoke(objectId, startedAt)
+                if (objectId != null && slot >= 0) {
+                    onStrokeCaptured?.invoke(objectId, strokeStarts.startedAt(slot), strokeStarts.ruled(slot))
+                }
+                if (slot >= 0) strokeStarts.clear(slot)
             }
             // Before the repaint: the stroke may have gone past the paper's edge, and on an
             // infinite page the paper follows it rather than cutting it off.
@@ -1309,19 +1333,9 @@ public class InkSurfaceView @JvmOverloads constructor(
         gestures.addPointer(event, pointerId)
     }
 
-    /**
-     * SPEC §3.3 — flipping the S Pen reports `TOOL_TYPE_ERASER`, and holding the
-     * barrel button shows up in the button state.
-     *
-     * Both `BUTTON_STYLUS_PRIMARY` and `BUTTON_SECONDARY` are checked because
-     * OEMs disagree about which one an S Pen's single button reports, and a
-     * quick-erase modifier that works on one tablet and not the next is worse
-     * than none.
-     */
+    /** SPEC §3.3 — a flipped S Pen or a held barrel button erases ([isHardwareEraser]). */
     private fun beginDrawOrErase(event: MotionEvent, index: Int, pointerId: Int, hardwareEraserAllowed: Boolean) {
-        val barrel = MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY
-        val hardwareEraser = hardwareEraserAllowed &&
-            (event.getToolType(index) == MotionEvent.TOOL_TYPE_ERASER || (event.buttonState and barrel) != 0)
+        val hardwareEraser = hardwareEraserAllowed && event.isHardwareEraser(index)
 
         if (hardwareEraser || tool == InkTool.ERASER) {
             // Only a hardware eraser is "temporary": it restores itself when the
@@ -1387,11 +1401,10 @@ public class InkSurfaceView @JvmOverloads constructor(
         // `event.eventTime`, which is `uptimeMillis` and stops during deep sleep: a recording holds
         // the CPU awake, so the two agree in practice, but only one of them is the clock the
         // timeline's offsets are defined against.
-        strokeStartedAtElapsed = SystemClock.elapsedRealtime()
+        val startedAt = SystemClock.elapsedRealtime()
         // One undo entry per stroke. Opened here and committed when the stroke
         // finishes, so the entry exists by the time onStrokesFinished inserts.
         strokes.beginEdit()
-        activeStrokeKind = pen.kind
         strokePointerId = pointerId
         activeStrokeIsStylus = event.isStylusPointer(pointerIndex)
         val ruled = rulerController.appliesTo(event, pointerIndex)
@@ -1411,7 +1424,7 @@ public class InkSurfaceView @JvmOverloads constructor(
         activeStrokeIsRuled = ruled
         if (ruled) strokeViewToPage.set(viewToPage)
         val projected = ruled(event)
-        activeStrokeId = wetView.startStroke(
+        val id = wetView.startStroke(
             event = projected,
             pointerId = pointerId,
             brush = brushFactory.brushFor(pen),
@@ -1421,6 +1434,10 @@ public class InkSurfaceView @JvmOverloads constructor(
             // Stroke space *is* page space, so nothing needs converting later (SPEC §4.4 rule 1).
             strokeToWorldTransform = IDENTITY,
         )
+        activeStrokeId = id
+        // The ruler flag is kept for handwriting synthesis (docs/HANDWRITING-SYNTHESIS.md §5.1): a ruled
+        // stroke is the ruler's line, not the user's hand, and must never be learned as handwriting.
+        strokeStarts.put(id, startedAt, ruled, pen.kind)
         release(event, projected)
     }
 

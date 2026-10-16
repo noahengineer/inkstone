@@ -9,8 +9,9 @@ import androidx.compose.runtime.Immutable
  * screen**.
  *
  * One immutable value, persisted beside the palette in [EditorPrefs] and edited only in the layout
- * editor. `ChromeLayout()` **is** the stock layout — the M10 design exactly as it shipped — so a user
- * who never opens the editor sees nothing change, and *Reset* is `ChromeLayout()`.
+ * editor. `ChromeLayout()` **is** the stock layout — since docs/UI-RAILS.md, the tools as a column in
+ * the top-left corner with the pen's settings as a row along the top beside them
+ * ([ChromeBar.stockArrangement]) — and *Reset* is `ChromeLayout()`.
  *
  * ## The model: every chip has an owner
  *
@@ -38,6 +39,13 @@ import androidx.compose.runtime.Immutable
  * @param bars position, size and arrangement per bar; a stock bar with no entry is stock.
  * @param contents bars whose chips differ from stock, and every floating bar. Read through [itemsOf].
  * @param hidden chips the user has hidden. Never a chip that is not [ChromeItem.hideable].
+ * @param panelSide ⭐ which edge the panel column stands against (docs/LAYOUTS.md).
+ * @param panelOrder the order panels stack in the column, top first. Read through [orderedPanels].
+ * @param floatingPanels panels dragged out of the column, and where. A panel with no entry is in the
+ *   column. Never the calculator, whose window keeps a place of its own (`CalculatorPrefs`) because the
+ *   library shows it too, and the library has no layout.
+ * @param brushMenu the pen's brushes as one `FOUNTAIN ▾` chip in a row, rather than a chip each.
+ * @param cardStyle how a contextual bar lays its chips out.
  */
 @Immutable
 data class ChromeLayout(
@@ -46,9 +54,47 @@ data class ChromeLayout(
     val bars: Map<BarId, BarLayout> = emptyMap(),
     val contents: Map<BarId, List<ChromeItem>> = emptyMap(),
     val hidden: Set<ChromeItem> = emptySet(),
+    val panelSide: PanelSide = PanelSide.RIGHT,
+    val panelOrder: List<DockSlot> = DockSlot.entries,
+    val floatingPanels: Map<DockSlot, ChromePosition> = emptyMap(),
+    val brushMenu: Boolean = true,
+    val cardStyle: CardStyle = CardStyle.CARD,
 ) {
 
+    /** Every panel, in the order the column stacks them: the user's, with any it does not name after. */
+    val orderedPanels: List<DockSlot>
+        get() = (panelOrder + DockSlot.entries).distinct()
+
+    /** [slot] one place earlier ([by] < 0) or later in the column. */
+    fun panelMoved(slot: DockSlot, by: Int): ChromeLayout {
+        val order = orderedPanels.toMutableList()
+        val from = order.indexOf(slot)
+        val to = (from + by).coerceIn(0, order.lastIndex)
+        if (from == to) return this
+        order.add(to, order.removeAt(from))
+        return copy(panelOrder = order)
+    }
+
+    /**
+     * [slot] out of the column at [position], or back in it for null. The calculator is refused: its
+     * window has its own place (see [floatingPanels]).
+     */
+    fun panelPlaced(slot: DockSlot, position: ChromePosition?): ChromeLayout = when {
+        slot == DockSlot.CALCULATOR -> this
+        position == null -> copy(floatingPanels = floatingPanels - slot)
+        else -> copy(floatingPanels = floatingPanels + (slot to position))
+    }
+
+    fun withPanelSide(side: PanelSide): ChromeLayout = copy(panelSide = side)
+
+    fun withBrushMenu(menu: Boolean): ChromeLayout = copy(brushMenu = menu)
+
+    fun withCardStyle(style: CardStyle): ChromeLayout = copy(cardStyle = style)
+
     fun bar(id: BarId): BarLayout = bars[id] ?: BarLayout()
+
+    /** How [id] lays its chips out: the user's choice, or the bar's own stock shape ([ChromeBar.stockArrangement]). */
+    fun arrangement(id: BarId): ChromeArrangement = bar(id).arrangement ?: stockArrangement(id)
 
     /** What [id] is drawn at: the overall size times its own. */
     fun scaleOf(id: BarId): Float = uiScale * bar(id).scale
@@ -131,8 +177,12 @@ data class ChromeLayout(
     fun reset(id: BarId): ChromeLayout =
         withBar(id, BarLayout(position = if (id is BarId.Floating) bar(id).position else null))
 
+    /**
+     * [id] laid out as [arrangement]. The bar's own stock shape is stored as no choice at all, so a bar
+     * set back to it is equal to one never touched — and follows the stock if a later build changes it.
+     */
     fun arranged(id: BarId, arrangement: ChromeArrangement): ChromeLayout =
-        withBar(id, bar(id).copy(arrangement = arrangement))
+        withBar(id, bar(id).copy(arrangement = arrangement.takeIf { it != stockArrangement(id) }))
 
     fun withUiScale(scale: Float): ChromeLayout = copy(uiScale = scale.coerceIn(UI_SCALE))
 
@@ -180,6 +230,12 @@ data class ChromeLayout(
         /** [bar]'s chips in the design's order, which is their declaration order in [ChromeItem]. */
         fun stockOrder(bar: ChromeBar): List<ChromeItem> = ChromeItem.entries.filter { it.home == bar }
 
+        /** The shape [id] has until the user picks one. A bar the user made starts as a row. */
+        fun stockArrangement(id: BarId): ChromeArrangement = when (id) {
+            is BarId.Stock -> id.bar.stockArrangement
+            is BarId.Floating -> ChromeArrangement.ROW
+        }
+
         /**
          * [stored] with every chip of [bar]'s that [ownedHere] and it does not mention put back after
          * the chip that precedes it in the stock order — so a chip a later build adds lands beside its
@@ -225,29 +281,69 @@ sealed interface BarId {
 
 /**
  * One bar's place, size and shape. [position] null is the stock slot; [scale] multiplies
- * [ChromeLayout.uiScale].
+ * [ChromeLayout.uiScale]; [arrangement] null is the bar's stock shape — read it through
+ * [ChromeLayout.arrangement], never from here.
  */
 @Immutable
 data class BarLayout(
     val position: ChromePosition? = null,
     val scale: Float = 1f,
-    val arrangement: ChromeArrangement = ChromeArrangement.ROW,
+    val arrangement: ChromeArrangement? = null,
 )
 
 /**
  * How a bar lays its chips out. A row is the design's pill; a column turns a bar into a strip down
- * the side of the screen; a grid packs it into a block.
+ * the side of the screen; a grid packs it into a block; a panel gives each group of chips a line of
+ * its own ([PanelShape]).
  *
- * @param columns how many chips go across. A row has no limit.
+ * @param columns how many chips go across. A row has no limit; a panel decides per group.
+ * @param vertical a strip down the screen rather than across it — what turns the page arrows to point
+ *   up and down.
  */
 @Suppress("MagicNumber") // The column counts are what the entries *are*; a constant per entry would name them twice.
-enum class ChromeArrangement(val columns: Int, val label: String) {
+enum class ChromeArrangement(val columns: Int, val label: String, val vertical: Boolean = false) {
     ROW(Int.MAX_VALUE, "Row"),
-    COLUMN(1, "Column"),
+    COLUMN(1, "Column", vertical = true),
+    PANEL(Int.MAX_VALUE, "Panel"),
     GRID_2(2, "2 across"),
     GRID_3(3, "3 across"),
     GRID_4(4, "4 across"),
 }
+
+/**
+ * ⭐ The [ChromeArrangement.PANEL] shape: one line per group of chips, so a bar reads as a small
+ * inspector — the brushes, then the width, then the colours, then the snapping — instead of thirteen
+ * chips in a row across the top of the page.
+ *
+ * ⚠️ **A group of four or more is two across**, because four brush names in a line is a bar as wide
+ * as the one this replaced; three or fewer stay on one line, because `Snap / Arrow / Grid` split two
+ * and one is a line with a hole in it. Pure, so `ChromeLayoutTest` can hold it.
+ */
+internal object PanelShape {
+
+    /** [items] as lines, each line a list of chips, in the bar's own order. */
+    fun lines(items: List<ChromeItem>): List<PanelLine> = groups(items).flatMap { group ->
+        val across = if (group.size >= WRAP_AT) WRAPPED else group.size
+        group.chunked(across.coerceAtLeast(1)).mapIndexed { index, line -> PanelLine(line, startsGroup = index == 0) }
+    }
+
+    /** Consecutive chips of one [ChromeItem.group], in order. */
+    private fun groups(items: List<ChromeItem>): List<List<ChromeItem>> {
+        val groups = mutableListOf<MutableList<ChromeItem>>()
+        items.forEach { item ->
+            val last = groups.lastOrNull()
+            if (last != null && last.last().group == item.group) last.add(item) else groups.add(mutableListOf(item))
+        }
+        return groups
+    }
+
+    private const val WRAP_AT = 4
+    private const val WRAPPED = 2
+}
+
+/** One line of a [ChromeArrangement.PANEL] bar. [startsGroup] draws a rule above it, except at the top. */
+@Immutable
+internal data class PanelLine(val items: List<ChromeItem>, val startsGroup: Boolean)
 
 /** The summoned panels and contextual bars, each with a size of its own. */
 enum class ChromePanel(val label: String) {
@@ -257,6 +353,40 @@ enum class ChromePanel(val label: String) {
     SELECTION("Selection bar"),
     TEXT("Text bar"),
     IMAGE("Image bar"),
+    ELEMENTS("Elements library"),
+    WRITE("Write panel"),
+}
+
+/**
+ * The panels that open in the panel column (`PanelDock`), in the column's stock order.
+ *
+ * The calculator is last because it is the one that can be any size: it takes what the others leave,
+ * and starts a column of its own when they leave too little.
+ *
+ * @param panel what sizes it, or null for the calculator, whose face is sized by its own grip.
+ */
+enum class DockSlot(val label: String, val panel: ChromePanel?) {
+    ELEMENTS("Elements", ChromePanel.ELEMENTS),
+    WRITE("Write", ChromePanel.WRITE),
+    COLOUR("Colour", ChromePanel.COLOUR),
+    SIZE("Size", ChromePanel.WIDTH),
+    DIAGNOSTICS("More", ChromePanel.MORE),
+    CALCULATOR("Calculator", null),
+}
+
+/** Which edge of the screen the panel column stands against. */
+enum class PanelSide(val label: String) {
+    RIGHT("Right"),
+    LEFT("Left"),
+}
+
+/**
+ * How a contextual bar — a selection's, a text box's, a picture's — lays its chips out: as a card whose
+ * lines wrap to the room it has (docs/UI-RAILS.md), or as one row that scrolls when it does not fit.
+ */
+enum class CardStyle(val label: String) {
+    CARD("Card"),
+    ROW("One row"),
 }
 
 /**
@@ -312,9 +442,19 @@ data class ChromePosition(val fx: Float, val fy: Float) {
  *   anchor), so they move and resize but do not take other chips.
  * @param movable false for the dock's second row, which follows the dock — below it, above it once
  *   the dock is in the lower half of the screen, beside it once the dock is taller than it is wide.
+ * @param stockArrangement ⭐ the design's shape for the bar (docs/UI-RAILS.md). The tools are a slim
+ *   column tucked into the top-left corner, and the pen's settings one thin row along the top beside
+ *   it — the corner "L" every note app the user pointed at uses. Everything else is a pill. `ChromeHost`
+ *   puts a bar in its stock slot by its measured shape, so a user who sets the tools back to a row gets
+ *   the original top-centre dock, exactly.
  */
-enum class ChromeBar(val label: String, val holdsChips: Boolean = true, val movable: Boolean = true) {
-    DOCK("Tools"),
+enum class ChromeBar(
+    val label: String,
+    val holdsChips: Boolean = true,
+    val movable: Boolean = true,
+    val stockArrangement: ChromeArrangement = ChromeArrangement.ROW,
+) {
+    DOCK("Tools", stockArrangement = ChromeArrangement.COLUMN),
     DRAW("Pen settings", movable = false),
     HISTORY("Undo"),
     PAGES("Pages"),
@@ -343,6 +483,7 @@ enum class ChromeItem(val home: ChromeBar, val group: String, val label: String,
     TOOL_TEXT(ChromeBar.DOCK, "objects", "Text"),
     TOOL_IMAGE(ChromeBar.DOCK, "objects", "Image"),
     TOOL_ELEMENTS(ChromeBar.DOCK, "objects", "Elements"),
+    TOOL_WRITE(ChromeBar.DOCK, "objects", "Write"),
     TOOL_RULER(ChromeBar.DOCK, "ruler", "Ruler"),
 
     BRUSH_FOUNTAIN(ChromeBar.DRAW, "brushes", "Fountain"),

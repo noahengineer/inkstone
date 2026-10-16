@@ -54,6 +54,14 @@ class LcdFrame(
     val text: String = "",
     /** SETUP ◀CONT▶, `Setup.MIN_CONTRAST..MAX_CONTRAST`; the UI maps it to ink density. */
     val contrast: Int = Setup.DEFAULT_CONTRAST,
+    /**
+     * The result on the glass, in [text]'s plain linear spelling (`55,55555556`, `1/200`,
+     * `1,25×10^-3`), while a calculation's result is showing — and null while typing, in a menu, on an
+     * error or with the glass off. A two-part result (`r=`/`θ=`, the ÷R quotient over `R=`) is its two
+     * lines. What the app lets the user drag onto a page (docs/CALCULATOR.md §6); an Inkstone
+     * addition, not anything on the real display.
+     */
+    val answer: String? = null,
 ) {
     init {
         require(pixels.size == WIDTH * HEIGHT) { "an LCD frame is $WIDTH×$HEIGHT dots" }

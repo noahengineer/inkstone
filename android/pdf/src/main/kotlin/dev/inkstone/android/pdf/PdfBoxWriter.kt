@@ -17,6 +17,7 @@ import com.tom_roush.pdfbox.pdmodel.common.PDStream
 import com.tom_roush.pdfbox.pdmodel.common.filespecification.PDComplexFileSpecification
 import com.tom_roush.pdfbox.pdmodel.common.filespecification.PDEmbeddedFile
 import dev.inkstone.core.model.AnnotationName
+import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageAnnotationMode
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.model.PdfBox
@@ -241,7 +242,7 @@ internal class PdfBoxWriter(faces: PdfFontFaces = PdfFontFaces.None, decoder: Pd
         when (plan.mode) {
             PageAnnotationMode.PER_STROKE -> {
                 dict.removeItem(COSName.getPDFName(PdfPageKeys.FLATTENED))
-                appendAnnotations(doc, dict, drawable, geometry)
+                appendAnnotations(doc, dict, drawable, geometry, plan.generated)
             }
 
             PageAnnotationMode.FLATTENED -> {
@@ -362,13 +363,16 @@ internal class PdfBoxWriter(faces: PdfFontFaces = PdfFontFaces.None, decoder: Pd
         pageDict: COSDictionary,
         outlines: List<StrokeOutline>,
         geometry: PdfPageGeometry,
+        generated: Set<ObjectId>,
     ) {
         if (outlines.isEmpty()) return
         val annots = (pageDict.getDictionaryObject(COSName.ANNOTS) as? COSArray) ?: COSArray().also {
             pageDict.setItem(COSName.ANNOTS, it)
         }
         for (outline in outlines) {
-            annots.add(inkAnnotation(doc, outline, geometry))
+            val annotation = inkAnnotation(doc, outline, geometry)
+            if (outline.objectId in generated) annotation.setBoolean(COSName.getPDFName(PdfPageKeys.GENERATED), true)
+            annots.add(annotation)
         }
         markUpdated(annots)
     }

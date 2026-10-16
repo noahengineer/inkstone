@@ -156,6 +156,21 @@ internal object StrokeGeometryCodec {
         return DecodedInputs(inputs, kind, inputModel)
     }
 
+    /**
+     * The brush a blob was **captured** with — kind, colour and size — read off the header alone.
+     *
+     * For handwriting synthesis (docs/HANDWRITING-SYNTHESIS.md D15), which copies the pen of the
+     * writing around a drop point and so needs to know what each stroke was written with. The same
+     * validation as [decodeInputs], and the same null for a blob that is not ours.
+     */
+    fun penOf(geometry: StrokeGeometry): CapturedPen? {
+        val bytes = geometry.bytes
+        if (bytes.size < HEADER_SIZE || !bytes.startsWithMagic()) return null
+        if (bytes[VERSION_OFFSET] > FORMAT_VERSION) return null
+        val kind = InkBrushKind.entries.getOrNull(bytes[KIND_OFFSET].toInt()) ?: return null
+        return CapturedPen(kind, bytes.readInt(COLOR_OFFSET), Float.fromBits(bytes.readInt(SIZE_OFFSET)))
+    }
+
     private fun ByteArrayOutputStream.writeInt(value: Int) {
         write((value ushr 24) and 0xFF)
         write((value ushr 16) and 0xFF)
@@ -206,6 +221,9 @@ internal class DecodedInputs(
     val kind: InkBrushKind,
     val inputModel: InkInputModel,
 )
+
+/** The header's brush — see [StrokeGeometryCodec.penOf]. Size in page points. */
+internal class CapturedPen(val kind: InkBrushKind, val colorArgb: Int, val sizePt: Float)
 
 /**
  * The two `ink-storage` calls, in one place.

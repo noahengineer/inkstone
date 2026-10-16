@@ -151,6 +151,10 @@ tiebreak: concurrent ops at the same counter compare equal, `Register.write` kee
 and the two diverge permanently with every op present and no error. That is the bug `DeviceIdentity`
 exists to prevent, reintroduced by the test setup. Read `files/device.id` off both and confirm they
 differ before believing anything a pair of them tells you. `tools/emulator-ui.py` drives either.
+⚠️ **A serial is a boot-order port, not an AVD.** Resolve it with `adb -s <serial> emu avd name`
+before every command. On 2026-10-13 `emulator-5554` had quietly become another session's
+Test_Tablet_B, and a command aimed at Test_Tablet took B out of airplane mode. The README's
+*Testing on an emulator* has that, and the second-AVD Wi-Fi fix.
 
 **Neither peer can sign in to the plain-HTTP test container, and no manifest or resource change
 fixes it.** Three gates, not one: the network-security config; `LoginFlowV2.begin`'s `isSecure`
@@ -280,8 +284,13 @@ A milestone is done when:
 | **Photos drawn as crossed boxes, 852-character z keys, 39,000 dots — the physics note at 3× the size** | `docs/IMAGES-PERF-2026-10.md` (§4 per-claim table, §6 found and not fixed) |
 | **The note stays loaded — `onStop` saves, only a finishing stop materializes, `largeHeap`, and why leaving for the Element editor destroyed the note** | `docs/NOTE-STAYS-LOADED.md` (§3 before/after, §4 per-claim table, §5 found and not fixed) |
 | **The reader — a website and an MCP server over your Nextcloud** | `docs/WEB-READER.md` (§2 Login Flow v2 in Python, §6 per-claim buckets, §7 unproven, §9 hosting it with Docker) |
-| **The built-in calculator — an fx-991ZA PLUS II rebuilt from scratch in `:core:calc`, its window and face in `:app` `calculator/`** | `docs/CALCULATOR.md` (§2 decisions D1–D7, §3 the firmware guesses; research in `docs/calculator/research/`) |
+| **The built-in calculator — an fx-991ZA PLUS II rebuilt from scratch in `:core:calc`, its window and face in `:app` `calculator/`; drag its answer off the LCD onto the page** | `docs/CALCULATOR.md` (§2 decisions D1–D7, §3 the firmware guesses, §6 the answer drag; research in `docs/calculator/research/`) |
 | **Saved toolbar preferences that stay, and the layout editor — move, resize and reshape (row / column / grid) any bar, hide chips, carry a chip into another bar or onto the page, size each panel** | `docs/CUSTOM-LAYOUT.md` (§1 the stale-seed bug, §3 what the emulator found, §4 per-claim table) |
+| **The editor's chrome rearranged — tools in the top-left corner with the pen's row along the top, one right-hand column every panel stacks in without overlapping (`PanelDock`), a dockable/resizable calculator, two-line contextual cards, and the `ui.version` migration; round one (side rails) and why it was rejected** | `docs/UI-RAILS.md` (§1 round one, §4 the panel column, §6 per-claim table) |
+| **Saved layouts (Default + the user's, switched in the editor), every panel draggable/resizable/dockable (`PanelWindow`), the column's side and order, brush-menu and one-row style switches, and snapping (`BarSnap`)** | `docs/LAYOUTS.md` (§1 how the Default stays untouched, §3 the two emulator finds, §6 per-claim table) |
+| **Handwriting synthesis (M13) — typed text dropped onto a page in your own hand: the design D1–D15, the pen ledger, the profile on disk, and why the model's training data must allow commercial use** | `docs/HANDWRITING-SYNTHESIS.md` (§12 phases, §14 the user's answers, §16 phase 2 and §18 phase 3 per-claim status; `hw` is SPEC §4.10) |
+| **Line segmentation version 2 — columns and mind maps read, marks that attach instead of linking, and the search hit that opened its note somewhere else** | `docs/LINE-SEGMENTATION-V2.md` (§3 what was measured, §5 per-claim table, §7 unverified; SPEC §8.2) |
+| **Handwritten maths — the Write panel's *Maths* switch: stacked fractions, roots, scripts and stretched brackets, laid out from runs the gate read** | `docs/HANDWRITING-MATHS.md` (§2 the notation, §3 the layout, §5 what the sheet found, §6 per-claim table) |
 
 ---
 
@@ -1413,3 +1422,110 @@ Collected during research so they don't get reintroduced from stale training dat
   (~6 CPU-seconds over a 9–11 s phase). `PreparedPage.build` is kept — it is exact
   (`PreparedPageParallelTest`) — but "parallel" is not a speed claim until it is measured on the
   tablet's release build.
+- ⚠️ **Ink reports a stroke finished after the pen lifts, and the next stroke can begin in
+  between.** It sometimes reports two strokes in one call. So anything latched at the down event
+  "for the live stroke" may belong to the wrong stroke by the time `onStrokesFinished` reads it.
+  `InkSurfaceView` kept the start time, the ruler flag and the pen kind in single fields, and the
+  KDoc said *"this surface never has two at once"*. That is true of *live* and false of
+  *finished*. As a result:
+  - M12's timeline and the handwriting ledger got the next stroke's start time;
+  - a stroke finishing after a quick change of pen could be stored as the next pen's kind.
+
+  Found by reading the ledger after three `input stylus swipe`s: two strokes at the same
+  millisecond. All three are now kept per stroke, keyed by ink's own stroke id (`StrokeStarts`).
+  The undo bracket has the same shape, and its KDoc already accepts that two quick strokes may
+  share one entry.
+- ⚠️ **The library index cannot tell you a note is gone; only the files can** (handwriting
+  synthesis). The learner withdrew a note's learned words once the index no longer listed the note.
+  But the index is a cache, rebuilt from `notes/` when it is lost (SPEC §13.1), and an empty or
+  half-rebuilt index lists nothing. A lost database would have withdrawn every word. The per-note
+  watermarks would then have gone on saying those notes were done, so nothing would have learned
+  them again. It reads `notes/` and the local trash now (`Departures`). Two rules generalise:
+  - anything that deletes or withdraws because something is *absent* must ask the source of truth,
+    not a cache of it;
+  - forgetting a thing must forget the bookkeeping that would stop it coming back.
+
+  Same family as *"a pruned subtree looks exactly like a deleted one"*.
+- ⚠️ **Two reads of the same strokes agreeing is self-consistency, not correctness** (handwriting
+  synthesis). The harvester learned a word when M7's line read and a fresh word-level read agreed.
+  Both read the same strokes, so a drawing the recogniser takes for a word is taken for it twice. On
+  the first real harvest, 16 of 18 learned "words" were drawings: zigzags as `m`, wavy scribbles as
+  `M`, an arrow as `b`. Every test passed, because the fake recogniser read only real words. What
+  separated them was the recogniser's *own* doubt. For writing it really reads, its other guesses
+  repeat the answer; for a drawing they scatter (`mm` came with `mmm`, `umm`, `mmu`, `um`). So
+  `Harvester.MIN_ECHOES` asks for two echoes. Before treating two signals as independent
+  confirmation, ask whether they share an input. Here they shared all of it.
+- ⚠️ **A median over "lines" is a median over whatever the segmenter called a line** (handwriting
+  synthesis phase 3). D15 sizes a dropped phrase from the writing around it, and on the physics note
+  **173 of 417** segmented lines were subscripts, arrowhead labels and dots — so a phrase dropped
+  beside a 4.5 pt paragraph came out at **1.85 pt**, and every unit test passed, because a fixture's
+  lines are all writing. `PageWriting.writingLines` keeps a line only with two strokes, 1.5 x-heights
+  of width and 0.45 of the **stroke-weighted** median x-height (a plain median is outvoted by the marks
+  it is meant to exclude). Before averaging a measurement over a segmenter's output, draw what it
+  segmented.
+- ⚠️ **A read-back gate reads a word, not a baseline** (handwriting synthesis phase 3, on the tablet).
+  Every generated word is read by ML Kit before it is drawn, and on the tablet's 136-word profile
+  every word passed first time while a `p` floated a whole descender above the line and a `t` ran into
+  the next one. Both came from one learned word whose line's frame did not fit it. Legible is not the
+  same as right, and a gate only rules out the first failure. The second needs its own check
+  (`LetterFit`: does each lower-case letter sit where its kind belongs?). And the emulator's 19-word
+  profile could not show it, because none of those words happened to be misframed. **A small profile
+  is a fixture, with a fixture's generosity.**
+- ⚠️ **A Python edit script on Windows writes CRLF unless told not to.** `open(p, 'w')` translates
+  every `\n`, so a one-line edit makes `spotlessCheck` flag the whole file — 19 files in one go in
+  phase 3, three of them files another session was working in — while `git diff` shows nothing, because git normalises
+  line endings. Open with `newline=''` and keep whatever the file had.
+- ⚠️ **ML Kit's model download does not fail offline — it waits.** `RemoteModelManager.download`
+  stayed pending for minutes in airplane mode and completed 45 s after it was switched off, with no
+  error and no bytes reported at any point. So *"the request is in flight"* is not *"it is
+  downloading"*, and a moving bar over it promises progress that is not happening. The panel asks
+  `NetworkStatus` and says *waiting for an internet connection* instead (`docs/M7-RECOGNITION.md`
+  §5.1). Its sibling: **with animations off, an indeterminate bar draws nothing but its track** —
+  *Remove animations*, and every AVD here, which run at animator scale 0. Let the words carry a
+  state; the bar is decoration.
+- ⚠️ **A press whose follow-up runs after a long `await` must not live in `viewModelScope`.** The
+  model download did, so backing out mid-download kept ML Kit's transfer (it is Play Services') and
+  lost the step after it — queueing the library's first read — while the panel had already gone.
+  Same family as Back losing ink and *"`ViewModel.onCleared` cannot suspend"*: the scope dies, not
+  the callback. `RecognitionModelController` is process-scoped for this.
+- ⛔ **A guard that reads state before it queues drops whatever arrives mid-open — and a one-page
+  note cannot show it.** `NoteEditor.withPage` returned when `session` was null, while the editor's
+  own `init` promised that anything arriving during the open *"queues behind the open"*. A search
+  hit's page turn is sent from `NoteEditorViewModel.init`, so it was always mid-open and always
+  dropped: every hit in a multi-page note opened on page 1, with its box on empty paper. Both device
+  checks of the hit had used one-page notes, where *"stayed on page 1"* and *"turned to the hit's
+  page"* are the same pixels. When a feature selects among N things, check it with N > 1.
+  (`docs/LINE-SEGMENTATION-V2.md` §4.1.)
+- ⛔ **A segmenter that knew it could not read a page skipped it, and nothing said the page was
+  unread** (line segmentation version 2). M7's `LineSegmenter` saw columns on the user's physics mind
+  map and returned `MULTI_COLUMN`: the main note of the library had no searchable word for two
+  milestones, filed as *"M7 recognises nothing on the physics note"*. A page it *failed* to see
+  columns on was worse, read straight across the gutter, because the clustering had no horizontal
+  limit. **A rule meant to keep one small stroke attached is a chaining path in union-find**: the
+  mark rule that kept an i-dot on its letter joined a descender from one line to an ascender from
+  the next. Strokes like that attach as leaves now, after the lines exist.
+  `docs/LINE-SEGMENTATION-V2.md`.
+- ⚠️ **Per-page recall is the wrong instrument for line segmentation.** ML Kit reads a line fused
+  across two columns in stroke order and mostly gets the words. Version 1's fused chemistry page
+  found 48 of 56 known words and version 2 found 49. What fusing got wrong was *where*: `WordBoxes`
+  spread the words over both columns, so the hit highlight and the PDF's text layer were in the wrong
+  place. Measure the lines (draw them) and the boxes, not only the words.
+- ⛔ **A camera move made before a refit is undone by it** (search). `InkSurfaceView.highlight`
+  centred the camera on a hit when the hit arrived. That was while the note was still opening, and
+  the first layout and the page load both refit to the page's width afterwards. So every tapped
+  search hit opened the right note at its top, with the word off screen. The KDoc above it said a
+  hit *"is the one caller most likely to be early"*. Same family as REMOTE-PDF's *"one statement too
+  early"*: when a call's own documentation names the race, check the code wins it.
+- ⚠️ **A debug receiver's coroutine is frozen a few seconds after its broadcast returns.** The
+  cached-apps freezer suspends every thread (`cat /proc/<pid>/task/*/wchan` says `do_freezer_trap`).
+  The work then neither finishes nor fails, which looked exactly like an ML Kit deadlock at a random
+  line. A locked tablet freezes it at once. The debug receivers queue an expedited `DebugTaskWorker`
+  instead, and must wait for the enqueue to be written, or the process is frozen first and no job ever
+  appears. And WorkManager's jobs live in a namespace: `cmd jobscheduler run -f -n
+  androidx.work.systemjobscheduler dev.inkstone <id>`, or *"Could not find job"*.
+- ⚠️ **An emulator screenshot can be a frozen frame, and so can the console's own** (handwritten
+  maths). `adb exec-out screencap` and `adb emu screenrecord screenshot` both returned the app's
+  launch screen for minutes, while `uiautomator dump` showed the Write panel live and the app logged
+  every action. The tell is the status-bar clock: it read 10:14 in every capture, against a device
+  clock of 12:07. Two presses of the power key (`input keyevent 26` twice) made it draw again. Before
+  believing a screenshot, compare its clock with `adb shell date`.

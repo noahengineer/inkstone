@@ -201,6 +201,52 @@ and SPEC §8.1's metrics disclosure are on the button rather than behind it.
 ⚠️ **Nothing deletes previously recognised text when the model goes missing.** A model that has
 been removed is not evidence that the words it produced were wrong (CLAUDE.md rule 1).
 
+### 5.1 After the press (2026-10-13)
+
+*"I pressed download and I think it worked but there was no real way of knowing."* The whole of the
+feedback had been the chip's label changing to *Downloading…* and then the panel **vanishing** —
+which is also what it did when nothing happened — and the next search still found only titles,
+because the library had not been read yet. *My handwriting*'s chip had no feedback at all, and no
+size or metrics line in front of it either. Three more things were wrong underneath:
+
+- **The download ran in `LibraryViewModel`'s `viewModelScope`.** ML Kit's transfer survives the
+  activity; the step after it — queueing a read of every note — did not, so backing out mid-download
+  left the library unread until the periodic *charging and idle* batch.
+- **Offline, ML Kit waits instead of failing.** Measured on Test_Tablet in airplane mode: the request
+  stayed pending for over three minutes and completed 45 s after airplane mode was switched off. A moving bar
+  over that is a promise of progress that is not happening.
+- **An indeterminate bar draws nothing with animations off** (*Remove animations*, and every AVD
+  this repo uses, which run at animator scale 0) — only its track, and `Ink.SegmentTrack` over a
+  panel composited to (30,30,33) on (24,24,27).
+
+What it does now — one panel (`RecognitionModelPanel`) on both screens, driven by one process-wide
+`RecognitionModelController`:
+
+| State | Says | Shown in the library |
+|---|---|---|
+| `Offer` | the size and SPEC §8.1's metrics line, *Download English* | only while searching |
+| `Offer(error)` | *Download failed: …*, *Try again*, *Dismiss* | always — it answers a press |
+| `Downloading(waitingForNetwork = true)` | *Waiting for an internet connection*, no bar | always |
+| `Downloading` | a moving bar on a visible track | always |
+| `Reading(n, m)` | *✓ Model downloaded*, *reading n of m notes*, a filling bar | always |
+| `Ready` | *✓ Handwriting search is ready*, what it read, *OK* | always, until OK |
+
+The bar counts **the batch the download started**: one WorkManager job per note, all tagged with
+the download's id, so a note drawn on or synced in meanwhile cannot move it backwards. Two details
+make the count honest. The jobs are enqueued with `APPEND_OR_REPLACE` — `KEEP` drops a note whose
+earlier job is still pending, and the bar would stop one short for ever. And the controller knows
+how many it queued, so the frame between writing the rows and WorkManager reporting them reads
+*0 of 23*, not *ready*. A batch found still running after a restart is followed; one that finished
+while nobody watched is not announced again. *OK* clears it on both screens.
+
+Walked on Test_Tablet through the app (the model deleted through ML Kit with the debug-only
+`RecognitionModelReceiver`): offer only while searching → *Download English* in airplane mode →
+*waiting for an internet connection*, on the library and on *My handwriting* → network on → 22:01:03
+*downloading* → 22:01:30 *0 of 23* → 22:01:40 *21 of 23* → 22:02:30 *ready, every note had already
+been read* (the pages were current) → *Learn now* enabled itself → *OK* in the library cleared both
+screens. **Not seen:** the moving bar actually moving — the AVD's animator scale is 0 — and the
+panel on the tablet, whose model was already downloaded.
+
 ---
 
 ## 6. What ran, and on what
@@ -254,9 +300,10 @@ JVM-only. It compiled for Android and failed `compileKotlinIosArm64`.
   (`enqueueRecognition`) is what the device verification exercised, and it is the same `doWork`.
 - **Only `en-US` is offered from the UI.** `MlKitModels.available()` lists ten languages and
   nothing renders that list yet; a second language needs a picker, not new plumbing.
-- **Multi-column pages are skipped, not read.** SPEC §8.2 says to, and IAMonDo's own two-block
-  pages are why the sample's reference had to be re-sorted. Reading them properly is a real
-  feature and not this milestone's.
+- ~~**Multi-column pages are skipped, not read.**~~ **Read since `LineSegmenter` version 2
+  (2026-10).** Skipping them was worse than it looked: version 1's clustering had no horizontal
+  limit, so a page it *failed* to recognise as having columns was read straight across the gutter,
+  and a mind map it did recognise was not read at all. `docs/LINE-SEGMENTATION-V2.md`.
 - **`WordBoxes` falls back to apportioning a line's box by character count** when the gap-derived
   word count disagrees with the recogniser's. The box is then within a word or two along the
   right line rather than exact.

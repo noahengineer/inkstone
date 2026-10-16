@@ -1,0 +1,28 @@
+Hershey fonts: futural.jhf, scripts.jhf, cursive.jhf; and, for corpus v2's maths, mathlow.jhf and
+greeks.jhf (symbol sets: they only lend characters a writer's face lacks)
+Source: https://github.com/kamalmostafa/hershey-fonts (downloaded 2026-10-14). COPYING beside this
+file is that repository's own licence file, unmodified. The repository's hershey.txt, the file that
+accompanied the original Usenet distribution, states the same usage conditions (re-read 2026-10-14).
+
+COPYING has two parts. The GNU GPL v2 in its first half covers the repository's C library and
+tools, which are NOT used here. The .jhf font data is covered only by the Hershey usage
+conditions in its second half, quoted below.
+
+    This distribution of the Hershey Fonts may be used by anyone for any purpose, commercial
+    or otherwise, providing that:
+      1. The following acknowledgements must be distributed with the font data:
+         - The Hershey Fonts were originally created by Dr. A. V. Hershey while working at the
+           U. S. National Bureau of Standards.
+         - The format of the Font data in this distribution was originally created by
+           James Hurt
+           Cognition, Inc.
+           900 Technology Park Drive
+           Billerica, MA 01821
+           (mit-eddie!ci-dandelion!hurt)
+      2. The font data in this distribution may be converted into any other format *EXCEPT*
+         the format distributed by the U.S. NTIS (which organization holds the rights to the
+         distribution and use of the font data in that particular format).
+
+How Inkstone complies: the two acknowledgements travel with the data (here, in the corpus
+manifest synth.py writes, and in the .ihwm header export.py writes), and the data is only ever
+converted to synthetic pen trajectories -- never to the NTIS format.

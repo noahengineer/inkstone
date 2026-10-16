@@ -29,6 +29,9 @@ import androidx.lifecycle.lifecycleScope
 import dagger.hilt.android.AndroidEntryPoint
 import dev.inkstone.app.audio.RecordingController
 import dev.inkstone.app.calculator.CalculatorPreferences
+import dev.inkstone.app.handwriting.HandwritingScreen
+import dev.inkstone.app.handwriting.HandwritingViewModel
+import dev.inkstone.app.handwriting.ModelSpeedSpike
 import dev.inkstone.app.ink.EditorPreferences
 import dev.inkstone.app.library.FolderCoverImage
 import dev.inkstone.app.library.LibraryActions
@@ -83,6 +86,9 @@ class MainActivity : ComponentActivity() {
 
     /** SPEC §7.7's list. A third screen, not a dialog — see [NeedsAttentionScreen]. */
     private val attention: AttentionViewModel by viewModels()
+
+    /** Handwriting synthesis's *My handwriting*. Lazy: nothing is read until the screen is opened. */
+    private val handwriting: HandwritingViewModel by viewModels()
 
     /**
      * SPEC §7.6's foreground poll (M6).
@@ -282,7 +288,7 @@ class MainActivity : ComponentActivity() {
      * enum and not a sealed class: an enum is `Serializable`, which Compose's default saver already
      * accepts, so there is no custom `Saver` to keep in step with the cases.
      */
-    private enum class Showing { LIBRARY, TRASH, SYNC, ATTENTION }
+    private enum class Showing { LIBRARY, TRASH, SYNC, ATTENTION, HANDWRITING }
 
     /**
      * The four screens, extracted so [Content] stays about *state* and this stays about *routing*.
@@ -332,6 +338,9 @@ class MainActivity : ComponentActivity() {
                 modifier = padding,
             )
 
+            Showing.HANDWRITING ->
+                HandwritingScreen(handwriting, library::downloadRecognitionModel, { onShow(Showing.LIBRARY) }, padding)
+
             Showing.LIBRARY -> LibraryScreen(
                 state = libraryState,
                 modifier = padding,
@@ -351,6 +360,7 @@ class MainActivity : ComponentActivity() {
                         onShow(Showing.SYNC)
                     },
                     onOpenAttention = { onShow(Showing.ATTENTION) },
+                    onOpenHandwriting = { onShow(Showing.HANDWRITING) },
                     onImportFromNextcloud = {
                         // The folder on screen, so an adopted PDF is filed where the user is
                         // standing rather than at the root. It does not follow the file's remote
@@ -408,11 +418,14 @@ class MainActivity : ComponentActivity() {
         onMoveSyncedNote: (DocumentId) -> Unit,
         onOpenAttention: () -> Unit,
         onImportFromNextcloud: () -> Unit,
+        onOpenHandwriting: () -> Unit,
     ) = LibraryActions(
         onOpenAttention = onOpenAttention,
+        onOpenHandwriting = onOpenHandwriting,
         onOpenNote = ::openNote,
         onOpenHit = ::openHit,
         onDownloadModel = library::downloadRecognitionModel,
+        onDismissModelPanel = library::dismissModelPanel,
         onOpenFolder = library::openFolder,
         onGoUp = { library.goUp() },
         onNewNote = { library.createNote(::openNote) },
@@ -449,6 +462,7 @@ class MainActivity : ComponentActivity() {
         onStopSyncing = sync::unbind,
         onOpenNextcloud = { onOpenSync(null) },
         onFillForMeasurement = library::fillForMeasurement,
+        onMeasureHandwritingModel = { lifecycleScope.launch(Dispatchers.Default) { ModelSpeedSpike.run() } },
         thumbnail = library::thumbnail,
         folderCover = library::folderCover,
         // A drawn cover is an ordinary note in the ordinary editor — the same activity a

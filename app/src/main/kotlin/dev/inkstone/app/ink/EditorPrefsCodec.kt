@@ -58,7 +58,9 @@ internal object EditorPrefsCodec {
         put(SHAPE_SNAP, prefs.shapeSnapEnabled.toString())
         put(ARROW_HEADS, prefs.arrowHeads.toString())
         put(GRID_SNAP, prefs.gridSnapEnabled.toString())
+        put(NEATNESS, prefs.handwritingNeatness.toString())
         putAll(ChromeLayoutCodec.encode(prefs.layout))
+        putAll(SavedLayoutsCodec.encode(prefs.savedLayouts))
     }
 
     /**
@@ -67,6 +69,7 @@ internal object EditorPrefsCodec {
      */
     fun decode(stored: Map<String, String>): EditorPrefs {
         val max = stored.maxWidth()
+        val layout = ChromeLayoutCodec.decode(stored)
         return EditorPrefs(
             palette = stored.palette(),
             widthSlots = stored.widths(max),
@@ -80,7 +83,10 @@ internal object EditorPrefsCodec {
             shapeSnapEnabled = stored.flag(SHAPE_SNAP, true),
             arrowHeads = stored.flag(ARROW_HEADS, false),
             gridSnapEnabled = stored.flag(GRID_SNAP, false),
-            layout = ChromeLayoutCodec.decode(stored),
+            handwritingNeatness = stored[NEATNESS]?.toFloatOrNull()?.takeIf { it in 0f..1f }
+                ?: EditorPrefs.DEFAULT_NEATNESS,
+            layout = layout,
+            savedLayouts = SavedLayoutsCodec.decode(stored, layout),
         )
     }
 
@@ -170,4 +176,5 @@ internal object EditorPrefsCodec {
     private const val SHAPE_SNAP = "ink.shapeSnap"
     private const val ARROW_HEADS = "ink.arrowHeads"
     private const val GRID_SNAP = "ink.gridSnap"
+    private const val NEATNESS = "ink.handwriting.neatness"
 }

@@ -29,7 +29,7 @@ class ChromeLayoutTest {
     fun `the stock layout is the design's order with the design's dividers`() {
         val stock = ChromeLayout()
         assertEquals(
-            listOf("Draw", "Erase", "Laser", "|", "Select", "|", "Text", "Image", "Elements", "|", "Ruler"),
+            listOf("Draw", "Erase", "Laser", "|", "Select", "|", "Text", "Image", "Elements", "Write", "|", "Ruler"),
             withDividers(stock.visibleItemsOf(dock)),
         )
         assertEquals(
@@ -41,6 +41,48 @@ class ChromeLayoutTest {
         )
         assertTrue(stock.floating.isEmpty())
         assertTrue(ChromeBar.entries.all { stock.bar(BarId.Stock(it)) == BarLayout() })
+    }
+
+    @Test
+    fun `the stock shapes are a column of tools with the pen's row beside it and pills elsewhere`() {
+        // docs/UI-RAILS.md — the corner "L": "at least move the tools bar to the top left corner".
+        val stock = ChromeLayout()
+        assertEquals(ChromeArrangement.COLUMN, stock.arrangement(dock))
+        assertEquals(ChromeArrangement.ROW, stock.arrangement(draw))
+        assertEquals(ChromeArrangement.ROW, stock.arrangement(pages))
+        assertEquals(ChromeArrangement.ROW, stock.arrangement(history))
+        assertEquals(ChromeArrangement.ROW, stock.arrangement(zoom))
+        val floated = stock.floated(ChromeItem.UNDO, ChromePosition(0.5f, 0.5f))
+        val own = floated.floating.single()
+        assertEquals(ChromeArrangement.ROW, floated.arrangement(own), "a bar of your own starts as a pill")
+    }
+
+    @Test
+    fun `the pen's panel is a line per group with the four brushes two by two`() {
+        val lines = PanelShape.lines(ChromeLayout().visibleItemsOf(draw)).map { line ->
+            (if (line.startsGroup) "+" else "") + line.items.joinToString(" ") { it.label }
+        }
+        assertEquals(
+            listOf("+Fountain Ballpoint", "Pencil Highlighter", "+Width slider Width", "+Colours", "+Snap Arrow Grid"),
+            lines,
+        )
+    }
+
+    @Test
+    fun `a table written before the rails reads as the rails, unless a bar was moved by hand`() {
+        // What every device that had opened a note holds: each stock bar written as stock, `ROW` and all,
+        // because a row was the only stock there was — and no `ui.version`.
+        val untouched = ChromeBar.entries.associate { "ui.bar.${it.name}" to ",,1.0,ROW" }
+        assertEquals(ChromeLayout(), ChromeLayoutCodec.decode(untouched))
+        // The same table with the dock dragged somewhere: that row was arranged by hand and stays a row.
+        val moved = untouched + ("ui.bar.DOCK" to "0.3,0.9,1.0,ROW")
+        val read = ChromeLayoutCodec.decode(moved)
+        assertEquals(ChromeArrangement.ROW, read.arrangement(dock))
+        assertEquals(ChromePosition(0.3f, 0.9f), read.bar(dock).position)
+        assertEquals(ChromeLayout(), read.copy(bars = read.bars - dock), "every other bar reads as stock")
+        // A shape chosen in the old editor is kept.
+        val gridded = untouched + ("ui.bar.ZOOM" to ",,1.0,GRID_2")
+        assertEquals(ChromeArrangement.GRID_2, ChromeLayoutCodec.decode(gridded).arrangement(zoom))
     }
 
     @Test
@@ -118,10 +160,16 @@ class ChromeLayoutTest {
 
     @Test
     fun `a bar remembers its own arrangement`() {
-        val layout = ChromeLayout().arranged(dock, ChromeArrangement.COLUMN)
-        assertEquals(ChromeArrangement.COLUMN, layout.bar(dock).arrangement)
-        assertEquals(ChromeArrangement.ROW, layout.bar(pages).arrangement)
-        assertEquals(ChromeLayout(), layout.arranged(dock, ChromeArrangement.ROW))
+        val layout = ChromeLayout().arranged(dock, ChromeArrangement.ROW).arranged(pages, ChromeArrangement.COLUMN)
+        assertEquals(ChromeArrangement.ROW, layout.arrangement(dock))
+        assertEquals(ChromeArrangement.COLUMN, layout.arrangement(pages))
+        assertEquals(ChromeArrangement.ROW, layout.arrangement(zoom))
+        // A bar set back to its own stock shape is a bar never touched.
+        assertEquals(
+            ChromeLayout(),
+            layout.arranged(dock, ChromeArrangement.COLUMN).arranged(pages, ChromeArrangement.ROW),
+        )
+        assertEquals(ChromeLayout(), ChromeLayout().arranged(history, ChromeArrangement.ROW))
     }
 
     @Test
@@ -196,7 +244,8 @@ class ChromeLayoutTest {
     fun `every edit survives the codec through the editor's own prefs`() {
         val custom = customised()
         assertEquals(custom, ChromeLayoutCodec.decode(ChromeLayoutCodec.encode(custom)))
-        val prefs = EditorPrefs(layout = custom)
+        // As the editor holds it: a changed layout is always one of the saved ones (`SavedLayouts.synced`).
+        val prefs = EditorPrefs(layout = custom, savedLayouts = SavedLayouts().synced(custom))
         assertEquals(prefs, EditorPrefsCodec.decode(EditorPrefsCodec.encode(prefs)))
     }
 
@@ -279,8 +328,10 @@ class ChromeLayoutTest {
         .withPanelScale(ChromePanel.SELECTION, 1.5f)
         .placed(dock, ChromePosition(0.1f, 0.9f))
         .scaled(dock, 0.75f)
-        .arranged(dock, ChromeArrangement.COLUMN)
+        // ⚠️ `ROW` on purpose: the M10 dock, chosen, is no longer the stock and must survive the codec.
+        .arranged(dock, ChromeArrangement.ROW)
         .arranged(draw, ChromeArrangement.GRID_2)
+        .arranged(zoom, ChromeArrangement.PANEL)
         .placed(pages, ChromePosition(0.5f, 0f))
         .scaled(zoom, 1.5f)
         .movedTo(ChromeItem.TOOL_RULER, dock, 0)
@@ -292,6 +343,47 @@ class ChromeLayoutTest {
         .toggled(ChromeItem.TOOL_LASER)
         .toggled(ChromeItem.PAGE_SHARE)
         .toggled(ChromeItem.REDO)
+
+    @Test
+    fun `the panel column, floating panels and both style switches survive the codec`() {
+        // docs/LAYOUTS.md: everything a saved layout is made of has to come back.
+        val layout = ChromeLayout()
+            .withPanelSide(PanelSide.LEFT)
+            .panelMoved(DockSlot.CALCULATOR, -(DockSlot.entries.size - 1))
+            .panelPlaced(DockSlot.COLOUR, ChromePosition(0.25f, 0.75f))
+            .withBrushMenu(false)
+            .withCardStyle(CardStyle.ROW)
+            .withPanelScale(ChromePanel.ELEMENTS, 1.4f)
+        assertEquals(layout, ChromeLayoutCodec.decode(ChromeLayoutCodec.encode(layout)))
+        assertEquals(DockSlot.CALCULATOR, layout.orderedPanels.first())
+    }
+
+    @Test
+    fun `a table from before the panel settings is the stock column with the stock styles`() {
+        val old = ChromeLayoutCodec.encode(ChromeLayout())
+            .filterKeys { !it.startsWith("ui.panels") && !it.startsWith("ui.style") }
+        assertEquals(ChromeLayout(), ChromeLayoutCodec.decode(old))
+    }
+
+    @Test
+    fun `the calculator never floats through the layout, because its window has a place of its own`() {
+        assertEquals(ChromeLayout(), ChromeLayout().panelPlaced(DockSlot.CALCULATOR, ChromePosition(0.5f, 0.5f)))
+    }
+
+    @Test
+    fun `moving a panel past either end of the column leaves it at that end`() {
+        val first = ChromeLayout().panelMoved(DockSlot.ELEMENTS, -1)
+        assertEquals(ChromeLayout(), first)
+        val order = ChromeLayout().panelMoved(DockSlot.COLOUR, 9).orderedPanels
+        assertEquals(DockSlot.COLOUR, order.last())
+        assertEquals(DockSlot.entries.size, order.size)
+    }
+
+    @Test
+    fun `an order naming only some panels still has every panel, the rest after`() {
+        val layout = ChromeLayout(panelOrder = listOf(DockSlot.SIZE))
+        assertEquals(listOf(DockSlot.SIZE) + DockSlot.entries.filter { it != DockSlot.SIZE }, layout.orderedPanels)
+    }
 
     /** The bar as a user sees it: labels, with `|` wherever a divider is drawn. */
     private fun withDividers(items: List<ChromeItem>): List<String> = buildList {

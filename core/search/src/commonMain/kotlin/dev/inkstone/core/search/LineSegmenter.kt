@@ -34,17 +34,43 @@ import kotlin.math.min
  * 2. **Non-writing strokes are removed first** — see [isWriting]. They are the strokes that
  *    would otherwise chain two lines into one: a bracket spanning four lines, an underline
  *    running the width of the page.
- * 3. **Lines are connected components under vertical overlap**, not clusters of centre-y. A
- *    centre-based rule puts `l` and `o` on different lines because their centres genuinely
- *    differ by a third of an x-height; overlap normalised by the *shorter* box does not care.
- * 4. **A horizontal gap breaks the connection.** Without it, two columns whose lines happen to
- *    align become one line each, read straight across the gutter — the exact nonsense SPEC §8.2
- *    says to detect rather than emit.
- * 5. **Then the page is checked for columns and each line for rotation**, and anything failing
- *    is returned in [Segmentation.skipped] rather than dropped, so *"nothing was searchable"*
- *    and *"this page is a diagram"* are different answers.
+ * 3. **Lines are connected components under vertical overlap and a shared baseline**, not
+ *    clusters of centre-y. A centre-based rule puts `l` and `o` on different lines because their
+ *    centres genuinely differ by a third of an x-height; overlap normalised by the *shorter* box
+ *    does not care. See [sameLine].
+ * 4. **Two strokes join only if they are horizontally near, within a gutter's width of each
+ *    other.** That width is a multiple of the page's typical *line* height, which a first pass
+ *    by vertical overlap alone measures ([typicalLineHeight]). See [rows] for why this is
+ *    version 2's whole fix. Pieces of one line that no pair of strokes joined, at a descender on a
+ *    word boundary, are joined by their median baselines ([mergeNeighbours]).
+ * 5. **Rotated writing is detected and skipped** ([rotatedRuns], [isSlanted]), and returned in
+ *    [Segmentation.skipped] rather than dropped, so *"nothing was searchable"* and *"this page is
+ *    a diagram"* are different answers.
+ * 6. **A stroke left on its own joins the line it sits on, above or below** ([attach]): an
+ *    i-dot, a subscript, a capital whose foot missed the baseline. It joins one line and never
+ *    links two, which is why it is a step of its own and not a rule in [sameLine].
+ * 7. **Lines come back top to bottom.** On a page with columns that interleaves them, and that is
+ *    harmless: each line is recognised on its own, and search does not care about order. The one
+ *    thing order did decide was the recogniser's context, the previous line's text. That is now
+ *    [contextLineFor], the line directly above in the same column.
  */
 public object LineSegmenter {
+
+    /**
+     * Which segmentation drew a page's lines. It is part of the recogniser's id
+     * (`MlKitRecogniser.id`), so text read from lines an older version drew is read again once.
+     * Bump it whenever a change would draw different lines on some page.
+     *
+     * - **1** was M7.
+     * - **2** read columns and mind maps (docs/LINE-SEGMENTATION-V2.md). Version 1 joined
+     *   strokes across a page without any horizontal limit, so a two-column page was read
+     *   straight across its gutter, and the columns' lines chained down the page in a staircase.
+     *   It then skipped any page it could tell had columns, so a mind map was not read at all.
+     *   Version 2 also stopped a dot or a bar linking two lines ([attach]), measured big writing
+     *   against itself ([sameLine]), joined a line split at a descender ([mergeNeighbours]) and
+     *   stopped calling a stack of fractions a margin note ([rotatedRuns], [isSlanted]).
+     */
+    public const val VERSION: Int = 2
 
     /**
      * @param strokes one page's recognisable strokes, in draw order. Highlighter and other
@@ -65,20 +91,19 @@ public object LineSegmenter {
         // Re-derived from the writing alone: on a page that is mostly diagram, the first
         // median is the diagram's and every real line would be measured against it.
         val textScale = medianHeight(writing)
-        val groups = rows(writing, textScale).flatMap { row -> splitAtGutters(row) }
-
-        val columns = columnsOf(groups, textScale)
-        if (columns > 1) {
-            // Whole-page verdict, not per line: the failure is the reading *order*, and every
-            // line participates in it. Two columns of perfectly good lines still concatenate
-            // into nonsense, which is what SPEC §8.2 refuses to emit.
-            return Segmentation(emptyList(), skipped + skip(writing, SkipReason.MULTI_COLUMN))
-        }
+        // A first pass by vertical overlap alone, only to learn how tall a line is on this page.
+        val lineHeight = typicalLineHeight(rows(writing, textScale, maxGap = Float.MAX_VALUE), textScale)
+        val gutter = lineHeight * GUTTER_FACTOR
+        val groups = mergeNeighbours(
+            rows(writing, textScale, maxGap = gutter).flatMap { row -> splitAtGutters(row) },
+            textScale,
+            gutter,
+        )
 
         // One skipped region per *run*, not per stroke: a note written up the margin is one
         // thing the user did, and reporting it as eleven skipped letters would be true and
         // useless.
-        val turned = rotatedRuns(groups)
+        val turned = rotatedRuns(groups, gutter)
         for (run in turned) skipped += skip(run, SkipReason.ROTATED)
         val turnedIds = turned.flatMapTo(HashSet()) { run -> run.map { it.id } }
 
@@ -91,21 +116,45 @@ public object LineSegmenter {
         // order lifted word recall from 0.313 to 0.378 for no cost.
         //
         // So the strokes keep the order they arrived in, and only the *lines* are sorted
-        // spatially. `isRotated` still asks its question of the x-ordered view, because a
-        // baseline is a spatial property.
+        // spatially.
         val order = HashMap<ObjectId, Int>(strokes.size)
         for ((index, stroke) in strokes.withIndex()) order[stroke.id] = index
 
-        val lines = ArrayList<TextLine>(groups.size)
+        val kept = ArrayList<List<SampledStroke>>(groups.size)
+        val loose = ArrayList<SampledStroke>()
         for (group in groups) {
-            if (group.any { it.id in turnedIds }) continue
-            if (isRotated(group.sortedBy { it.bounds.left })) {
-                skipped += skip(group, SkipReason.ROTATED)
-            } else {
-                lines += lineOf(group.sortedBy { order[it.id] ?: 0 })
+            when {
+                group.any { it.id in turnedIds } -> Unit
+                isSlanted(group, textScale) -> skipped += skip(group, SkipReason.ROTATED)
+                group.size == 1 -> loose += group.single()
+                else -> kept += group
             }
         }
+        val lines = attach(loose, kept, textScale, gutter).map { line ->
+            lineOf(line.sortedBy { order[it.id] ?: 0 })
+        }
         return Segmentation(lines.sortedBy { it.writingArea.centreY }, skipped)
+    }
+
+    /**
+     * The line whose text is [line]'s recognition context: the nearest of [lines] *above* it that it
+     * overlaps horizontally, by at least [CONTEXT_OVERLAP] of the narrower of the two, within
+     * [CONTEXT_GAP_LINES] of its own height. Null when there is none.
+     *
+     * The previous line in page order is the wrong answer as soon as a page has columns: it is
+     * usually the line *beside* this one, across the gutter. ML Kit treats the context as the text
+     * the writer had just written, so a wrong one is worse than none (SPEC §8.2 step 4).
+     */
+    public fun contextLineFor(line: TextLine, lines: List<TextLine>): TextLine? {
+        val area = line.writingArea
+        return lines
+            .filter { other ->
+                val above = other.writingArea
+                above.bottom <= area.centreY &&
+                    area.top - above.bottom <= area.height * CONTEXT_GAP_LINES &&
+                    horizontalOverlapShare(above, area) >= CONTEXT_OVERLAP
+            }
+            .maxByOrNull { it.writingArea.bottom }
     }
 
     // -----------------------------------------------------------------------
@@ -150,26 +199,41 @@ public object LineSegmenter {
     // -----------------------------------------------------------------------
 
     /**
-     * ⭐ **Step one: rows, by vertical overlap alone — no horizontal test whatsoever.**
+     * ⭐ **Rows: strokes joined by vertical overlap, and only when they are within [maxGap] of each
+     * other horizontally.**
      *
-     * The first version of this refused to join two strokes more than a few median stroke
-     * heights apart, meaning to keep two columns separate. Measured against 20 real pages it
-     * found **632 lines where there were 472**, and drawing the boxes over the ink showed why
-     * immediately: it had split every line into its individual *words*. The threshold was
-     * scaled to the median **stroke** height — roughly one letter — while the gap it had to
-     * tolerate is a word space, which is a fraction of the **line** height. Those two scales
-     * differ by about three times in ordinary handwriting, and the wrong one put the cut-off
-     * squarely between "letters in a word" and "words in a line".
+     * **Version 1 had no horizontal test here at all, and that was the bug**
+     * (docs/LINE-SEGMENTATION-V2.md). Its first draft had refused to join strokes more than a few median
+     * *stroke* heights apart.
+     * On 20 real pages that split every line into its words (632 lines where there were 472), because
+     * a word space is a fraction of the *line* height, about three times a stroke's. So the test was
+     * removed, and the horizontal question was left to [splitAtGutters], after the row existed. But by
+     * then the damage is done:
+     * - A line in one column joins the line beside it in the other.
+     * - That line, at a different pitch, joins the *next* line of the first column.
+     * - Union-find chains the staircase down the page.
      *
-     * The line height is not known until the row exists, so the horizontal question cannot be
-     * asked here at all. It is asked in [splitAtGutters], where the answer is available.
+     * On the user's two-column chemistry page that fused three and four lines at a time, across both
+     * columns. The row was then several lines tall, so [splitAtGutters]'s threshold, a multiple of the
+     * row's own height, was wider than the gutter it should have found.
+     *
+     * The fix keeps version 1's lesson about the unit and puts the test back where the chaining
+     * happens. [maxGap] is a multiple of the page's typical *line* height, which a first pass with no
+     * limit at all measures ([typicalLineHeight]). Within a line almost every word space is far
+     * narrower, so a line stays connected through its own neighbours. Nothing can bridge an empty
+     * gutter, because a link needs two strokes that are themselves within [maxGap].
+     *
+     * The errors are deliberately on the side of splitting. The widest word spaces on the user's pages
+     * are about two line heights, and a line cut there is two pieces each read on its own: a little
+     * context lost for the recogniser, nothing for search. A line read across a gutter loses both, and
+     * puts its words' boxes in the wrong column.
      *
      * Union-find over a window rather than all pairs: strokes are sorted by `top`, so once a
      * candidate's `top` is more than a line below the current stroke's `bottom` it cannot
      * overlap this one or any later one and the scan stops. A 2 000-stroke lecture page stays
      * near-linear instead of four million comparisons.
      */
-    private fun rows(strokes: List<SampledStroke>, scale: Float): List<List<SampledStroke>> {
+    private fun rows(strokes: List<SampledStroke>, scale: Float, maxGap: Float): List<List<SampledStroke>> {
         val sorted = strokes.sortedBy { it.bounds.top }
         val parent = IntArray(sorted.size) { it }
 
@@ -178,13 +242,31 @@ public object LineSegmenter {
             for (j in i + 1 until sorted.size) {
                 val b = sorted[j].bounds
                 if (b.top > a.bottom + scale) break
-                if (sameLine(a, b, scale)) union(parent, i, j)
+                if (a.horizontalGapTo(b) <= maxGap && sameLine(a, b, scale)) union(parent, i, j)
             }
         }
 
         val groups = LinkedHashMap<Int, MutableList<SampledStroke>>()
         for (i in sorted.indices) groups.getOrPut(find(parent, i)) { ArrayList() } += sorted[i]
         return groups.values.toList()
+    }
+
+    /**
+     * How tall a line of writing is on this page: the median height of [rows] holding more than
+     * one stroke.
+     *
+     * A one-stroke row is a dot, a stray mark or a lone letter. It says nothing about a line's
+     * height, and on a sparse page such rows outnumber the lines. A row fused from several lines
+     * is taller than a line, which is why this is a median: most rows are single lines, even on the
+     * pages that needed version 2.
+     */
+    private fun typicalLineHeight(rows: List<List<SampledStroke>>, scale: Float): Float {
+        val heights = rows
+            .filter { it.size > 1 }
+            .map { row -> row.maxOf { it.bounds.bottom } - row.minOf { it.bounds.top } }
+            .sorted()
+        if (heights.isEmpty()) return scale * LONE_LINE_HEIGHT
+        return max(heights[heights.size / 2], scale)
     }
 
     /**
@@ -204,17 +286,135 @@ public object LineSegmenter {
      * line. So two strokes belong to the same line when their **bottoms** agree to within
      * [BASELINE_TOLERANCE] — which is wide enough for a `g` and narrower than a line's pitch.
      *
-     * ⚠️ **With one exception, or every `i` loses its dot.** A dot, a `t` bar and an accent are
-     * separate strokes that share no baseline with anything; they sit directly *above* the
-     * letter they belong to. So a small mark also joins when it is horizontally on top of its
-     * neighbour. Without this they become singletons, and a page of singletons is then a page
-     * the rotated-text detector starts guessing about.
+     * The tolerance is measured in the page's text scale, **or in the smaller stroke's own height
+     * when that is larger.** A heading written three times the size of the notes under it wobbles
+     * three times as far off its baseline, and measured against the notes' scale its letters fell
+     * apart into fragments. The tolerance only ever grows, so small writing is judged exactly as it
+     * was in version 1.
+     *
+     * ⚠️ **Version 1 had a second way in, and it chained lines.** A dot, a `t` bar or an accent
+     * shares no baseline with anything, so a small mark also joined any neighbour whose height it
+     * sat within. Between two close lines, an i-dot sits in the band of a descender from the line
+     * above *and* of an ascender from the line below, so one dot joined both and fused the two
+     * lines. On the user's chemistry page that read *"How to work out what"* and the line under it
+     * as one line. Marks now join their line afterwards, in [attach], which can join a mark to one
+     * line and cannot join two lines to each other.
      */
     private fun sameLine(a: PageRect, b: PageRect, scale: Float): Boolean {
         if (a.verticalOverlap(b) < MIN_VERTICAL_OVERLAP) return false
-        if (abs(a.bottom - b.bottom) <= scale * BASELINE_TOLERANCE) return true
-        val mark = min(a.height, b.height) <= scale * MARK_HEIGHT_FRACTION
-        return mark && a.horizontalGapTo(b) <= scale * MARK_GAP_FACTOR
+        val size = max(scale, min(a.height, b.height))
+        return abs(a.bottom - b.bottom) <= size * BASELINE_TOLERANCE
+    }
+
+    /**
+     * ⭐ **Join the pieces of one line that [rows] left apart**: groups of two or more strokes side by
+     * side, within [gutter] of each other, on one baseline.
+     *
+     * [rows] links two strokes, and a word boundary can leave no pair that qualifies. In the user's
+     * *"Equations with squareds"*, the `q` of *Eq* hangs too far below the `u` beside it for their
+     * bottoms to agree, and the `E` before it is 26 pt from that `u`, past the 21 pt gutter. Version 1
+     * read that heading whole only because it had no gutter at all; the first draft of version 2 read
+     * *"Eq"* and *"uations with squareds"*, and a search for *equations* found neither. A group's
+     * baseline is the **median** of its strokes' bottoms, so one descender cannot move it, and the
+     * tolerance is [sameLine]'s.
+     *
+     * Two groups may overlap horizontally by no more than half the narrower one's width: more than
+     * that is one group above the other, not beside it. A lone stroke is not merged here but attached
+     * in [attach], as a leaf.
+     *
+     * Measured over the user's 183 pages, this cut the suspected mid-word splits by more than a third
+     * (84 to 54) and added one fused line. A guard against merging writing of different sizes was
+     * tried and dropped: it mostly stopped equations being read whole, whose fractions and exponents
+     * give the two halves different median heights.
+     */
+    private fun mergeNeighbours(
+        groups: List<List<SampledStroke>>,
+        scale: Float,
+        gutter: Float,
+    ): List<List<SampledStroke>> {
+        val multi = groups.filter { it.size > 1 }
+        if (multi.size < 2) return groups
+        val boxes = multi.map { group -> group.map { it.bounds }.reduce(PageRect::union) }
+        val baselines = multi.map { group -> medianOf(group.map { it.bounds.bottom }) }
+        val sizes = multi.map { group -> max(medianOf(group.map { it.bounds.height }), MIN_SCALE_PT) }
+        val order = multi.indices.sortedBy { boxes[it].top }
+        val parent = IntArray(multi.size) { it }
+
+        for ((x, i) in order.withIndex()) {
+            val a = boxes[i]
+            for (y in x + 1 until order.size) {
+                val j = order[y]
+                val b = boxes[j]
+                if (b.top > a.bottom) break
+                val gap = a.horizontalGapTo(b)
+                val beside = gap <= gutter && -gap <= min(a.width, b.width) * MERGE_OVERLAP_SHARE
+                val level = a.verticalOverlap(b) >= MIN_VERTICAL_OVERLAP &&
+                    abs(baselines[i] - baselines[j]) <= max(scale, min(sizes[i], sizes[j])) * BASELINE_TOLERANCE
+                if (beside && level) union(parent, i, j)
+            }
+        }
+
+        val merged = LinkedHashMap<Int, MutableList<SampledStroke>>()
+        for (i in multi.indices) merged.getOrPut(find(parent, i)) { ArrayList() } += multi[i]
+        return merged.values.toList() + groups.filter { it.size == 1 }
+    }
+
+    /**
+     * ⭐ **Give each stroke that is still on its own to the line it belongs to**, or leave it a line
+     * of its own when there is none.
+     *
+     * Who is left on their own after [rows]: an i-dot or an accent, which sits above its letter and
+     * shares no baseline with anything; a subscript, which sits below; a capital, or a letter of a
+     * drifting hand, whose foot missed the baseline by a little more than the tolerance; the bars of
+     * an `E` or a `t`. As lines of their own each of them was handed to the recogniser as a word,
+     * came back as a stray character in the index, and left a word short of a stroke. That was half
+     * the lines version 2 first drew on the user's pages.
+     *
+     * A stroke joins the line whose box its centre is inside, or the nearest line within
+     * [ATTACH_ABOVE] text scales above it or [ATTACH_BELOW] below. The line must be no further away
+     * than [gutter] horizontally, and no shorter than the stroke over [ATTACH_TALLER]. Ties go to the
+     * nearer line horizontally, then to the line whose middle is nearest the stroke's.
+     *
+     * ⚠️ **The lines' boxes are measured once, before anything joins them.** A stroke that joins a
+     * line therefore cannot widen it to reach the next stroke. Joining is a leaf operation: it adds
+     * a stroke to one line and never links two lines, which is why the marks moved here out of
+     * [sameLine] (see there).
+     */
+    private fun attach(
+        loose: List<SampledStroke>,
+        lines: List<List<SampledStroke>>,
+        scale: Float,
+        gutter: Float,
+    ): List<List<SampledStroke>> {
+        val boxes = lines.map { line -> line.map { it.bounds }.reduce(PageRect::union) }
+        val joined = lines.mapTo(ArrayList()) { ArrayList(it) }
+        val alone = ArrayList<List<SampledStroke>>()
+        for (stroke in loose) {
+            val host = hostFor(stroke.bounds, boxes, scale, gutter)
+            if (host == null) alone += listOf(stroke) else joined[host] += stroke
+        }
+        return joined + alone
+    }
+
+    /** The line [mark] fits best, by [Fit]'s order; on a tie, the first. */
+    private fun hostFor(mark: PageRect, boxes: List<PageRect>, scale: Float, gutter: Float): Int? = boxes.indices
+        .mapNotNull { index -> fitOf(mark, boxes[index], scale, gutter)?.let { fit -> index to fit } }
+        .minWithOrNull(compareBy({ it.second.off }, { it.second.gap }, { it.second.middle }))
+        ?.first
+
+    /** How far [mark] is from [box] vertically, then horizontally, then from its middle. */
+    private class Fit(val off: Float, val gap: Float, val middle: Float)
+
+    /** Null when [mark] cannot join the line in [box] at all. */
+    private fun fitOf(mark: PageRect, box: PageRect, scale: Float, gutter: Float): Fit? {
+        val gap = mark.horizontalGapTo(box)
+        if (mark.height > box.height * ATTACH_TALLER || gap > gutter) return null
+        val off = when {
+            mark.centreY < box.top -> (box.top - mark.centreY).takeIf { it <= scale * ATTACH_ABOVE }
+            mark.centreY > box.bottom -> (mark.centreY - box.bottom).takeIf { it <= scale * ATTACH_BELOW }
+            else -> 0f
+        } ?: return null
+        return Fit(off, max(gap, 0f), abs(mark.centreY - box.centreY))
     }
 
     /**
@@ -252,21 +452,6 @@ public object LineSegmenter {
         return blocks
     }
 
-    private fun find(parent: IntArray, index: Int): Int {
-        var root = index
-        while (parent[root] != root) {
-            parent[root] = parent[parent[root]]
-            root = parent[root]
-        }
-        return root
-    }
-
-    private fun union(parent: IntArray, a: Int, b: Int) {
-        val rootA = find(parent, a)
-        val rootB = find(parent, b)
-        if (rootA != rootB) parent[rootB] = rootA
-    }
-
     private fun lineOf(ordered: List<SampledStroke>): TextLine {
         var box = ordered.first().bounds
         for (stroke in ordered.drop(1)) box = box.union(stroke.bounds)
@@ -274,42 +459,8 @@ public object LineSegmenter {
     }
 
     // -----------------------------------------------------------------------
-    // The two things SPEC §8.2 says to detect and skip
+    // The one thing SPEC §8.2 still says to detect and skip
     // -----------------------------------------------------------------------
-
-    /**
-     * How many horizontally disjoint blocks the lines fall into.
-     *
-     * Measured on the *lines*, not the strokes: the gap between two words is the same shape as
-     * the gutter between two columns, and only a gap that persists down the page tells them
-     * apart. Requiring [MIN_COLUMN_LINES] lines on each side is what stops a single indented
-     * paragraph from reading as a second column.
-     */
-    private fun columnsOf(groups: List<List<SampledStroke>>, scale: Float): Int {
-        if (groups.size < MIN_COLUMN_LINES * 2) return 1
-        val spans = groups.map { group ->
-            val left = group.minOf { it.bounds.left }
-            val right = group.maxOf { it.bounds.right }
-            left to right
-        }.sortedBy { it.first }
-
-        var blocks = 1
-        var blockRight = spans.first().second
-        var linesInBlock = 1
-        var linesBefore = 0
-        for ((left, right) in spans.drop(1)) {
-            if (left - blockRight > scale * COLUMN_GUTTER_FACTOR) {
-                if (linesInBlock >= MIN_COLUMN_LINES && linesBefore + linesInBlock >= MIN_COLUMN_LINES) blocks++
-                linesBefore += linesInBlock
-                linesInBlock = 1
-                blockRight = right
-            } else {
-                linesInBlock++
-                blockRight = max(blockRight, right)
-            }
-        }
-        return if (blocks > 1 && linesInBlock >= MIN_COLUMN_LINES) blocks else 1
-    }
 
     /**
      * ⭐ Strokes that read as a line **only if the page is turned** — a note written up the margin.
@@ -328,14 +479,20 @@ public object LineSegmenter {
      *
      * Only singletons are offered, so a page of ordinary writing does no work here and a bullet
      * that sits beside its own line of text is never a candidate.
+     *
+     * ⚠️ **The run gets the same [gutter] as a line.** Transposed, the gap between two strokes is
+     * the vertical gap between them on the page, and letters written up a margin are as close as
+     * letters written across it. Version 1 had no limit here, and version 2 first kept that, so on
+     * the user's physics page numerators, fraction bars and denominators stacked down a column of
+     * equations chained into one "margin note" 440 pt tall, and 263 strokes went unread.
      */
-    private fun rotatedRuns(groups: List<List<SampledStroke>>): List<List<SampledStroke>> {
+    private fun rotatedRuns(groups: List<List<SampledStroke>>, gutter: Float): List<List<SampledStroke>> {
         val singles = groups.filter { it.size == 1 }.map { it.single() }
         if (singles.size < MIN_ROTATED_RUN) return emptyList()
 
         val byId = singles.associateBy { it.id }
         val turned = singles.map { it.copy(bounds = transpose(it.bounds)) }
-        return rows(turned, medianHeight(turned))
+        return rows(turned, medianHeight(turned), maxGap = gutter)
             .filter { it.size >= MIN_ROTATED_RUN }
             // Back to the untransposed strokes, so the reported region is where the writing
             // actually is rather than where it would be if the page were turned.
@@ -364,23 +521,37 @@ public object LineSegmenter {
         return box.height > box.width * MIN_ROTATED_ASPECT
     }
 
-    private fun transpose(bounds: PageRect): PageRect =
-        PageRect(left = bounds.top, top = bounds.left, right = bounds.bottom, bottom = bounds.right)
-
     /**
-     * Whether the line's baseline drifts too far from horizontal to be read as one line.
+     * Whether a line's baseline slopes too far from horizontal for it to be read as one line.
      *
-     * The baseline is taken from the *bottoms* of the boxes rather than their centres, because
-     * a capital at the start of a sentence moves the centre and not the baseline. A one-stroke
-     * line has no slope; [rotatedRuns] is what covers those.
+     * The baseline is the line of the strokes' *bottoms*, not their centres, because a capital at
+     * the start of a sentence moves the centre and not the baseline. Its slope is the median bottom
+     * of the right half of the letters against the median bottom of the left half, over the
+     * distance between the halves' median centres: a dot or a descender moves a median by one place
+     * at most.
+     *
+     * ⚠️ **Version 1 measured the first stroke against the last, and that made letters rotated.** A
+     * capital `I` with serifs is three strokes, two bars and a stem, and the first bar's bottom is
+     * the letter's height above the stem's: a slope of five. So were a `t` and its bar, an `F`, a
+     * fraction and its bar, and every short group with a dot. Below [MIN_SLANT_LETTERS] letters, or
+     * [MIN_SLANT_WIDTH] text scales across, a group is too short to have a measurable baseline and is
+     * never called slanted. Marks are not counted as letters at all. A line written up the margin is
+     * still found, by [rotatedRuns].
      */
-    private fun isRotated(ordered: List<SampledStroke>): Boolean {
-        if (ordered.size < 2) return false
-        val first = ordered.first().bounds
-        val last = ordered.last().bounds
-        val run = last.left - first.left
-        val rise = last.bottom - first.bottom
-        if (abs(run) < MIN_SCALE_PT) return abs(rise) > MIN_SCALE_PT
+    private fun isSlanted(group: List<SampledStroke>, scale: Float): Boolean {
+        val letters = group
+            .filter { it.bounds.height > scale * MARK_HEIGHT_FRACTION }
+            .sortedBy { it.bounds.centreX }
+        if (letters.size < MIN_SLANT_LETTERS) return false
+        val left = letters.minOf { it.bounds.left }
+        val right = letters.maxOf { it.bounds.right }
+        if (right - left < scale * MIN_SLANT_WIDTH) return false
+        val half = letters.size / 2
+        val first = letters.take(half)
+        val last = letters.takeLast(half)
+        val run = medianOf(last.map { it.bounds.centreX }) - medianOf(first.map { it.bounds.centreX })
+        if (run <= 0f) return false
+        val rise = medianOf(last.map { it.bounds.bottom }) - medianOf(first.map { it.bounds.bottom })
         return !isNearHorizontal(rise, run, MAX_BASELINE_SLOPE)
     }
 
@@ -441,14 +612,23 @@ public object LineSegmenter {
      * and column gutters run to several, so the two populations are far apart and the exact
      * value is not delicate — but the *scale* is, and getting it wrong the first time (median
      * stroke height, about a third of this) split every line into its words.
+     *
+     * [rows], [rotatedRuns] and [attach] measure it in the page's typical line height, and
+     * [splitAtGutters] in the row's own.
      */
     private const val GUTTER_FACTOR = 1.5f
 
-    /** Fewer lines than this on one side of a gap is an indent, not a column. */
-    private const val MIN_COLUMN_LINES = 3
+    /**
+     * A page with no row of two strokes has no line to measure. Its line height is taken as this
+     * many median stroke heights, the ratio an ordinary hand shows between the two.
+     */
+    private const val LONE_LINE_HEIGHT = 3f
 
-    /** The same question at page scale, where the unit available is the median stroke height. */
-    private const val COLUMN_GUTTER_FACTOR = 6f
+    /** The share of the narrower line's width a line above must cover to be its context. */
+    private const val CONTEXT_OVERLAP = 0.3f
+
+    /** How far above, in the line's own height, a line may be and still be its context. */
+    private const val CONTEXT_GAP_LINES = 2f
 
     /** A margin note is a narrow vertical band: this many times taller than wide, at least. */
     private const val MIN_ROTATED_ASPECT = 3f
@@ -456,18 +636,81 @@ public object LineSegmenter {
     /**
      * How far two strokes' bottoms may differ and still be one line, in median stroke heights.
      *
-     * 1.2. A descender drops well under one x-height below the baseline, and the next line's
+     * 0.7. A descender drops well under one x-height below the baseline, and the next line's
      * baseline is a line pitch away — 1.5 to 2.5 x-heights in ordinary handwriting. The value
      * sits in that gap, and both populations are wide enough that it is not delicate.
      */
     private const val BASELINE_TOLERANCE = 0.7f
 
-    /** A stroke this short is a mark rather than a letter — an i-dot, a t-bar, an accent. */
+    /**
+     * A stroke this short is a mark rather than a letter — an i-dot, a t-bar, an accent — and
+     * [isSlanted] does not measure a baseline from it.
+     */
     private const val MARK_HEIGHT_FRACTION = 0.6f
-
-    /** …and it belongs to the letter it is sitting on top of, so it must be right above it. */
-    private const val MARK_GAP_FACTOR = 0.5f
 
     /** ~11°. Enough for a sloping hand on unruled paper, not enough for writing up a margin. */
     private const val MAX_BASELINE_SLOPE = 0.2f
+
+    /** Fewer letters than this have no baseline worth measuring: see [isSlanted]. */
+    private const val MIN_SLANT_LETTERS = 4
+
+    /** …nor does a group narrower than this many text scales. */
+    private const val MIN_SLANT_WIDTH = 4f
+
+    /**
+     * How far above a line's box a lone stroke's centre may be and still join it, in text scales.
+     * One: an i-dot over a word with no ascenders sits about that far above the x-height.
+     */
+    private const val ATTACH_ABOVE = 1f
+
+    /**
+     * …and below it. Half: a subscript or a missed descender hangs below the baseline by less than
+     * that, and the next line's ascenders start not much further down.
+     */
+    private const val ATTACH_BELOW = 0.5f
+
+    /** A stroke this many times taller than a line is not part of it: a bracket beside it. */
+    private const val ATTACH_TALLER = 1.3f
+
+    /**
+     * How far two groups may overlap horizontally, as a share of the narrower one's width, and still be
+     * side by side for [mergeNeighbours]. Further than that, one is above the other.
+     */
+    private const val MERGE_OVERLAP_SHARE = 0.5f
+}
+
+// ---------------------------------------------------------------------------
+// Plain helpers, outside the object so its own count stays about the segmenter
+// ---------------------------------------------------------------------------
+
+/** How much of the narrower box's width the other box covers horizontally, 0 to 1. */
+private fun horizontalOverlapShare(a: PageRect, b: PageRect): Float {
+    val narrower = min(a.width, b.width)
+    if (narrower <= 0f) return 0f
+    return ((min(a.right, b.right) - max(a.left, b.left)) / narrower).coerceIn(0f, 1f)
+}
+
+/** The middle value, or the mean of the middle two. [values] must not be empty. */
+private fun medianOf(values: List<Float>): Float {
+    val sorted = values.sorted()
+    val middle = sorted.size / 2
+    return if (sorted.size % 2 == 1) sorted[middle] else (sorted[middle - 1] + sorted[middle]) / 2f
+}
+
+private fun transpose(bounds: PageRect): PageRect =
+    PageRect(left = bounds.top, top = bounds.left, right = bounds.bottom, bottom = bounds.right)
+
+private fun find(parent: IntArray, index: Int): Int {
+    var root = index
+    while (parent[root] != root) {
+        parent[root] = parent[parent[root]]
+        root = parent[root]
+    }
+    return root
+}
+
+private fun union(parent: IntArray, a: Int, b: Int) {
+    val rootA = find(parent, a)
+    val rootB = find(parent, b)
+    if (rootA != rootB) parent[rootB] = rootA
 }

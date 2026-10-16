@@ -16,6 +16,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -84,13 +85,14 @@ internal fun ChromeHost(
     ui: InkUiState,
     geometry: ChromeGeometry,
     modifier: Modifier = Modifier,
+    pagesInRow: Boolean = ui.layout.arrangement(PagesBar) == ChromeArrangement.ROW,
     content: @Composable () -> Unit,
 ) {
     Layout(
         content = content,
         modifier = modifier.fillMaxSize().onGloballyPositioned { geometry.origin = it.positionInRoot() },
     ) { measurables, constraints ->
-        val (placed, space) = measureChrome(measurables, constraints, ui)
+        val (placed, space) = measureChrome(measurables, constraints, ui, pagesInRow)
         geometry.update(space)
         layout(constraints.maxWidth, constraints.maxHeight) {
             val order = ChromeBar.entries.map(BarId::Stock) +
@@ -116,13 +118,14 @@ private val DrawBar = BarId.Stock(ChromeBar.DRAW)
 private val PagesBar = BarId.Stock(ChromeBar.PAGES)
 
 /**
- * Every bar measured against the screen less its edges — except the page bar in its stock slot, which
- * is measured into what history and zoom leave of the bottom edge.
+ * Every bar measured against the screen less its edges — except the page bar in its stock slot as a
+ * row, which is measured into what history and zoom leave of the bottom edge.
  */
 private fun MeasureScope.measureChrome(
     measurables: List<Measurable>,
     constraints: Constraints,
     ui: InkUiState,
+    pagesInRow: Boolean,
 ): Pair<Map<Any, Placeable>, HostSpace> {
     val width = constraints.maxWidth
     val edge = InkDims.EdgePadding.roundToPx()
@@ -132,23 +135,87 @@ private fun MeasureScope.measureChrome(
     )
     val byKey = measurables.mapNotNull { m -> m.layoutId?.let { it to m } }.toMap()
     val placed = HashMap<Any, Placeable>()
-    byKey.forEach { (key, measurable) -> if (key != PagesBar) placed[key] = measurable.measure(loose) }
+    byKey.forEach { (key, measurable) ->
+        if (key != PagesBar &&
+            key != DrawBar
+        ) {
+            placed[key] = measurable.measure(loose)
+        }
+    }
 
+    val (left, right) = bottomGap(placed, ui, width, edge)
+    byKey[PagesBar]?.let { pages ->
+        val between = loose.copy(maxWidth = (right - left).coerceAtLeast(0))
+        placed[PagesBar] = pages.measure(if (pagesInRow && ui.isStock(ChromeBar.PAGES)) between else loose)
+    }
+    val (utilityRight, calculatorLeft) = utilityCorner(placed, ui, width - edge)
+    byKey[DrawBar]?.let { draw -> placed[DrawBar] = draw.measure(drawRoom(placed, ui, loose, utilityRight)) }
+    return placed to HostSpace(
+        width.toFloat(),
+        constraints.maxHeight.toFloat(),
+        edge.toFloat(),
+        density,
+        left,
+        right,
+        utilityRight.toFloat(),
+        calculatorLeft,
+    )
+}
+
+/** What history and zoom, in their stock corners, leave of the bottom edge for the page bar, in px. */
+private fun MeasureScope.bottomGap(placed: Map<Any, Placeable>, ui: InkUiState, width: Int, edge: Int): Pair<Int, Int> {
     val zoneGap = ZoneGap.roundToPx()
     val history = placed[BarId.Stock(ChromeBar.HISTORY)]?.takeIf { it.width > 0 && ui.isStock(ChromeBar.HISTORY) }
     val zoom = placed[BarId.Stock(ChromeBar.ZOOM)]?.takeIf { it.width > 0 && ui.isStock(ChromeBar.ZOOM) }
-    val left = edge + (history?.let { it.width + zoneGap } ?: 0)
-    val right = width - edge - (zoom?.let { it.width + zoneGap } ?: 0)
-    byKey[PagesBar]?.let { pages ->
-        val between = loose.copy(maxWidth = (right - left).coerceAtLeast(0))
-        placed[PagesBar] = pages.measure(if (ui.isStock(ChromeBar.PAGES)) between else loose)
-    }
-    return placed to HostSpace(width.toFloat(), constraints.maxHeight.toFloat(), edge.toFloat(), density, left, right)
+    return edge + (history?.let { it.width + zoneGap } ?: 0) to width - edge - (zoom?.let { it.width + zoneGap } ?: 0)
 }
 
 /**
- * The host's own px, the density its dp were measured in, and the stock page bar's span — passed
- * around as one value.
+ * The room the pen's row has: everything, unless it is the top edge between a column of tools in the
+ * top-left corner and the record chip in the top-right — the corner "L" (docs/UI-RAILS.md). Measured
+ * into that gap, the row scrolls (and fades at its end) on a narrow screen rather than running under
+ * the record chip, which is the M10 page bar's lesson applied to the top edge.
+ */
+private fun MeasureScope.drawRoom(
+    placed: Map<Any, Placeable>,
+    ui: InkUiState,
+    loose: Constraints,
+    utilityRight: Int,
+): Constraints {
+    val dock = placed[DockBar]?.takeIf { it.width > 0 && it.height > it.width && ui.isStock(ChromeBar.DOCK) }
+        ?: return loose
+    val record = placed[BarId.Stock(ChromeBar.RECORD)]?.takeIf { it.width > 0 && ui.isStock(ChromeBar.RECORD) }
+    val gap = DockRowGap.roundToPx()
+    val end = utilityRight - (record?.let { it.width + UtilityGap.roundToPx() } ?: 0)
+    val start = InkDims.EdgePadding.roundToPx() + dock.width + gap
+    return loose.copy(maxWidth = (end - start).coerceIn(0, loose.maxWidth))
+}
+
+/**
+ * Where the record chip's right edge goes, and whether the calculator takes the top-*left* corner.
+ *
+ * ⭐ The calculator takes the top-right corner and the record chip sits beside it, so the record pill
+ * grows *leftwards* when a lecture starts and the calculator never moves under a finger.
+ *
+ * ⚠️ Not while the tools are a row across the top: that is M10's dock, which in portrait already abuts
+ * the record chip, and a second pill beside it would run under the dock. The calculator then goes back
+ * to the top-left corner it had, so a user who chose the row gets M10's top edge exactly.
+ */
+private fun MeasureScope.utilityCorner(
+    placed: Map<Any, Placeable>,
+    ui: InkUiState,
+    rightEdge: Int,
+): Pair<Int, Boolean> {
+    val dock = placed[DockBar]?.takeIf { it.width > 0 }
+    val dockAcross = dock != null && dock.width > dock.height && ui.isStock(ChromeBar.DOCK)
+    val calculator = placed[BarId.Stock(ChromeBar.CALCULATOR)]
+        ?.takeIf { it.width > 0 && ui.isStock(ChromeBar.CALCULATOR) && !dockAcross }
+    return rightEdge - (calculator?.let { it.width + UtilityGap.roundToPx() } ?: 0) to dockAcross
+}
+
+/**
+ * The host's own px, the density its dp were measured in, the stock page bar's span as a row, and
+ * where the record chip's right edge goes — passed around as one value.
  */
 internal class HostSpace(
     val width: Float,
@@ -157,21 +224,52 @@ internal class HostSpace(
     val density: Float,
     val pagesLeft: Int = 0,
     val pagesRight: Int = 0,
+    val utilityRight: Float = width - edge,
+    val calculatorLeft: Boolean = false,
 )
 
-/** The stock top-left of [id]'s whole child, edit handles included. A floating bar's is the middle. */
+/**
+ * The stock top-left of [id]'s whole child, edit handles included. A floating bar's is the middle.
+ *
+ * ⭐ **The tools and the pages go by their measured shape**, not by a name (docs/UI-RAILS.md). Taller
+ * than wide — a column, or a grid that came out tall — and the tools sit in the **top-left corner**
+ * (the pen's row then runs along the top beside them), and the pages down the right. Wider than tall
+ * and they are the original M10 dock across the top and page bar across the bottom, slot for slot — so
+ * a user who sets the tools back to a row gets exactly what shipped before, and the Element editor's
+ * Done bar, which stands in the page bar's place, still sits along the bottom.
+ *
+ * ⚠️ The corner and not centred top to bottom: centred, the column was in the middle of the page's
+ * left margin, where people write, with empty space above it that nothing used — *"taking up a lot
+ * of unnecessary space … at least move the tools bar to the top left corner"*.
+ */
 private fun stockSlot(id: BarId, placeable: Placeable, space: HostSpace): Offset {
     val w = placeable.width.toFloat()
     val h = placeable.height.toFloat()
     val bottom = space.height - space.edge - h
-    if (id !is BarId.Stock) return Offset((space.width - w) / 2f, (space.height - h) / 2f)
+    val middle = (space.height - h) / 2f
+    val upright = h > w
+    if (id !is BarId.Stock) return Offset((space.width - w) / 2f, middle)
+    val right = space.width - space.edge - w
     return when (id.bar) {
-        ChromeBar.DOCK, ChromeBar.DRAW -> Offset((space.width - w) / 2f, space.edge)
-        ChromeBar.RECORD -> Offset(space.width - space.edge - w, space.edge)
-        ChromeBar.CALCULATOR -> Offset(space.edge, space.edge)
+        ChromeBar.DOCK, ChromeBar.DRAW -> if (upright) {
+            Offset(space.edge, space.edge)
+        } else {
+            Offset((space.width - w) / 2f, space.edge)
+        }
+
+        ChromeBar.RECORD -> Offset(space.utilityRight - w, space.edge)
+
+        ChromeBar.CALCULATOR -> Offset(if (space.calculatorLeft) space.edge else right, space.edge)
+
         ChromeBar.HISTORY -> Offset(space.edge, bottom)
-        ChromeBar.ZOOM -> Offset(space.width - space.edge - w, bottom)
-        ChromeBar.PAGES -> Offset(space.pagesLeft + (space.pagesRight - space.pagesLeft - w) / 2f, bottom)
+
+        ChromeBar.ZOOM -> Offset(right, bottom)
+
+        ChromeBar.PAGES -> if (upright) {
+            Offset(right, middle)
+        } else {
+            Offset(space.pagesLeft + (space.pagesRight - space.pagesLeft - w) / 2f, bottom)
+        }
     }
 }
 
@@ -192,10 +290,28 @@ private fun InkUiState.place(
     val stored = layout.bar(id).position ?: if (id is BarId.Floating) ChromePosition(HALF, HALF) else null
     val base = stored?.topLeft(pillW, pillH, space.width, space.height, space.edge)?.let { Offset(it.first, it.second) }
         ?: Offset(stock.x + left, stock.y)
-    val pill = clamped(base + chromeDrag.offsetFor(id), pillW, pillH, space)
-    geometry.pills[id] = Rect(pill, Size(pillW, pillH))
+    var pill = clamped(base + chromeDrag.offsetFor(id), pillW, pillH, space)
+    if (chromeDrag.isMoving(id)) {
+        // ⭐ Lined up with the screen and the other bars when it comes near (docs/LAYOUTS.md). The commit
+        // on lift reads the pill recorded below, so what snapped is what is kept.
+        val followers = if (id == DockBar) setOf(id, DrawBar) else setOf(id)
+        val others = geometry.pillsNow().filterKeys { it !in followers }.values.toList()
+        val snapped = BarSnap.snap(
+            Rect(pill, Size(pillW, pillH)),
+            others,
+            Size(space.width, space.height),
+            space.edge,
+            SnapReach.value * space.density,
+        )
+        pill = clamped(pill + snapped.by, pillW, pillH, space)
+        geometry.snapGuide = snapped
+    }
+    geometry.record(id, Rect(pill, Size(pillW, pillH)))
     return Offset(pill.x - left, pill.y)
 }
+
+/** How near a dragged bar comes to lining up before it snaps. */
+private val SnapReach = 12.dp
 
 /**
  * The dock's second row — the pen's settings — placed against the dock: centred **below** it; **above**
@@ -204,7 +320,7 @@ private fun InkUiState.place(
  * so a column of tools down one side opens its settings into the page rather than across itself.
  */
 private fun InkUiState.placeSecondary(row: Placeable, space: HostSpace, geometry: ChromeGeometry): Offset {
-    val dock = geometry.pills[DockBar] ?: return Offset.Zero
+    val dock = geometry.pillNow(DockBar) ?: return Offset.Zero
     val (left, right) = insets(DrawBar, space.density)
     val w = (row.width - left - right).coerceAtLeast(0f)
     val h = row.height.toFloat()
@@ -217,7 +333,7 @@ private fun InkUiState.placeSecondary(row: Placeable, space: HostSpace, geometry
         Offset(dock.center.x - w / 2f, if (above) dock.top - gap - h else dock.bottom + gap)
     }
     val pill = clamped(wanted, w, h, space)
-    geometry.pills[DrawBar] = Rect(pill, Size(w, h))
+    geometry.record(DrawBar, Rect(pill, Size(w, h)))
     return Offset(pill.x - left, pill.y)
 }
 
@@ -252,19 +368,97 @@ private fun InkUiState.insets(id: BarId, density: Float): Pair<Float, Float> {
 
 /**
  * Where each bar's pill was last placed, in [ChromeHost]'s px, and where the host itself is. Written in
- * the layout passes and read by a drag's commit — plain fields, never state: nothing should recompose
- * because a bar was placed.
+ * the layout passes and read by a drag's commit.
+ *
+ * ⭐ **What opens around the chrome reads it too** — the right-hand panel column (`PanelDock`) finds
+ * its top and bottom from the bars in the corners, and a contextual bar keeps off a column of tools
+ * (docs/UI-RAILS.md). Those read [pill], which subscribes to [revision]; it is bumped only when a
+ * pill actually *changes*, so a layout pass that puts every bar where it already was invalidates
+ * nothing and the chrome cannot drive itself round a loop. A drag in the layout editor bumps it per
+ * frame, which is the one time anything should follow a bar.
  */
+@Stable
 internal class ChromeGeometry {
-    val pills = HashMap<BarId, Rect>()
+    private val pills = HashMap<BarId, Rect>()
+    private var revision by mutableIntStateOf(0)
 
     /** The host's top-left in root px — what turns a finger's root position into the host's own. */
     var origin: Offset = Offset.Zero
     private var space = HostSpace(0f, 0f, 0f, 1f)
 
+    /** The right-hand panel column, which takes its top and bottom from the bars placed here. */
+    val dock: PanelDock = PanelDock(this)
+
     fun update(next: HostSpace) {
         space = next
     }
+
+    /** Written by the placement pass. */
+    fun record(id: BarId, rect: Rect) {
+        if (id == DrawBar && rect.width > 0f && rect.height > 0f) rememberRow(rect)
+        if (pills[id] == rect) return
+        pills[id] = rect
+        revision++
+    }
+
+    /** The pen's row at its full height, for while a contextual bar has folded it away. */
+    private var lastRow: Rect? = null
+
+    /**
+     * ⚠️ The row folds with an animation (`DockSecondary`, `shrinkVertically`), so it is recorded at every
+     * height on its way to nothing. Only a row at least as tall, or one that has moved, replaces the one
+     * kept — otherwise the kept row is the last sliver of the animation, and the column under it rose
+     * anyway (found on the emulator, after the first fix).
+     */
+    private fun rememberRow(rect: Rect) {
+        val last = lastRow
+        if (last == null || rect.height >= last.height || (rect.topLeft - last.topLeft).getDistance() > 1f) {
+            lastRow = rect
+        }
+    }
+
+    /**
+     * Every placed pill, with the pen's row at its full height even while a contextual bar folds it away —
+     * what the panel column measures its space from. Without it, a left-hand column under the row rose to
+     * the top of the screen the moment something was selected and fell back when it was not (found on
+     * the emulator).
+     */
+    fun pillsWithFoldedRow(): Collection<Rect> {
+        val others = pills().filterKeys { it != DrawBar }.values
+        return others + listOfNotNull(lastRow?.takeIf { DrawBar in pills })
+    }
+
+    /** [id]'s pill in the host's px, or null before it has been placed. Read from composition, this follows it. */
+    fun pill(id: BarId): Rect? {
+        revision
+        return pills[id]?.takeIf { it.width > 0f && it.height > 0f }
+    }
+
+    /** Every placed pill, in the host's px. Read from composition, this follows them. */
+    fun pills(): Map<BarId, Rect> {
+        revision
+        return pills.filterValues { it.width > 0f && it.height > 0f }
+    }
+
+    /** The host's own size and edge padding, in px — what [pill]s are positioned within. */
+    val width: Float get() = space.width
+    val height: Float get() = space.height
+    val edge: Float get() = space.edge
+
+    /**
+     * The upright bars among [bars] — a column of tools down the side — which a contextual bar keeps
+     * out from under (`ContextBarPlacement.place`).
+     */
+    fun keepOut(bars: Collection<BarId>): List<Rect> = bars.mapNotNull(::pill).filter { it.height > it.width }
+
+    /** [id]'s pill without subscribing — for a gesture's commit, which must not recompose anything. */
+    fun pillNow(id: BarId): Rect? = pills[id]
+
+    /** Every placed pill without subscribing — what a bar being dragged snaps to, read in placement. */
+    fun pillsNow(): Map<BarId, Rect> = pills.filterValues { it.width > 0f && it.height > 0f }
+
+    /** What the bar or panel under the finger has lined up with, drawn as guides; null otherwise. */
+    var snapGuide by mutableStateOf<Snapped?>(null)
 
     /** The position that keeps [id] exactly where it is on screen now. */
     fun positionOf(id: BarId): ChromePosition? = pills[id]?.let { pill ->
@@ -300,6 +494,9 @@ class ChromeDrag {
     private var startWidth = 1f
 
     fun offsetFor(target: BarId): Offset = if (bar == target) offset else Offset.Zero
+
+    /** True while [target] is being moved — not resized, which snaps nothing. */
+    fun isMoving(target: BarId): Boolean = bar == target && scale == null
 
     fun scaleFor(target: BarId): Float? = if (bar == target) scale else null
 
@@ -391,7 +588,7 @@ internal fun ChromeBarFrame(id: BarId, ui: InkUiState, geometry: ChromeGeometry,
             // pixel it is offered, and measured in order it left the grip after it zero wide — the
             // page bar, in its stock slot, had no resize grip at all (found on the emulator).
             val slotted = Modifier.weight(1f, fill = false)
-            val row = ui.layout.bar(id).arrangement == ChromeArrangement.ROW
+            val row = ui.layout.arrangement(id) == ChromeArrangement.ROW
             val shape = if (row) InkDims.Pill else InkDims.PanelCorner
             val edge = if (chosen) ChosenOutline else EditOutline
             val tint = if (chosen) Ink.Accent else Ink.Focus
@@ -441,8 +638,12 @@ private fun MoveHandle(id: BarId, ui: InkUiState, geometry: ChromeGeometry) {
                 onDragEnd = {
                     geometry.positionOf(id)?.let { ui.layout = ui.layout.placed(id, it) }
                     ui.chromeDrag.end()
+                    geometry.snapGuide = null
                 },
-                onDragCancel = { ui.chromeDrag.end() },
+                onDragCancel = {
+                    ui.chromeDrag.end()
+                    geometry.snapGuide = null
+                },
             )
         }
         .pointerInput(id) { detectTapGestures(onTap = { ui.selectedBar = id }) }
@@ -460,7 +661,7 @@ private fun ResizeGrip(id: BarId, ui: InkUiState, geometry: ChromeGeometry) {
             onDragStart = { at ->
                 ui.selectedBar = id
                 val from = ui.layout.bar(id).scale
-                val width = geometry.pills[id]?.width ?: 1f
+                val width = geometry.pillNow(id)?.width ?: 1f
                 where.root(at)?.let { ui.chromeDrag.beginResize(id, it, from, width) }
             },
             onDrag = { change, _ ->
@@ -541,6 +742,9 @@ internal class RootMapper {
 
 /** `ZONE_GAP` from the `Row` this replaced: the space between the three bottom bars. */
 private val ZoneGap = 28.dp
+
+/** Between the record chip and the calculator chip in the top-right corner — two pills, not one. */
+private val UtilityGap = InkDims.GroupGap
 private val HandleWidth = 26.dp
 private val HandleHeight = 34.dp
 private val HandleGap = 6.dp

@@ -1,28 +1,23 @@
 package dev.inkstone.app.ink
 
-import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Dp
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import dev.inkstone.android.ink.InkSelection
+import dev.inkstone.app.ui.CardFlow
 import dev.inkstone.app.ui.ChipDivider
 import dev.inkstone.app.ui.ChipKind
-import dev.inkstone.app.ui.GlassBar
+import dev.inkstone.app.ui.GlassCard
+import dev.inkstone.app.ui.GlassStrip
 import dev.inkstone.app.ui.InkDims
 import dev.inkstone.app.ui.MicroLabel
 import dev.inkstone.app.ui.Readout
@@ -69,12 +64,13 @@ import androidx.compose.ui.text.style.TextAlign as ComposeTextAlign
  *   *"hides the Dynamic Dock's secondary row to maintain focus"*.
  */
 @Composable
-fun ContextBars(
+internal fun ContextBars(
     ui: InkUiState,
     objects: ObjectToolState,
     actions: InkToolbarActions,
     objectActions: ObjectActions,
     onSummon: (PanelKind, Rect) -> Unit,
+    geometry: ChromeGeometry,
     modifier: Modifier = Modifier,
 ): Boolean {
     val editing = objects.editing
@@ -88,9 +84,9 @@ fun ContextBars(
                 editing.bounds,
                 ui.camera,
                 clearsGrips = false,
-                hidden = false,
                 layout = ui.layout,
                 panel = ChromePanel.TEXT,
+                geometry = geometry,
                 modifier = modifier,
             ) {
                 TextFormatBar(editing.id, objects, ui.slots, objectActions, onSummon)
@@ -103,31 +99,35 @@ fun ContextBars(
         // the lift would move the chrome every time the user touched a selection.
         image != null -> {
             val chrome = ui.selectionChrome.takeIf { ui.selectionSize > 0 }
-            AnchoredBar(
-                chrome ?: image.bounds,
-                ui.camera,
-                clearsGrips = chrome != null,
-                hidden = ui.selectionManipulating,
-                layout = ui.layout,
-                panel = ChromePanel.IMAGE,
-                modifier = modifier,
-            ) {
-                ImageBar(ui, objects, actions, objectActions)
+            if (!ui.selectionManipulating) {
+                AnchoredBar(
+                    chrome ?: image.bounds,
+                    ui.camera,
+                    clearsGrips = chrome != null,
+                    layout = ui.layout,
+                    panel = ChromePanel.IMAGE,
+                    geometry = geometry,
+                    modifier = modifier,
+                ) {
+                    ImageBar(ui, objects, actions, objectActions)
+                }
             }
             true
         }
 
         selection != null -> {
-            AnchoredBar(
-                ui.selectionChrome ?: selection,
-                ui.camera,
-                clearsGrips = true,
-                hidden = ui.selectionManipulating,
-                layout = ui.layout,
-                panel = ChromePanel.SELECTION,
-                modifier = modifier,
-            ) {
-                SelectionBar(ui, objects, actions, onSummon)
+            if (!ui.selectionManipulating) {
+                AnchoredBar(
+                    ui.selectionChrome ?: selection,
+                    ui.camera,
+                    clearsGrips = true,
+                    layout = ui.layout,
+                    panel = ChromePanel.SELECTION,
+                    geometry = geometry,
+                    modifier = modifier,
+                ) {
+                    SelectionBar(ui, objects, actions, onSummon)
+                }
             }
             true
         }
@@ -144,67 +144,96 @@ fun ContextBars(
  * un-pressable and looks like the feature is broken — the same class of defect as a tool that owns
  * touch and swallows the gesture beneath it (`EditorTool.IMAGE`).
  *
- * The bar is invisible for its first frame. It has to be measured before it can be centred, and the
- * alternative to hiding it is a visible jump from the top-left corner on every selection.
- *
  * ⚠️ **[clearsGrips] keeps the bar out of the grips' touch reach, not just off their drawing.** A
  * selection's anchor is its *chrome* (`InkSelection.chromeBounds`, which reaches up to the rotate
  * grip); anchored to the box alone with the 14 dp gap, the bar sat squarely on the rotate grip.
  *
- * ⚠️ **[hidden] for the length of a drag.** The bar is placed from where the selection was at
- * pen-down, so while the pen moves it stands still over whatever the object is being dragged across —
- * *"it only updates its position once you let go … hard to see what you are doing"*. Not composed at
- * all while hidden, so none of its chips can take a stray press either.
+ * ⚠️ **Not composed for the length of a drag** — the call sites skip it while
+ * `InkUiState.selectionManipulating`. The bar is placed from where the selection was at pen-down, so
+ * while the pen moves it would stand still over whatever the object is being dragged across — *"it only
+ * updates its position once you let go … hard to see what you are doing"*. Not composed at all, so none
+ * of its chips can take a stray press either.
+ *
+ * ⭐ **A card of two lines, not a pill of one** (docs/UI-RAILS.md). The selection's bar was 810 dp
+ * across on the emulator — two thirds of a landscape tablet — for a bar about one object. Each bar
+ * now says *what to do with it* on its first line and *what it looks like* on its second, at about
+ * half the width. It keeps clear of the tools and the panels ([geometry], host px) as it keeps clear of
+ * the dock.
+ *
+ * ⭐ **Placed in the layout pass, from the card's intrinsic sizes** (`ContextBarPlacement.spot`). Where
+ * the card fits depends on how tall it is, and how tall it is depends on the width it is given, because
+ * its lines wrap — so the placement asks the card its height at each width it considers rather than
+ * measuring once and moving it a frame later. It is never drawn in the wrong place first, either: the
+ * old version had to hide its first frame, or it jumped in from the top-left corner on every selection.
  */
 @Composable
 private fun AnchoredBar(
     bounds: PageRect,
     camera: Camera,
     clearsGrips: Boolean,
-    hidden: Boolean,
     layout: ChromeLayout,
     panel: ChromePanel,
+    geometry: ChromeGeometry,
     modifier: Modifier = Modifier,
-    content: @Composable RowScope.() -> Unit,
+    content: @Composable () -> Unit,
 ) {
-    if (hidden) return
-    BoxWithConstraints(modifier = modifier.fillMaxSize()) {
-        var size by remember { mutableStateOf(IntSize.Zero) }
-        val density = LocalDensity.current
-        val gap = with(density) { InkDims.ContextGap.toPx() }
-        val reach = with(density) { InkSelection.HANDLE_REACH_DP.dp.toPx() }
-        val pad = with(density) { InkDims.EdgePadding.toPx() }
-        val safeTop = with(density) { layout.dockSafeTop().toPx() }
-
+    // ⭐ At this bar's own size (`ChromeLayout.panelScale`). The placement stays in the screen's own px:
+    // it is about where the *object* is, and the object is not scaled.
+    Layout(
+        content = {
+            ScaledChrome(layout.panelScale(panel)) {
+                // ⭐ A card whose lines wrap, or one scrolling row — the layout's choice (docs/LAYOUTS.md).
+                if (layout.cardStyle == CardStyle.ROW) GlassStrip(content = content) else GlassCard { content() }
+            }
+        },
+        modifier = modifier.fillMaxSize(),
+    ) { measurables, constraints ->
+        val card = measurables.first()
         val topLeft = pageToView(PagePoint(bounds.left, bounds.top), camera)
         val bottomRight = pageToView(PagePoint(bounds.right, bounds.bottom), camera)
-        val (x, y) = ContextBarPlacement.place(
-            anchorLeft = topLeft.x,
-            anchorTop = topLeft.y,
-            anchorRight = bottomRight.x,
-            anchorBottom = bottomRight.y,
-            barWidth = size.width.toFloat(),
-            barHeight = size.height.toFloat(),
-            viewportWidth = constraints.maxWidth.toFloat(),
-            viewportHeight = constraints.maxHeight.toFloat(),
-            clearance = if (clearsGrips) max(gap, reach) else gap,
-            edgePadding = pad,
-            safeTop = safeTop,
-        )
-
-        // ⭐ At this bar's own size (`ChromeLayout.panelScale`). The placement above stays in the screen's
-        // own px: it is about where the *object* is, and the object is not scaled.
-        ScaledChrome(layout.panelScale(panel)) {
-            GlassBar(
-                modifier = Modifier
-                    .offset { IntOffset(x.roundToInt(), y.roundToInt()) }
-                    .onSizeChanged { size = it }
-                    .alpha(if (size == IntSize.Zero) 0f else 1f),
-                content = content,
+        val gap = InkDims.ContextGap.toPx()
+        val heights = HashMap<Int, Float>()
+        // Read here rather than in composition, so a panel opening or a bar moving re-places the card
+        // without recomposing it.
+        val panels = geometry.dock.occupied()
+        val spotFor = { naturalWidth: Float, heightAt: (Float) -> Float ->
+            ContextBarPlacement.spot(
+                anchor = Rect(topLeft.x, topLeft.y, bottomRight.x, bottomRight.y),
+                naturalWidth = naturalWidth,
+                heightAt = heightAt,
+                viewport = Size(constraints.maxWidth.toFloat(), constraints.maxHeight.toFloat()),
+                clearance = if (clearsGrips) max(gap, InkSelection.HANDLE_REACH_DP.dp.toPx()) else gap,
+                edgePadding = InkDims.EdgePadding.toPx(),
+                safeTop = layout.dockSafeTop().toPx(),
+                reach = CardReach.toPx(),
+                minWidth = MinCardWidth.toPx(),
+                rails = geometry.keepOut(RailBars) + panels,
+                chrome = geometry.pills().values + panels,
             )
+        }
+        // The width the card may have, from its intrinsic sizes …
+        val allowed = spotFor(card.maxIntrinsicWidth(constraints.maxHeight).toFloat()) { width ->
+            heights.getOrPut(width.toInt()) { card.maxIntrinsicHeight(width.toInt()).toFloat() }
+        }
+        val placeable = card.measure(Constraints(maxWidth = allowed.width.toInt(), maxHeight = constraints.maxHeight))
+        // … and where it goes at the width it took. A card whose lines wrapped is narrower than the width
+        // it was allowed — as wide as its longest line — and centring the allowance instead left it hard
+        // against one side of its gap, found on the emulator. Any space narrower than the card is refused
+        // here, because the card has already been measured and cannot be made narrower again.
+        val settled = spotFor(placeable.width.toFloat()) { width ->
+            if (width >= placeable.width) placeable.height.toFloat() else Float.POSITIVE_INFINITY
+        }
+        layout(constraints.maxWidth, constraints.maxHeight) {
+            placeable.place(settled.x.roundToInt(), settled.y.roundToInt())
         }
     }
 }
+
+/** How far above and below an object a contextual card may end up — what its free width is measured over. */
+private val CardReach = 160.dp
+
+/** Narrower than this and a card would be a tower of single chips; it falls back to the screen's width. */
+private val MinCardWidth = 280.dp
 
 /**
  * Where a contextual bar may start: clear of the dock's first row while the dock is in its stock
@@ -233,22 +262,35 @@ private fun ChromeLayout.dockSafeTop(): Dp = if (bar(Dock).position == null &&
  * hide the ink drawn over it (ROADMAP M8b asks for fill to *exist*, not for a panel to set it from).
  */
 @Composable
-private fun RowScope.SelectionBar(
+private fun SelectionBar(
     ui: InkUiState,
     objects: ObjectToolState,
     actions: InkToolbarActions,
     onSummon: (PanelKind, Rect) -> Unit,
 ) {
-    EditTextChip(objects, actions)
-    // ⚠️ **No "N selected" caption.** The bar's own presence says something is selected and the
-    // handles on the page say which — a count repeated in words is the kind of caption the design
-    // review removed everywhere else, and this one survived a round because it reads as data.
-    TextChip(label = "Delete", danger = true, onClick = actions.onDeleteSelection)
-    TextChip(label = "Duplicate", onClick = actions.onDuplicateSelection)
-    Segmented {
-        SegmentChip(label = "Front", selected = false, onClick = actions.onBringSelectionToFront)
-        SegmentChip(label = "Back", selected = false, onClick = actions.onSendSelectionToBack)
+    // ⭐ Line one is what to *do* with the selection; line two is what it *looks like*.
+    CardFlow {
+        EditTextChip(objects, actions)
+        // ⭐ docs/HANDWRITING-SYNTHESIS.md §6.2.
+        dev.inkstone.app.handwriting.HandwritingChips(objects.write, objects.text)
+        // ⚠️ **No "N selected" caption.** The bar's own presence says something is selected and the
+        // handles on the page say which — a count repeated in words is the kind of caption the design
+        // review removed everywhere else, and this one survived a round because it reads as data.
+        TextChip(label = "Delete", danger = true, onClick = actions.onDeleteSelection)
+        TextChip(label = "Duplicate", onClick = actions.onDuplicateSelection)
+        Segmented {
+            SegmentChip(label = "Front", selected = false, onClick = actions.onBringSelectionToFront)
+            SegmentChip(label = "Back", selected = false, onClick = actions.onSendSelectionToBack)
+        }
+        ChipDivider()
+        SaveAsElementChip(actions)
     }
+    CardFlow { SelectionLook(ui, actions, onSummon) }
+}
+
+/** The selection bar's second line: width, fill, corners, shape, knockout, route and colour. */
+@Composable
+private fun RowScope.SelectionLook(ui: InkUiState, actions: InkToolbarActions, onSummon: (PanelKind, Rect) -> Unit) {
     TextChip(
         label = "${ui.pen.widthDp.roundToInt()} dp",
         kind = ChipKind.VALUE,
@@ -281,7 +323,7 @@ private fun RowScope.SelectionBar(
         )
     }
     ShapeGeometryChips(ui, actions)
-    ElementChips(ui, actions)
+    ElementLookChips(ui, actions)
     if (ui.selectedConnectors > 0) {
         ChipDivider()
         ConnectorRoute.entries.forEach { route ->
@@ -398,33 +440,36 @@ private fun RowScope.EditTextChip(objects: ObjectToolState, actions: InkToolbarA
  * rather than the sentence.
  */
 @Composable
-private fun RowScope.TextFormatBar(
+private fun TextFormatBar(
     id: ObjectId?,
     state: ObjectToolState,
     slots: List<Int>,
     actions: ObjectActions,
     onSummon: (PanelKind, Rect) -> Unit,
 ) {
-    FontAndSize(id, state, actions)
-    AlignAndLists(id, state, actions)
-    ChipDivider()
-    SwatchStrip(
-        colors = slots.take(QUICK_SLOTS),
-        selectedArgb = state.style.colorArgb,
-        onPick = { argb ->
-            state.style = state.style.copy(colorArgb = argb)
-            actions.onColourChanged(id, argb)
-        },
-        onMore = { onSummon(PanelKind.COLOUR, it) },
-    )
-    ChipDivider()
-    TextChip(
-        label = "Done",
-        onClick = {
-            actions.onTextChanged(id, state.draft)
-            state.stopEditing()
-        },
-    )
+    // ⭐ Line one is the letters — face, size, colour — and the way out; line two is the paragraph.
+    CardFlow {
+        FontAndSize(id, state, actions)
+        ChipDivider()
+        SwatchStrip(
+            colors = slots.take(QUICK_SLOTS),
+            selectedArgb = state.style.colorArgb,
+            onPick = { argb ->
+                state.style = state.style.copy(colorArgb = argb)
+                actions.onColourChanged(id, argb)
+            },
+            onMore = { onSummon(PanelKind.COLOUR, it) },
+        )
+        ChipDivider()
+        TextChip(
+            label = "Done",
+            onClick = {
+                actions.onTextChanged(id, state.draft)
+                state.stopEditing()
+            },
+        )
+    }
+    CardFlow { AlignAndLists(id, state, actions) }
 }
 
 /** Family and size. Both are `SetFormat`, never `SetTextContent` — SPEC §4.9.2. */
@@ -507,7 +552,7 @@ private fun RowScope.AlignAndLists(id: ObjectId?, state: ObjectToolState, action
  * `SetTransform` carrying a negated matrix — absolute, like everything else in that register.
  */
 @Composable
-private fun RowScope.ImageBar(
+private fun ImageBar(
     ui: InkUiState,
     state: ObjectToolState,
     actions: InkToolbarActions,
@@ -515,49 +560,76 @@ private fun RowScope.ImageBar(
 ) {
     val focused = state.image ?: return
     if (state.cropping != null) {
-        TextChip(label = "Done", onClick = { state.commitCrop(objectActions) })
-        TextChip(label = "Reset", onClick = { state.resetCrop() })
-        TextChip(label = "Cancel", onClick = { state.cancelCrop() })
+        CardFlow {
+            TextChip(label = "Done", onClick = { state.commitCrop(objectActions) })
+            TextChip(label = "Reset", onClick = { state.resetCrop() })
+            TextChip(label = "Cancel", onClick = { state.cancelCrop() })
+        }
         return
     }
-    TextChip(label = "Rotate", onClick = { objectActions.onTurn(focused.id, QUARTER_TURN, false, false) })
-    Segmented {
-        SegmentChip(label = "Flip ⇄", selected = false, onClick = { objectActions.onTurn(focused.id, 0f, true, false) })
-        SegmentChip(label = "Flip ⇅", selected = false, onClick = { objectActions.onTurn(focused.id, 0f, false, true) })
+    // ⭐ Line one turns and trims the picture; line two is what the selection bar's first line is.
+    CardFlow {
+        TextChip(label = "Rotate", onClick = { objectActions.onTurn(focused.id, QUARTER_TURN, false, false) })
+        Segmented {
+            SegmentChip(
+                label = "Flip ⇄",
+                selected = false,
+                onClick = { objectActions.onTurn(focused.id, 0f, true, false) },
+            )
+            SegmentChip(
+                label = "Flip ⇅",
+                selected = false,
+                onClick = { objectActions.onTurn(focused.id, 0f, false, true) },
+            )
+        }
+        ChipDivider()
+        TextChip(label = "Crop", onClick = { state.beginCrop() })
+        TextChip(label = "Uncrop", onClick = { objectActions.onCrop(focused.id, null) })
     }
-    ChipDivider()
-    TextChip(label = "Crop", onClick = { state.beginCrop() })
-    TextChip(label = "Uncrop", onClick = { objectActions.onCrop(focused.id, null) })
-    ChipDivider()
-    TextChip(label = "Duplicate", onClick = actions.onDuplicateSelection)
-    TextChip(label = "Delete", danger = true, onClick = actions.onDeleteSelection)
-    // A sole image is the case the knockout chip matters most for — an icon with a transparent
-    // background — and the image bar replaces the selection bar, so it has to carry the chips too.
-    ElementChips(ui, actions)
+    CardFlow {
+        TextChip(label = "Delete", danger = true, onClick = actions.onDeleteSelection)
+        TextChip(label = "Duplicate", onClick = actions.onDuplicateSelection)
+        ChipDivider()
+        SaveAsElementChip(actions)
+        // A sole image is the case the knockout chip matters most for — an icon with a transparent
+        // background — and the image bar replaces the selection bar, so it has to carry the chips too.
+        ElementLookChips(ui, actions)
+    }
 }
 
 /**
- * ⭐ The two Element-follow-up chips, shared by the selection bar and the image bar.
+ * ⭐ **Save as Element** — the selection, handwriting included, into the same name dialog the Elements
+ * tool's box opens. Here because a selection is how a person has already said *"this"*. Shared by the
+ * selection bar and the image bar.
+ */
+@Composable
+private fun SaveAsElementChip(actions: InkToolbarActions) {
+    TextChip(label = "Save as Element", onClick = actions.onSaveSelectionAsElement)
+}
+
+/**
+ * ⭐ The Element follow-up's switches, shared by the selection bar and the image bar — behind a divider,
+ * and no divider at all when neither applies.
  *
+ * - **Grid** for a copy with a pivot, which snaps by it whatever it is made of — not shown twice when
+ *   shapes already put it on the bar.
  * - **Knockout** (SPEC §4.9.6) — a toggle, for the reason `Rounded` and `Arrow` are toggles: one
  *   boolean, and the chip shows which side of it you are on. *On* only when every eligible object
  *   is, so pressing it on a half-flagged selection flags the rest rather than clearing the half.
- * - **Save as Element** — the selection, handwriting included, into the same name dialog the
- *   Elements tool's box opens. Here because a selection is how a person has already said *"this"*.
  */
 @Composable
-private fun RowScope.ElementChips(ui: InkUiState, actions: InkToolbarActions) {
+private fun RowScope.ElementLookChips(ui: InkUiState, actions: InkToolbarActions) {
+    val grid = ui.selectionPivot != null && ui.selectedShapes == 0
+    val knockout = ui.selectedKnockoutEligible > 0
+    if (!grid && !knockout) return
     ChipDivider()
-    // ⭐ A copy with a pivot snaps by it, whatever it is made of — so the lattice's switch belongs
-    // here too, not only beside the shape chips. Not shown twice when shapes already put it there.
-    if (ui.selectionPivot != null && ui.selectedShapes == 0) {
+    if (grid) {
         TextChip(label = "Grid", selected = ui.gridSnapEnabled, onClick = { ui.gridSnapEnabled = !ui.gridSnapEnabled })
     }
-    if (ui.selectedKnockoutEligible > 0) {
+    if (knockout) {
         val allOn = ui.selectedKnockoutOn == ui.selectedKnockoutEligible
         TextChip(label = "Knockout", selected = allOn, onClick = { actions.onKnockoutSelection(!allOn) })
     }
-    TextChip(label = "Save as Element", onClick = actions.onSaveSelectionAsElement)
 }
 
 private fun ObjectToolState.resize(id: ObjectId?, delta: Float, actions: ObjectActions) {
@@ -608,6 +680,9 @@ private val ListStyle.label: String
     }
 
 private val Dock = BarId.Stock(ChromeBar.DOCK)
+
+/** The two bars that stand as rails at the sides in the stock layout. */
+private val RailBars = listOf(Dock, BarId.Stock(ChromeBar.PAGES))
 
 /** Clear of the Dynamic Dock's primary row, which is the one row that is always on screen. */
 private val DockSafeTop = 78.dp

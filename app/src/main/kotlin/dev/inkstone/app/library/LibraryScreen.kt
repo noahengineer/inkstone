@@ -21,7 +21,6 @@ import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -39,6 +38,8 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.inkstone.app.calculator.CalculatorChip
 import dev.inkstone.app.calculator.CalculatorLayer
+import dev.inkstone.app.search.RecognitionModelPanel
+import dev.inkstone.app.search.shownInLibrary
 import dev.inkstone.app.ui.ChipDivider
 import dev.inkstone.app.ui.ChipKind
 import dev.inkstone.app.ui.GlassBar
@@ -315,11 +316,17 @@ private fun LibraryChrome(state: LibraryUiState, actions: LibraryActions, dialog
             HandwritingHits(hits = state.handwritingHits, onOpen = actions.onOpenHit)
         }
 
-        // ROADMAP M7: *"search degrades to titles, message is clear"*. Shown only while
-        // searching, so it is an answer to a question the user just asked rather than a
-        // banner nagging about a 20 MB download on a screen they opened to find a note.
-        if (state.searching && !state.model.downloaded) {
-            RecognitionModelOffer(state.model, actions.onDownloadModel)
+        // ROADMAP M7: *"search degrades to titles, message is clear"*. The offer is shown only
+        // while searching, so it is an answer to a question the user just asked rather than a
+        // banner nagging about a 20 MB download on a screen they opened to find a note — and
+        // everything after the press is shown wherever they are (`shownInLibrary`).
+        state.modelPanel?.takeIf { it.shownInLibrary(state.searching) }?.let { panel ->
+            RecognitionModelPanel(
+                panel = panel,
+                purpose = "Searching titles and folders only — handwriting recognition needs a language model.",
+                onDownload = actions.onDownloadModel,
+                onDismiss = actions.onDismissModelPanel,
+            )
         }
     }
 }
@@ -351,6 +358,7 @@ private fun LibraryToolbar(state: LibraryUiState, actions: LibraryActions, onNew
         TextChip(label = "New folder", onClick = onNewFolder)
         TextChip(label = "Trash", onClick = actions.onOpenTrash)
         TextChip(label = "Nextcloud", onClick = actions.onOpenNextcloud)
+        TextChip(label = "Handwriting", onClick = actions.onOpenHandwriting)
         MeasureMenu(actions)
 
         // ⭐ SPEC §7.7's list, and it appears only when there is something in it (M6). A
@@ -527,49 +535,6 @@ private fun HandwritingHitRow(hit: SearchHit, onOpen: () -> Unit) {
 /** Enough to be useful, few enough that the notes below stay on screen. */
 private const val MAX_HANDWRITING_HITS = 8
 
-/**
- * SPEC §8.1 — the language model, offered at the moment it would have helped.
- *
- * ⚠️ **The size and the metrics disclosure are in front of the user, not behind the button.** SPEC
- * §8.1 requires disclosing that ML Kit reports anonymous performance metrics to Google, and the
- * only useful place for that is before the download rather than after.
- *
- * ⭐ ROADMAP M10 — that sentence used to be the button's *label*, which was the same argument by a
- * different route and is no longer available: a [TextChip] is one clipped line, so a 74-character
- * label would have silently truncated exactly the disclosure SPEC §8.1 requires, and the failure
- * mode is that it still looks fine. Nothing is dropped — the size and the metrics sentence sit on
- * their own line *above* the chip, which is earlier in the reading order than a button label, and
- * the chip keeps only the verb.
- */
-@Composable
-private fun RecognitionModelOffer(model: RecognitionModelState, onDownload: () -> Unit) {
-    GlassPanel(modifier = Modifier.fillMaxWidth()) {
-        MicroLabel("Handwriting search")
-        Text(
-            text = "Searching titles and folders only — handwriting recognition needs a language model.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = Ink.TextNormal,
-        )
-        Text(
-            text = "English (~20 MB) · ML Kit sends anonymous usage metrics to Google",
-            style = MaterialTheme.typography.bodySmall,
-            color = Ink.TextMuted,
-        )
-        model.error?.let {
-            Text(
-                text = "Download failed: $it",
-                style = MaterialTheme.typography.bodySmall,
-                color = Ink.Danger,
-            )
-        }
-        TextChip(
-            label = if (model.downloading) "Downloading…" else "Download English",
-            enabled = !model.downloading,
-            onClick = onDownload,
-        )
-    }
-}
-
 @Composable
 private fun EmptyLibrary(searching: Boolean, query: String) {
     Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -661,6 +626,8 @@ data class LibraryActions(
     val onOpenHit: (SearchHit) -> Unit,
     /** SPEC §8.1 — fetch the recognition model. Only ever from a press (see the offer). */
     val onDownloadModel: () -> Unit,
+    /** The OK on the model panel's *Ready*, or on a failed download's error. */
+    val onDismissModelPanel: () -> Unit,
     val onOpenFolder: (FolderId?) -> Unit,
     val onGoUp: () -> Unit,
     val onNewNote: () -> Unit,
@@ -717,8 +684,15 @@ data class LibraryActions(
      * rule 6). Everything in that list has already been resolved without losing anything.
      */
     val onOpenAttention: () -> Unit,
+    /**
+     * Handwriting synthesis — *My handwriting* (docs/HANDWRITING-SYNTHESIS.md §5.7): what has been
+     * learned from the user's writing, with every label correctable and everything deletable.
+     */
+    val onOpenHandwriting: () -> Unit,
     /** ROADMAP M3's frame-rate gate needs 500 notes. See `LibraryFixture`. */
     val onFillForMeasurement: () -> Unit,
+    /** docs/HANDWRITING-SYNTHESIS.md §7.5 — phase 4.0's speed spike, written to logcat. */
+    val onMeasureHandwritingModel: () -> Unit = {},
     val thumbnail: suspend (NoteSummary) -> androidx.compose.ui.graphics.ImageBitmap?,
     /** A folder's cover picture, or null when it shows its icon (SPEC §9). */
     val folderCover: suspend (Folder) -> androidx.compose.ui.graphics.ImageBitmap?,
@@ -768,6 +742,13 @@ private fun MeasureMenu(actions: LibraryActions) {
                 text = { MicroLabel("Fill library (500 notes, 50 folders)") },
                 onClick = {
                     actions.onFillForMeasurement()
+                    open = false
+                },
+            )
+            DropdownMenuItem(
+                text = { MicroLabel("Handwriting model speed (logcat)") },
+                onClick = {
+                    actions.onMeasureHandwritingModel()
                     open = false
                 },
             )

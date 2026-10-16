@@ -90,7 +90,13 @@ internal class ChromeDeps(
     }
 }
 
-/** What the chrome needs from `InkScreen` besides the shared state — one value, for `LongParameterList`. */
+/**
+ * What the chrome needs from `InkScreen` besides the shared state — one value, for `LongParameterList`.
+ *
+ * @param geometry where every bar was placed. `InkScreen` owns it rather than `Chrome`, because the
+ *   panels that open beside the rails read it too (docs/UI-RAILS.md §3). One instance for the screen's
+ *   life, so holding it here keeps this class's equality meaningful.
+ */
 @Immutable
 internal class ChromeWiring(
     val onSummon: (PanelKind, Rect) -> Unit,
@@ -99,4 +105,5 @@ internal class ChromeWiring(
     val exporting: Boolean,
     val diagnosticsOpen: Boolean,
     val onToggleDiagnostics: () -> Unit,
+    val geometry: ChromeGeometry,
 )

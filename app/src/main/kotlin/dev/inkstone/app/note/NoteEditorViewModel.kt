@@ -8,6 +8,8 @@ import dev.inkstone.app.audio.RecordingController
 import dev.inkstone.app.audio.RecordingUiState
 import dev.inkstone.app.elements.ElementPreviews
 import dev.inkstone.app.elements.ElementShelf
+import dev.inkstone.app.handwriting.phraseOf
+import dev.inkstone.app.handwriting.stampHandwriting
 import dev.inkstone.app.library.LibraryRepository
 import dev.inkstone.app.library.Thumbnails
 import dev.inkstone.app.search.NoteRecogniser
@@ -85,6 +87,10 @@ class NoteEditorViewModel @Inject constructor(
     publisher: PdfPublisher,
     /** SPEC §8.3's recogniser (M7), handed to the editor so its debounce has something to run. */
     recogniser: NoteRecogniser,
+    /** Handwriting synthesis (docs/HANDWRITING-SYNTHESIS.md D8): which strokes the pen drew here. */
+    private val penLedger: dev.inkstone.app.handwriting.PenLedgerRecorder,
+    /** Handwriting synthesis, phase 3: the Write panel's writer. A pass-through; see [stampHandwriting]. */
+    val handwriting: dev.inkstone.app.handwriting.HandwritingWriter,
     savedState: SavedStateHandle,
 ) : ViewModel() {
 
@@ -473,9 +479,13 @@ class NoteEditorViewModel @Inject constructor(
      * `display` that loads it. §15.6 made the page the alignment unit, so this is the field the
      * whole server half reads.
      */
-    fun strokeCaptured(objectId: dev.inkstone.core.model.ObjectId, atElapsedRealtime: Long) {
+    fun strokeCaptured(objectId: dev.inkstone.core.model.ObjectId, atElapsedRealtime: Long, ruled: Boolean) {
         val current = state.value
         recordings.strokeCaptured(objectId, atElapsedRealtime, current.pageIds.getOrNull(current.pageIndex))
+        // Handwriting synthesis — the pen ledger (docs/HANDWRITING-SYNTHESIS.md D8). No note id means
+        // the Element editor's scratch canvas, whose ink is an icon being drawn, not handwriting to
+        // learn; it is never recognised either.
+        noteId?.let { penLedger.strokeCaptured(it, objectId, atElapsedRealtime, ruled) }
     }
 
     init {
@@ -485,12 +495,21 @@ class NoteEditorViewModel @Inject constructor(
         // stacks a second editor and note A's `onCleared` never fires.
         noteId?.let { recordings.noteOpened(it) }
         // SPEC §8.4 — arrive at the word, not at the note. Queued rather than applied: the
-        // editor is still opening, and `showPage` takes the same lock the open holds.
+        // editor is still opening, and `showPage` queues behind the open.
+        //
+        // ⚠️ **The box waits for the turn.** `highlight` carries no page: the surface gives a hit
+        // to the page it is first centred on (`SearchHitTracker`), so a box sent while the note
+        // was still opening was centred on the page the note opened at — the right place on the
+        // wrong page — and the turn that followed cleared it. Sent only once the hit's page is
+        // the one on screen (or the one a surface attaching later will load), and not at all
+        // when the page is gone from the note.
         val pageId = savedState.get<String>(ARG_PAGE_ID)?.let(::PageId)
         val box = savedState.get<FloatArray>(ARG_HIT_BOX)
         if (pageId != null) {
             viewModelScope.launch {
-                editor.showPage(pageId)
+                editor.showPage(pageId).join()
+                val shown = editor.state.value
+                if (shown.pageIds.getOrNull(shown.pageIndex) != pageId) return@launch
                 pendingHighlight = box?.takeIf { it.size == BOX_VALUES }?.let(::rectOf)
                 applyPendingHighlight()
             }
@@ -648,6 +667,23 @@ class NoteEditorViewModel @Inject constructor(
         if (placed.isNotEmpty()) noteId?.let { elements.recordUse(element.id, it) }
         return placed
     }
+
+    /**
+     * ⭐ docs/HANDWRITING-SYNTHESIS.md §6.3 — a written phrase onto the page on screen, one undo entry,
+     * replacing [replacing] in the same entry. @return the new strokes, to select.
+     */
+    suspend fun stampHandwriting(
+        strokes: List<dev.inkstone.core.model.StrokeGeometry>,
+        tags: List<dev.inkstone.core.model.GeneratedInk>,
+        record: dev.inkstone.core.model.PhraseRecord,
+        replacing: List<dev.inkstone.core.model.ObjectId> = emptyList(),
+    ): List<dev.inkstone.core.model.ObjectId> = editor.stampHandwriting(strokes, tags, record, scratchIds, replacing)
+
+    /** The generated phrase [ids] belong to on the page on screen, or null. */
+    suspend fun phraseOf(ids: List<dev.inkstone.core.model.ObjectId>) = editor.phraseOf(ids)
+
+    /** The note on screen, for D15's *this note's writing first*. Null in the Element editor. */
+    val openNoteId: DocumentId? get() = if (editingElement == null) noteId else null
 
     /**
      * ⭐ Save [ids] as a named Element — handwriting included.

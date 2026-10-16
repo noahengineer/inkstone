@@ -38,5 +38,71 @@
             android:name="dev.inkstone.app.debug.InkHostActivity"
             android:exported="false"
             android:theme="@android:style/Theme.Material.NoActionBar" />
+
+        <!--
+          Writes every note's pages, as the line segmenter sees them, to filesDir/debug, so that
+          LineSegmenter can be measured on the JVM against real ink (see InkExportReceiver).
+          `exported="true"` so that `adb shell am broadcast -n …` can reach it. It reads notes
+          read-only and writes only into the app's own private storage, and only a debug build
+          has it at all.
+        -->
+        <receiver
+            android:name="dev.inkstone.app.debug.InkExportReceiver"
+            android:exported="true" />
+
+        <!--
+          Reads lines drawn by a plan file, or by this build's LineSegmenter, with ML Kit, and writes
+          down the text, so two segmentations can be compared by what the recogniser makes of them
+          (see LineReadReceiver). Same terms as the export above: debug only, its own files only.
+        -->
+        <receiver
+            android:name="dev.inkstone.app.debug.LineReadReceiver"
+            android:exported="true" />
+
+        <!--
+          Handwriting synthesis phase 4: writes test words with the neural backend and reads them back
+          with the real gate, primed and unprimed, logging pass counts (see NeuralGateReceiver).
+          Debug only; touches no note.
+        -->
+        <receiver
+            android:name="dev.inkstone.app.debug.NeuralGateReceiver"
+            android:exported="true" />
+
+        <!--
+          Handwritten maths: writes a plan's expressions with the Maths switch on through the real gate,
+          and scores every run's reading under the top-reading rule and the any-of-five rule it replaced
+          (see MathsGateReceiver). Debug only; touches no note.
+        -->
+        <receiver
+            android:name="dev.inkstone.app.debug.MathsGateReceiver"
+            android:exported="true" />
+
+        <!--
+          Handwriting synthesis phase 5: one personalisation pass now, ignoring the charging-and-idle
+          constraints the real worker has (see PersonaliseReceiver). Debug only.
+        -->
+        <receiver
+            android:name="dev.inkstone.app.debug.PersonaliseReceiver"
+            android:exported="true" />
+
+        <!--
+          Deletes the recognition model through ML Kit, or reports whether it is there, so the
+          download panel can be walked from a fresh install's state (see RecognitionModelReceiver).
+          Never downloads: that is a press in the app. Debug only.
+        -->
+        <receiver
+            android:name="dev.inkstone.app.debug.RecognitionModelReceiver"
+            android:exported="true" />
+
+        <!--
+          Handwriting synthesis phase 6: the contact sheet (one sentence, twelve times, per backend and
+          neatness) drawn through the real ink engine, from this device's profile, gated by ML Kit
+          unless told to trust (see HandwritingSheetActivity). `exported="true"` so `adb shell am start
+          -n …` can reach it; it writes only into the app's own files/debug. Debug only; touches no note.
+        -->
+        <activity
+            android:name="dev.inkstone.app.debug.HandwritingSheetActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar" />
     </application>
 </manifest>

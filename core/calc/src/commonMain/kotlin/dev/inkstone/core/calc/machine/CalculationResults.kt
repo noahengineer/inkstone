@@ -191,7 +191,9 @@ internal fun Calculation.renderResult(shown: CalcView.Result): LcdFrame {
         }
     }
     val icons = host.indicators(extra)
-    if (laidOut.parts.isNotEmpty()) return Screens.stacked(icons, shown.expr, laidOut.parts, natural = input.natural)
+    if (laidOut.parts.isNotEmpty()) {
+        return Screens.stacked(icons, shown.expr, laidOut.parts, natural = input.natural, answer = laidOut.parts.size)
+    }
     return Screens.calculation(
         icons,
         shown.expr,

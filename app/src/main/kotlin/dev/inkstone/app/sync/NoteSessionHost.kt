@@ -571,6 +571,28 @@ class NoteSessionHost @Inject constructor(
     }
 
     /**
+     * ⭐ Handwriting synthesis's read of one note (docs/HANDWRITING-SYNTHESIS.md §5.6) — **read-only**,
+     * through the gate, and never a note an editor holds.
+     *
+     * Learning writes nothing into a note, so it is not a second *writer*. It would be a second
+     * *reader* of a session, though, and a session opened over a note an editor holds reads the bundle
+     * without the editor's pending work — so an open note is skipped, which costs one night's delay on
+     * the page in front of the user. The [LearningNote] handed to [block] has reads only: a caller
+     * cannot write through it however it is used, which is the gate-5 lesson applied before the bug.
+     *
+     * Off the caller's thread, like every own-session branch here should be: the fold is the cost.
+     *
+     * @return null when the note is open in an editor or will not open.
+     */
+    suspend fun <T> readForLearning(noteId: DocumentId, block: suspend (LearningNote) -> T): T? = withLock(noteId) {
+        if (editorFor(noteId) != null) return@withLock null
+        withContext(Dispatchers.Default) {
+            val note = store.open(noteId) ?: return@withContext null
+            block(LearningNote(NoteSession.open(store, ids, clock, note, deviceIdentity.get())))
+        }
+    }
+
+    /**
      * SPEC §7.6 step 3, third branch — a note from a peer this device has never held.
      *
      * ⚠️ **A directory that already exists is never overwritten.** `NoteStore.installBundle`

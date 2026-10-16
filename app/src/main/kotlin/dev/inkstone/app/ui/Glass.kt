@@ -15,9 +15,12 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.FlowRowScope
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.defaultMinSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -28,6 +31,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -125,17 +130,31 @@ fun GlassBar(
 }
 
 /**
- * ⭐ [GlassBar]'s material, for a bar laid out as a column or a grid rather than a row.
+ * ⭐ [GlassBar]'s material, for a bar laid out as a column, a grid or a panel rather than a row.
  *
  * Panel corners rather than a pill: a pill's ends are half its *height*, so a tall column drawn as one
  * would be a lozenge with semicircular caps half a toolbar tall. It scrolls vertically when it does not
  * fit, for the reason [GlassBar] scrolls sideways — a toolbar whose last chips are simply gone is
  * definition-of-done #6 caused by a layout decision.
- *
- * @param columns how many chips go across; 1 is a column.
  */
 @Composable
-fun GlassBlock(columns: Int, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+fun GlassBlock(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    GlassCard(modifier = modifier, scrollable = true, content = content)
+}
+
+/**
+ * ⭐ The material of a bar, in a card: translucent, panel corners, the bar's own padding — for a
+ * contextual toolbar of two lines (`ContextBars`) and, scrolling, for [GlassBlock].
+ *
+ * Not [GlassPanel]: that is opaque and padded for *content* — a hex field, a list — where this holds
+ * chips and should read as the same material as the pills around it.
+ */
+@Composable
+fun GlassCard(
+    modifier: Modifier = Modifier,
+    scrollable: Boolean = false,
+    content: @Composable ColumnScope.() -> Unit,
+) {
     val shape = InkDims.PanelCorner
     Box(
         modifier = modifier
@@ -144,14 +163,78 @@ fun GlassBlock(columns: Int, modifier: Modifier = Modifier, content: @Composable
             .border(HairlineWidth, Ink.PanelBorder, shape)
             .clip(shape),
     ) {
-        ChipGrid(
-            columns = columns,
+        Column(
             modifier = Modifier
-                .verticalScroll(rememberScrollState())
+                .then(if (scrollable) Modifier.verticalScroll(rememberScrollState()) else Modifier)
                 .padding(horizontal = InkDims.BarPadding + InkDims.ChipGap, vertical = InkDims.BarPadding),
+            verticalArrangement = Arrangement.spacedBy(InkDims.ChipGap),
             content = content,
         )
     }
+}
+
+/**
+ * [GlassCard]'s material as **one scrolling row** — a contextual bar's lines side by side rather than
+ * one above the other (`CardStyle.ROW`, docs/LAYOUTS.md). Each line is a `CardFlow`, which, given the
+ * unbounded width a horizontal scroll offers, never wraps.
+ */
+@Composable
+fun GlassStrip(modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+    val shape = InkDims.Pill
+    Box(
+        modifier = modifier
+            .shadow(BarElevation, shape, clip = false)
+            .background(Ink.Panel, shape)
+            .border(HairlineWidth, Ink.PanelBorder, shape)
+            .clip(shape),
+    ) {
+        Row(
+            modifier = Modifier
+                .horizontalScroll(rememberScrollState())
+                .padding(horizontal = InkDims.BarPadding + InkDims.ChipGap, vertical = InkDims.BarPadding),
+            horizontalArrangement = Arrangement.spacedBy(InkDims.GroupGap),
+            verticalAlignment = Alignment.CenterVertically,
+        ) { content() }
+    }
+}
+
+/** One line of chips inside a [GlassCard] — a [GlassBar]'s row without the pill around it. */
+@Composable
+fun CardLine(modifier: Modifier = Modifier, content: @Composable RowScope.() -> Unit) {
+    Row(
+        modifier = modifier,
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(InkDims.ChipGap),
+        content = content,
+    )
+}
+
+/**
+ * [CardLine] that **wraps** when the card is given less width than the line wants — a contextual
+ * toolbar squeezed between the tools and the panel column (docs/UI-RAILS.md §3) becomes a taller card
+ * rather than one slid under a panel.
+ */
+@Composable
+fun CardFlow(modifier: Modifier = Modifier, content: @Composable FlowRowScope.() -> Unit) {
+    FlowRow(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(InkDims.ChipGap),
+        verticalArrangement = Arrangement.spacedBy(InkDims.ChipGap),
+        itemVerticalAlignment = Alignment.CenterVertically,
+        content = content,
+    )
+}
+
+/** A hairline across a card, between two groups of lines — [ChipDivider] laid flat and full width. */
+@Composable
+fun CardRule(modifier: Modifier = Modifier) {
+    Box(
+        modifier = modifier
+            .padding(vertical = CardRuleGap)
+            .fillMaxWidth()
+            .height(HairlineWidth)
+            .background(Ink.Hairline),
+    )
 }
 
 /**
@@ -160,15 +243,32 @@ fun GlassBlock(columns: Int, modifier: Modifier = Modifier, content: @Composable
  *
  * Hand-written rather than `FlowRow`, because a grid's cells have to line up down the page and a flow
  * row does not — a `Fit width` chip would push the next row's second chip out of line with the first's.
+ *
+ * @param fillCells every chip is measured at its column's full width, so a column of words is a
+ *   column of equal keys and the chosen one's fill spans the strip rather than hugging its own word.
+ *   Off by default: `HandwritingScreen` lays out letters with it and wants them as they are.
  */
 @Composable
-fun ChipGrid(columns: Int, modifier: Modifier = Modifier, content: @Composable () -> Unit) {
+fun ChipGrid(columns: Int, modifier: Modifier = Modifier, fillCells: Boolean = false, content: @Composable () -> Unit) {
     Layout(content = content, modifier = modifier) { measurables, constraints ->
         val gap = InkDims.ChipGap.roundToPx()
         val loose = constraints.copy(minWidth = 0, minHeight = 0)
-        val placeables = measurables.map { it.measure(loose) }
-        if (placeables.isEmpty()) return@Layout layout(constraints.minWidth, constraints.minHeight) {}
-        val across = columns.coerceIn(1, placeables.size)
+        if (measurables.isEmpty()) return@Layout layout(constraints.minWidth, constraints.minHeight) {}
+        val across = columns.coerceIn(1, measurables.size)
+        val placeables = if (fillCells) {
+            // ⚠️ Intrinsics, because a cell's width is the widest chip in its column and a measurable
+            // can be measured only once per pass.
+            val column = IntArray(across) { col ->
+                measurables.filterIndexed { i, _ -> i % across == col }
+                    .maxOf { it.maxIntrinsicWidth(loose.maxHeight) }
+            }
+            measurables.mapIndexed { i, m ->
+                val w = column[i % across].coerceAtMost(loose.maxWidth)
+                m.measure(loose.copy(minWidth = w, maxWidth = w))
+            }
+        } else {
+            measurables.map { it.measure(loose) }
+        }
         val rows = placeables.chunked(across)
         val widths = IntArray(across) { col -> rows.maxOf { row -> row.getOrNull(col)?.width ?: 0 } }
         val heights = rows.map { row -> row.maxOf { it.height } }
@@ -253,6 +353,46 @@ fun GlassPanel(
         verticalArrangement = Arrangement.spacedBy(InkDims.GroupGap),
         content = content,
     )
+}
+
+/**
+ * What a panel's header does besides naming it and closing it, supplied by whatever is placing the
+ * panel (`PanelWindow`): the gesture its title is dragged by, and — once it is out of its column — the
+ * way back in. The default is a panel that does neither.
+ */
+@Immutable
+class PanelChrome(val grab: Modifier = Modifier, val onDock: (() -> Unit)? = null)
+
+/** See [PanelChrome]. Provided per panel, read by [PanelHeader]. */
+val LocalPanelChrome = compositionLocalOf { PanelChrome() }
+
+/**
+ * ⭐ Every panel's top line: its name — which is also the handle it is dragged by — then *Dock* when it
+ * has been dragged out of its column, then ✕ (docs/LAYOUTS.md). One composable rather than the same
+ * `Row` in each panel, so a panel cannot be the one that forgot to be movable.
+ *
+ * Only the name drags. The chips beside it keep their own taps, and a drag that starts on one of them
+ * is a press on that chip and nothing else.
+ */
+@Composable
+fun PanelHeader(title: String, onClose: () -> Unit, modifier: Modifier = Modifier) {
+    val chrome = LocalPanelChrome.current
+    Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .defaultMinSize(minHeight = InkDims.ChipMinHeight)
+                .then(chrome.grab),
+            contentAlignment = Alignment.CenterStart,
+        ) {
+            MicroLabel(title, color = Ink.TextNormal)
+        }
+        chrome.onDock?.let { TextChip(label = "Dock", onClick = it) }
+        // ✕ rather than the word: close is the one control here whose meaning survives being a symbol.
+        // `ChipKind.GLYPH` sets it larger and in the normal face, and the `contentDescription` is what
+        // stops it reaching the a11y tree as a bare codepoint.
+        TextChip(label = "✕", kind = ChipKind.GLYPH, onClick = onClose, contentDescription = "Close")
+    }
 }
 
 /**
@@ -357,6 +497,10 @@ private fun ChipLabel(label: String, kind: ChipKind, color: Color) {
 /**
  * `.segmented` — a recessed track holding mutually exclusive options.
  *
+ * ⚠️ **No outline of its own** (docs/UI-RAILS.md): it sits inside a bar that already has one, and a
+ * hairline round a recessed fill inside a hairline round a panel read as *"weird borders"*. The darker
+ * fill is what makes it a track.
+ *
  * Used where the choice is *between* things (partial vs whole erase, lasso vs marquee, left vs
  * centre vs right) and a plain chip row would leave the un-chosen options looking merely unpressed.
  */
@@ -366,8 +510,35 @@ fun Segmented(modifier: Modifier = Modifier, content: @Composable RowScope.() ->
         modifier = modifier
             .clip(InkDims.SegmentCorner)
             .background(Ink.SegmentTrack)
-            .border(HairlineWidth, Ink.PanelBorder, InkDims.SegmentCorner)
             .padding(SegmentTrackPadding),
+        verticalAlignment = Alignment.CenterVertically,
+        // Centred, so a track stretched to a column's width keeps its options in the middle of it.
+        horizontalArrangement = Arrangement.spacedBy(SegmentTrackPadding, Alignment.CenterHorizontally),
+        content = content,
+    )
+}
+
+/**
+ * A [Segmented] track holding several lines of options — the panel's four brushes as two by two. One
+ * track, not one per line: they are one choice, and two tracks would read as two.
+ */
+@Composable
+fun SegmentedGrid(modifier: Modifier = Modifier, content: @Composable ColumnScope.() -> Unit) {
+    Column(
+        modifier = modifier
+            .clip(InkDims.SegmentCorner)
+            .background(Ink.SegmentTrack)
+            .padding(SegmentTrackPadding),
+        verticalArrangement = Arrangement.spacedBy(SegmentTrackPadding),
+        content = content,
+    )
+}
+
+/** One line of a [SegmentedGrid]; give each option `Modifier.weight(1f)` so the lines' cells align. */
+@Composable
+fun SegmentedLine(content: @Composable RowScope.() -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(SegmentTrackPadding),
         content = content,
@@ -604,10 +775,9 @@ fun SwatchStrip(
         modifier = modifier
             .clip(InkDims.Pill)
             .background(Ink.SegmentTrack)
-            .border(HairlineWidth, Ink.PanelBorder, InkDims.Pill)
             .padding(SwatchStripPadding),
         verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(InkDims.ChipGap),
+        horizontalArrangement = Arrangement.spacedBy(InkDims.ChipGap, Alignment.CenterHorizontally),
     ) {
         // ⚠️ Indexed, because these *are* slots 0..n of the palette — the strip is the first few of
         // the same twelve the panel shows, not a copy — and a drop has to know which one it landed
@@ -764,6 +934,7 @@ private val PanelElevation = 14.dp
 internal val PanelPadding = 14.dp
 private val HairlineWidth = 1.dp
 private val DividerHeight = 16.dp
+private val CardRuleGap = 3.dp
 private val SegmentTrackPadding = 3.dp
 private val SegmentChipHeight = 28.dp
 private val SegmentChipPaddingH = 12.dp

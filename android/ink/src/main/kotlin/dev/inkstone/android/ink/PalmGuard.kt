@@ -37,9 +37,23 @@ internal class PalmGuard {
 }
 
 /** A stylus, whether tip-down or flipped to the eraser end. */
-internal fun MotionEvent.isStylusPointer(pointerIndex: Int): Boolean = when (getToolType(pointerIndex)) {
+fun MotionEvent.isStylusPointer(pointerIndex: Int): Boolean = when (getToolType(pointerIndex)) {
     MotionEvent.TOOL_TYPE_STYLUS, MotionEvent.TOOL_TYPE_ERASER -> true
     else -> false
+}
+
+/**
+ * SPEC §3.3 — the pen is erasing: flipped to its eraser end (`TOOL_TYPE_ERASER`), or held with its
+ * barrel button down.
+ *
+ * Both `BUTTON_STYLUS_PRIMARY` and `BUTTON_SECONDARY` are checked because OEMs disagree about which
+ * one an S Pen's single button reports, and a quick-erase modifier that works on one tablet and not
+ * the next is worse than none. Public so every surface that takes the pen erases by the same rule —
+ * the note editor and the quick start's writing area.
+ */
+fun MotionEvent.isHardwareEraser(pointerIndex: Int): Boolean {
+    val barrel = MotionEvent.BUTTON_STYLUS_PRIMARY or MotionEvent.BUTTON_SECONDARY
+    return getToolType(pointerIndex) == MotionEvent.TOOL_TYPE_ERASER || (buttonState and barrel) != 0
 }
 
 /**
@@ -47,5 +61,5 @@ internal fun MotionEvent.isStylusPointer(pointerIndex: Int): Boolean = when (get
  * from API 33. A cancelled pointer must not finish its stroke; finishing it is
  * exactly the stray mark the flag exists to prevent.
  */
-internal fun MotionEvent.isCancelledPointer(): Boolean =
+fun MotionEvent.isCancelledPointer(): Boolean =
     Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && (flags and MotionEvent.FLAG_CANCELED) != 0

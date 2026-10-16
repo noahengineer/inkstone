@@ -253,6 +253,9 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      */
     var gridSnapEnabled by mutableStateOf(STOCK.gridSnapEnabled)
 
+    /** ⭐ The Write panel's neatness slider (docs/HANDWRITING-SYNTHESIS.md §6.2), persisted. */
+    var handwritingNeatness by mutableFloatStateOf(STOCK.handwritingNeatness)
+
     /**
      * ⭐ True while the page's paper is up and its objects are still being built off the main
      * thread (`PreparedPage`).
@@ -366,8 +369,45 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      * ⚠️ Written at the **end** of a drag, not per frame — a bar being moved or resized lives in
      * [chromeDrag] until it is let go. Writing here per frame would recompose every bar on screen
      * and re-run [toPrefs] at 120 Hz for a value nobody reads until the finger lifts.
+     *
+     * ⭐ Every write is also a write to the saved layout on screen ([savedLayouts], `SavedLayouts.synced`)
+     * — or, on the Default, the start of a new one. [adopt] and [switchLayout] write [shownLayout]
+     * instead, because neither is a change the user made to the layout on screen.
      */
-    var layout by mutableStateOf(STOCK.layout)
+    var layout: ChromeLayout
+        get() = shownLayout
+        set(value) {
+            shownLayout = value
+            savedLayouts = savedLayouts.synced(value)
+        }
+
+    private var shownLayout by mutableStateOf(STOCK.layout)
+
+    /** ⭐ The layouts the user has kept, and which one is on screen. Persisted; see [SavedLayouts]. */
+    var savedLayouts by mutableStateOf(STOCK.savedLayouts)
+        private set
+
+    /** Put [id]'s layout on screen — null is the Default. */
+    fun switchLayout(id: Int?) {
+        savedLayouts = savedLayouts.switchedTo(id)
+        shownLayout = savedLayouts.layoutOf(savedLayouts.active)
+    }
+
+    /** Keep the layout on screen as a new one, and carry on editing that. */
+    fun duplicateLayout() {
+        savedLayouts = savedLayouts.added(shownLayout)
+    }
+
+    fun renameLayout(id: Int, name: String) {
+        savedLayouts = savedLayouts.renamed(id, name)
+    }
+
+    /** Forget [id]. If it was on screen, the Default replaces it. */
+    fun deleteLayout(id: Int) {
+        val wasShown = savedLayouts.active == id
+        savedLayouts = savedLayouts.deleted(id)
+        if (wasShown) shownLayout = ChromeLayout()
+    }
 
     private var layoutEditorOpen by mutableStateOf(false)
 
@@ -439,7 +479,9 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
         shapeSnapEnabled = prefs.shapeSnapEnabled
         arrowHeads = prefs.arrowHeads
         gridSnapEnabled = prefs.gridSnapEnabled
-        layout = prefs.layout
+        handwritingNeatness = prefs.handwritingNeatness
+        shownLayout = prefs.layout
+        savedLayouts = prefs.savedLayouts
     }
 
     /**
@@ -611,7 +653,9 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
         shapeSnapEnabled = shapeSnapEnabled,
         arrowHeads = arrowHeads,
         gridSnapEnabled = gridSnapEnabled,
-        layout = layout,
+        handwritingNeatness = handwritingNeatness,
+        layout = shownLayout,
+        savedLayouts = savedLayouts,
     )
 
     private companion object {

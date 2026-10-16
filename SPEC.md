@@ -97,6 +97,14 @@ A tablet note-taking app where:
 
 No real-time collaboration. No AI. No infinite canvas. Audio recording — designed for M12, **capture half built**; see §12 and `docs/M12-AUDIO.md` §15.
 
+*Amended 2026-10-12:* "No AI" meant no **cloud** AI, and §12 gives that reason. **On-device handwriting
+synthesis** — typed text dropped onto a page in the user's own hand — is in scope at the user's request,
+and nothing in it leaves the device: `docs/HANDWRITING-SYNTHESIS.md`.
+
+*Amended 2026-10-14:* phase 3 is built — words assembled from the user's own harvested letters, each
+read back by ML Kit before it is drawn, placed to match the writing around it. It writes ordinary ink
+(§4.10). The neural backend (phase 4) is not built.
+
 ### 1.3 The design principle
 
 **Goodnotes forces a choice on export: searchable handwriting *or* preserved document structure, never both** — their own docs confirm it. This app refuses that trade-off (see **§5.5**). If you build nothing else distinctive, build that.
@@ -114,6 +122,7 @@ No real-time collaboration. No AI. No infinite canvas. Audio recording — desig
 :core:sync        KMP  · Nextcloud client (Ktor), outbox, reconciler, merge engine. NO OkHttp, NO dav4jvm.
 :core:search      KMP  · Tokenizer + FTS index over recognised text.
 :core:calc        KMP  · fx-991ZA PLUS II calculator engine: physical keys in, 96×31 LCD frame out. Zero deps.
+:core:handwriting KMP  · Handwriting synthesis: learns the user's hand from their own pen strokes (docs/HANDWRITING-SYNTHESIS.md).
 
 :android:ink      AND  · androidx.ink, MotionEvent handling, renderer, stroke blob encode/decode.
 :android:pdf      AND  · PDF import, render, materialize (annotations + text layer + embedded bundle).
@@ -139,6 +148,13 @@ is materialization read backwards — a downloaded PDF in, the embedded bundle a
 bytes: a 40 MB lecture must not cross the boundary in memory inside a WorkManager job on the 4 GB
 device §10 names.
 
+*Added 2026-10-12, handwriting synthesis phase 2.* **`:core:handwriting` → `:core:search` and
+`:core:model`.** It reads lines and words with M7's own `LineSegmenter` and `WordBoxes`, because the
+recognised text it labels the user's words with came from exactly those, and a second segmenter would
+disagree with the first about where a word is. Acyclic; nothing depends on `:core:handwriting` but
+`:app`. Its two platform ports — `StrokeReader` (full-fidelity samples, `:android:ink`) and `InkReader`
+(one word with alternatives, `:android:ocr`) — live in `:core:model` beside the recogniser's.
+
 **Ktor is a third-party type too.** `:core:sync` exposes `NextcloudTransport`, which is opaque outside the module — so `:app` cannot name an `HttpClient`, and therefore has nothing to make a request *with* outside the outbox (§7.6). Added in M5, when Hilt asked `:app` to name a provider's return type.
 
 ### 2.2 Interfaces core needs from the platform
@@ -153,6 +169,9 @@ interface CredentialStore { ... }          // Keystore-backed
 interface WorkScheduler { ... }            // WorkManager
 interface FileSystem { ... }               // okio, or expect/actual
 interface Clock { ... }
+fun interface ModelSource {                // handwriting synthesis' weights (.ihwm), an APK asset on Android;
+    suspend fun bytes(): ByteArray?        // core parses and checks them. Null: the neural backend is off.
+}                                          // (docs/HANDWRITING-SYNTHESIS.md §4.4, §19)
 ```
 
 ### 2.3 The guardrail (build it in M0, not later)
@@ -1498,6 +1517,52 @@ for ruled and Cornell, 18 pt otherwise). A paper's lattice starts at **the paper
 (`SnapGrid.forBackground(background, paperLeft, paperTop)`), which is where its lines are drawn from
 and which is negative on a canvas that has grown up or left (§4.5).
 
+### 4.10 Generated handwriting — the `hw` key and the phrase record ⭐
+
+*Added 2026-10-14, handwriting synthesis phase 3 (`docs/HANDWRITING-SYNTHESIS.md` §4.3, §6, §18).*
+
+**A written phrase is ordinary ink.** Every pen-down of a generated word is a `StrokeObject` with an
+ordinary geometry blob (`StrokeGeometryCodec`, §5.4), drawn with a real pen. There is no new object
+kind and no new op type, so erasing (§3.5), selecting, undo, sync, merge, search and the published PDF
+treat it as ink, and an older build reads it as ink.
+
+**Two things mark it, both in registers that already existed:**
+
+```
+SetFormat       hw=<group>:<backend>:<model>        on every stroke of the phrase
+SetTextContent  hw1;x=…;y=…;xh=…;sl=…;an=…;w=…;p=…;n=…[;g=…]\n<the words>   on the first stroke only
+```
+
+- `hw` lives in `ObjectFormat.extras` (§4.9), which an older build keeps and writes back. `<group>` is a
+  UUIDv7 per phrase, `<backend>` is `a` (glyph assembly) or `n` (the neural model), and `<model>` is
+  eight hex digits of the model's SHA-256, or `-`.
+- **`<backend>` and `<model>` are per stroke, and so per word.** *Since H4 (2026-10-14):* a phrase can
+  mix the two backends, because the neural model writes only what assembly cannot. Every stroke of a
+  phrase shares `<group>`, so the phrase still selects as one thing, and each stroke says which backend
+  wrote its own word (`WrittenPhrase.taggedStrokes`; `PhraseOps.build` takes one tag per stroke).
+- **A phrase is one thing because its strokes share a copy key**: the group plus the strokes' shared
+  transform, rounded (`GeneratedInk.copyKey`), exactly as an Element copy is (§4.9.7). A tap or lasso on
+  any stroke selects the phrase; a duplicate lands at another transform and is a second phrase.
+- The `hw1` record holds the words and where they were put — the first baseline point, x-height,
+  slant, baseline angle, wrap width, line pitch, neatness and, when the page gave one, the word gap
+  (`g`). It is read through the first stroke's **current** transform (`PhraseRecord.placementOn`), so
+  *Write again* lands where the phrase is now. Unknown header keys are kept (§5.8, one level down).
+  Erase or delete the first stroke and the phrase becomes plain ink: a degrade, never a fault.
+
+**One phrase is one `session.apply`, so one undo entry**: tombstones for whatever it replaces (the old
+strokes on *Write again* and *Edit text*, a text box on *Handwrite*), then `AddObject` per stroke at
+`SelectionEdit.keysAbove(topZ, n)` with the style register unset, then `SetFormat(hw)` per stroke,
+then the `SetTextContent` record (`PhraseOps.build`). It goes through `NoteEditor.editShownPage`, the
+editor's own lock and reconcile; the page is marked unread so recognition reads the new words.
+
+**Generated ink is never learned from.** `Harvester.ineligibility` refuses any stroke with `hw`, and
+the pen ledger never sees it (it is applied, not drawn).
+
+**In the published PDF** each phrase stroke is an ordinary `/Ink` annotation with `/AP` (§6.4), plus
+`/INKS_Generated true` (§5.6), so a generated mark can always be told from a written one in the file. A
+page flattened by §6.4's density rule has no annotations, so there the mark is only in the bundle. The
+text layer (§5.5) is the recognised text, as for any ink.
+
 ---
 
 ## 5. Storage and file format
@@ -1715,6 +1780,9 @@ every published page dictionary carries private keys:
 /INKS_SortKey    its fractional key, so a recovered page keeps its place
 /INKS_Flattened  true where §6.4's density rule applied, so recovery can say so
 ```
+
+*Added 2026-10-14, handwriting synthesis phase 3:* every `/Ink` annotation written from a generated
+stroke carries `/INKS_Generated true` (§4.10). It is provenance, not identity: recovery ignores it.
 
 **Three-way detection on open:**
 
@@ -2622,6 +2690,7 @@ Quota via PROPFIND `d:quota-available-bytes` — ⚠️ **sentinel negatives**: 
 
 - **Input is x/y/t only. No pressure or tilt.** Your renderer uses them; the recogniser can't.
 - Models are **~20 MB per language**, downloaded on demand. Handle failure gracefully — the app must work fully without recognition.
+- **⚠️ A download does not fail offline — it waits**, silently, and finishes by itself once a network appears (measured: three minutes in airplane mode with the request still pending, done 45 s after airplane mode was switched off). `RemoteModelManager.download` reports no bytes either. So the UI follows the press rather than the transfer: *waiting for an internet connection* / *downloading* (a moving bar) → *✓ model downloaded, reading N of M notes* (a filling bar, one step per note of the batch the download starts) → *✓ handwriting search is ready*, which stays until the user says OK (`RecognitionModelController`, `docs/M7-RECOGNITION.md` §5.1). The download and that batch belong to the process, not to a screen.
 - **⭐ The recogniser assumes a single line of text.** Passing a whole page produces garbage. Segment first (§8.2) and size the `WritingArea` to the line. This is the biggest accuracy lever and the most commonly missed.
 - `preContext` (max 20 chars) helps — feed it the previous line.
 - Out-of-order strokes degrade results.
@@ -2632,11 +2701,18 @@ Quota via PROPFIND `d:quota-available-bytes` — ⚠️ **sentinel negatives**: 
 ### 8.2 Line segmentation
 
 1. Compute stroke bounding boxes (page space) — from the **samples**, not the tessellated mesh
-2. Cluster by vertical overlap **and baseline proximity** — both, see below
-3. Order clusters top-to-bottom; within a line, keep the strokes **in the order they were written**
-4. Emit one `Ink` per line with a line-sized `WritingArea`, and the previous line as `preContext`
+2. Cluster by vertical overlap **and baseline proximity** — both, see below — and only between
+   strokes **within a gutter's width** of each other horizontally (1.5 typical line heights). Then join
+   clusters side by side within that gutter whose **median** baselines agree: a word boundary at a
+   descender can leave no pair of strokes that joins them
+3. Give each stroke still on its own (an i-dot, a subscript, a capital that missed the baseline) to
+   the line it sits on, above or below. This joins one line and never links two
+4. Order clusters top-to-bottom; within a line, keep the strokes **in the order they were written**
+5. Emit one `Ink` per line with a line-sized `WritingArea`, and as `preContext` the line **above it
+   in the same column**, which is not the previous line once a page has columns
 
-Multi-column and rotated text are out of scope for v1 — detect and skip rather than emitting nonsense.
+Rotated text is out of scope — detect and skip rather than emitting nonsense. **Columns and mind maps
+are read** (since `LineSegmenter` version 2); version 1 skipped any page it could tell had columns.
 
 #### Corrected in M7, all three by measurement
 
@@ -2660,6 +2736,38 @@ letter — and split every line into its individual words: **632 lines where the
 two scales differ by roughly three times, which put the cut-off squarely between "letters in a
 word" and "words in a line".
 
+#### Corrected in version 2, on the user's own notes (2026-10, `docs/LINE-SEGMENTATION-V2.md`)
+
+**That lesson moved the horizontal test out of the clustering, and the clustering needed it.**
+With no horizontal limit, a line in one column joined the line beside it in the other, that line
+joined the next of the first column at a different pitch, and union-find chained the staircase down
+the page. Version 1 then skipped any page it could see had columns, so the user's physics mind map
+had **no searchable word at all**. The limit is back in step 2, in the unit the lesson asks for:
+1.5 of the page's typical *line* height, measured by a first pass with no limit.
+
+**A mark must never be a link.** Version 1 let a small stroke join anything whose height it sat
+inside, so that an i-dot would keep its letter. Between two close lines a dot sits inside a
+descender from above *and* an ascender from below, joined both, and fused the lines. Marks now join
+afterwards (step 3), as leaves: a stroke joins one line, and the lines' boxes are measured before
+anything joins them, so nothing joined can reach further.
+
+**Big writing is measured against itself.** The baseline tolerance is 0.7 of the page's text scale
+or of the smaller stroke's own height, whichever is larger. A heading three times the size of the
+notes under it wobbles three times as far off its baseline and fell apart into fragments.
+
+**A limit between strokes needs a second look between pieces.** With the gutter in place, *"Equations
+with squareds"* came apart into *"Eq"* and *"uations"*. The `q` hung too far below the `u` for their
+bottoms to agree, and the `E` was past the gutter from the `u`. Pieces of two or more strokes side by
+side within the gutter now join when their median baselines agree. Over the user's 183 pages that took
+suspected word splits from 84 to 54 and added one fused line.
+
+**A slope measured first stroke to last calls letters rotated.** A serifed `I`, a `t` with its bar,
+a fraction and its bar: each has a first stroke whose foot is a letter's height from its last. The
+slope is now the median bottom of the right half of a line's letters against the left half's, and
+a group under four letters or four text scales across is never called slanted. Margin-note runs
+(singletons that line up when the page is turned) are held to the same gutter as a line, or a
+column of equations' numerators and bars chains into a 440 pt "margin note".
+
 ### 8.3 When it runs
 
 Never during writing. Never on the UI thread. Debounced ~3 s after the last stroke on a page, or on close; batched in WorkManager when charging and idle for backlog. Output goes to `text/<pageId>.json` and the FTS index. **Recognition is advisory — it never modifies strokes.**
@@ -2669,6 +2777,18 @@ Never during writing. Never on the UI thread. Debounced ~3 s after the last stro
 Full-text search over recognised text + titles + folder names. Results carry note + page +
 page-space bounding box, so a tap scrolls to and highlights the word. The same data feeds §5.5's
 invisible PDF text layer.
+
+⚠️ **The scroll has to come after the page's own fit.** A hit opens its note, and the open fits the
+page's width once the page loads and once the view is first laid out. The surface used to move the
+camera when the hit arrived, which was before both, so a tap opened the right note at its top with
+the word off screen (2026-10, found on the emulator). `InkSurfaceView` now holds the hit and centres
+it at the end of every refit; `SearchHitTracker` decides which page it belongs to and when it goes.
+
+⚠️ **And the page turn has to come before the box.** The hit asks for its page while its note is
+still opening, so the turn must queue behind the open (it was dropped, and every hit in a multi-page
+note opened on page 1 — found on the tablet, `docs/LINE-SEGMENTATION-V2.md` §4.1), and the box is
+sent only once the hit's page is on screen, because the surface gives a box to the page it is first
+centred on.
 
 ⚠️ **This section said FTS5. There is no FTS5 on Android, and it would not have been enough
 anyway** (corrected in M7). Two independent reasons:
@@ -2790,7 +2910,7 @@ Toolchain is ready: Kotlin 2.3.20, Compose Multiplatform iOS stable since 1.8.0,
 | Feature | Why not now |
 |---|---|
 | Real-time collaboration | The op-log supports it; transport and presence UI are their own project |
-| AI features | ML Kit GenAI can't do handwriting; cloud AI contradicts offline-first |
+| AI features | ML Kit GenAI can't do handwriting; cloud AI contradicts offline-first. **Amended 2026-10-12:** on-device handwriting synthesis is in scope (`docs/HANDWRITING-SYNTHESIS.md`) — the reason above is about *cloud* AI, and that feature never leaves the device. Its training data must also allow commercial use (D13 there). **2026-10-14:** glyph assembly and the Write panel are built (§4.10); the neural model is not. |
 | ~~Infinite canvas~~ | ~~Different rendering and viewport model~~ — **built**, §4.5. The reason given here was right about *where* the cost would be and wrong about how much: the viewport model needed one value (`PageCanvas`) rather than a new one, and the rendering needed the paper's rectangle to stop being assumed. What made it affordable is that the canvas is **derived from the ink** rather than journaled, so it added no op, no merge rule and no format version — and the same rectangle it introduced is what stopped ink being written beside a *fixed* page, which was a live data-visibility bug the whole time this row said "not now". Off by default, per page. |
 | Audio + stroke sync | Large surface, and a data-loss risk area. **Designed for M12 — `docs/M12-AUDIO.md`. The capture half is now built (§15); alignment and transcription are not.** Still out of scope for v1, which ends at M11; the reason above turned out to be exactly right, and the design is mostly the answer to it — the one thing it under-rated is the outbox's coalescing key, which would have eaten a lecture in silence |
 | Tags / backlinks | Worth doing properly later |

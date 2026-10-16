@@ -40,6 +40,7 @@ import dev.inkstone.app.ui.Ink
 import dev.inkstone.app.ui.InkDims
 import dev.inkstone.app.ui.InkType
 import dev.inkstone.app.ui.MicroLabel
+import dev.inkstone.app.ui.PanelHeader
 import dev.inkstone.app.ui.Readout
 import dev.inkstone.app.ui.ReadoutFamily
 import dev.inkstone.app.ui.SlimSlider
@@ -96,10 +97,7 @@ internal fun SizePanel(
     val editing = editingIndex in slots.indices
     GlassPanel(modifier = Modifier.width(PanelWidth)) {
         Column(verticalArrangement = Arrangement.spacedBy(InkDims.ChipGap)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                MicroLabel("Size", modifier = Modifier.weight(1f))
-                TextChip(label = "✕", onClick = onClose, contentDescription = "Close")
-            }
+            PanelHeader("Size", onClose)
 
             SlotRow(widthDp, slots, editingIndex, defaultWidthDp, edits)
 

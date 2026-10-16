@@ -143,8 +143,21 @@ class CalculatorController internal constructor(
 
     private val _position = MutableStateFlow<WindowPosition?>(null)
 
-    /** Where the user left the window, unclamped; null until the first drag. */
+    /** Where the user left the window, unclamped; null until the first drag, and after a dock. */
     val position: StateFlow<WindowPosition?> = _position.asStateFlow()
+
+    private val _face = MutableStateFlow<Float?>(null)
+
+    /** The face's width in dp as the user sized it; null for the default. */
+    val face: StateFlow<Float?> = _face.asStateFlow()
+
+    /** The user resized the window before the seed arrived; the seed's size is stale. */
+    @Volatile
+    private var faceTouched = false
+
+    /** True after a dock, false after a drag, null until either — what is written as `calc.window.docked`. */
+    @Volatile
+    private var dockedChoice: Boolean? = null
 
     /** The newest engine snapshot. Null until the seed is read, so a write before then omits it. */
     @Volatile
@@ -176,7 +189,23 @@ class CalculatorController internal constructor(
     /** Remember where the user dropped the window. The caller has already clamped it to the screen. */
     fun moveTo(position: WindowPosition) {
         positionTouched = true
+        dockedChoice = false
         _position.value = position
+        persist()
+    }
+
+    /** Put the window back in the panel column: it forgets where it was dragged to. */
+    fun dock() {
+        positionTouched = true
+        dockedChoice = true
+        _position.value = null
+        persist()
+    }
+
+    /** Remember the face's width, in dp, from a drag of the window's corner. */
+    fun resizeTo(face: Float) {
+        faceTouched = true
+        _face.value = face
         persist()
     }
 
@@ -190,6 +219,7 @@ class CalculatorController internal constructor(
         val seed = preferences.seed.filterNotNull().first()
         if (!openTouched) _open.value = seed.open
         if (!positionTouched) _position.value = seed.window
+        if (!faceTouched) _face.value = seed.face
         var engine = engineFor(seed.snapshot)
         snapshot = seed.snapshot
         _frame.value = engine.frame
@@ -244,7 +274,15 @@ class CalculatorController internal constructor(
      */
     @Synchronized
     private fun persist() {
-        preferences.changed(CalculatorPrefs(snapshot = snapshot, open = _open.value, window = _position.value))
+        preferences.changed(
+            CalculatorPrefs(
+                snapshot = snapshot,
+                open = _open.value,
+                window = _position.value,
+                face = _face.value,
+                docked = dockedChoice,
+            ),
+        )
     }
 
     private companion object {

@@ -141,6 +141,59 @@ class CalculatorPlacementTest {
     }
 
     @Test
+    fun `a size the user chose is kept, and still has to fit`() {
+        // "the calculator should be resizable by like dragin in the corner" (docs/UI-RAILS.md §3).
+        val chosen = CalculatorPlacement.faceWidth(landscape, chromeWidth, chromeHeight, preferred = 200f)
+        assertEquals(200f, chosen)
+        val huge = CalculatorPlacement.faceWidth(landscape, chromeWidth, chromeHeight, preferred = 9000f)
+        val fitted = CalculatorPlacement.windowSize(huge, chromeWidth, chromeHeight)
+        assertTrue(
+            fitted.height <= landscape.height - safeTop - bottomReserve + 0.01f,
+            "a big size still fits the height",
+        )
+        val tiny = CalculatorPlacement.faceWidth(landscape, chromeWidth, chromeHeight, preferred = 1f)
+        assertEquals(CalculatorPlacement.MIN_FACE_WIDTH_DP, tiny)
+    }
+
+    @Test
+    fun `a window smaller than its space can move up and down as well as across`() {
+        // "it should also not be locked to the center": at the old fill-the-height size the clamp left
+        // a window no vertical travel at all.
+        // The editor's window, which keeps under one row of chrome rather than the library's two.
+        val editor = Viewport(1280f, 752f, 66f, bottomReserve, edge)
+        val face = CalculatorPlacement.faceWidth(
+            editor,
+            chromeWidth,
+            chromeHeight,
+            CalculatorPlacement.DEFAULT_FACE_WIDTH_DP,
+        )
+        val size = CalculatorPlacement.windowSize(face, chromeWidth, chromeHeight)
+        val high = CalculatorPlacement.clamp(WindowPosition(500f, -999f), size, editor)
+        val low = CalculatorPlacement.clamp(WindowPosition(500f, 9999f), size, editor)
+        assertTrue(low.y - high.y > 100f, "only ${low.y - high.y} dp of vertical travel")
+    }
+
+    @Test
+    fun `dragging a corner along the window's diagonal grows it, and across it does little`() {
+        val start = 220f
+        val aspect = CalculatorPlacement.ASPECT
+        assertEquals(start + 40f, CalculatorPlacement.resized(start, 40f, 40f * aspect, fromLeft = false), 0.01f)
+        // Straight down a corner still grows it — the aspect is locked, so height is width.
+        assertTrue(CalculatorPlacement.resized(start, 0f, 100f, fromLeft = false) > start)
+        // The bottom-left grip of a window in the column grows it when dragged left.
+        assertEquals(
+            CalculatorPlacement.resized(start, 40f, 40f * aspect, fromLeft = false),
+            CalculatorPlacement.resized(start, -40f, 40f * aspect, fromLeft = true),
+            0.01f,
+        )
+        assertEquals(CalculatorPlacement.MIN_FACE_WIDTH_DP, CalculatorPlacement.resized(start, -900f, -900f, false))
+        assertEquals(
+            CalculatorPlacement.MAX_RESIZED_FACE_WIDTH_DP,
+            CalculatorPlacement.resized(start, 900f, 900f, false),
+        )
+    }
+
+    @Test
     fun `with no chip laid out yet the window starts at the top left of the free space`() {
         assertEquals(
             WindowPosition(edge, safeTop),

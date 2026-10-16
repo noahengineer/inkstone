@@ -4,6 +4,7 @@ import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FileSystem
 import dev.inkstone.core.model.FoldedPage
+import dev.inkstone.core.model.GeneratedInk
 import dev.inkstone.core.model.ImageObject
 import dev.inkstone.core.model.MaterializedFile
 import dev.inkstone.core.model.ObjectFormat
@@ -188,6 +189,7 @@ public class InkstonePdfMaterializer internal constructor(
                 outlines = outlines,
                 words = wordsFor(note, folded),
                 objects = objectsOf(folded, assets),
+                generated = folded.formats.filterValues { GeneratedInk.ofRecord(it) != null }.keys,
             )
         }
     }

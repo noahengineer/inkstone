@@ -842,6 +842,14 @@ class LibraryRepository @Inject constructor(
     suspend fun allNoteIdsForRecognition(): List<DocumentId> = index.allNotes(includeTrashed = false).map { it.id }
 
     /**
+     * The notes handwriting synthesis may learn from, each with the `localRev` that says whether it
+     * has changed since the last pass. Folder covers are left out: a drawn cover is a picture, not
+     * writing.
+     */
+    suspend fun notesForLearning(): List<Pair<DocumentId, Long>> =
+        index.allNotes(includeTrashed = false).filterNot { it.isCover }.map { it.id to it.localRev }
+
+    /**
      * SPEC §8.3 — a recognition pass read this note and its bundle was rewritten (M7).
      *
      * ⚠️ **Two deliberate differences from its siblings, and each is a bug avoided.**

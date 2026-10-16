@@ -3,6 +3,11 @@
 What the app looks like now, why, and the handful of things the design asked for that could not be
 built as written.
 
+> ⭐ **The stock layout has since changed** — the tools are a column in the top-left corner with the
+> pen's row along the top beside them, every panel opens in one right-hand column, and the contextual
+> bars are two-line cards (docs/UI-RAILS.md). The top-centre dock described below is still exactly
+> what a user gets by setting the tools to *Row* in the layout editor.
+
 The source of truth is two documents the user supplied together: a rendered reference page
 (`aura_notes_typography_ui.html`) and a written brief. Where they disagree, **the HTML wins** — a
 rendered artefact is a specification and a prose adjective is not — and §1.1 lists every place they
