@@ -128,7 +128,12 @@ fun DiagnosticsPanel(
             },
         )
 
+        // Headed, because three rows of unlabelled chips — one of which (`CLEAR`) empties the page —
+        // was the editor's share of *"random buttons everywhere"*. `FINGER` and `SPRING` are also on
+        // the library's Settings screen; both write the same `EditorPrefs`.
+        MicroLabel("Pen input")
         InputSwitches(state)
+        MicroLabel("Measurement")
         LoadAndReset(state, actions)
 
         // ⚠️ `Readout`, not `MicroLabel`: these lines are *measurements*, and MicroLabel uppercases.
