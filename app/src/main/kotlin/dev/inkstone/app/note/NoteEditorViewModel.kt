@@ -91,6 +91,8 @@ class NoteEditorViewModel @Inject constructor(
     private val penLedger: dev.inkstone.app.handwriting.PenLedgerRecorder,
     /** Handwriting synthesis, phase 3: the Write panel's writer. A pass-through; see [stampHandwriting]. */
     val handwriting: dev.inkstone.app.handwriting.HandwritingWriter,
+    /** Draws the pages beside the one being edited, for a note that scrolls like a PDF. See [pagePicture]. */
+    private val stripRenderer: PageStripRenderer,
     savedState: SavedStateHandle,
 ) : ViewModel() {
 
@@ -722,6 +724,41 @@ class NoteEditorViewModel @Inject constructor(
      */
     suspend fun pageThumbnail(pageId: PageId) = state.value.documentId?.let { id ->
         library.pageThumbnail(id, pageId) { editor.foldedPage(pageId) }
+    }
+
+    private val stripCache = PageStripCache<dev.inkstone.android.ink.PageNeighbour>()
+
+    /**
+     * ⭐ A picture of [pageId] [widthPx] wide, for the strip beside the page being edited — reused
+     * while the page has not changed, redrawn when it has.
+     *
+     * Folded from the **open session**, like [pageThumbnail], for the same reason: the journal has
+     * ops the bundle does not. Null when the page cannot be found or drawn, which the strip shows as
+     * no neighbour at all rather than as a broken one.
+     *
+     * ⚠️ A failure to draw is swallowed except for cancellation. The strip is decoration over a page
+     * that is already safe on disk, so an out-of-memory render must cost the picture and nothing
+     * else.
+     */
+    @Suppress("SwallowedException") // Deliberate: see above - a missing picture is a missing neighbour.
+    suspend fun pagePicture(pageId: PageId, widthPx: Int): dev.inkstone.android.ink.PageNeighbour? {
+        val noteId = editor.openDocumentId ?: return null
+        val folded = editor.foldedPage(pageId) ?: return null
+        val revision = PageRevision.of(folded, widthPx)
+        stripCache.get(pageId, revision)?.let { return it }
+        val bitmap = try {
+            stripRenderer.render(noteId, folded, widthPx)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (@Suppress("TooGenericExceptionCaught") failure: Exception) {
+            null
+        } catch (failure: OutOfMemoryError) {
+            // Three pictures of a long note is the one allocation here that can plausibly fail.
+            null
+        } ?: return null
+        return dev.inkstone.android.ink.PageNeighbour(pageId, bitmap, folded.size).also {
+            stripCache.put(pageId, revision, it)
+        }
     }
 
     /**

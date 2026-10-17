@@ -58,6 +58,7 @@ internal object EditorPrefsCodec {
         put(SHAPE_SNAP, prefs.shapeSnapEnabled.toString())
         put(ARROW_HEADS, prefs.arrowHeads.toString())
         put(GRID_SNAP, prefs.gridSnapEnabled.toString())
+        put(SCROLL_PAGES, prefs.scrollPagesEnabled.toString())
         put(NEATNESS, prefs.handwritingNeatness.toString())
         putAll(ChromeLayoutCodec.encode(prefs.layout))
         putAll(SavedLayoutsCodec.encode(prefs.savedLayouts))
@@ -83,6 +84,7 @@ internal object EditorPrefsCodec {
             shapeSnapEnabled = stored.flag(SHAPE_SNAP, true),
             arrowHeads = stored.flag(ARROW_HEADS, false),
             gridSnapEnabled = stored.flag(GRID_SNAP, false),
+            scrollPagesEnabled = stored.flag(SCROLL_PAGES, false),
             handwritingNeatness = stored[NEATNESS]?.toFloatOrNull()?.takeIf { it in 0f..1f }
                 ?: EditorPrefs.DEFAULT_NEATNESS,
             layout = layout,
@@ -176,5 +178,6 @@ internal object EditorPrefsCodec {
     private const val SHAPE_SNAP = "ink.shapeSnap"
     private const val ARROW_HEADS = "ink.arrowHeads"
     private const val GRID_SNAP = "ink.gridSnap"
+    private const val SCROLL_PAGES = "ink.scrollPages"
     private const val NEATNESS = "ink.handwriting.neatness"
 }

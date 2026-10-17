@@ -61,6 +61,12 @@ data class EditorPrefs(
     val arrowHeads: Boolean = false,
     val gridSnapEnabled: Boolean = false,
     /**
+     * ⭐ Scroll from one page into the next like a PDF, instead of stopping at the page's edge and
+     * turning with the page bar. Off by default: a note that has always stopped at the page's edge
+     * keeps doing so until its owner asks otherwise.
+     */
+    val scrollPagesEnabled: Boolean = false,
+    /**
      * ⭐ The Write panel's *neatness* (docs/HANDWRITING-SYNTHESIS.md §6.2): `0` loose, `1` neat; how
      * much a written phrase varies (`Variation.forNeatness`).
      */

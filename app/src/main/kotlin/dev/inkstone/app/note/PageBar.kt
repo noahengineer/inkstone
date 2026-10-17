@@ -57,8 +57,7 @@ internal fun PageChip(item: ChromeItem, state: NoteEditorState, actions: PageBar
                 open = open,
                 onOpen = { open = true },
                 onDismiss = { open = false },
-                onPick = actions.onTemplate,
-                onToggleInfinite = actions.onToggleInfiniteCanvas,
+                actions = actions,
             )
         }
 
@@ -180,8 +179,7 @@ private fun TemplateChip(
     open: Boolean,
     onOpen: () -> Unit,
     onDismiss: () -> Unit,
-    onPick: (PageTemplate) -> Unit,
-    onToggleInfinite: () -> Unit,
+    actions: PageBarActions,
 ) {
     Box(propagateMinConstraints = true) {
         TextChip(
@@ -195,7 +193,7 @@ private fun TemplateChip(
                     text = { MicroLabel(entry.label()) },
                     onClick = {
                         onDismiss()
-                        onPick(entry)
+                        actions.onTemplate(entry)
                     },
                 )
             }
@@ -207,7 +205,18 @@ private fun TemplateChip(
                 text = { MicroLabel(if (infinite) "Fixed page" else "Infinite canvas") },
                 onClick = {
                     onDismiss()
-                    onToggleInfinite()
+                    actions.onToggleInfiniteCanvas()
+                },
+            )
+            DropdownMenuItem(
+                // Says what pressing it does, like the item above — and this one is the editor-wide
+                // choice, not the page's, so it is worded as the behaviour rather than the paper.
+                text = {
+                    MicroLabel(if (actions.scrollPages) "Turn pages with the bar" else "Scroll pages like a PDF")
+                },
+                onClick = {
+                    onDismiss()
+                    actions.onToggleScrollPages()
                 },
             )
         }
@@ -243,6 +252,16 @@ data class PageBarActions(
      * every page" is what `Add` already does by inheriting the current page's paper.
      */
     val onToggleInfiniteCanvas: () -> Unit,
+    /**
+     * ⭐ Whether the note scrolls from one page into the next like a PDF, and the switch for it.
+     *
+     * Not per page and not per note: it is how this device's editor behaves, remembered with the
+     * toolbar (`EditorPrefs.scrollPagesEnabled`). It sits in the paper menu because that is where
+     * the neighbouring question — what a page is made of — is already asked, and a twelfth chip
+     * would spend the width `docs/M10-PORTRAIT.md` recorded running out.
+     */
+    val scrollPages: Boolean,
+    val onToggleScrollPages: () -> Unit,
     /** ROADMAP M3 — the page overview, with a thumbnail per page. */
     val onShowPages: () -> Unit,
     /** ROADMAP M4 — materialize and hand the published PDF to another app (SPEC §5.2). */
