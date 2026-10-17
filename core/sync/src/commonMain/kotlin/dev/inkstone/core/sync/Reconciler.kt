@@ -181,6 +181,10 @@ public class Reconciler(
         // Null covers a missing credential and a stored one whose uid disagrees with the account
         // row (`isUsable` has already vouched for the row's view of it).
         val store = storeFactory.open(account) ?: return report.skipping(account.id)
+        // ⚠️ A feed store is never walked (see [PullShape]). Skipped, not "reconciled": an upload-only
+        // OneDrive account is a known limit until its `delta` pull exists (docs/CLOUD-PROVIDERS.md §4),
+        // and a walk would look healthy while missing every remote change.
+        if (store.pullShape != PullShape.LISTING) return report.skipping(account.id)
         return pass(store, limit, report)
     }
 

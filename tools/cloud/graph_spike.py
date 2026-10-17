@@ -12,6 +12,8 @@ named ``Inkstone-spike-<time>`` appearing in). It answers M-M1 .. M-M8 of the de
   M-M6  is an unfinished upload session invisible (no torn remote file)?
   M-M7  what does delta report after a move and after a folder rename?
   M-M8  does If-Match on DELETE work, and does DELETE go to the recycle bin?
+  M-M9  does a move onto a name that is already taken refuse (409) and leave the occupant alone?
+  M-M10 does GET item carry @microsoft.graph.downloadUrl, and does it download with NO bearer token?
 
 How it signs in: authorization-code + PKCE in YOUR browser, redirect to http://localhost:<port>/.
 This script never sees your password. The tokens live in memory only: they are not printed, not
@@ -245,6 +247,17 @@ def measure(d: Drive, root_id: str, results: dict) -> None:
     item = f.json() if f is not None else {}
     item_id, etag1 = item.get("id"), item.get("eTag")
     m1["etag_after_create_present"] = bool(etag1)
+
+    m10: dict = {}
+    if item_id:
+        url = d.meta(item_id).get("@microsoft.graph.downloadUrl")
+        m10["downloadUrl_present"] = bool(url)
+        if url:
+            plain = http("GET", url)  # deliberately no Authorization header
+            m10["download_without_bearer_status"] = plain.status
+            m10["download_without_bearer_bytes_match"] = plain.body == payload_a
+    results["M-M10"] = m10
+
     if item_id:
         s, f = d.upload(f"/me/drive/items/{item_id}", payload_b, if_match=etag1)
         m1["update_with_current_etag"] = {"session": summarise(s), "final": summarise(f)}
@@ -319,6 +332,17 @@ def measure(d: Drive, root_id: str, results: dict) -> None:
         m5["move_with_CURRENT_file_etag"] = summarise(good)
         m5["same_id_after_move"] = good.json().get("id") == mv_id
         m5["etag_after_move_changed"] = good.json().get("eTag") != current
+
+        m9: dict = {}
+        s2, f2 = d.upload(f"/me/drive/items/{a_id}:/moving.bin:", payload_b, behavior="fail")
+        twin = f2.json() if f2 is not None else {}
+        if twin.get("id"):
+            clash = d.req("PATCH", f"/me/drive/items/{twin['id']}", json_body={"parentReference": {"id": b_id}})
+            m9["move_onto_taken_name"] = summarise(clash)
+            m9["occupant_untouched"] = d.content(mv_id) == payload_a
+            m9["twin_still_in_A"] = d.meta(twin["id"]).get("parentReference", {}).get("id") == a_id
+            m9["VERDICT_refuses_without_overwriting"] = clash.status in (409, 412) and m9["occupant_untouched"]
+        results["M-M9"] = m9
     results["M-M5"] = m5
 
     m7: dict = {}

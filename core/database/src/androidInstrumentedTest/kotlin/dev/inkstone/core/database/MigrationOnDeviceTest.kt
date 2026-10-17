@@ -7,6 +7,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import app.cash.sqldelight.db.SqlDriver
 import app.cash.sqldelight.driver.android.AndroidSqliteDriver
 import dev.inkstone.core.database.library.LibraryIndex
+import dev.inkstone.core.database.sync.SqlAccountStore
 import dev.inkstone.core.database.sync.SqlAttentionStore
 import dev.inkstone.core.database.sync.SqlBindingStore
 import dev.inkstone.core.database.sync.SqlBrowsedFolderStore
@@ -16,7 +17,9 @@ import dev.inkstone.core.database.sync.SqlRemoteDirectoryStore
 import dev.inkstone.core.database.sync.SqlSyncCursorStore
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.NoteSyncState
+import dev.inkstone.core.sync.AccountState
 import dev.inkstone.core.sync.OutboxOpType
+import dev.inkstone.core.sync.ProviderKind
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
@@ -25,6 +28,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -114,6 +118,25 @@ class MigrationOnDeviceTest {
         assertEquals(NoteSyncState.PENDING_UPLOAD, note.syncState)
         assertEquals(1, index.allFolders().size, "the folder from 2.sqm's era is still there")
     }
+
+    @Test
+    fun `an account written before providers existed upgrades to a Nextcloud account with every field intact`() =
+        runTest(dispatcher) {
+            writeVersion4WithData()
+
+            val database = upgradeInPlace()
+
+            // 10.sqm's two ALTERs, read through the production store. The DEFAULT is what makes this
+            // true, and `upsertAccount` being INSERT OR REPLACE is why the unit test beside it checks
+            // that the provider also survives a write — this checks the *upgrade* of a row that existed.
+            val account = assertNotNull(SqlAccountStore(database, dispatcher).find(ACCOUNT))
+            assertEquals(ProviderKind.NEXTCLOUD, account.provider, "an upgrade must not change what an account is")
+            assertNull(account.providerData)
+            assertEquals("https://cloud.example.com", account.serverUrl)
+            assertEquals("me@example.com", account.loginName)
+            assertEquals("me", account.uid)
+            assertEquals(AccountState.ACTIVE, account.state)
+        }
 
     @Test
     fun `the new column on an existing binding defaults to never seen remotely`() = runTest(dispatcher) {

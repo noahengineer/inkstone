@@ -289,6 +289,8 @@ internal class ReconcileHarness(
     trashes: (DocumentId) -> Boolean = { true },
     /** Parks a pass mid-merge. See [FakeMergeGate.onMerge]. */
     onMerge: suspend (DocumentId) -> Unit = {},
+    /** docs/CLOUD-PROVIDERS.md §2 — null is the Nextcloud factory the reconciler defaults to. */
+    storeFactory: CloudStoreFactory? = null,
 ) {
     val recorded = RecordedRequests()
     val clock = FakeClock()
@@ -320,17 +322,34 @@ internal class ReconcileHarness(
     private val pull = ReconcileStores(directories, cursors, downloads, attention, folders, peers, foreign)
     val engine: SyncEngine = SyncEngine(stores, clock, scheduler)
 
-    val reconciler: Reconciler = Reconciler(
-        stores = stores,
-        pull = pull,
-        credentials = credentials,
-        fs = fs,
-        clock = clock,
-        transport = mockTransport(recorded) { request -> server.handle(request)() },
-        extractor = extractor,
-        gate = gate,
-        engine = engine,
-    )
+    private val transport = mockTransport(recorded) { request -> server.handle(request)() }
+
+    val reconciler: Reconciler = if (storeFactory == null) {
+        Reconciler(
+            stores = stores,
+            pull = pull,
+            credentials = credentials,
+            fs = fs,
+            clock = clock,
+            transport = transport,
+            extractor = extractor,
+            gate = gate,
+            engine = engine,
+        )
+    } else {
+        Reconciler(
+            stores = stores,
+            pull = pull,
+            credentials = credentials,
+            fs = fs,
+            clock = clock,
+            transport = transport,
+            extractor = extractor,
+            gate = gate,
+            engine = engine,
+            storeFactory = storeFactory,
+        )
+    }
 
     suspend fun bind(
         noteId: DocumentId,

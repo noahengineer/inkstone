@@ -24,6 +24,13 @@ import dev.inkstone.core.model.CredentialStore
 public enum class ProviderKind {
     NEXTCLOUD,
     ONEDRIVE,
+
+    /**
+     * A name this build does not know — an account written by a newer one. No factory opens it, so it
+     * is unusable rather than silently treated as Nextcloud and sent a Basic-auth header meant for
+     * nobody (the same reasoning as an unrecognised [AccountState] reading as NEEDS_REAUTH).
+     */
+    UNKNOWN,
 }
 
 /**
@@ -87,6 +94,9 @@ public interface CloudStore {
     /** False when an [WritePrecondition.Unchecked] replace must be refused. See that type. */
     public val supportsUncheckedReplace: Boolean
 
+    /** See [PullShape]. */
+    public val pullShape: PullShape
+
     // -- writes (OutboxDrainer) ------------------------------------------------------------------
 
     /** Create [path] and every missing parent. Idempotent: an existing folder is success. */
@@ -128,6 +138,21 @@ public interface CloudStore {
     public suspend fun locate(fileId: Long): DavOutcome<List<DavResource>>
 }
 
+/**
+ * How a store learns what changed — which decides whether the reconciler may poll it.
+ *
+ * [LISTING] is Nextcloud's: walk folders, pruned by directory ETag (SPEC §7.4). [FEED] is a change
+ * feed (Graph `delta`). A feed store **must not** be walked: Graph's folder ETags are not documented
+ * to propagate to parents, so a walk would report success and miss every remote change.
+ *
+ * Deliberately **not defaulted** on [CloudStore]. A default would make "poll this like Nextcloud" the
+ * silent behaviour of every store somebody forgot to think about.
+ */
+public enum class PullShape {
+    LISTING,
+    FEED,
+}
+
 /** How much of a folder a [CloudStore.listing] returns. Always explicit — SPEC §7.3. */
 public enum class ListingDepth {
     SELF,
@@ -152,6 +177,7 @@ public class NextcloudStoreFactory(
 ) : CloudStoreFactory {
 
     override suspend fun open(account: SyncAccount): CloudStore? {
+        if (account.provider != ProviderKind.NEXTCLOUD) return null
         val credential = credentials.get(account.id) ?: return null
         // NextcloudSession's constructor throws on an empty uid; a stored credential can disagree
         // with the account row, so this is checked here and not only through `isUsable`.
@@ -168,6 +194,8 @@ public class NextcloudStore(private val session: NextcloudSession) : CloudStore 
     override val kind: ProviderKind get() = ProviderKind.NEXTCLOUD
 
     override val supportsUncheckedReplace: Boolean get() = true
+
+    override val pullShape: PullShape get() = PullShape.LISTING
 
     override suspend fun ensureFolder(path: String): DavOutcome<Unit> = session.dav.mkcolRecursive(path)
 
@@ -211,4 +239,17 @@ public class NextcloudStore(private val session: NextcloudSession) : CloudStore 
     override suspend fun download(path: String): DavOutcome<DownloadedFile> = session.dav.download(path)
 
     override suspend fun locate(fileId: Long): DavOutcome<List<DavResource>> = session.dav.searchByFileId(fileId)
+}
+
+/**
+ * Opens an account with the factory for its [SyncAccount.provider].
+ *
+ * A provider with no factory — [ProviderKind.UNKNOWN], or one this build has not been given — opens
+ * as null, which every caller already reads as *"stop touching this account"*. There is no default
+ * factory to fall back on: a fallback would be the Nextcloud one, sending the wrong credential shape
+ * to the wrong server.
+ */
+public class ProviderRoutingFactory(private val factories: Map<ProviderKind, CloudStoreFactory>) : CloudStoreFactory {
+
+    override suspend fun open(account: SyncAccount): CloudStore? = factories[account.provider]?.open(account)
 }

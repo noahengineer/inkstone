@@ -44,6 +44,15 @@ public data class SyncAccount(
     val state: AccountState = AccountState.ACTIVE,
     val capabilities: NextcloudCapabilities? = null,
     val lastError: String? = null,
+    /**
+     * docs/CLOUD-PROVIDERS.md §7. For anything but Nextcloud the three Nextcloud-worded columns above
+     * are reused: [serverUrl] is the API base, [loginName] the account's email, [uid] the provider's
+     * stable id for the drive — and [uid] empty still means *not resolved yet*, so [isUsable] keeps
+     * guarding every provider the same way.
+     */
+    val provider: ProviderKind = ProviderKind.NEXTCLOUD,
+    /** The provider's own JSON (OneDrive: the drive id), so the columns above keep one meaning each. */
+    val providerData: String? = null,
 ) {
     public val isUsable: Boolean get() = state == AccountState.ACTIVE && uid.isNotEmpty()
 

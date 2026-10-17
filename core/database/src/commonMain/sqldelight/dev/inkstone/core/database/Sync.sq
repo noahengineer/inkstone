@@ -45,7 +45,11 @@ CREATE TABLE account (
     state         TEXT    NOT NULL DEFAULT 'ACTIVE',
     -- The cached §7.9 capabilities document, refetched on a server version change.
     capabilities  TEXT,
-    lastError     TEXT
+    lastError     TEXT,
+    -- 10.sqm. Last, because `ALTER TABLE ADD COLUMN` appends and this definition must read as the
+    -- migrated table does. A name from `ProviderKind`.
+    provider      TEXT    NOT NULL DEFAULT 'NEXTCLOUD',
+    providerData  TEXT
 );
 
 CREATE TABLE remoteBinding (
@@ -434,10 +438,12 @@ SELECT * FROM account;
 selectAccount:
 SELECT * FROM account WHERE id = ?;
 
+-- ⚠️ INSERT OR REPLACE resets any column it omits to its DEFAULT, so `provider` has to be in this
+-- list: leaving it out would turn every OneDrive account back into a Nextcloud one on its next write.
 upsertAccount:
 INSERT OR REPLACE INTO account(id, serverUrl, loginName, uid, displayName, defaultFolder,
-                               state, capabilities, lastError)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                               state, capabilities, lastError, provider, providerData)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 
 updateAccountState:
 UPDATE account SET state = :state, lastError = :lastError WHERE id = :id;

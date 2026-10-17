@@ -19,8 +19,36 @@
     what Nextcloud already does when no usable ETag is stored (weak or stripped: no header is sent, and
     the checksum stands in). **That is pre-existing, unchanged, and a rule 1 soft spot of its own** —
     it is exactly why a store with `supportsUncheckedReplace = false` (OneDrive) must refuse it.
-- **P0 — instrument written, not run.** `tools/cloud/graph_spike.py` + `tools/cloud/README.md`. It
-  needs the Azure registration and a throwaway-account sign-in, both the user's.
+- **P0 — instrument written, not run.** `tools/cloud/graph_spike.py` + `tools/cloud/README.md`
+  (now M-M1 … M-M10). It needs an Entra app registration, and a plain personal Microsoft account has no
+  Entra directory (the portal answers `AADSTS50020`), so registering means an Azure free sign-up first.
+  **Decision (user, 2026-10-17): skip it for now and build against a stand-in.** The premise of all
+  of the below — that a stale `If-Match` on `createUploadSession` is refused — rests on Microsoft's docs
+  and one outside developer's log, **not on anything seen here**. Run the spike before anyone relies on this.
+- **P2 — account model, built.** `10.sqm` (`account.provider`, `account.providerData`, both additive);
+  `SyncAccount.provider`; `ProviderKind { NEXTCLOUD, ONEDRIVE, UNKNOWN }` where **UNKNOWN is what an
+  unrecognised name reads as and no factory opens it**; `ProviderRoutingFactory` (no fallback factory);
+  `NextcloudStoreFactory` declines a non-Nextcloud account. `upsertAccount` is `INSERT OR REPLACE`, so
+  `provider` is in its column list — a unit test checks it survives `setState` and `upsert`.
+  *Not done:* the on-device migration test is **written and not run** (it needs the emulator, and
+  `connectedAndroidTest` uninstalls the app and takes its data with it); and the Keystore-backed
+  `TokenVault` is an interface only — the Android implementation shares the credential file's crypto and is
+  written with the sign-in UI, where it can be exercised on a device.
+- **P3a — `OneDriveStore` and `MicrosoftTokenSource`, built, tested against a stand-in.**
+  `OneDriveStore` writes only through upload sessions with `If-Match`, addresses updates by item id,
+  creates with `conflictBehavior: fail`, deletes to the recycle bin, never retries, and sends no bearer token
+  to the pre-authorised upload or download URL. `MicrosoftTokenSource` implements §5.3: refresh before
+  sending when nearly spent; one forced refresh after a 401, persisted cooldown; `invalid_grant` is sticky
+  and never asked about again; unreachable concludes nothing; the rotated refresh token is saved **before**
+  the access token is used. `GraphStandIn` (a `ServerSocket` server) and 26 tests drive it (plus 4 for the provider column, 3 for routing, 1 for the feed skip) — including
+  `OneDriveThroughOutboxTest`, which runs the production `OutboxDrainer` over real SQL stores.
+  Five mutations (drop `If-Match`; bearer to the upload URL; non-sticky `invalid_grant`; no cooldown; and
+  the reconciler's feed guard) each turned tests red; a sixth (allow an unchecked write) was **not** run.
+- **P3b — NOT built, and it is the thing that stops OneDrive being usable:** the `delta` pull. Until it
+  exists a OneDrive account is **upload-only**: `PullShape.FEED` makes the reconciler skip it (named in
+  `skippedAccounts`, pinned by `FeedStoreIsNotWalkedTest`), because walking it would report health and miss
+  every remote change. It must not reach the UI before this does. The sign-in (Custom Tab + PKCE), the
+  `TokenVault` implementation, the Sync-screen chooser and the device walk are P4.
 
 ## Original design (2026-10-17)
 

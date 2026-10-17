@@ -15,6 +15,7 @@ import dev.inkstone.core.sync.OutboxOpType
 import dev.inkstone.core.sync.OutboxPlan
 import dev.inkstone.core.sync.OutboxStore
 import dev.inkstone.core.sync.PendingRecording
+import dev.inkstone.core.sync.ProviderKind
 import dev.inkstone.core.sync.RecordingUploads
 import dev.inkstone.core.sync.RemoteBinding
 import dev.inkstone.core.sync.StaleBinding
@@ -63,6 +64,8 @@ public class SqlAccountStore(private val database: InkstoneDatabase, private val
             state = account.state.name,
             capabilities = account.capabilities?.let { NextcloudCapabilities.encode(it) },
             lastError = account.lastError,
+            provider = account.provider.name,
+            providerData = account.providerData,
         )
     }
 
@@ -307,6 +310,9 @@ private fun dev.inkstone.core.database.Account.toAccount() = SyncAccount(
     state = AccountState.entries.firstOrNull { it.name == state } ?: AccountState.NEEDS_REAUTH,
     capabilities = capabilities?.let { NextcloudCapabilities.decode(it) },
     lastError = lastError,
+    // Unknown, never Nextcloud: see 10.sqm.
+    provider = ProviderKind.entries.firstOrNull { it.name == provider } ?: ProviderKind.UNKNOWN,
+    providerData = providerData,
 )
 
 private fun dev.inkstone.core.database.RemoteBinding.toBinding() = RemoteBinding(

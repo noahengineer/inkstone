@@ -27,6 +27,7 @@ class CloudStoreSeamTest {
     private class RecordingStore(override val account: SyncAccount, override val supportsUncheckedReplace: Boolean) :
         CloudStore {
         override val kind: ProviderKind = ProviderKind.ONEDRIVE
+        override val pullShape: PullShape = PullShape.FEED
         val puts = mutableListOf<Pair<RemoteTarget, WritePrecondition>>()
 
         override suspend fun ensureFolder(path: String): DavOutcome<Unit> = DavOutcome.Ok(Unit)

@@ -1,0 +1,12 @@
+-- docs/CLOUD-PROVIDERS.md §7 — which service an account talks to.
+--
+-- Additive, like 5.sqm and 8.sqm: two ALTERs, nothing rewritten. The DEFAULT is what every row
+-- already in the table is, so an upgrade cannot change what an existing Nextcloud account does.
+--
+-- `provider` is a name from `ProviderKind`; an unrecognised one reads back as UNKNOWN and is
+-- never treated as Nextcloud (a newer build's account must not be sent Basic auth by an older one).
+-- `providerData` is the provider's own JSON (OneDrive: the drive id) — kept out of `serverUrl`,
+-- `loginName` and `uid` so those three columns keep meaning one thing each.
+
+ALTER TABLE account ADD COLUMN provider     TEXT NOT NULL DEFAULT 'NEXTCLOUD';
+ALTER TABLE account ADD COLUMN providerData TEXT;
