@@ -136,6 +136,54 @@ public interface CloudStore {
      * is a real answer; any failure means *"cannot tell"* and must not be read as deletion.
      */
     public suspend fun locate(fileId: Long): DavOutcome<List<DavResource>>
+
+    /**
+     * What changed since [since] — only a [PullShape.FEED] store answers; a listing store fails.
+     *
+     * [since] is the opaque cursor a previous [ChangeBatch.cursor] returned, or null for a first
+     * enumeration. The whole feed is read before this returns (so a file's path can be resolved
+     * from folders that arrive after it), and **nothing is concluded from a partial read**: a page
+     * that fails fails the call.
+     */
+    public suspend fun changes(since: String?): DavOutcome<ChangeBatch>
+}
+
+/**
+ * One complete reading of a change feed (docs/CLOUD-PROVIDERS.md §4).
+ *
+ * @property cursor where the next call resumes. **Only worth keeping once every change here has been
+ *   dealt with** — a cursor advanced past a change that failed is that change lost.
+ */
+public data class ChangeBatch(val changes: List<RemoteChange>, val cursor: String, val kind: DeltaKind)
+
+/**
+ * Why a batch looks the way it does — which decides how much of its *silence* may be believed.
+ *
+ * Only [INCREMENTAL] may say a file is gone, and only by naming it ([RemoteChange.Removed]). A first
+ * enumeration and a resync both list "what exists", and a file's absence from that list is exactly
+ * what a partial or reset server also produces — Graph's own resync codes include one that means the
+ * *server* lost things and the client should upload (`resyncChangesUploadDifferences`). So absence
+ * after either is never grounds to trash a note.
+ */
+public enum class DeltaKind {
+    /** No cursor: everything that exists. */
+    FIRST,
+
+    /** A cursor this feed still honours: only what changed, with deletions named. */
+    INCREMENTAL,
+
+    /** The feed refused the cursor (Graph `410 Gone`) and started over: everything that exists. */
+    RESYNC,
+}
+
+/** One change. Folders and non-PDF files are consumed by the store (for paths) and never surface. */
+public sealed interface RemoteChange {
+
+    /** A PDF that exists, at [resource]'s path now. [parentId] is its folder's id, for the library mirror. */
+    public data class File(val resource: DavResource, val parentId: String?) : RemoteChange
+
+    /** The item with this id is gone (recycle bin or otherwise). Named, never inferred. */
+    public data class Removed(val id: String) : RemoteChange
 }
 
 /**
@@ -239,6 +287,9 @@ public class NextcloudStore(private val session: NextcloudSession) : CloudStore 
     override suspend fun download(path: String): DavOutcome<DownloadedFile> = session.dav.download(path)
 
     override suspend fun locate(fileId: Long): DavOutcome<List<DavResource>> = session.dav.searchByFileId(fileId)
+
+    override suspend fun changes(since: String?): DavOutcome<ChangeBatch> =
+        DavOutcome.Failed(DavFailure.Malformed("Nextcloud is walked, not read as a change feed"))
 }
 
 /**

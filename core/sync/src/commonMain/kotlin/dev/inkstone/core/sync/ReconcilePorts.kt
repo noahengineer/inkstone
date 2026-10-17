@@ -79,6 +79,13 @@ public data class SyncCursor(
     val lastReconcileAtEpochMillis: Long = 0L,
     val lastFullAtEpochMillis: Long = 0L,
     val refusedUntilEpochMillis: Long = 0L,
+    /**
+     * docs/CLOUD-PROVIDERS.md §4 — where a [PullShape.FEED] store's feed resumes (Graph's
+     * `deltaLink`). Null for a listing store, and for a feed that has never been read. **Not
+     * [rootEtag]**: that column means "the version of a folder", and one column meaning two things
+     * is how a cursor ends up compared against an ETag.
+     */
+    val feedCursor: String? = null,
 )
 
 /**

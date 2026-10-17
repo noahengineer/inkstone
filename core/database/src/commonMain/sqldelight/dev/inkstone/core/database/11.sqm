@@ -1,0 +1,6 @@
+-- docs/CLOUD-PROVIDERS.md §4 — where a change-feed store resumes.
+--
+-- Additive, like 5.sqm: one ALTER, nothing rewritten. NULL is what every existing row is — "no feed read
+-- yet" — and for a Nextcloud account it stays NULL for good.
+
+ALTER TABLE syncCursor ADD COLUMN feedCursor TEXT;

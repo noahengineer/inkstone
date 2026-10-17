@@ -44,11 +44,47 @@
   `OneDriveThroughOutboxTest`, which runs the production `OutboxDrainer` over real SQL stores.
   Five mutations (drop `If-Match`; bearer to the upload URL; non-sticky `invalid_grant`; no cooldown; and
   the reconciler's feed guard) each turned tests red; a sixth (allow an unchecked write) was **not** run.
-- **P3b — NOT built, and it is the thing that stops OneDrive being usable:** the `delta` pull. Until it
-  exists a OneDrive account is **upload-only**: `PullShape.FEED` makes the reconciler skip it (named in
-  `skippedAccounts`, pinned by `FeedStoreIsNotWalkedTest`), because walking it would report health and miss
-  every remote change. It must not reach the UI before this does. The sign-in (Custom Tab + PKCE), the
-  `TokenVault` implementation, the Sync-screen chooser and the device walk are P4.
+- **P3b — the `delta` pull, built and tested against the stand-in** (user: "build the OneDrive pull next").
+  `CloudStore.changes(cursor)` returns a whole, path-resolved `ChangeBatch` (`FIRST` / `INCREMENTAL` /
+  `RESYNC`); `Reconciler.feedPass` reads it and **reuses every per-file decision the folder walk makes**
+  (`visit`: moved / changed / adopt / layer 3, the merge, the outbox table, the foreign-file cache) by
+  handing each changed PDF to the same code. What is different, and why it is safe:
+  - **a deletion is named, never inferred** — only a `Removed` in an `INCREMENTAL` batch trashes a note.
+    After a first enumeration or a `410` resync a missing file is *not* a deletion (Graph's own
+    `resyncChangesUploadDifferences` means the *server* lost things), so the note stays bound and, if the
+    file is truly gone, its next upload answers 404 and the note says `ERROR`. The "pruned subtree looks
+    deleted" bug class cannot occur;
+  - **the cursor moves only when every change was dealt with** (a failure, a deferral, an editor holding a
+    note, or the pass limit keeps it, and the changes come back — they are idempotent);
+  - **a cursor, `nextLink` or `deltaLink` that is not on the account's own API host is refused**, so a
+    response cannot steer the bearer token elsewhere;
+  - **a 401 opens the same persisted cooldown** the walk uses, and a halted account is not asked again;
+  - unknown PDFs are adopted only inside the walk roots; a known note is followed anywhere.
+  Migration `11.sqm` adds `syncCursor.feedCursor` (and `upsertCursor` names it — `INSERT OR REPLACE`).
+  `OneDriveTwoDevicesTest` runs **two production tablets over the stand-in** (real `NoteStore`, PDF
+  publisher, extractor, merge gate, drainer, reconciler): a note written on one arrives on the other as a
+  real PDF; idle polls cost one feed call and nothing else; concurrent offline writes converge with both
+  strokes; a named deletion trashes the note with its unsynced edit restorable; an edit behind a tablet's
+  back is a conflict that overwrites nothing; a refused grant halts one tablet and sends nothing more.
+  Each safety rule above was checked red: nine mutations (a deletion trusted in any batch; the cursor always
+  advancing; adoption anywhere; no 401 cooldown; deletions applied before files; a `nextLink` on another host
+  followed; a `410` not treated as a resync; deletions not reported; paging stopping early) each failed at
+  least one test. One mutation *survived* — a "binding was re-pointed" check on the deletion path — because
+  the check was dead code (`findByOcId` already guarantees it); it was removed, and the ordering that really
+  protects a re-created file is what the last mutation now covers.
+  **Limits, none of them fixed:**
+  - a first enumeration is the **whole drive** (`root/delta`) — on a real library that is large; scoping
+    it (the App Folder, or a `children` walk of one folder plus `?token=latest`) is open (M-M3);
+  - a **folder rename** reports no descendants, so a binding under it keeps a stale *path* (writes use the
+    item id and are unaffected, but a later local rename would re-create the old folder name and move the
+    file into it);
+  - a **rename costs one download** (Graph's eTag moves on any metadata change; the merge then finds
+    nothing new and uploads nothing);
+  - the feed is **unverified against Graph**: that parents repeat, that delta items have no path, what
+    `410` carries. M-M7 in the spike is that check, and it has not run.
+
+  The sign-in (Custom Tab + PKCE), the Keystore `TokenVault`, the Sync-screen chooser and the device walk are
+  P4. **It still must not reach the UI before the spike has run.**
 
 ## Original design (2026-10-17)
 

@@ -45,15 +45,16 @@ import kotlinx.serialization.json.Json as KJson
  *   [MicrosoftTokenSource].
  * - **The upload URL is pre-authorised and is sent no bearer token** (Graph answers 401 if one is added).
  *
- * ## What this store is NOT yet
+ * ## How it pulls
  *
- * It has no change feed. [pullShape] is [PullShape.FEED] and nothing implements `delta`, so the
- * reconciler refuses to poll a OneDrive account — an upload-only account is a known, loud limit
- * (docs §12), whereas pulling through a folder listing would look healthy and miss every remote
- * change, because Graph's folder ETags are not documented to propagate the way Nextcloud's do.
+ * Through `delta` ([changes]), never through folder listings: Graph's folder ETags are not documented
+ * to propagate the way Nextcloud's do, so a walk would look healthy and miss every remote change.
+ * [pullShape] is [PullShape.FEED], and the reconciler reads it as one.
  *
  * ⚠️ Unverified against a live Graph (docs §9, M-M1…M-M10): the 412, the 409 on a duplicate create, that
- * a half-finished session is invisible, and that an item carries a `@microsoft.graph.downloadUrl`.
+ * a half-finished session is invisible, that an item carries a `@microsoft.graph.downloadUrl`, **and
+ * everything about `delta`** — that parents arrive with their children, that a folder rename omits its
+ * descendants, what `410` carries. Nothing here has seen a real feed.
  *
  * @param fragmentBytes must be a multiple of 320 KiB (327,680) — Graph fails the *commit* of a
  *   file uploaded in any other size. A parameter so a test can use a small one.
@@ -260,6 +261,15 @@ public class OneDriveStore(
     override suspend fun locate(fileId: Long): DavOutcome<List<DavResource>> = DavOutcome.Failed(
         DavFailure.Malformed("OneDrive has no file-id search; its pull is a delta feed, which is not built yet"),
     )
+
+    /** `delta`, read to the end. See [GraphFeedReader] for what it does and what it assumes. */
+    override suspend fun changes(since: String?): DavOutcome<ChangeBatch> = feedReader.read(since)
+
+    private val feedReader: GraphFeedReader by lazy {
+        GraphFeedReader(base, drive) { url, describe ->
+            send(HttpMethod.Get, url, describe) {}.flatten { it.json() }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Pieces
@@ -470,51 +480,10 @@ public class OneDriveStore(
         if (status in SUCCESS_FLOOR until REDIRECT_FLOOR) {
             return DavOutcome.Ok(Reply(status, bytes))
         }
-        return DavOutcome.Failed(failureFor(response, status, bytes, describe))
+        return DavOutcome.Failed(GraphFailures.of(status, response.headers["Retry-After"], bytes, describe))
     }
 
     private suspend fun HttpResponse.readBytes(): ByteArray = body()
-
-    private fun failureFor(response: HttpResponse, status: Int, body: ByteArray, describe: String): DavFailure {
-        val code = errorCode(body)
-        val detail = body.decodeToString().take(DETAIL_LIMIT).takeIf { it.isNotBlank() }
-        return when (status) {
-            HTTP_UNAUTHORIZED -> DavFailure.Unauthorized
-
-            HTTP_FORBIDDEN -> DavFailure.Forbidden(detail)
-
-            HTTP_NOT_FOUND -> DavFailure.NotFound(describe)
-
-            // 409 nameAlreadyExists is a create over something that exists; 412 is a stale If-Match.
-            // Both are "someone else got there first", and both are conflicts rather than retries.
-            HTTP_PRECONDITION_FAILED -> DavFailure.PreconditionFailed(null)
-
-            HTTP_CONFLICT ->
-                if (code ==
-                    "nameAlreadyExists"
-                ) {
-                    DavFailure.PreconditionFailed(null)
-                } else {
-                    DavFailure.Server(status, detail)
-                }
-
-            HTTP_LOCKED -> DavFailure.Locked(null)
-
-            HTTP_TOO_MANY_REQUESTS -> DavFailure.RateLimited(response.headers["Retry-After"]?.toLongOrNull())
-
-            HTTP_INSUFFICIENT_STORAGE -> DavFailure.QuotaExceeded
-
-            else -> DavFailure.Server(status, detail)
-        }
-    }
-
-    @Suppress("SwallowedException", "TooGenericExceptionCaught")
-    private fun errorCode(body: ByteArray): String? = try {
-        (KJson.parseToJsonElement(body.decodeToString()).jsonObject["error"] as? JsonObject)
-            ?.get("code")?.let { (it as? JsonPrimitive)?.contentOrNull }
-    } catch (ignored: Exception) {
-        null
-    }
 
     private class Reply(val status: Int, val bytes: ByteArray) {
         fun json(): JsonElement = try {
@@ -584,17 +553,8 @@ public class OneDriveStore(
         const val FRAGMENT_BYTES = 32 * FRAGMENT_UNIT
         const val PAGE_SIZE = 200
         const val MAX_PAGES = 500
-        const val DETAIL_LIMIT = 500
         const val SUCCESS_FLOOR = 200
         const val REDIRECT_FLOOR = 300
-        const val HTTP_UNAUTHORIZED = 401
-        const val HTTP_FORBIDDEN = 403
-        const val HTTP_NOT_FOUND = 404
-        const val HTTP_CONFLICT = 409
-        const val HTTP_PRECONDITION_FAILED = 412
-        const val HTTP_LOCKED = 423
-        const val HTTP_TOO_MANY_REQUESTS = 429
-        const val HTTP_INSUFFICIENT_STORAGE = 507
         val FINAL_STATUSES = setOf(200, 201)
     }
 }

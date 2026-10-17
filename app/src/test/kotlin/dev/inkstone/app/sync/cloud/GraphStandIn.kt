@@ -29,7 +29,12 @@ import kotlin.concurrent.thread
  * - `DELETE` goes to a recycle bin, never away;
  * - a move onto a name that is taken is a 409;
  * - refresh tokens **rotate**, and an old one is refused (`invalid_grant`), so a client that uses the
- *   wrong one fails here rather than working by luck.
+ *   wrong one fails here rather than working by luck;
+ * - `delta` lists the **latest state** of each changed item (a rename shows once, under its new name),
+ *   repeats the changed items' parents, gives **no `parentReference.path`**, reports a deletion as
+ *   `{"deleted":{}}`, pages through `@odata.nextLink`, ends in `@odata.deltaLink`, and a token the
+ *   service has given up on is a `410`. A *folder* rename reports the folder and **not** its
+ *   descendants, as the docs say. None of this has been seen on a real Graph.
  *
  * `tools/cloud/graph_spike.py` is how those stop being claims. **This file agreeing with the store is
  * evidence the store matches this file, and nothing more** — CLAUDE.md's oldest lesson.
@@ -73,6 +78,11 @@ internal class GraphStandIn {
     private val recycleBin = ArrayList<Node>()
     private val sessions = HashMap<String, Session>()
     private var idCounter = 1000
+
+    /** Delta: the sequence number of each item's last change, and of each deletion. */
+    private var seq = 0L
+    private val changedAt = LinkedHashMap<String, Long>()
+    private val deletedAt = LinkedHashMap<String, Long>()
     private var sessionCounter = 0
     private var tokenCounter = 1
 
@@ -110,7 +120,25 @@ internal class GraphStandIn {
 
     @Volatile var accessLifetimeSeconds: Long = 3600
 
-    private var currentRefresh = "rt-1"
+    /** How many items a `delta` page carries. Small, to make paging happen. */
+    @Volatile var deltaPageSize: Int = 1000
+
+    /** Emit children before their parents, because Graph does not promise the other order. */
+    @Volatile var deltaChildrenFirst: Boolean = false
+
+    /** Every cursor the service ever issued is now refused with a 410. */
+    @Volatile var expireDeltaTokens: Boolean = false
+
+    /** Do not repeat a changed item's parents — the store must then ask for them. */
+    @Volatile var deltaOmitsAncestors: Boolean = false
+
+    /** Point `@odata.nextLink` at somebody else's host, to see whether the bearer token follows it. */
+    @Volatile var deltaPointsElsewhere: Boolean = false
+
+    val delta = Counter()
+
+    /** One rotating refresh-token chain per signed-in device: chain number → the one token that works now. */
+    private val chains = HashMap<Int, String>()
     private val validAccess = HashSet<String>()
 
     private val socket = ServerSocket(0, BACKLOG, InetAddress.getByName("127.0.0.1"))
@@ -122,9 +150,18 @@ internal class GraphStandIn {
     val baseUrl: String = "$origin/v1.0"
     val tokenUrl: String = "$origin/oauth/token"
     val driveId: String = "drive-1"
-    val initialRefreshToken: String = "rt-1"
+    val initialRefreshToken: String
+
+    /** A new device signs in: its own refresh-token chain, independent of every other's. */
+    fun signIn(): String = synchronized(lock) {
+        val chain = chains.size + 1
+        val token = if (chain == 1) "rt-1" else "rt-s$chain"
+        chains[chain] = token
+        token
+    }
 
     init {
+        initialRefreshToken = signIn()
         nodes[rootId] = Node(rootId, "root", null, isFolder = true)
         thread(isDaemon = true, name = "graph-standin-accept") { acceptLoop() }
     }
@@ -152,11 +189,40 @@ internal class GraphStandIn {
         val node = checkNotNull(find(path)) { "no $path" }
         node.bytes = bytes
         node.version++
+        mark(node)
     }
 
     /** A metadata-only change (a rename elsewhere, an indexer): the eTag moves, the bytes do not. */
     fun touchMetadata(path: String) = synchronized(lock) {
-        checkNotNull(find(path)).version++
+        checkNotNull(find(path)).also {
+            it.version++
+            mark(it)
+        }
+    }
+
+    /** Another client removing a file or folder (to the recycle bin). */
+    fun removeBehindTheirBack(path: String) {
+        synchronized(lock) { delete(checkNotNull(find(path)) { "no $path" }) }
+    }
+
+    /** Another client renaming a folder or file. */
+    fun renameBehindTheirBack(path: String, newName: String) = synchronized(lock) {
+        val node = checkNotNull(find(path)) { "no $path" }
+        node.name = newName
+        node.version++
+        mark(node)
+    }
+
+    /** Another client moving an item under another folder. */
+    fun moveBehindTheirBack(path: String, newParentPath: String) = synchronized(lock) {
+        val node = checkNotNull(find(path)) { "no $path" }
+        node.parentId = checkNotNull(find(newParentPath)) { "no $newParentPath" }.id
+        node.version++
+        mark(node)
+    }
+
+    private fun mark(node: Node) {
+        changedAt[node.id] = ++seq
     }
 
     fun seedFile(path: String, bytes: ByteArray): String = synchronized(lock) {
@@ -304,6 +370,7 @@ internal class GraphStandIn {
             val suffix = inner.substring(close + 1)
             return byPath(request, itemPath, suffix)
         }
+        if (rest == "/root/delta") return delta(request)
         if (rest == "/root") return json(200, itemJson(nodes.getValue(rootId)))
         if (rest == "/root/children") return childrenOrCreate(request, nodes.getValue(rootId))
         if (rest.startsWith("/items/")) {
@@ -315,6 +382,57 @@ internal class GraphStandIn {
             return byId(request, node, suffix)
         }
         return json(404, error("itemNotFound"))
+    }
+
+    @Suppress("CyclomaticComplexMethod") // A fixture that mirrors the docs paragraph by paragraph.
+    private fun delta(request: Request): Response {
+        delta.hit()
+        val token = Regex("token=([^&]+)").find(request.query)?.groupValues?.get(1)?.let {
+            URLDecoder.decode(it, "UTF-8")
+        }
+        if (token != null && expireDeltaTokens) {
+            return json(410, error("resyncRequired"), mapOf("Location" to "$baseUrl/drives/$driveId/root/delta"))
+        }
+        // `S<seq>` is a finished feed's cursor; `P<from>:<offset>:<snapshot>` is a page in progress.
+        val (from, offset, snapshot) = when {
+            token == null -> Triple(0L, 0, seq)
+
+            token.startsWith("S") -> Triple(token.substring(1).toLong(), 0, seq)
+
+            token.startsWith("P") -> token.substring(1).split(':').let {
+                Triple(it[0].toLong(), it[1].toInt(), it[2].toLong())
+            }
+
+            else -> return json(400, error("invalidRequest"))
+        }
+        val changed = if (from == 0L) {
+            nodes.values.toList()
+        } else {
+            nodes.values.filter { (changedAt[it.id] ?: 0L) in (from + 1)..snapshot }
+        }
+        // Graph repeats the parents of what changed, up to the root.
+        val withAncestors = LinkedHashMap<String, Node>()
+        for (node in changed) {
+            if (deltaOmitsAncestors && from != 0L) {
+                withAncestors[node.id] = node
+                continue
+            }
+            var up: Node? = node
+            while (up != null && withAncestors.putIfAbsent(up.id, up) == null) up = up.parentId?.let { nodes[it] }
+        }
+        val ordered = withAncestors.values.toList().let { if (deltaChildrenFirst) it.reversed() else it }
+        val gone = if (from == 0L) emptyList() else deletedAt.filterValues { it in (from + 1)..snapshot }.keys.toList()
+        val all = ordered.map { itemJson(it, forDelta = true) } + gone.map { id -> "{\"id\":\"$id\",\"deleted\":{}}" }
+        val page = all.drop(offset).take(deltaPageSize)
+        val more = offset + page.size < all.size
+        val host = if (deltaPointsElsewhere) "http://evil.invalid/v1.0" else baseUrl
+        val link = "$host/drives/$driveId/root/delta?token="
+        val tail = if (more) {
+            "\"@odata.nextLink\":\"${link}P$from:${offset + page.size}:$snapshot\""
+        } else {
+            "\"@odata.deltaLink\":\"${link}S$snapshot\""
+        }
+        return json(200, "{\"value\":[${page.joinToString(",")}],$tail}")
     }
 
     private fun byPath(request: Request, itemPath: String, suffix: String): Response {
@@ -405,6 +523,7 @@ internal class GraphStandIn {
         return if (existing != null) {
             existing.bytes = bytes
             existing.version++
+            mark(existing)
             json(200, itemJson(existing))
         } else {
             if (child(session.parentId, session.name) != null) return json(409, error("nameAlreadyExists"))
@@ -432,6 +551,7 @@ internal class GraphStandIn {
         node.name = newName
         node.parentId = newParent
         node.version++
+        mark(node)
         return json(200, itemJson(node))
     }
 
@@ -439,6 +559,8 @@ internal class GraphStandIn {
         // Soft: out of the namespace, into the bin. Nothing here can destroy bytes.
         nodes.remove(node.id)
         recycleBin += node
+        changedAt.remove(node.id)
+        deletedAt[node.id] = ++seq
         return Response(204)
     }
 
@@ -450,13 +572,14 @@ internal class GraphStandIn {
                     URLDecoder.decode(it.substringAfter('='), "UTF-8")
             }
         log += "token refresh=${form["refresh_token"]}"
-        if (grantDead || form["grant_type"] != "refresh_token" || form["refresh_token"] != currentRefresh) {
+        val chain = chains.entries.firstOrNull { it.value == form["refresh_token"] }
+        if (grantDead || form["grant_type"] != "refresh_token" || chain == null) {
             return json(400, """{"error":"invalid_grant","error_description":"refused"}""")
         }
         val n = ++tokenCounter
         val access = "at-$n"
         val refresh = "rt-$n"
-        currentRefresh = refresh
+        chains[chain.key] = refresh
         validAccess += access
         log += "token issued $access $refresh"
         json(
@@ -481,18 +604,37 @@ internal class GraphStandIn {
 
     private fun newNode(parentId: String?, name: String, folder: Boolean, bytes: ByteArray = ByteArray(0)): Node {
         val id = "item-${idCounter++}"
-        return Node(id, name, parentId, folder, bytes).also { nodes[id] = it }
+        return Node(id, name, parentId, folder, bytes).also {
+            nodes[id] = it
+            mark(it)
+        }
     }
 
-    private fun itemJson(node: Node): String = buildString {
-        append("""{"id":"${node.id}","name":"${node.name}","eTag":"${node.etag.replace("\"", "\\\"")}",""")
-        append(""""size":${node.bytes.size},"lastModifiedDateTime":"2026-10-17T00:00:00Z",""")
-        val kindFields = if (node.isFolder) {
-            """"folder":{}"""
-        } else {
-            """"file":{},"@microsoft.graph.downloadUrl":"$origin/download/${node.id}/${node.version}""""
+    private fun pathOf(node: Node): String {
+        val names = ArrayList<String>()
+        var up: Node? = node.parentId?.let { nodes[it] }
+        while (up != null && up.id != rootId) {
+            names += up.name
+            up = up.parentId?.let { nodes[it] }
         }
-        append(kindFields)
+        return "/drive/root:" + names.reversed().joinToString("") { "/$it" }
+    }
+
+    private fun itemJson(node: Node, forDelta: Boolean = false): String = buildString {
+        val etag = node.etag.replace("\"", "\\\"")
+        append("{\"id\":\"${node.id}\",\"name\":\"${node.name}\",\"eTag\":\"$etag\",")
+        append("\"size\":${node.bytes.size},\"lastModifiedDateTime\":\"2026-10-17T00:00:00Z\",")
+        if (node.parentId != null) {
+            // A delta item carries no `path` — the docs say so, and a client that leans on one fails here.
+            val path = if (forDelta) "" else ",\"path\":\"${pathOf(node)}\""
+            append("\"parentReference\":{\"id\":\"${node.parentId}\"$path},")
+        }
+        if (node.id == rootId) append("\"root\":{},")
+        if (node.isFolder) {
+            append("\"folder\":{}")
+        } else {
+            append("\"file\":{},\"@microsoft.graph.downloadUrl\":\"$origin/download/${node.id}/${node.version}\"")
+        }
         append("}")
     }
 

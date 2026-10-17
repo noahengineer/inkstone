@@ -31,8 +31,10 @@ import dev.inkstone.core.storage.NoteLayout
 import dev.inkstone.core.storage.NoteSession
 import dev.inkstone.core.storage.NoteStore
 import dev.inkstone.core.sync.AttentionEntry
+import dev.inkstone.core.sync.CloudStoreFactory
 import dev.inkstone.core.sync.DavOutcome
 import dev.inkstone.core.sync.DrainReport
+import dev.inkstone.core.sync.NextcloudStoreFactory
 import dev.inkstone.core.sync.NextcloudTransport
 import dev.inkstone.core.sync.OutboxDrainer
 import dev.inkstone.core.sync.OutboxEntry
@@ -72,6 +74,9 @@ import kotlin.time.Duration.Companion.minutes
  * Block comment, not KDoc: a file-level KDoc attaches to no declaration.
  */
 
+/** The account a [Device] syncs to and the factory that opens it, when it is not the Nextcloud default. */
+internal class DeviceWiring(val account: SyncAccount, val factory: CloudStoreFactory)
+
 /** One tablet: everything below the UI, all of it real. */
 @Suppress("TooManyFunctions")
 // The vocabulary one row of the matrix needs of a device — create, edit, bind, drain, pull, and
@@ -85,6 +90,8 @@ internal class Device(
     val remoteFolder: String,
     val clock: MatrixClock,
     private val root: Path,
+    /** docs/CLOUD-PROVIDERS.md — null is Nextcloud, which is what every existing row uses. */
+    private val wiring: DeviceWiring? = null,
 ) {
 
     val fs: TempFileSystem = TempFileSystem(root)
@@ -155,6 +162,8 @@ internal class Device(
      */
     private val transport: NextcloudTransport = NextcloudTransport.create()
 
+    private val storeFactory: CloudStoreFactory = wiring?.factory ?: NextcloudStoreFactory(credentials, transport)
+
     val reconciler: Reconciler = Reconciler(
         stores = syncStores,
         pull = pullStores,
@@ -165,15 +174,16 @@ internal class Device(
         extractor = PulledPdfExtractor(fs, dispatcher),
         gate = gate,
         engine = engine,
+        storeFactory = storeFactory,
     )
 
     /** Zero jitter, so a backoff assertion is about the ladder and not about a random number. */
     val drainer: OutboxDrainer
-        get() = OutboxDrainer(syncStores, credentials, materializer, fs, clock, transport) { 0.0 }
+        get() = OutboxDrainer(syncStores, credentials, materializer, fs, clock, transport, storeFactory) { 0.0 }
 
     suspend fun start() {
         accounts.upsert(
-            SyncAccount(
+            wiring?.account ?: SyncAccount(
                 id = MATRIX_ACCOUNT_ID,
                 serverUrl = server.credential.serverUrl,
                 loginName = server.credential.loginName,

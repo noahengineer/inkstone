@@ -181,11 +181,13 @@ public class Reconciler(
         // Null covers a missing credential and a stored one whose uid disagrees with the account
         // row (`isUsable` has already vouched for the row's view of it).
         val store = storeFactory.open(account) ?: return report.skipping(account.id)
-        // ⚠️ A feed store is never walked (see [PullShape]). Skipped, not "reconciled": an upload-only
-        // OneDrive account is a known limit until its `delta` pull exists (docs/CLOUD-PROVIDERS.md §4),
-        // and a walk would look healthy while missing every remote change.
-        if (store.pullShape != PullShape.LISTING) return report.skipping(account.id)
-        return pass(store, limit, report)
+        // ⚠️ A feed store is never walked (see [PullShape]): Graph's folder ETags are not documented to
+        // propagate, so a walk would look healthy while missing every remote change. It is read as a
+        // feed instead, which names its deletions rather than leaving them to be inferred.
+        return when (store.pullShape) {
+            PullShape.LISTING -> pass(store, limit, report)
+            PullShape.FEED -> feedPass(store, limit, report)
+        }
     }
 
     /**
@@ -258,6 +260,184 @@ public class Reconciler(
                 polled,
             )
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // A change feed — docs/CLOUD-PROVIDERS.md §4
+    // -----------------------------------------------------------------------
+
+    /**
+     * One pass over a store whose pull is a change feed (Graph `delta`).
+     *
+     * It reuses **every** per-file decision the walk makes — [visit]'s four branches, the merge, the
+     * outbox table, layer 3, the foreign-file cache — by handing each changed PDF to the same code
+     * with a one-folder [WalkStep] standing in for the listing it did not come from. What differs is
+     * only where the facts come from and what silence is allowed to mean:
+     *
+     * - **A deletion is named, never inferred.** [RemoteChange.Removed] is the only thing that trashes
+     *   a note, and only in an [DeltaKind.INCREMENTAL] batch. A first enumeration and a resync list
+     *   what *exists*, and a file missing from that list is also what a partial or reset server looks
+     *   like — Graph's own `resyncChangesUploadDifferences` means *the server* lost things. So after
+     *   either, a note whose file is not listed is **left bound**; if the file really is gone its next
+     *   upload answers 404 and the note says so (`ERROR`), which costs a visible message and loses
+     *   nothing. That also removes the whole "pruned subtree looks deleted" class of bug.
+     * - **The cursor advances only when every change was dealt with.** A failure, a deferral or the
+     *   pass limit keeps the old one, so the same changes come back next pass; they are idempotent
+     *   (an unchanged ETag is a no-op), which is what makes "come back" safe. The same rule as a
+     *   directory's cached ETag being written only when everything under it finished.
+     * - **A 401 stops the pass and opens the cooldown**, exactly as the walk does (rule 5): the cursor
+     *   is not advanced and nothing else is sent.
+     * - **Unknown PDFs are adopted only inside the walk roots.** A known note is followed wherever it
+     *   goes — which is what makes a move *out* of every root visible — but an unknown PDF elsewhere in
+     *   somebody's OneDrive is not ours to download.
+     */
+    @Suppress("LongMethod", "CyclomaticComplexMethod", "ReturnCount")
+    // One pass has five jobs in a fixed order — read, adopt/merge the files, apply the named
+    // deletions, stamp, and decide whether the cursor may move — and splitting them would scatter the
+    // one condition (`finished`) that ties them together across five functions.
+    private suspend fun feedPass(store: CloudStore, limit: Int, report: ReconcileReport): ReconcileReport {
+        val accountId = store.account.id
+        val passStartedAt = clock.nowEpochMillis()
+        val cursor = pull.cursors.find(accountId) ?: SyncCursor(accountId)
+        if (passStartedAt < cursor.refusedUntilEpochMillis) return report.skipping(accountId)
+        val polled = report.copy(accountsPolled = report.accountsPolled + 1)
+
+        val batch = when (val read = store.changes(cursor.feedCursor)) {
+            is DavOutcome.Failed -> {
+                val outcome = ReconcileOutcome.Failed(null, "", read.error)
+                record(outcome, accountId)
+                if (read.error == DavFailure.Unauthorized) {
+                    pull.cursors.upsert(cursor.copy(refusedUntilEpochMillis = passStartedAt + REFUSAL_COOLDOWN_MILLIS))
+                }
+                return halting(read.error, accountId, polled.counting(outcome))
+            }
+
+            is DavOutcome.Ok -> read.value
+        }
+        if (batch.changes.isEmpty()) {
+            pull.cursors.upsert(
+                cursor.copy(feedCursor = batch.cursor, lastReconcileAtEpochMillis = passStartedAt),
+            )
+            return polled.copy(unchanged = polled.unchanged + 1)
+        }
+
+        val bindingPaths = bindings.forAccount(accountId).map { it.remotePath }
+        val pinned = pull.folders.pathsForAccount(accountId)
+        val roots = RemoteWalk.rootsOf(store.account.defaultFolder, bindingPaths, pinned.values)
+        val pass = Pass(store, accountId, passStartedAt, roots, batch.kind != DeltaKind.INCREMENTAL, limit)
+        val visited = Visited()
+        val progress = FeedProgress(polled)
+
+        for (change in batch.changes.filterIsInstance<RemoteChange.File>()) {
+            if (!feedFile(pass, change, visited, progress)) break
+        }
+        if (batch.kind == DeltaKind.INCREMENTAL && !visited.refused) {
+            for (change in batch.changes.filterIsInstance<RemoteChange.Removed>()) {
+                feedRemoval(accountId, change, progress)
+            }
+        }
+        val running = progress.report
+        val finished = progress.finished
+
+        bindings.stampSeen(visited.seen, passStartedAt)
+        pull.cursors.upsert(
+            cursor.copy(
+                feedCursor = if (finished && !visited.refused) batch.cursor else cursor.feedCursor,
+                lastReconcileAtEpochMillis = passStartedAt,
+                lastFullAtEpochMillis = if (finished && batch.kind != DeltaKind.INCREMENTAL) {
+                    passStartedAt
+                } else {
+                    cursor.lastFullAtEpochMillis
+                },
+                refusedUntilEpochMillis = if (visited.refused) {
+                    passStartedAt + REFUSAL_COOLDOWN_MILLIS
+                } else {
+                    cursor.refusedUntilEpochMillis
+                },
+            ),
+        )
+        return running
+    }
+
+    /** What one feed pass has concluded so far: the running report, and whether every change was dealt with. */
+    private class FeedProgress(var report: ReconcileReport) {
+        var finished: Boolean = true
+    }
+
+    /** One changed PDF. False means *stop the pass*: the limit, or a refused account. */
+    private suspend fun feedFile(
+        pass: Pass,
+        change: RemoteChange.File,
+        visited: Visited,
+        progress: FeedProgress,
+    ): Boolean {
+        if (visited.acted >= pass.limit) {
+            progress.finished = false
+            return false
+        }
+        if (!feedWants(pass, change)) return true
+        val parent = change.resource.path.substringBeforeLast('/', "")
+        val walk =
+            WalkStep(
+                RemoteDirectory(pass.accountId, parent, ocId = change.parentId),
+                emptyList(),
+                emptyList(),
+                emptyList(),
+            )
+        val outcome = visit(pass, walk, change.resource, visited)
+        record(outcome, pass.accountId)
+        progress.report = progress.report.counting(outcome)
+        if (outcome is ReconcileOutcome.Failed && outcome.failure == DavFailure.Unauthorized) {
+            visited.refused = true
+            progress.finished = false
+            progress.report = halting(outcome.failure, pass.accountId, progress.report)
+            return false
+        }
+        if (outcome is ReconcileOutcome.Deferred || outcome is ReconcileOutcome.Failed) progress.finished = false
+        return true
+    }
+
+    /**
+     * One *named* deletion. Run **after** every file in the batch — that order is the guard: a file deleted
+     * and re-created under a new id reaches [visit] first, which repoints the binding at the new id, so the
+     * lookup by the old id then finds nothing and the note is not trashed. Reversing the two loops would
+     * trash a note whose file is still on the server. And a note that never reached the server cannot have
+     * been deleted from it (the same third guard as [isAbsentRemotely]).
+     */
+    private suspend fun feedRemoval(accountId: String, change: RemoteChange.Removed, progress: FeedProgress) {
+        val binding = bindings.findByOcId(change.id).firstOrNull { it.accountId == accountId } ?: return
+        if (!binding.everUploaded) return
+        val outcome = trashNamedDeletion(binding)
+        record(outcome, accountId)
+        progress.report = progress.report.counting(outcome)
+        if (outcome is ReconcileOutcome.Deferred) progress.finished = false
+    }
+
+    /** A known note is followed anywhere; an unknown PDF only inside a walk root. */
+    private suspend fun feedWants(pass: Pass, change: RemoteChange.File): Boolean {
+        val file = change.resource
+        val known = file.ocId?.let { id -> bindings.findByOcId(id).any { it.accountId == pass.accountId } } == true
+        if (known || bindings.findByPath(pass.accountId, file.path).isNotEmpty()) return true
+        val parent = file.path.substringBeforeLast('/', "")
+        return pass.roots.any { root ->
+            if (root.isEmpty()) parent.isEmpty() else parent == root || parent.startsWith("$root/")
+        }
+    }
+
+    /**
+     * The trash half of [resolveAbsent], without the question [resolveAbsent] asks first.
+     *
+     * [locate] exists because a walk can fail to *see* a file that moved; a feed has no such blind
+     * spot — it named the deletion — so there is nothing to look for. The gate's answer is the same:
+     * *"not now"* when an editor holds the note, in which case nothing happens, the cursor stays
+     * where it was and the next pass concludes the same thing again.
+     */
+    private suspend fun trashNamedDeletion(binding: RemoteBinding): ReconcileOutcome {
+        if (!gate.trashRemotelyDeleted(binding.noteId, DELETED_REASON)) {
+            return ReconcileOutcome.Deferred(binding.noteId, binding.remotePath, EDITOR_HOLDS)
+        }
+        engine.noteDeletedRemotely(binding.noteId)
+        return ReconcileOutcome.DeletedRemotely(binding.noteId, binding.remotePath)
     }
 
     /**

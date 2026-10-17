@@ -213,7 +213,9 @@ CREATE TABLE syncCursor (
     -- ⚠️ Added in M6 by repair, so it is **last** in this table: `ALTER TABLE ADD COLUMN` appends,
     -- and a fresh install must produce the column order a migrated database has or
     -- `verifyMigrations` fails the build. See 5.sqm.
-    refusedUntil    INTEGER NOT NULL DEFAULT 0
+    refusedUntil    INTEGER NOT NULL DEFAULT 0,
+    -- 11.sqm. Last, for the reason above. A feed store's resume point (a Graph `deltaLink`).
+    feedCursor      TEXT
 );
 
 -- A remote version fetched but not yet merged. SPEC §7.6 step 3's "REMOTE EDIT → download →
@@ -614,9 +616,11 @@ SELECT * FROM syncCursor WHERE accountId = ?;
 -- one silently resets whatever the earlier one stored — and the value being reset here is the thing
 -- standing between a refused credential and the sixty-second poll (CLAUDE.md rule 5).
 upsertCursor:
+-- ⚠️ `feedCursor` is in this list for the same reason `refusedUntil` is: INSERT OR REPLACE resets what it
+-- omits, so leaving it out would restart a OneDrive account's feed from nothing on every pass.
 INSERT OR REPLACE INTO syncCursor(accountId, dataFingerprint, rootEtag, rootEtagWeak,
-                                  lastReconcileAt, lastFullAt, refusedUntil)
-VALUES (?, ?, ?, ?, ?, ?, ?);
+                                  lastReconcileAt, lastFullAt, refusedUntil, feedCursor)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 
 -- ---------------------------------------------------------------------------
 -- Pending downloads

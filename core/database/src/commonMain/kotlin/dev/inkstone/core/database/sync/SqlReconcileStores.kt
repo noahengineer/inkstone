@@ -280,6 +280,7 @@ public class SqlSyncCursorStore(private val database: InkstoneDatabase, private 
             lastReconcileAt = cursor.lastReconcileAtEpochMillis,
             lastFullAt = cursor.lastFullAtEpochMillis,
             refusedUntil = cursor.refusedUntilEpochMillis,
+            feedCursor = cursor.feedCursor,
         )
     }
 }
@@ -582,6 +583,7 @@ private fun dev.inkstone.core.database.SyncCursor.toCursor() = SyncCursor(
     lastReconcileAtEpochMillis = lastReconcileAt,
     lastFullAtEpochMillis = lastFullAt,
     refusedUntilEpochMillis = refusedUntil,
+    feedCursor = feedCursor,
 )
 
 private fun dev.inkstone.core.database.ForeignRemote.toForeignRemote() = ForeignRemote(
