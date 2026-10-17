@@ -5,7 +5,6 @@ import dev.inkstone.core.model.CredentialStore
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.DocumentMaterializer
 import dev.inkstone.core.model.FileSystem
-import dev.inkstone.core.model.NextcloudCredential
 import dev.inkstone.core.model.NoteSyncState
 import kotlin.coroutines.cancellation.CancellationException
 
@@ -40,11 +39,17 @@ import kotlin.coroutines.cancellation.CancellationException
  */
 public class OutboxDrainer(
     private val stores: SyncStores,
-    private val credentials: CredentialStore,
+    credentials: CredentialStore,
     private val materializer: DocumentMaterializer,
     private val fs: FileSystem,
     private val clock: Clock,
-    private val transport: NextcloudTransport,
+    transport: NextcloudTransport,
+    /**
+     * docs/CLOUD-PROVIDERS.md §2 — how an account becomes a connection. Defaulted to Nextcloud's so
+     * existing construction sites are unchanged; the app passes a routing factory once a second
+     * provider exists. **Before [jitter]** so the trailing-lambda call sites still bind the lambda to it.
+     */
+    private val storeFactory: CloudStoreFactory = NextcloudStoreFactory(credentials, transport),
     /** 0..1. A parameter so a test gets a deterministic backoff; see [Backoff]. */
     private val jitter: () -> Double,
 ) {
@@ -70,7 +75,7 @@ public class OutboxDrainer(
         if (due.isEmpty()) return DrainReport()
 
         var report = DrainReport()
-        val sessions = HashMap<String, NextcloudSession?>()
+        val sessions = HashMap<String, CloudStore?>()
         val halted = HashSet<String>()
 
         for (entry in due) {
@@ -122,7 +127,7 @@ public class OutboxDrainer(
     // them would bury the one line that actually performs the op.
     private suspend fun drainOne(
         entry: OutboxEntry,
-        sessions: MutableMap<String, NextcloudSession?>,
+        sessions: MutableMap<String, CloudStore?>,
         halted: MutableSet<String>,
         now: Long,
         report: DrainReport,
@@ -259,9 +264,9 @@ public class OutboxDrainer(
     // One op
     // -----------------------------------------------------------------------
 
-    private suspend fun perform(entry: OutboxEntry, binding: RemoteBinding, session: NextcloudSession): OpOutcome =
+    private suspend fun perform(entry: OutboxEntry, binding: RemoteBinding, session: CloudStore): OpOutcome =
         when (entry.opType) {
-            OutboxOpType.MKCOL -> classify(session.dav.mkcolRecursive(parentOf(binding.remotePath)), session) {
+            OutboxOpType.MKCOL -> classify(session.ensureFolder(parentOf(binding.remotePath)), session) {
                 OpOutcome.Done
             }
 
@@ -311,7 +316,7 @@ public class OutboxDrainer(
     private suspend fun performMediaUpload(
         entry: OutboxEntry,
         binding: RemoteBinding,
-        session: NextcloudSession,
+        session: CloudStore,
     ): OpOutcome {
         // Null means the server already has it, or the recording was discarded under §10's
         // thirty-second floor after this row was enqueued. Either way nothing is owed — and
@@ -359,25 +364,25 @@ public class OutboxDrainer(
         // Idempotent (405 is success), and needed on every attempt: the note's own folder may
         // exist while `.inkstone-media/<id>/` does not. `performMove` does the same thing for
         // the same reason.
-        session.dav.mkcolRecursive(directory)
+        session.ensureFolder(directory)
 
-        val timelineOutcome = session.dav.put(
-            remotePath = RemoteMedia.timeline(binding.remotePath, binding.noteId, recording.recordingId),
+        val timelineOutcome = session.put(
+            target = RemoteTarget(RemoteMedia.timeline(binding.remotePath, binding.noteId, recording.recordingId)),
             bytes = timeline,
-            ifNoneMatchStar = true,
+            precondition = WritePrecondition.CreateOnly,
             mtimeEpochSeconds = recording.startedAtEpochMillis / MILLIS_PER_SECOND,
             md5Hex = Md5.hex(timeline),
-            contentType = WebDavClient.TIMELINE,
+            kind = UploadKind.TIMELINE,
         )
         landed(timelineOutcome, session)?.let { return it }
 
-        val audioOutcome = session.dav.put(
-            remotePath = RemoteMedia.audio(binding.remotePath, binding.noteId, recording.recordingId),
+        val audioOutcome = session.put(
+            target = RemoteTarget(RemoteMedia.audio(binding.remotePath, binding.noteId, recording.recordingId)),
             bytes = audio,
-            ifNoneMatchStar = true,
+            precondition = WritePrecondition.CreateOnly,
             mtimeEpochSeconds = recording.startedAtEpochMillis / MILLIS_PER_SECOND,
             md5Hex = Md5.hex(audio),
-            contentType = WebDavClient.AUDIO_OGG,
+            kind = UploadKind.AUDIO_OGG,
         )
         landed(audioOutcome, session)?.let { return it }
 
@@ -393,13 +398,12 @@ public class OutboxDrainer(
      * cannot observe a failure and forget to stop: the only way to see one is to be handed the
      * [OpOutcome] that reports it.
      */
-    private suspend fun landed(outcome: DavOutcome<UploadReceipt>, session: NextcloudSession): OpOutcome? =
-        when (outcome) {
-            is DavOutcome.Ok -> null
+    private suspend fun landed(outcome: DavOutcome<UploadReceipt>, session: CloudStore): OpOutcome? = when (outcome) {
+        is DavOutcome.Ok -> null
 
-            is DavOutcome.Failed ->
-                if (outcome.error is DavFailure.PreconditionFailed) null else failureOutcome(outcome.error, session)
-        }
+        is DavOutcome.Failed ->
+            if (outcome.error is DavFailure.PreconditionFailed) null else failureOutcome(outcome.error, session)
+    }
 
     /**
      * SPEC §7.6 — MOVE drains before UPLOAD, and SPEC §7.5 — `Overwrite: F`.
@@ -408,7 +412,7 @@ public class OutboxDrainer(
      * upload) is a no-op rather than a 404: the UPLOAD behind it will create the file at
      * the new path, which is the same end state with one request instead of two errors.
      */
-    private suspend fun performMove(binding: RemoteBinding, session: NextcloudSession): OpOutcome {
+    private suspend fun performMove(binding: RemoteBinding, session: CloudStore): OpOutcome {
         val from = binding.movedFromPath
         if (from == null || from == binding.remotePath || !binding.everUploaded) {
             bindings.upsert(binding.copy(movedFromPath = null))
@@ -416,9 +420,9 @@ public class OutboxDrainer(
         }
         // The destination's folder may not exist yet — a move into a folder created on
         // this device while offline. MKCOL is idempotent (405 means "already there").
-        session.dav.mkcolRecursive(parentOf(binding.remotePath))
+        session.ensureFolder(parentOf(binding.remotePath))
         moveMediaDirectory(from, binding, session)
-        return classify(session.dav.move(from, binding.remotePath), session) { receipt ->
+        return classify(session.move(RemoteTarget(from, binding.remoteOcId), binding.remotePath), session) { receipt ->
             bindings.upsert(
                 binding.copy(
                     movedFromPath = null,
@@ -454,12 +458,12 @@ public class OutboxDrainer(
      * path segment rather than on "sits beside this PDF" precisely so that none of this can strand
      * a lecture.
      */
-    private suspend fun moveMediaDirectory(from: String, binding: RemoteBinding, session: NextcloudSession) {
+    private suspend fun moveMediaDirectory(from: String, binding: RemoteBinding, session: CloudStore) {
         val fromDir = RemoteMedia.directory(from, binding.noteId)
         val toDir = RemoteMedia.directory(binding.remotePath, binding.noteId)
         if (fromDir == toDir) return
-        session.dav.mkcolRecursive(parentOf(toDir))
-        session.dav.move(fromDir, toDir)
+        session.ensureFolder(parentOf(toDir))
+        session.move(RemoteTarget(fromDir), toDir)
     }
 
     @Suppress("ReturnCount")
@@ -468,7 +472,7 @@ public class OutboxDrainer(
     private suspend fun performUpload(
         entry: OutboxEntry,
         binding: RemoteBinding,
-        session: NextcloudSession,
+        session: CloudStore,
     ): OpOutcome {
         val now = clock.nowEpochMillis()
 
@@ -476,6 +480,15 @@ public class OutboxDrainer(
         val earliest = binding.lastUploadAtEpochMillis + MIN_UPLOAD_INTERVAL_MILLIS
         if (binding.lastUploadAtEpochMillis > 0 && now < earliest) {
             return OpOutcome.Deferred(earliest)
+        }
+
+        // CLAUDE.md rule 1, enforced by the type: a store that cannot overwrite blind is never
+        // asked to. Reaching here means the binding has uploaded before but holds no version to
+        // compare, so the safe move is to stop and let the reconciler read the file's version, not
+        // to write over whatever is there. Before materializing, so no work is spent on it.
+        val precondition = uploadPrecondition(binding)
+        if (precondition is WritePrecondition.Unchecked && !session.supportsUncheckedReplace) {
+            return OpOutcome.Parked(NoteSyncState.ERROR, UNCHECKED_REFUSED)
         }
 
         // Rule 1 — the bytes are produced here, not carried in the row. Materialize first
@@ -487,14 +500,10 @@ public class OutboxDrainer(
         }
         val checksum = Md5.hex(bytes)
 
-        val outcome = session.dav.put(
-            remotePath = binding.remotePath,
+        val outcome = session.put(
+            target = RemoteTarget(binding.remotePath, binding.remoteOcId),
             bytes = bytes,
-            // CLAUDE.md rule 1: never overwrite a remote file without If-Match. A weak
-            // ETag yields null from asIfMatch — SPEC §7.3 — and the checksum is what
-            // stands in for it, which is why lastChecksum is stored.
-            ifMatch = binding.lastSyncedEtag,
-            ifNoneMatchStar = !binding.everUploaded,
+            precondition = precondition,
             mtimeEpochSeconds = now / MILLIS_PER_SECOND,
             md5Hex = checksum,
         )
@@ -502,6 +511,21 @@ public class OutboxDrainer(
         return classify(outcome, session) { receipt ->
             finishUpload(entry, binding, receipt, materialized.localRev, checksum, now)
         }
+    }
+
+    /**
+     * CLAUDE.md rule 1 — never overwrite a remote file without a precondition.
+     *
+     * Never uploaded: the file must not exist. Otherwise the ETag we last saw; a weak ETag is still
+     * passed through, because [WebDavClient.put] turns it into *no header* (SPEC §7.3 — returning
+     * `W/"…"` in `If-Match` is a permanent 412 loop) and the checksum is what stands in for it,
+     * which is why `lastChecksum` is stored. With no ETag at all the write is [WritePrecondition.Unchecked]
+     * — Nextcloud's long-standing behaviour, preserved by P1, and the one thing a stricter store
+     * refuses.
+     */
+    private fun uploadPrecondition(binding: RemoteBinding): WritePrecondition = when {
+        !binding.everUploaded -> WritePrecondition.CreateOnly
+        else -> binding.lastSyncedEtag?.let { WritePrecondition.IfMatch(it) } ?: WritePrecondition.Unchecked
     }
 
     /**
@@ -559,9 +583,9 @@ public class OutboxDrainer(
      * (SPEC §7.7). A 404 is success: something already removed it, and reporting an
      * error would leave the row retrying against a file that is not there.
      */
-    private suspend fun performDelete(binding: RemoteBinding, session: NextcloudSession): OpOutcome {
+    private suspend fun performDelete(binding: RemoteBinding, session: CloudStore): OpOutcome {
         val path = binding.movedFromPath ?: binding.remotePath
-        val outcome = session.dav.delete(path)
+        val outcome = session.trash(RemoteTarget(path, binding.remoteOcId))
         if (outcome is DavOutcome.Failed && outcome.error is DavFailure.NotFound) {
             bindings.remove(binding.noteId)
             return OpOutcome.Done
@@ -578,7 +602,7 @@ public class OutboxDrainer(
 
     private suspend inline fun <T> classify(
         outcome: DavOutcome<T>,
-        session: NextcloudSession,
+        session: CloudStore,
         onSuccess: (T) -> OpOutcome,
     ): OpOutcome = when (outcome) {
         is DavOutcome.Ok -> onSuccess(outcome.value)
@@ -589,7 +613,7 @@ public class OutboxDrainer(
     // One branch per row of SPEC §7.5's response table plus §7.2's. Collapsing them
     // would mean losing the one-to-one correspondence with the spec, which is the only
     // way to check this is right.
-    private suspend fun failureOutcome(failure: DavFailure, session: NextcloudSession): OpOutcome = when (failure) {
+    private suspend fun failureOutcome(failure: DavFailure, session: CloudStore): OpOutcome = when (failure) {
         // SPEC §7.2 — confirm once, then halt. Never a second credential attempt.
         DavFailure.Unauthorized -> when (session.confirmStillAuthorised()) {
             false -> OpOutcome.HaltAccount(AccountState.NEEDS_REAUTH, failure.describe)
@@ -638,12 +662,10 @@ public class OutboxDrainer(
      * flagged `NEEDS_REAUTH`, its credential is gone from the Keystore, or its uid was
      * never resolved (SPEC §0.1 #3 — [NextcloudSession] refuses to be built without one).
      */
-    private suspend fun openSession(accountId: String): NextcloudSession? {
+    private suspend fun openSession(accountId: String): CloudStore? {
         val account = accounts.find(accountId) ?: return null
         if (!account.isUsable) return null
-        val credential: NextcloudCredential = credentials.get(accountId) ?: return null
-        if (credential.uid.isEmpty()) return null
-        return NextcloudSession(account, credential, transport)
+        return storeFactory.open(account)
     }
 
     private fun parentOf(remotePath: String): String = remotePath.substringBeforeLast('/', "")
@@ -676,6 +698,9 @@ public class OutboxDrainer(
         const val PARK_MILLIS = 24L * 60 * 60 * 1000
 
         const val UNUSABLE_ACCOUNT = "Sign in to this Nextcloud account again to resume syncing."
+
+        const val UNCHECKED_REFUSED =
+            "This file has no recorded version on the server, so Inkstone will not overwrite it blind."
 
         /**
          * M12 — the queued lecture's file is not on disk.

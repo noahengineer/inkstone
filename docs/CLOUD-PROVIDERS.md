@@ -1,6 +1,30 @@
 # Cloud providers — Google Drive and OneDrive beside Nextcloud
 
-**Status: design, 2026-10-17. Nothing is built. Not in SPEC.md, ROADMAP.md or SPEC §12 — this is
+## Decisions (user, 2026-10-17)
+
+- **D1** OneDrive first. **D2** Drive option (a): **Drive is not shipped until Google adds a
+  precondition** (§3.2) — no Drive code, no rule 1 amendment. **D3** OneDrive `Files.ReadWrite`; Drive,
+  if it ever ships, `drive.file` with no adoption. **D4** assume commercial. P0 and P1 authorised.
+
+## Progress
+
+- **P1 — built, behaviour-preserving** (`core/sync/.../CloudStore.kt`). `OutboxDrainer` and
+  `Reconciler` now hold a `CloudStore`; `NextcloudStore` forwards every call to the unchanged
+  `WebDavClient`. Where it differs from the §2 sketch, and why:
+  - the change-feed method is **not** there yet — an interface with one implementation that cannot
+    return it is an untested seam; it arrives with OneDrive's `delta` (P3);
+  - `DavOutcome` / `DavFailure` keep their names (renaming is churn with no behaviour change);
+  - addressing is `RemoteTarget(path, id)`, so OneDrive can update by id without reshaping call sites;
+  - the write precondition is `WritePrecondition { CreateOnly, IfMatch, Unchecked }`. `Unchecked` is
+    what Nextcloud already does when no usable ETag is stored (weak or stripped: no header is sent, and
+    the checksum stands in). **That is pre-existing, unchanged, and a rule 1 soft spot of its own** —
+    it is exactly why a store with `supportsUncheckedReplace = false` (OneDrive) must refuse it.
+- **P0 — instrument written, not run.** `tools/cloud/graph_spike.py` + `tools/cloud/README.md`. It
+  needs the Azure registration and a throwaway-account sign-in, both the user's.
+
+## Original design (2026-10-17)
+
+**Status: design. Nothing in the sections below was built unless Progress above says so. Not in SPEC.md, ROADMAP.md or SPEC §12 — this is
 new scope the user asked for.** Written from the official docs and the code; **no provider call was
 made** (no account, and the app never sees a password). Every API claim below cites the page it was
 read from; §10 lists what was *not* read or measured, and §9 lists the measurements that must come

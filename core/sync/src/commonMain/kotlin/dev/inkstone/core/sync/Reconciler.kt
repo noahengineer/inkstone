@@ -93,13 +93,15 @@ import kotlinx.coroutines.sync.Mutex
 public class Reconciler(
     private val stores: SyncStores,
     private val pull: ReconcileStores,
-    private val credentials: CredentialStore,
+    credentials: CredentialStore,
     private val fs: FileSystem,
     private val clock: Clock,
-    private val transport: NextcloudTransport,
+    transport: NextcloudTransport,
     private val extractor: RemoteBundleExtractor,
     private val gate: RemoteMergeGate,
     private val engine: SyncEngine,
+    /** docs/CLOUD-PROVIDERS.md §2. Defaulted to Nextcloud's so existing construction sites are unchanged. */
+    private val storeFactory: CloudStoreFactory = NextcloudStoreFactory(credentials, transport),
 ) {
 
     private val accounts get() = stores.accounts
@@ -176,11 +178,10 @@ public class Reconciler(
 
     private suspend fun reconcileAccount(account: SyncAccount, limit: Int, report: ReconcileReport): ReconcileReport {
         if (!account.isUsable) return unusable(account, report)
-        val credential = credentials.get(account.id) ?: return report.skipping(account.id)
-        // NextcloudSession's ctor requires a non-empty uid and would throw. `isUsable` already
-        // covers the account row's view of it; this covers a stored credential that disagrees.
-        if (credential.uid.isEmpty()) return report.skipping(account.id)
-        return pass(NextcloudSession(account, credential, transport), limit, report)
+        // Null covers a missing credential and a stored one whose uid disagrees with the account
+        // row (`isUsable` has already vouched for the row's view of it).
+        val store = storeFactory.open(account) ?: return report.skipping(account.id)
+        return pass(store, limit, report)
     }
 
     /**
@@ -217,7 +218,7 @@ public class Reconciler(
      * Reading the clock twice would put a note stamped mid-pass on the wrong side of that
      * comparison, and the wrong side of *that* comparison is the trash.
      */
-    private suspend fun pass(session: NextcloudSession, limit: Int, report: ReconcileReport): ReconcileReport {
+    private suspend fun pass(session: CloudStore, limit: Int, report: ReconcileReport): ReconcileReport {
         val accountId = session.account.id
         val passStartedAt = clock.nowEpochMillis()
         val cursor = pull.cursors.find(accountId) ?: SyncCursor(accountId)
@@ -267,13 +268,13 @@ public class Reconciler(
      * never asked before".
      */
     private suspend fun probeRoot(
-        session: NextcloudSession,
+        session: CloudStore,
         roots: List<String>,
         cursor: SyncCursor,
         passStartedAt: Long,
     ): RootProbe {
         val ancestor = RemoteWalk.commonAncestor(roots)
-        val resource = when (val outcome = session.dav.propfind(ancestor, WebDavClient.Depth.Zero)) {
+        val resource = when (val outcome = session.listing(ancestor, ListingDepth.SELF)) {
             is DavOutcome.Failed -> return RootProbe.Failed(ancestor, outcome.error)
 
             is DavOutcome.Ok -> outcome.value.firstOrNull()
@@ -386,7 +387,7 @@ public class Reconciler(
     }
 
     private suspend fun list(pass: Pass, path: String): Listing =
-        when (val outcome = pass.session.dav.propfind(path, WebDavClient.Depth.One)) {
+        when (val outcome = pass.session.listing(path, ListingDepth.CHILDREN)) {
             is DavOutcome.Failed ->
                 // A root the user deleted is not a failure worth stopping for. There is nothing
                 // under it to reconcile — and nothing to trash either, because the bindings that
@@ -878,7 +879,7 @@ public class Reconciler(
      * [WebDavClient.download] exists at all and `get()` was not enough.
      */
     private suspend fun fetchTo(pass: Pass, stem: String, file: DavResource): Fetch {
-        val downloaded = when (val outcome = pass.session.dav.download(file.path)) {
+        val downloaded = when (val outcome = pass.session.download(file.path)) {
             is DavOutcome.Failed -> return Fetch.Failed(outcome.error)
             is DavOutcome.Ok -> outcome.value
         }
@@ -1046,7 +1047,7 @@ public class Reconciler(
     private suspend fun locate(pass: Pass, binding: RemoteBinding): FileIdSearch {
         val ocId = binding.remoteOcId ?: return FileIdSearch.CannotTell
         val fileId = binding.remoteFileId ?: return FileIdSearch.CannotTell
-        val found = when (val outcome = pass.session.dav.searchByFileId(fileId)) {
+        val found = when (val outcome = pass.session.locate(fileId)) {
             is DavOutcome.Failed -> return FileIdSearch.CannotTell
             is DavOutcome.Ok -> outcome.value
         }
@@ -1186,10 +1187,9 @@ public class Reconciler(
         }
     }
 
-    private suspend fun sessionFor(accountId: String): NextcloudSession? {
+    private suspend fun sessionFor(accountId: String): CloudStore? {
         val account = accounts.find(accountId)?.takeIf { it.isUsable } ?: return null
-        val credential = credentials.get(accountId)?.takeIf { it.uid.isNotEmpty() } ?: return null
-        return NextcloudSession(account, credential, transport)
+        return storeFactory.open(account)
     }
 
     /** SPEC §4.7's horizon: what this peer has seen, so `oldestAckedCounter` stops being null. */
@@ -1291,7 +1291,7 @@ public class Reconciler(
 
     /** One account's pass. Everything in it is fixed for the whole walk. */
     private inner class Pass(
-        val session: NextcloudSession,
+        val session: CloudStore,
         val accountId: String,
         val passStartedAt: Long,
         val roots: List<String>,
