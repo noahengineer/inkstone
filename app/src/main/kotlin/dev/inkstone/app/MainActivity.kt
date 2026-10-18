@@ -7,6 +7,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.IntentSenderRequest
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
@@ -83,6 +84,12 @@ class MainActivity : ComponentActivity() {
 
     private val library: LibraryViewModel by viewModels()
     private val sync: SyncViewModel by viewModels()
+
+    /** Google's consent screen is an IntentSender Play Services hands us; this is where it returns. */
+    private val googleConsent =
+        registerForActivityResult(ActivityResultContracts.StartIntentSenderForResult()) { result ->
+            sync.googleConsentResult(if (result.resultCode == RESULT_OK) result.data else null)
+        }
 
     /** SPEC §7.7's list. A third screen, not a dialog — see [NeedsAttentionScreen]. */
     private val attention: AttentionViewModel by viewModels()
@@ -260,6 +267,14 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // docs/CLOUD-PROVIDERS.md §5.2 - Google's consent screen, launched once and consumed.
+        LaunchedEffect(syncState.googleConsent) {
+            syncState.googleConsent?.let { pending ->
+                sync.googleConsentShown()
+                googleConsent.launch(IntentSenderRequest.Builder(pending).build())
+            }
+        }
+
         // A PDF adopted off the server opens straight away — and the Sync screen is left standing
         // behind it holding the sentence that says where the ink will go, because the editor
         // arriving over a snackbar is how that sentence gets dismissed unread (SPEC §5.6 point 4,
@@ -401,6 +416,7 @@ class MainActivity : ComponentActivity() {
         onCancelBrowse = sync::cancelBrowse,
         onSyncNow = sync::syncNow,
         onSignInOneDrive = { sync.startOneDriveLogin() },
+        onSignInGoogle = { sync.startGoogleLogin() },
         oneDriveConfigured = sync.oneDriveConfigured,
         oneDriveRedirect = sync.oneDriveRedirect,
     )

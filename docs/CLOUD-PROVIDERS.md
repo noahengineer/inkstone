@@ -158,6 +158,84 @@
     (the `NEEDS_REAUTH` button — made identical here, on purpose), `NextcloudAccounts`, `SyncPorts`,
     `OutboxDrainer` and `Reconciler`. Merge them together, not one after the other.
 
+## Google Drive (2026-10-18, after the user's decision to build it)
+
+The user chose to build Drive with a **best-effort overwrite check** and to amend CLAUDE.md rule 1 for Drive alone
+(the exception is written into rule 1). What exists, and what has run:
+
+- **`DriveStore`** (`:core:sync`): check `headRevisionId` → write with the new head pinned → verify the revision before
+  ours is the one we based the write on → unpin the revision we replaced (`keepForever=false`, never a delete). A writer
+  who landed in the window is pinned, downloaded and written beside the note as `… (displaced <time>).pdf`; nothing is
+  discarded. A version tag is `headRevisionId` (not `version`, which moves on a rename). A path resolves to the *oldest* of
+  duplicate names; a create and a move refuse a taken name themselves, since Drive allows duplicates. `DriveFeedReader`
+  reads `changes` (a stale page token starts over as a resync). `GoogleFailures` tells a 403's three meanings apart.
+- **Scope `drive.file`**: the app sees only files it created, so a first pull is small and needs no scoping — and PDFs
+  already in the user's Drive cannot be listed or adopted (D3).
+- **Sign-in** (`:app`): Play Services' `AuthorizationClient` (`play-services-auth` 22.0.0, SPEC §0.2). `GoogleAuthorizer`
+  is the seam; `GoogleAccessTokens` has the rule-5 behaviour (a grant that needs a screen is dead and sticky; one
+  forced refresh after a 401, cooldown 5 min; unreachable concludes nothing; a registration Google refuses is dead);
+  `GoogleDriveAccounts` signs in (consent screen via `StartIntentSenderForResult`), refuses a different identity on
+  re-sign-in, and **really revokes on sign-out** (`revokeAccess`, best effort). No secret is stored on the device.
+- **Tests** against `DriveStandIn` (ignores `If-Match`, honours `fields`, pinned-only revision download): 21 store, 10 feed,
+  5 through the real `OutboxDrainer`, 7 token-source, 13 accounts. Mutation-checked red: no pre-write check; displaced writer
+  not kept; head not pinned; replaced revision left pinned; create over an existing name; bearer sent to the upload session;
+  trash as a delete; identity check off; sign-out without revoke; launch check flagging an unreachable Google; dead grant not
+  sticky; no cooldown; refused token not cleared; unreachable treated as dead. (One mutation first *survived* — it showed the
+  first revision was never pinned; fixed.)
+- **Driven on the emulator:** the app builds (Hilt graph included), installs over the existing data, shows the Drive section,
+  and the button opens Google's own sign-in flow (no Google account on the emulator). **Nothing past that point has run.**
+
+**Not proven — all of it is Google's behaviour, none of it observed:** that `If-Match` is ignored (the premise of the whole
+protocol, from one community report); that `keepRevisionForever` pins the new head; that `revisions.list` returns what the
+store assumes and in a sortable order; that a pinned revision is downloadable; that a resumable session URI needs no bearer;
+that `about.get` works under `drive.file`; what a stale `changes` token answers (400/404/410 are all treated as "start over");
+what Play Services answers for a granted, ungranted or mis-registered app; whether Testing mode ends the grant after 7 days.
+The sign-in itself needs the user's Google account on the device and the Cloud-console registration (package `dev.inkstone`
++ SHA-1 `2D:ED:50:A6:71:32:4E:BF:80:94:86:C8:F6:AE:A0:2A:59:84:7B:90`).
+
+**Residual risk, said plainly:** between the check and the write, a concurrent writer is overwritten *in the head* — detectable
+and recoverable (their revision is pinned and kept as a file), but the head is briefly not theirs. Nextcloud and OneDrive
+refuse that write on the server; Drive cannot.
+
+## Google Drive (2026-10-18, after the user's decision to build it)
+
+The user chose to build Drive with a **best-effort overwrite check** and to amend CLAUDE.md rule 1 for Drive alone
+(the exception is written into rule 1). What exists, and what has run:
+
+- **`DriveStore`** (`:core:sync`): check `headRevisionId` → write with the new head pinned → verify the revision before
+  ours is the one we based the write on → unpin the revision we replaced (`keepForever=false`, never a delete). A writer
+  who landed in the window is pinned, downloaded and written beside the note as `… (displaced <time>).pdf`; nothing is
+  discarded. A version tag is `headRevisionId` (not `version`, which moves on a rename). A path resolves to the *oldest* of
+  duplicate names; a create and a move refuse a taken name themselves, since Drive allows duplicates. `DriveFeedReader`
+  reads `changes` (a stale page token starts over as a resync). `GoogleFailures` tells a 403's three meanings apart.
+- **Scope `drive.file`**: the app sees only files it created, so a first pull is small and needs no scoping — and PDFs
+  already in the user's Drive cannot be listed or adopted (D3).
+- **Sign-in** (`:app`): Play Services' `AuthorizationClient` (`play-services-auth` 22.0.0, SPEC §0.2). `GoogleAuthorizer`
+  is the seam; `GoogleAccessTokens` has the rule-5 behaviour (a grant that needs a screen is dead and sticky; one
+  forced refresh after a 401, cooldown 5 min; unreachable concludes nothing; a registration Google refuses is dead);
+  `GoogleDriveAccounts` signs in (consent screen via `StartIntentSenderForResult`), refuses a different identity on
+  re-sign-in, and **really revokes on sign-out** (`revokeAccess`, best effort). No secret is stored on the device.
+- **Tests** against `DriveStandIn` (ignores `If-Match`, honours `fields`, pinned-only revision download): 21 store, 10 feed,
+  5 through the real `OutboxDrainer`, 7 token-source, 13 accounts. Mutation-checked red: no pre-write check; displaced writer
+  not kept; head not pinned; replaced revision left pinned; create over an existing name; bearer sent to the upload session;
+  trash as a delete; identity check off; sign-out without revoke; launch check flagging an unreachable Google; dead grant not
+  sticky; no cooldown; refused token not cleared; unreachable treated as dead. (One mutation first *survived* — it showed the
+  first revision was never pinned; fixed.)
+- **Driven on the emulator:** the app builds (Hilt graph included), installs over the existing data, shows the Drive section,
+  and the button opens Google's own sign-in flow (no Google account on the emulator). **Nothing past that point has run.**
+
+**Not proven — all of it is Google's behaviour, none of it observed:** that `If-Match` is ignored (the premise of the whole
+protocol, from one community report); that `keepRevisionForever` pins the new head; that `revisions.list` returns what the
+store assumes and in a sortable order; that a pinned revision is downloadable; that a resumable session URI needs no bearer;
+that `about.get` works under `drive.file`; what a stale `changes` token answers (400/404/410 are all treated as "start over");
+what Play Services answers for a granted, ungranted or mis-registered app; whether Testing mode ends the grant after 7 days.
+The sign-in itself needs the user's Google account on the device and the Cloud-console registration (package `dev.inkstone`
++ SHA-1 `2D:ED:50:A6:71:32:4E:BF:80:94:86:C8:F6:AE:A0:2A:59:84:7B:90`).
+
+**Residual risk, said plainly:** between the check and the write, a concurrent writer is overwritten *in the head* — detectable
+and recoverable (their revision is pinned and kept as a file), but the head is briefly not theirs. Nextcloud and OneDrive
+refuse that write on the server; Drive cannot.
+
 ## First real OneDrive (2026-10-18) — what the stand-in could not show
 
 The user registered the app (Entra, *Any Entra ID Tenant + Personal Microsoft accounts*, Android platform

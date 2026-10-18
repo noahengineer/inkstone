@@ -71,6 +71,10 @@ Pin these. Verified 5 Aug 2026.
 - **androidx** "latest stable": `core-ktx` 1.19.0, `lifecycle` 2.11.0 and `hilt-navigation-compose` 1.4.0 all require compileSdk 37 + AGP 9.1.0. Pinned **1.18.0 / 2.10.0 / 1.3.0**. Wherever this table says "latest stable at M0", read it as **latest stable that works with the pinned AGP**.
 - **`androidx.pdf` 1.0.0-alpha19** requires compile SDK **extension level ≥ 19**. The API 36 platform ships extension level 17; API 37 ships 22. **`compileSdk = 36` alone cannot consume this pin.** ~~M4 must choose between an ext-19 platform package and moving to compileSdk 37~~ — **decided in M4: neither.** The M4.0 spike ruled `androidx.pdf` out for writing (§6.1), and the only thing left to want from it was one bitmap call, which §6.1's own fallback provides from plain `android-36`. `:android:pdf` leaves the dependency undeclared permanently, **compileSdk stays 36, the AGP 8.13.0 pin is untouched**, and `verifyCatalogCoordinates` still proves the coordinate resolves. (Both options were real — `platforms;android-36-ext19` exists — so this is a choice, not a limitation.)
 
+- **Google Drive sign-in (2026-10-18):** `com.google.android.gms:play-services-auth` **22.0.0** — `<release>` and `<latest>` in <https://dl.google.com/android/maven2/com/google/android/gms/play-services-auth/maven-metadata.xml>, no alpha/beta/rc in its version list; it resolves and builds on compileSdk 36 / AGP 8.13.0. Only `AuthorizationClient` is used (no refresh token on the device, docs/CLOUD-PROVIDERS.md §5.2); its surface was read off the jar with `javap`.
+
+- **Google Drive sign-in (2026-10-18):** `com.google.android.gms:play-services-auth` **22.0.0** — `<release>` and `<latest>` in <https://dl.google.com/android/maven2/com/google/android/gms/play-services-auth/maven-metadata.xml>, no alpha/beta/rc in its version list; it resolves and builds on compileSdk 36 / AGP 8.13.0. Only `AuthorizationClient` is used (no refresh token on the device, docs/CLOUD-PROVIDERS.md §5.2); its surface was read off the jar with `javap`.
+
 Before bumping any Android library, read its `aar-metadata.properties`.
 
 ### 0.3 What this actually costs

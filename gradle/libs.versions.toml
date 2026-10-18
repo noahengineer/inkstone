@@ -75,6 +75,14 @@ annotation = "1.10.0"
 #   browser  1.8.0 -> minCompileSdk 34, minAGP 1.0.0   also fine, but older for no gain
 browser = "1.10.0"
 
+# ---- Google sign-in for Drive (docs/CLOUD-PROVIDERS.md §5.2) ----------------------------------------
+# play-services-auth 22.0.0: <release> and <latest> in
+# https://dl.google.com/android/maven2/com/google/android/gms/play-services-auth/maven-metadata.xml,
+# read 2026-10-18; no alpha/beta/rc in the version list. Only `AuthorizationClient` (Identity API) is used:
+# short-lived access tokens, no refresh token kept on the device. Not for sign-in-with-Google, not for
+# credentials. Check minCompileSdk/minAGP the way the comment above does if this is ever moved.
+playServicesAuth = "22.0.0"
+
 # ---- Data ------------------------------------------------------------------
 sqldelight = "2.3.2"
 ktor = "3.5.0"
@@ -129,6 +137,7 @@ androidx-lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-ru
 androidx-annotation = { module = "androidx.annotation:annotation", version.ref = "annotation" }
 androidx-work-runtime-ktx = { module = "androidx.work:work-runtime-ktx", version.ref = "work" }
 androidx-browser = { module = "androidx.browser:browser", version.ref = "browser" }
+play-services-auth = { module = "com.google.android.gms:play-services-auth", version.ref = "playServicesAuth" }
 
 # ---- DI --------------------------------------------------------------------
 hilt-android = { module = "com.google.dagger:hilt-android", version.ref = "hilt" }

@@ -54,8 +54,10 @@ class NextcloudAccounts @Inject constructor(
     /**
      * Every account whose provider is not Nextcloud is handled here instead (docs/CLOUD-PROVIDERS.md §5).
      * The Sync screen has one accounts collaborator; nothing below the checks that reach this changed.
+     * [OneDriveAccounts] also holds the provider-agnostic reads (browse, fetch, new folder) for Drive.
      */
     private val oneDrive: OneDriveAccounts,
+    private val google: GoogleDriveAccounts,
 ) {
 
     private val loginFlow = LoginFlowV2(transport)
@@ -187,6 +189,7 @@ class NextcloudAccounts @Inject constructor(
         // An account already flagged NEEDS_REAUTH is not touched at all: CLAUDE.md rule 5
         // means "no request", not "one polite request per launch".
         oneDrive.repairAndRefresh()
+        google.repairAndRefresh()
         val repairable = accounts.all()
             .filter { it.state != AccountState.NEEDS_REAUTH && it.provider == ProviderKind.NEXTCLOUD }
         for (account in repairable) {
@@ -217,7 +220,11 @@ class NextcloudAccounts @Inject constructor(
      * be able to trap the user in a session they asked to end.
      */
     suspend fun signOut(accountId: String): SignOutResult {
-        if (isOneDrive(accountId)) return oneDrive.signOut(accountId)
+        when (providerOf(accountId)) {
+            ProviderKind.ONEDRIVE -> return oneDrive.signOut(accountId)
+            ProviderKind.GOOGLE_DRIVE -> return google.signOut(accountId)
+            else -> Unit
+        }
         credentials.get(accountId)?.let { ocs.revokeAppPassword(it) }
 
         // ⭐ **Paused, not unbound** (M6). Every note on this account stops syncing and its
@@ -254,7 +261,11 @@ class NextcloudAccounts @Inject constructor(
      * go back to `LOCAL_ONLY`, and their copies on the server are left exactly where they are.
      */
     suspend fun forgetAccount(accountId: String) {
-        if (isOneDrive(accountId)) return oneDrive.forgetAccount(accountId)
+        when (providerOf(accountId)) {
+            ProviderKind.ONEDRIVE -> return oneDrive.forgetAccount(accountId)
+            ProviderKind.GOOGLE_DRIVE -> return google.forgetAccount(accountId)
+            else -> Unit
+        }
         credentials.get(accountId)?.let { ocs.revokeAppPassword(it) }
         for (binding in bindings.forAccount(accountId)) sync.unbind(binding.noteId)
         credentials.remove(accountId)
@@ -305,7 +316,7 @@ class NextcloudAccounts @Inject constructor(
      * [WebDavClient.Depth] makes unrepresentable.
      */
     suspend fun browse(accountId: String, remotePath: String): BrowseResult {
-        if (isOneDrive(accountId)) return oneDrive.browse(accountId, remotePath)
+        if (isCloudProvider(accountId)) return oneDrive.browse(accountId, remotePath)
         val here = remotePath.trim('/')
         val session = session(accountId) ?: return BrowseResult.Unavailable
         return when (val outcome = session.dav.propfind(remotePath, WebDavClient.Depth.One)) {
@@ -393,7 +404,7 @@ class NextcloudAccounts @Inject constructor(
      * A 401 halts the account exactly as a walk would (SPEC §7.1 rule 5): one failure, no retry.
      */
     suspend fun fetchPdf(accountId: String, remotePath: String): FetchResult {
-        if (isOneDrive(accountId)) return oneDrive.fetchPdf(accountId, remotePath)
+        if (isCloudProvider(accountId)) return oneDrive.fetchPdf(accountId, remotePath)
         val session = session(accountId) ?: return FetchResult.Unavailable
         return when (val outcome = session.dav.download(remotePath)) {
             is DavOutcome.Ok -> FetchResult.Downloaded(outcome.value)
@@ -419,7 +430,7 @@ class NextcloudAccounts @Inject constructor(
      * anything into never needs to exist.
      */
     suspend fun createRemoteFolder(accountId: String, remotePath: String): FolderCreateResult {
-        if (isOneDrive(accountId)) return oneDrive.createRemoteFolder(accountId, remotePath)
+        if (isCloudProvider(accountId)) return oneDrive.createRemoteFolder(accountId, remotePath)
         val session = session(accountId) ?: return FolderCreateResult.Failed("That account needs signing in again.")
         return when (val outcome = session.dav.mkcolRecursive(remotePath)) {
             is DavOutcome.Ok -> FolderCreateResult.Created
@@ -450,8 +461,11 @@ class NextcloudAccounts @Inject constructor(
         }
     }
 
-    private suspend fun isOneDrive(accountId: String): Boolean =
-        accounts.find(accountId)?.provider == ProviderKind.ONEDRIVE
+    private suspend fun providerOf(accountId: String): ProviderKind? = accounts.find(accountId)?.provider
+
+    /** Any account that is not Nextcloud: its reads go through [CloudStore], never through the WebDAV session below. */
+    private suspend fun isCloudProvider(accountId: String): Boolean =
+        providerOf(accountId)?.let { it != ProviderKind.NEXTCLOUD } == true
 
     private suspend fun session(accountId: String): NextcloudSession? {
         val account = accounts.find(accountId)?.takeIf { it.isUsable } ?: return null

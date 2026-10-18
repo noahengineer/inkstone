@@ -23,6 +23,7 @@ import dev.inkstone.core.sync.NextcloudTransport
 import dev.inkstone.core.sync.OneDriveStoreFactory
 import dev.inkstone.core.sync.PkceCrypto
 import dev.inkstone.core.sync.ProviderKind
+import dev.inkstone.core.sync.ProviderRoutingFactory
 import dev.inkstone.core.sync.SyncAccount
 import dev.inkstone.core.sync.SyncEngine
 import dev.inkstone.core.sync.SyncStores
@@ -93,6 +94,9 @@ class OneDriveAccountsTest {
         rawStandIn = server.baseUrl.removeSuffix("/v1.0"),
     )
 
+    /** One factory shared by sign-in (which forgets its latch) and by the stores that read it, as in production. */
+    private val oneDriveFactory = OneDriveStoreFactory(settings.oauth, vault, transport, clock)
+
     private val oneDrive = OneDriveAccounts(
         accounts = accountStore,
         vault = vault,
@@ -101,7 +105,8 @@ class OneDriveAccountsTest {
         clock = clock,
         folderCache = cache,
         settings = settings,
-        factory = OneDriveStoreFactory(settings.oauth, vault, transport, clock),
+        factory = oneDriveFactory,
+        stores = ProviderRoutingFactory(mapOf(ProviderKind.ONEDRIVE to oneDriveFactory)),
         transport = transport,
         pending = pending,
         crypto = object : PkceCrypto {
@@ -317,6 +322,7 @@ class OneDriveAccountsTest {
             folderCache = cache,
             settings = MicrosoftSettings(rawClientId = " ", redirectUri = "msauth://dev.inkstone/x", rawStandIn = ""),
             factory = OneDriveStoreFactory(settings.oauth, vault, transport, clock),
+            stores = ProviderRoutingFactory(emptyMap()),
             transport = transport,
             pending = pending,
             crypto = object : PkceCrypto {

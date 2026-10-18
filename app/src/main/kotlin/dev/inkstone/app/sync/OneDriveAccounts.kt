@@ -8,6 +8,7 @@ import dev.inkstone.core.sync.AccountStore
 import dev.inkstone.core.sync.BindingStore
 import dev.inkstone.core.sync.CachedFolder
 import dev.inkstone.core.sync.CloudStore
+import dev.inkstone.core.sync.CloudStoreFactory
 import dev.inkstone.core.sync.DavFailure
 import dev.inkstone.core.sync.DavOutcome
 import dev.inkstone.core.sync.ListingDepth
@@ -46,7 +47,8 @@ sealed interface SignInNotice {
 
     data class SignedIn(val account: SyncAccount, val resumed: Boolean) : SignInNotice {
         override val message: String = buildString {
-            append("Signed in to OneDrive as ${account.loginName}.")
+            val service = if (account.provider == ProviderKind.GOOGLE_DRIVE) "Google Drive" else "OneDrive"
+            append("Signed in to $service as ${account.loginName}.")
             if (resumed) append(" Your notes pick up where they left off.")
         }
     }
@@ -89,6 +91,12 @@ class OneDriveAccounts @Inject constructor(
     private val folderCache: RemoteFolderCache,
     private val settings: MicrosoftSettings,
     private val factory: OneDriveStoreFactory,
+    /**
+     * ⭐ Every non-Nextcloud store, by provider. The interactive reads below ([browse], [fetchPdf],
+     * [createRemoteFolder]) are provider-agnostic — they speak [CloudStore] — so Google Drive's accounts are
+     * browsed through this class too; only *who is signed in* differs ([GoogleDriveAccounts]).
+     */
+    private val stores: CloudStoreFactory,
     transport: NextcloudTransport,
     pending: PendingSignInStore,
     crypto: PkceCrypto,
@@ -343,8 +351,8 @@ class OneDriveAccounts @Inject constructor(
     }
 
     private suspend fun storeFor(accountId: String): CloudStore? {
-        val account = accounts.find(accountId)?.takeIf { it.isUsable && it.provider == ProviderKind.ONEDRIVE }
-        return account?.let { factory.open(it) }
+        val account = accounts.find(accountId)?.takeIf { it.isUsable && it.provider != ProviderKind.NEXTCLOUD }
+        return account?.let { stores.open(it) }
     }
 
     companion object {

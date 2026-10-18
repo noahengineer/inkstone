@@ -1,5 +1,7 @@
 package dev.inkstone.app.sync
 
+import android.app.PendingIntent
+import android.content.Intent
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -50,6 +52,8 @@ class SyncViewModel @Inject constructor(
     private val accounts: NextcloudAccounts,
     /** docs/CLOUD-PROVIDERS.md §5 — the OneDrive sign-in. Everything else reaches it through [accounts]. */
     private val oneDrive: OneDriveAccounts,
+    /** docs/CLOUD-PROVIDERS.md §5.2 - the Google Drive sign-in, which is Play Services and has no redirect. */
+    private val google: GoogleDriveAccounts,
     private val library: LibraryRepository,
     private val outbox: OutboxStore,
     /** M12 §11 — how many lectures are waiting, and how much of the tablet they hold. */
@@ -256,9 +260,18 @@ class SyncViewModel @Inject constructor(
      */
     fun signInAgain(accountId: String) {
         val account = mutable.value.accounts.firstOrNull { it.id == accountId } ?: return
-        if (account.provider == ProviderKind.ONEDRIVE) {
-            startOneDriveLogin(accountId)
-            return
+        when (account.provider) {
+            ProviderKind.ONEDRIVE -> {
+                startOneDriveLogin(accountId)
+                return
+            }
+
+            ProviderKind.GOOGLE_DRIVE -> {
+                startGoogleLogin(accountId)
+                return
+            }
+
+            else -> Unit
         }
         mutable.update { it.copy(serverUrl = account.serverUrl) }
         startLogin()
@@ -284,6 +297,40 @@ class SyncViewModel @Inject constructor(
                     it.copy(message = null, openUrl = url)
                 }
             }
+        }
+    }
+
+    /**
+     * Step one of the Google Drive sign-in. Play Services either answers at once (the grant stands, so the
+     * account appears) or hands back a consent screen for the Activity to show; the result comes back
+     * through [googleConsentResult], not through this call.
+     */
+    fun startGoogleLogin(accountId: String? = null) {
+        viewModelScope.launch {
+            mutable.update { it.copy(busy = true, message = null) }
+            when (val begun = google.begin(accountId)) {
+                is GoogleDriveAccounts.Begin.Done -> {
+                    mutable.update { it.copy(busy = false, message = begun.notice.message) }
+                    refresh()
+                }
+
+                is GoogleDriveAccounts.Begin.Consent ->
+                    mutable.update { it.copy(busy = false, googleConsent = begun.request as? PendingIntent) }
+            }
+        }
+    }
+
+    /** The Activity is showing Google's consent screen; do not show it again on the next recomposition. */
+    fun googleConsentShown() {
+        mutable.update { it.copy(googleConsent = null) }
+    }
+
+    /** Google's consent screen closed. [data] is null when the user backed out. */
+    fun googleConsentResult(data: Intent?) {
+        viewModelScope.launch {
+            val notice = google.complete(data)
+            mutable.update { it.copy(busy = false, message = notice.message) }
+            refresh()
         }
     }
 
@@ -364,14 +411,18 @@ class SyncViewModel @Inject constructor(
 
     fun signOut(accountId: String) {
         viewModelScope.launch {
-            val oneDriveAccount = mutable.value.accounts.firstOrNull { it.id == accountId }
-                ?.takeIf { it.provider == ProviderKind.ONEDRIVE }
+            val signedOut = mutable.value.accounts.firstOrNull { it.id == accountId }
+            val oneDriveAccount = signedOut?.takeIf { it.provider == ProviderKind.ONEDRIVE }
+            val googleAccount = signedOut?.takeIf { it.provider == ProviderKind.GOOGLE_DRIVE }
             val result = accounts.signOut(accountId)
             mutable.update {
                 it.copy(
                     // Microsoft offers a public client no way to revoke a refresh token, so this must not
                     // claim to have: the grant is forgotten here and can be removed at its source.
-                    message = if (oneDriveAccount != null) {
+                    message = if (googleAccount != null) {
+                        "Signed out of Google Drive. Inkstone's permission was withdrawn; if that could not be " +
+                            "reached, remove it at myaccount.google.com/permissions."
+                    } else if (oneDriveAccount != null) {
                         "Signed out of OneDrive on this device. To remove Inkstone's access entirely, " +
                             "use account.microsoft.com → Privacy → Apps and services. " +
                             if (result.pausedNotes == 0) {
@@ -763,6 +814,8 @@ data class SyncUiState(
     val openInBrowser: LoginFlowStart? = null,
     /** The OneDrive sign-in URL, set once and consumed the same way. */
     val openUrl: String? = null,
+    /** Google's consent screen, set once for the Activity to launch and consumed the same way. */
+    val googleConsent: PendingIntent? = null,
     val browser: RemoteBrowser? = null,
     val bindingNote: DocumentId? = null,
     /** Non-null while a synced note's remote copy is being relocated (a MOVE, not a re-bind). */

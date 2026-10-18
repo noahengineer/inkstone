@@ -9,6 +9,7 @@ import dev.inkstone.core.sync.OneDriveStoreFactory
 import dev.inkstone.core.sync.PendingSignIn
 import dev.inkstone.core.sync.PendingSignInStore
 import dev.inkstone.core.sync.PkceCrypto
+import dev.inkstone.core.sync.ProviderRoutingFactory
 import dev.inkstone.core.sync.RemoteFolderCache
 import dev.inkstone.core.sync.SyncEngine
 import dev.inkstone.core.sync.TokenVault
@@ -57,8 +58,43 @@ internal fun unusedOneDrive(
         folderCache = folderCache,
         settings = settings,
         factory = OneDriveStoreFactory(settings.oauth, NoVault, transport, clock),
+        stores = ProviderRoutingFactory(emptyMap()),
         transport = transport,
         pending = NoPending,
         crypto = NoCrypto,
+    )
+}
+
+/**
+ * A [GoogleDriveAccounts] for tests of the Nextcloud path. Its authorizer says "no" to everything and an
+ * account whose provider is Nextcloud never reaches it.
+ */
+internal fun unusedGoogle(
+    accounts: AccountStore,
+    bindings: BindingStore,
+    sync: SyncEngine,
+    clock: Clock,
+    folderCache: RemoteFolderCache,
+    transport: NextcloudTransport,
+): GoogleDriveAccounts {
+    val authorizer = object : GoogleAuthorizer {
+        override suspend fun authorize(accountEmail: String?) = GoogleAuthorization.Failed("unused", retryable = true)
+
+        override fun fromConsentResult(data: Any?) = GoogleAuthorization.Failed("unused", retryable = true)
+
+        override suspend fun clearToken(token: String) = Unit
+
+        override suspend fun revoke(accountEmail: String?) = Unit
+    }
+    return GoogleDriveAccounts(
+        accounts = accounts,
+        bindings = bindings,
+        sync = sync,
+        clock = clock,
+        folderCache = folderCache,
+        registry = GoogleTokenRegistry(authorizer, clock),
+        authorizer = authorizer,
+        settings = GoogleSettings(),
+        transport = transport,
     )
 }

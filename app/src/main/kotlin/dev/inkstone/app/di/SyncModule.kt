@@ -7,8 +7,11 @@ import dagger.hilt.components.SingletonComponent
 import dev.inkstone.app.platform.AndroidPkceCrypto
 import dev.inkstone.app.platform.KeystorePendingSignInStore
 import dev.inkstone.app.platform.KeystoreTokenVault
+import dev.inkstone.app.sync.GoogleAuthorizer
+import dev.inkstone.app.sync.GoogleTokenRegistry
 import dev.inkstone.app.sync.MicrosoftSettings
 import dev.inkstone.app.sync.NoteSessionHost
+import dev.inkstone.app.sync.PlayServicesAuthorizer
 import dev.inkstone.core.database.InkstoneDatabase
 import dev.inkstone.core.database.sync.SqlAccountStore
 import dev.inkstone.core.database.sync.SqlAttentionStore
@@ -34,6 +37,7 @@ import dev.inkstone.core.sync.AttentionLog
 import dev.inkstone.core.sync.BindingStore
 import dev.inkstone.core.sync.CloudStoreFactory
 import dev.inkstone.core.sync.DirectoryCache
+import dev.inkstone.core.sync.DriveStoreFactory
 import dev.inkstone.core.sync.FolderBindingStore
 import dev.inkstone.core.sync.ForeignRemoteCache
 import dev.inkstone.core.sync.NextcloudStoreFactory
@@ -119,6 +123,16 @@ object SyncModule {
         clock: Clock,
     ): OneDriveStoreFactory = OneDriveStoreFactory(settings.oauth, vault, transport, clock)
 
+    @Provides
+    @Singleton
+    fun provideGoogleAuthorizer(authorizer: PlayServicesAuthorizer): GoogleAuthorizer = authorizer
+
+    /** Drive's token source is `:app`'s (Play Services); the factory only asks the registry for it. */
+    @Provides
+    @Singleton
+    fun provideDriveStoreFactory(transport: NextcloudTransport, tokens: GoogleTokenRegistry): DriveStoreFactory =
+        DriveStoreFactory(transport) { account -> tokens.tokensFor(account) }
+
     /**
      * ⭐ The only way the drainer and the reconciler get a store. **No fallback**: an account whose
      * provider is unknown opens nothing, because falling back to Nextcloud would send a OneDrive
@@ -130,10 +144,12 @@ object SyncModule {
         credentials: CredentialStore,
         transport: NextcloudTransport,
         oneDrive: OneDriveStoreFactory,
+        drive: DriveStoreFactory,
     ): CloudStoreFactory = ProviderRoutingFactory(
         mapOf(
             ProviderKind.NEXTCLOUD to NextcloudStoreFactory(credentials, transport),
             ProviderKind.ONEDRIVE to oneDrive,
+            ProviderKind.GOOGLE_DRIVE to drive,
         ),
     )
 

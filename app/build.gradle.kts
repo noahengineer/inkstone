@@ -88,6 +88,8 @@ dependencies {
     implementation(libs.androidx.work.runtime.ktx)
     // SPEC §7.1 — the login flow opens in a Custom Tab.
     implementation(libs.androidx.browser)
+    // docs/CLOUD-PROVIDERS.md §5.2 — Google Drive's access tokens come from Play Services' AuthorizationClient.
+    implementation(libs.play.services.auth)
 
     implementation(libs.hilt.android)
     implementation(libs.hilt.navigation.compose)

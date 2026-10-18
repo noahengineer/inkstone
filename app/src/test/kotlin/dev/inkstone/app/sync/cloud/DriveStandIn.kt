@@ -35,6 +35,9 @@ import kotlin.concurrent.thread
  * [beforeCommit] fires inside the upload, after the store's own check and before the bytes land: what a
  * concurrent writer in the window looks like.
  */
+// A fixture that mirrors the Drive docs route by route: a router and a query parser are the shape this rule
+// judges worst, and splitting them would hide which documented behaviour each line stands for.
+@Suppress("CyclomaticComplexMethod", "ComplexCondition", "TooManyFunctions")
 internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
 
     class Rev(val id: String, val modified: String, val bytes: ByteArray, var keepForever: Boolean)
@@ -89,6 +92,11 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
     @Volatile var rejectAccessTokens: Boolean = false
 
     @Volatile var expireChangeTokens: Boolean = false
+
+    /** Who `about` says owns the token. Two people on one tablet is how identity checks are tested. */
+    @Volatile var userPermissionId: String = "perm-1"
+
+    @Volatile var userEmail: String = "test.user@gmail.com"
 
     /** Never return more than this many items in a page, whatever `pageSize` asks — to make paging happen. */
     @Volatile var pageCap: Int? = null
@@ -148,7 +156,8 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
         val segments = path.split('/').filter { it.isNotEmpty() }
         var parent = rootId
         for (segment in segments.dropLast(1)) {
-            parent = children(parent).firstOrNull { it.name == segment && it.folder }?.id ?: newNode(parent, segment, true).id
+            val existing = children(parent).firstOrNull { it.name == segment && it.folder }
+            parent = existing?.id ?: newNode(parent, segment, true).id
         }
         val node = newNode(parent, segments.last(), false)
         addRevision(node, bytes, keep = true)
@@ -196,7 +205,8 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
         return current
     }
 
-    private fun md5(bytes: ByteArray) = MessageDigest.getInstance("MD5").digest(bytes).joinToString("") { "%02x".format(it) }
+    private fun md5(bytes: ByteArray) =
+        MessageDigest.getInstance("MD5").digest(bytes).joinToString("") { "%02x".format(it) }
 
     /** The resource the way Google would show it before `fields` is applied. */
     private fun view(node: Node): Map<String, Any?> = buildMap {
@@ -230,7 +240,7 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
         request.header("if-match").let { ifMatchSeen += it }
         val path = request.path
         return when {
-            path == "/drive/v3/about" -> json(200, project(mapOf("user" to mapOf("permissionId" to "perm-1")), request))
+            path == "/drive/v3/about" -> json(200, project(mapOf("user" to who()), request))
             path == "/drive/v3/changes/startPageToken" -> json(200, "{\"startPageToken\":\"S$seq\"}")
             path == "/drive/v3/changes" -> changes(request)
             path == "/drive/v3/files" && request.method == "GET" -> list(request)
@@ -254,15 +264,19 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
                 }
 
             parts.size == 1 && request.method == "PATCH" -> patch(request, node)
+
             parts.size == 2 && parts[1] == "revisions" -> listRevisions(request, node)
+
             parts.size == 3 && parts[1] == "revisions" -> revision(request, node, parts[2])
+
             else -> json(404, error("notFound", "no route"))
         }
     }
 
     private fun list(request: Request): Response {
         val q = request.query["q"].orEmpty()
-        val parent = Regex("""'((?:[^'\\]|\\.)*)' in parents""").find(q)?.groupValues?.get(1)?.let { resolveAlias(unescape(it)) }
+        val parentPattern = Regex("""'((?:[^'\\]|\\.)*)' in parents""")
+        val parent = parentPattern.find(q)?.groupValues?.get(1)?.let { resolveAlias(unescape(it)) }
         val name = Regex("""name='((?:[^'\\]|\\.)*)'""").find(q)?.groupValues?.get(1)?.let(::unescape)
         val mime = Regex("""mimeType='([^']*)'""").find(q)?.groupValues?.get(1)
         val liveOnly = q.contains("trashed=false")
@@ -297,7 +311,8 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
         (body["name"] as? String)?.let { node.name = it }
         (body["trashed"] as? Boolean)?.let { node.trashed = it }
         request.query["addParents"]?.takeIf { it.isNotEmpty() }?.let { node.parents.add(resolveAlias(it)) }
-        request.query["removeParents"]?.takeIf { it.isNotEmpty() }?.split(',')?.forEach { node.parents.remove(resolveAlias(it)) }
+        request.query["removeParents"]?.takeIf { it.isNotEmpty() }?.split(',')
+            ?.forEach { node.parents.remove(resolveAlias(it)) }
         changedAt[node.id] = ++seq
         return json(200, project(view(node), request))
     }
@@ -305,23 +320,34 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
     private fun listRevisions(request: Request, node: Node): Response {
         val body = mapOf(
             "kind" to "drive#revisionList",
-            "revisions" to node.revisions.map { mapOf("kind" to "drive#revision", "id" to it.id, "modifiedTime" to it.modified, "keepForever" to it.keepForever) },
+            "revisions" to node.revisions.map {
+                mapOf(
+                    "kind" to "drive#revision",
+                    "id" to it.id,
+                    "modifiedTime" to it.modified,
+                    "keepForever" to it.keepForever,
+                )
+            },
         )
         return json(200, project(body, request, default = "kind,revisions(kind,id,mimeType)"))
     }
 
     private fun revision(request: Request, node: Node, id: String): Response {
-        val rev = node.revisions.firstOrNull { it.id == id } ?: return json(404, error("notFound", "Revision not found: $id"))
+        val rev = node.revisions.firstOrNull { it.id == id }
+            ?: return json(404, error("notFound", "Revision not found: $id"))
         if (request.method == "PATCH") {
             (parseObject(request.body)["keepForever"] as? Boolean)?.let { rev.keepForever = it }
             return json(200, project(mapOf("id" to rev.id, "keepForever" to rev.keepForever), request))
         }
         if (request.query["alt"] == "media") {
             // The revisions guide: only a revision marked keepForever can be downloaded.
-            if (!rev.keepForever && rev !== node.head) return json(403, error("downloadRestricted", "Revision is not pinned"))
+            if (!rev.keepForever && rev !== node.head) {
+                return json(403, error("downloadRestricted", "Revision is not pinned"))
+            }
             return Response(200, rev.bytes, mapOf("Content-Type" to PDF))
         }
-        return json(200, project(mapOf("id" to rev.id, "modifiedTime" to rev.modified, "keepForever" to rev.keepForever), request))
+        val shown = mapOf("id" to rev.id, "modifiedTime" to rev.modified, "keepForever" to rev.keepForever)
+        return json(200, project(shown, request))
     }
 
     private fun startUpload(request: Request): Response {
@@ -370,7 +396,10 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
         val token = request.query["pageToken"].orEmpty()
         val (from, offset, snapshot) = when {
             token.startsWith("S") -> Triple(token.drop(1).toLong(), 0, seq)
-            token.startsWith("P") -> token.drop(1).split(':').let { Triple(it[0].toLong(), it[1].toInt(), it[2].toLong()) }
+
+            token.startsWith("P") ->
+                token.drop(1).split(':').let { Triple(it[0].toLong(), it[1].toInt(), it[2].toLong()) }
+
             else -> return json(400, error("invalid", "Invalid Value"))
         }
         val changed = changedAt.filter { it.value in (from + 1)..snapshot }.keys.toList()
@@ -380,7 +409,14 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
             put("kind", "drive#changeList")
             put(
                 "changes",
-                page.map { id -> mapOf("kind" to "drive#change", "fileId" to id, "removed" to false, "file" to view(nodes.getValue(id))) },
+                page.map { id ->
+                    mapOf(
+                        "kind" to "drive#change",
+                        "fileId" to id,
+                        "removed" to false,
+                        "file" to view(nodes.getValue(id)),
+                    )
+                },
             )
             if (offset + page.size < changed.size) {
                 put("nextPageToken", "P$from:${offset + page.size}:$snapshot")
@@ -426,9 +462,12 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
 
     private fun projectValue(value: Any?, tree: FieldTree?): Any? = when {
         tree == null -> value
+
         value is Map<*, *> -> value.entries.filter { it.key in tree.children }
             .associate { it.key as String to projectValue(it.value, tree.children[it.key]) }
+
         value is List<*> -> value.map { projectValue(it, tree) }
+
         else -> value
     }
 
@@ -449,18 +488,32 @@ internal class DriveStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
 
     private fun convert(element: kotlinx.serialization.json.JsonElement): Any? = when (element) {
         is kotlinx.serialization.json.JsonObject -> element.entries.associate { it.key to convert(it.value) }
+
         is kotlinx.serialization.json.JsonArray -> element.map { convert(it) }
+
         is kotlinx.serialization.json.JsonPrimitive ->
-            if (element.isString) element.content else element.content.toBooleanStrictOrNull() ?: element.content.toLongOrNull()
+            if (element.isString) {
+                element.content
+            } else {
+                element.content.toBooleanStrictOrNull() ?: element.content.toLongOrNull()
+            }
+
         else -> null
     }
 
     private fun unescape(text: String) = text.replace("\\'", "'").replace("\\\\", "\\")
 
-    private fun error(reason: String, message: String) =
-        "{\"error\":{\"code\":0,\"message\":\"$message\",\"errors\":[{\"reason\":\"$reason\",\"message\":\"$message\"}]}}"
+    private fun error(reason: String, message: String) = "{\"error\":{\"code\":0,\"message\":\"$message\"," +
+        "\"errors\":[{\"reason\":\"$reason\",\"message\":\"$message\"}]}}"
 
-    private fun json(status: Int, body: String) = Response(status, body.encodeToByteArray(), mapOf("Content-Type" to "application/json"))
+    private fun who() = mapOf(
+        "permissionId" to userPermissionId,
+        "emailAddress" to userEmail,
+        "displayName" to "Test User",
+    )
+
+    private fun json(status: Int, body: String) =
+        Response(status, body.encodeToByteArray(), mapOf("Content-Type" to "application/json"))
 
     // -- plumbing ----------------------------------------------------------------------------------
 

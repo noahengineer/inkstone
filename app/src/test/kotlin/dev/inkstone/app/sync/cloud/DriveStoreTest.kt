@@ -107,7 +107,13 @@ class DriveStoreTest {
         val store = store()
         store.create("Inkstone/Lecture.pdf", "mine")
 
-        val out = store.put(RemoteTarget("Inkstone/Lecture.pdf"), "other".encodeToByteArray(), WritePrecondition.CreateOnly, null, null)
+        val out = store.put(
+            RemoteTarget("Inkstone/Lecture.pdf"),
+            "other".encodeToByteArray(),
+            WritePrecondition.CreateOnly,
+            null,
+            null,
+        )
 
         assertIs<DavFailure.PreconditionFailed>(out.failure())
         assertEquals(listOf("Lecture.pdf"), server.namesIn("Inkstone"))
@@ -149,8 +155,14 @@ class DriveStoreTest {
 
         val revisions = server.revisionsAt("Inkstone/Lecture.pdf")
         assertEquals(2, revisions.size)
-        assertFalse(revisions.first().keepForever, "the replaced revision must be unpinned (never deleted) or pins pile up to Drive's cap")
-        assertTrue(revisions.last().keepForever, "the new head must be pinned, so a verify can find what lies behind it")
+        assertFalse(
+            revisions.first().keepForever,
+            "the replaced revision must be unpinned (never deleted) or pins pile up to Drive's cap",
+        )
+        assertTrue(
+            revisions.last().keepForever,
+            "the new head must be pinned, so a verify can find what lies behind it",
+        )
     }
 
     @Test
@@ -214,7 +226,13 @@ class DriveStoreTest {
         store.create("Inkstone/Lecture.pdf", "v1")
         val commits = server.contentCommits.count
 
-        val unchecked = store.put(RemoteTarget("Inkstone/Lecture.pdf"), "x".encodeToByteArray(), WritePrecondition.Unchecked, null, null)
+        val unchecked = store.put(
+            RemoteTarget("Inkstone/Lecture.pdf"),
+            "x".encodeToByteArray(),
+            WritePrecondition.Unchecked,
+            null,
+            null,
+        )
         val weak = store.put(
             RemoteTarget("Inkstone/Lecture.pdf"),
             "x".encodeToByteArray(),

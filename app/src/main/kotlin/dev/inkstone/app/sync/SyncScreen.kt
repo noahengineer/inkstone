@@ -170,7 +170,11 @@ private fun AccountsPane(state: SyncUiState, actions: SyncActions) {
 @Composable
 private fun AccountPanel(account: SyncAccount, actions: SyncActions) {
     GlassPanel(modifier = Modifier.fillMaxWidth()) {
-        val heading = if (account.provider == ProviderKind.ONEDRIVE) "OneDrive" else "Account"
+        val heading = when (account.provider) {
+            ProviderKind.ONEDRIVE -> "OneDrive"
+            ProviderKind.GOOGLE_DRIVE -> "Google Drive"
+            else -> "Account"
+        }
         MicroLabel(heading, color = account.state.tint())
         Text(
             account.displayName ?: account.loginName,
@@ -180,7 +184,7 @@ private fun AccountPanel(account: SyncAccount, actions: SyncActions) {
             overflow = TextOverflow.Ellipsis,
         )
         // A OneDrive row's "server" is Microsoft's API address, which says nothing a person needs.
-        if (account.provider != ProviderKind.ONEDRIVE) Readout(account.serverUrl, color = Ink.TextMuted, maxLines = 2)
+        if (account.provider == ProviderKind.NEXTCLOUD) Readout(account.serverUrl, color = Ink.TextMuted, maxLines = 2)
         AccountStateLine(account)
         Row(horizontalArrangement = Arrangement.spacedBy(InkDims.ChipGap)) {
             // NEEDS_REAUTH gets the same one-tap way back as SIGNED_OUT: the card said "sign in
@@ -215,22 +219,7 @@ private fun AccountStateLine(account: SyncAccount) {
     when (account.state) {
         // SPEC §7.2 / CLAUDE.md rule 5 — this is the *only* thing that happens after
         // a confirmed 401. No retry, no background attempt, just this line.
-        AccountState.NEEDS_REAUTH -> StateLine(
-            if (account.provider == ProviderKind.ONEDRIVE) {
-                if (account.lastError == OneDriveAccounts.MISSING_TOKEN_REASON) {
-                    // Nobody refused anything: the saved sign-in is simply not on this device any more.
-                    "Signed out — ${OneDriveAccounts.MISSING_TOKEN_REASON} Sign in again to resume syncing; " +
-                        "your notes are still linked."
-                } else {
-                    "Microsoft signed this device out. Sign in again to resume syncing — " +
-                        "Inkstone will not retry on its own."
-                }
-            } else {
-                "Signed out by the server. Sign in again to resume syncing — " +
-                    "Inkstone will not retry on its own."
-            },
-            Ink.Danger,
-        )
+        AccountState.NEEDS_REAUTH -> StateLine(reauthText(account), Ink.Danger)
 
         AccountState.NEEDS_UID -> StateLine(
             "Finishing sign-in the next time the server can be reached.",
@@ -248,6 +237,30 @@ private fun AccountStateLine(account: SyncAccount) {
 
         AccountState.ACTIVE -> account.lastError?.let { StateLine(it, Ink.Danger) }
     }
+}
+
+/** Why a halted account is halted, in words. The same promise for every provider: nothing retries on its own. */
+private fun reauthText(account: SyncAccount): String = when (account.provider) {
+    ProviderKind.ONEDRIVE ->
+        if (account.lastError == OneDriveAccounts.MISSING_TOKEN_REASON) {
+            // Nobody refused anything: the saved sign-in is simply not on this device any more.
+            "Signed out — ${OneDriveAccounts.MISSING_TOKEN_REASON} Sign in again to resume syncing; " +
+                "your notes are still linked."
+        } else {
+            "Microsoft signed this device out. Sign in again to resume syncing — " +
+                "Inkstone will not retry on its own."
+        }
+
+    ProviderKind.GOOGLE_DRIVE ->
+        if (account.lastError == GoogleAccessTokens.MISSING_GRANT_REASON) {
+            "Signed out — ${GoogleAccessTokens.MISSING_GRANT_REASON} Sign in again to resume syncing; " +
+                "your notes are still linked."
+        } else {
+            "Google signed this device out. Sign in again to resume syncing — " +
+                "Inkstone will not retry on its own."
+        }
+
+    else -> "Signed out by the server. Sign in again to resume syncing — Inkstone will not retry on its own."
 }
 
 @Composable
@@ -283,7 +296,29 @@ private fun AddAccountPanel(state: SyncUiState, actions: SyncActions) {
             color = Ink.TextMuted,
         )
         OneDriveSignIn(actions)
+        GoogleSignIn(actions)
     }
+}
+
+/**
+ * The third provider. There is no registration string to show: Google's Android sign-in finds the app by its
+ * package and signing fingerprint, which the Cloud console holds. What a person does need to know is the scope.
+ */
+@Composable
+private fun GoogleSignIn(actions: SyncActions) {
+    MicroLabel("Or use Google Drive")
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(InkDims.GroupGap),
+    ) {
+        TextChip(label = "Sign in to Google Drive", selected = true, onClick = actions.onSignInGoogle)
+    }
+    Text(
+        "Uses the Google account on this tablet; Inkstone never sees your password. It can only see the files " +
+            "it creates in your Drive, so PDFs already there will not appear, and nothing is ever deleted for good.",
+        style = MaterialTheme.typography.bodySmall,
+        color = Ink.TextMuted,
+    )
 }
 
 /**
@@ -619,6 +654,8 @@ data class SyncActions(
     val onSyncNow: () -> Unit,
     /** docs/CLOUD-PROVIDERS.md §5 — sign in to OneDrive in a Custom Tab. */
     val onSignInOneDrive: () -> Unit,
+    /** docs/CLOUD-PROVIDERS.md §5.2 - ask Play Services for Drive access. */
+    val onSignInGoogle: () -> Unit,
     /** False when this build has no Microsoft client id. Fixed for the install, so it is not in the UI state. */
     val oneDriveConfigured: Boolean,
     /** The `msauth://` redirect this install must be registered under. */

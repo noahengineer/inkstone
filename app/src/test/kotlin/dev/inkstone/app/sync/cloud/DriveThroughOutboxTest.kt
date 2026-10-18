@@ -164,7 +164,11 @@ class DriveThroughOutboxTest {
         assertEquals(1, report.uploaded)
         assertContentEquals("version one".encodeToByteArray(), server.bytesAt("Inkstone/Lecture.pdf"))
         val binding = assertNotNull(bindings.find(note))
-        assertEquals(server.idAt("Inkstone/Lecture.pdf"), binding.remoteOcId, "the file id is what later writes address")
+        assertEquals(
+            server.idAt("Inkstone/Lecture.pdf"),
+            binding.remoteOcId,
+            "the file id is what later writes address",
+        )
         assertEquals(server.headRevisionAt("Inkstone/Lecture.pdf"), binding.lastSyncedEtag?.value)
         assertEquals(NoteSyncState.SYNCED, notes.states[note.value])
         assertEquals(0, outbox.all().size, "the row must be gone once it has landed")
@@ -201,7 +205,11 @@ class DriveThroughOutboxTest {
         assertEquals(1, report.parked)
         assertEquals(setOf(note), report.conflicted, "the conflict must be reported so a reconcile can be asked for")
         assertEquals(NoteSyncState.CONFLICTED, notes.states[note.value])
-        assertContentEquals("theirs".encodeToByteArray(), server.bytesAt("Inkstone/Lecture.pdf"), "rule 1: theirs was overwritten")
+        assertContentEquals(
+            "theirs".encodeToByteArray(),
+            server.bytesAt("Inkstone/Lecture.pdf"),
+            "rule 1: theirs was overwritten",
+        )
         assertEquals(commits, server.contentCommits.count, "bytes were sent after the conflict was found")
         assertEquals(1, outbox.all().size, "the row stays — parked, not dropped (rule 1)")
     }

@@ -50,15 +50,18 @@ class DriveFeedTest {
         tokens,
     )
 
-    private suspend fun CloudStore.read(since: String? = null): ChangeBatch = when (val out = changes(since, listOf("Inkstone"))) {
-        is DavOutcome.Ok -> out.value
-        is DavOutcome.Failed -> error("expected a batch but got ${out.error.describe}")
-    }
+    private suspend fun CloudStore.read(since: String? = null): ChangeBatch =
+        when (val out = changes(since, listOf("Inkstone"))) {
+            is DavOutcome.Ok -> out.value
+            is DavOutcome.Failed -> error("expected a batch but got ${out.error.describe}")
+        }
 
     private fun ChangeBatch.files(): Map<String, RemoteChange.File> =
         changes.filterIsInstance<RemoteChange.File>().associateBy { it.resource.path }
 
-    private fun ChangeBatch.removed(): Set<String> = changes.filterIsInstance<RemoteChange.Removed>().map { it.id }.toSet()
+    private fun ChangeBatch.removed(): Set<String> = changes.filterIsInstance<RemoteChange.Removed>().map {
+        it.id
+    }.toSet()
 
     @Test
     fun `a first enumeration lists the pdfs with their paths and the version to check against`() = runTest {
@@ -105,7 +108,10 @@ class DriveFeedTest {
         val batch = store().read(first.cursor)
 
         assertEquals(setOf("Inkstone/Physics/Waves.pdf"), batch.files().keys)
-        assertEquals(server.headRevisionAt("Inkstone/Physics/Waves.pdf"), batch.files().values.single().resource.etag?.value)
+        assertEquals(
+            server.headRevisionAt("Inkstone/Physics/Waves.pdf"),
+            batch.files().values.single().resource.etag?.value,
+        )
     }
 
     @Test
@@ -166,7 +172,13 @@ class DriveFeedTest {
     @Test
     fun `the store's own write is not mistaken for somebody else's change that needs merging`() = runTest {
         val store = store()
-        val created = store.put(RemoteTarget("Inkstone/Lecture.pdf"), "v1".encodeToByteArray(), WritePrecondition.CreateOnly, null, null)
+        val created = store.put(
+            RemoteTarget("Inkstone/Lecture.pdf"),
+            "v1".encodeToByteArray(),
+            WritePrecondition.CreateOnly,
+            null,
+            null,
+        )
         val first = store.read()
 
         // The feed reports the file, at the version the store itself recorded, so the reconciler's
