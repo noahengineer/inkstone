@@ -73,8 +73,8 @@
   the check was dead code (`findByOcId` already guarantees it); it was removed, and the ordering that really
   protects a re-created file is what the last mutation now covers.
   **Limits, none of them fixed:**
-  - a first enumeration is the **whole drive** (`root/delta`) — on a real library that is large; scoping
-    it (the App Folder, or a `children` walk of one folder plus `?token=latest`) is open (M-M3);
+  - ~~a first enumeration is the whole drive~~ — **fixed after the first real sign-in, see "First real
+    OneDrive" below**;
   - a **folder rename** reports no descendants, so a binding under it keeps a stale *path* (writes use the
     item id and are unaffected, but a later local rename would re-create the old folder name and move the
     file into it);
@@ -157,6 +157,46 @@
     OneDrive account unless it skips `provider != NEXTCLOUD`. It edits the same lines of `SyncScreen`
     (the `NEEDS_REAUTH` button — made identical here, on purpose), `NextcloudAccounts`, `SyncPorts`,
     `OutboxDrainer` and `Reconciler`. Merge them together, not one after the other.
+
+## First real OneDrive (2026-10-18) — what the stand-in could not show
+
+The user registered the app (Entra, *Any Entra ID Tenant + Personal Microsoft accounts*, Android platform
+entry for `dev.inkstone`) and signed in on the emulator with a real personal account. **That is the first
+time any of this has touched Microsoft**, and it found three things the stand-in had agreed with.
+
+1. **`GET /me` needs `User.Read`.** The scope was `Files.ReadWrite offline_access`; sign-in succeeded and
+   the app then refused to save the account ("would not say who you are"). The stand-in answered `/me` for
+   any token. Scope is now `User.Read Files.ReadWrite offline_access`; the stand-in refuses `/me` without
+   it for browser sign-ins; the failure message names the call and the HTTP status.
+2. **A first enumeration of `root/delta` is every file in the account.** On the user's OneDrive (game
+   folders, mod packs, a ComfyUI install) the first pull received ~118 MB of metadata and had not finished,
+   holding the reconciler's lock so every later pass returned RETRY in milliseconds. The stand-in's drive was
+   a dozen files, so "everything" was cheap — the fixture was more generous than production. **Fixed:**
+   `CloudStore.changes(since, firstPassScope)`. With no usable cursor (first pass, or a `410` resync) the
+   store takes `delta?token=latest` first (the cursor for *now*, no items) and then lists only the
+   reconciler's walk roots (default folder, binding parents, pinned folders); a blank root is listed without
+   descending; folders capped at 2,000. Marker first, walk second, so a change during the walk arrives in the
+   next incremental batch. Measured on the real drive after the fix: the first pass finished in seconds,
+   received ~20 KB, saved Microsoft's real cursor, raised nothing, and a second forced pass read an empty
+   incremental batch and left the note alone. **Costs:** a bound note *outside* the walk roots that was edited
+   on the server before this device's first pass is not noticed until it is next uploaded (a 412, which is a
+   conflict and loses nothing) or changes again; PDFs past the folder cap are not adopted until they change.
+3. **The registration must contain the exact package.** `invalid_request: redirect_uri … not valid` was a
+   registration typo (`inkstone` for `dev.inkstone`), not a code fault — but the app now shows its redirect
+   URI on the Sync screen so the string to register is not derived by hand.
+
+Also found, not caused by the code: an emulator started without `-dns-server` cannot resolve any name
+(`DNS_PROBE_FINISHED_BAD_CONFIG` in Chrome) while `ping 8.8.8.8` works; restarting it with
+`-dns-server 8.8.8.8,1.1.1.1` fixed it. The README's emulator notes should say so.
+
+**Proven on the real service (emulator, debug build, real personal account):** sign-in and consent;
+token stored sealed; account row; folder browse of the real top level; creating `Inkstone/` and uploading a
+new note (`createUploadSession`, create-only); an edit re-uploading against the stored version tag (rev 3 → 5,
+tag `…},3`); a first pull and a second incremental pull, both clean; and token refresh with rotation (access tokens are
+not persisted, so every new process refreshes — several have, against the real token endpoint). **Not proven:** that the uploaded PDF
+opens correctly in OneDrive's own viewer (the user is asked to look); a remote edit or a newly dropped PDF
+arriving on the device; a stale `If-Match` actually answering 412 on Graph (M-M1); a rename or move
+made on the server; the physical Galaxy Tab.
 
 ## Original design (2026-10-17)
 

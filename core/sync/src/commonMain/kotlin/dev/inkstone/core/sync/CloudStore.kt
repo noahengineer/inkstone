@@ -144,8 +144,16 @@ public interface CloudStore {
      * enumeration. The whole feed is read before this returns (so a file's path can be resolved
      * from folders that arrive after it), and **nothing is concluded from a partial read**: a page
      * that fails fails the call.
+     *
+     * ⭐ **[firstPassScope] is what a first enumeration (and a resync) is allowed to list.** Without a
+     * cursor a feed's only honest answer is "everything that exists", and on a real OneDrive that is
+     * every file in the account — ~118 MB of metadata and a pass that never finished on the first real
+     * sign-in, because a drive holds games, mod packs and photo libraries as well as notes. So a store
+     * takes the feed's *latest* cursor first and then lists only these folders (the reconciler's walk
+     * roots); everything after that arrives as an ordinary incremental batch. A blank entry means the
+     * drive's top level and is listed **without** descending.
      */
-    public suspend fun changes(since: String?): DavOutcome<ChangeBatch>
+    public suspend fun changes(since: String?, firstPassScope: List<String>): DavOutcome<ChangeBatch>
 }
 
 /**
@@ -288,7 +296,7 @@ public class NextcloudStore(private val session: NextcloudSession) : CloudStore 
 
     override suspend fun locate(fileId: Long): DavOutcome<List<DavResource>> = session.dav.searchByFileId(fileId)
 
-    override suspend fun changes(since: String?): DavOutcome<ChangeBatch> =
+    override suspend fun changes(since: String?, firstPassScope: List<String>): DavOutcome<ChangeBatch> =
         DavOutcome.Failed(DavFailure.Malformed("Nextcloud is walked, not read as a change feed"))
 }
 

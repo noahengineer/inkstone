@@ -263,12 +263,17 @@ public class OneDriveStore(
     )
 
     /** `delta`, read to the end. See [GraphFeedReader] for what it does and what it assumes. */
-    override suspend fun changes(since: String?): DavOutcome<ChangeBatch> = feedReader.read(since)
+    override suspend fun changes(since: String?, firstPassScope: List<String>): DavOutcome<ChangeBatch> =
+        feedReader.read(since, firstPassScope)
 
     private val feedReader: GraphFeedReader by lazy {
-        GraphFeedReader(base, drive) { url, describe ->
-            send(HttpMethod.Get, url, describe) {}.flatten { it.json() }
-        }
+        GraphFeedReader(
+            base,
+            drive,
+            get = { url, describe -> send(HttpMethod.Get, url, describe) {}.flatten { it.json() } },
+            listChildren = ::children,
+            folderOf = { path -> listing(path, ListingDepth.SELF).map { it.single() } },
+        )
     }
 
     // -----------------------------------------------------------------------

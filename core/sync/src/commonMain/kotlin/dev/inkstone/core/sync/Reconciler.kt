@@ -302,7 +302,13 @@ public class Reconciler(
         if (passStartedAt < cursor.refusedUntilEpochMillis) return report.skipping(accountId)
         val polled = report.copy(accountsPolled = report.accountsPolled + 1)
 
-        val batch = when (val read = store.changes(cursor.feedCursor)) {
+        // The roots first: a first enumeration may list only these (CloudStore.changes), and they are
+        // also what decides which unknown PDFs may be adopted below.
+        val bindingPaths = bindings.forAccount(accountId).map { it.remotePath }
+        val pinned = pull.folders.pathsForAccount(accountId)
+        val roots = RemoteWalk.rootsOf(store.account.defaultFolder, bindingPaths, pinned.values)
+
+        val batch = when (val read = store.changes(cursor.feedCursor, roots)) {
             is DavOutcome.Failed -> {
                 val outcome = ReconcileOutcome.Failed(null, "", read.error)
                 record(outcome, accountId)
@@ -321,9 +327,6 @@ public class Reconciler(
             return polled.copy(unchanged = polled.unchanged + 1)
         }
 
-        val bindingPaths = bindings.forAccount(accountId).map { it.remotePath }
-        val pinned = pull.folders.pathsForAccount(accountId)
-        val roots = RemoteWalk.rootsOf(store.account.defaultFolder, bindingPaths, pinned.values)
         val pass = Pass(store, accountId, passStartedAt, roots, batch.kind != DeltaKind.INCREMENTAL, limit)
         val visited = Visited()
         val progress = FeedProgress(polled)

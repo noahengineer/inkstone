@@ -30,26 +30,125 @@ internal class GraphFeedReader(
     private val base: String,
     private val drive: String,
     private val get: suspend (url: String, describe: String) -> DavOutcome<JsonElement>,
+    private val listChildren: suspend (path: String) -> DavOutcome<List<DavResource>>,
+    private val folderOf: suspend (path: String) -> DavOutcome<DavResource>,
 ) {
 
-    suspend fun read(since: String?): DavOutcome<ChangeBatch> {
+    /**
+     * @param firstPassScope the folders a first enumeration or a resync may list — see
+     *   [CloudStore.changes]. Ignored when [since] is a live cursor, which is already only what changed.
+     */
+    suspend fun read(since: String?, firstPassScope: List<String>): DavOutcome<ChangeBatch> {
         if (since != null && !since.startsWith(base)) {
             return DavOutcome.Failed(DavFailure.Malformed("a feed cursor that is not this account's"))
         }
-        var kind = if (since == null) DeltaKind.FIRST else DeltaKind.INCREMENTAL
-        var feed = readPages(since ?: firstUrl)
-        val failure = (feed as? DavOutcome.Failed)?.error
-        if (since != null && failure is DavFailure.Server && failure.status == HTTP_GONE) {
-            kind = DeltaKind.RESYNC
-            feed = readPages(firstUrl)
-        }
-        return when (feed) {
-            is DavOutcome.Ok -> DavOutcome.Ok(ChangeBatch(resolve(feed.value), feed.value.deltaLink, kind))
-            is DavOutcome.Failed -> feed
+        if (since == null) return startOver(DeltaKind.FIRST, firstPassScope)
+        return when (val feed = readPages(since)) {
+            is DavOutcome.Ok ->
+                DavOutcome.Ok(ChangeBatch(resolve(feed.value), feed.value.deltaLink, DeltaKind.INCREMENTAL))
+
+            is DavOutcome.Failed -> {
+                val failure = feed.error
+                if (failure is DavFailure.Server && failure.status == HTTP_GONE) {
+                    startOver(DeltaKind.RESYNC, firstPassScope)
+                } else {
+                    feed
+                }
+            }
         }
     }
 
-    private val firstUrl: String get() = "$drive/root/delta"
+    /**
+     * No usable cursor: take the feed's *latest* one, then list only [scope].
+     *
+     * ⭐ **The marker first, the walk second.** Anything that changes while the walk runs is then in the
+     * next incremental batch rather than lost between the two; and a change that is seen twice is
+     * harmless, because every per-file decision downstream is idempotent (an unchanged version tag is a
+     * no-op). The other order loses changes silently.
+     *
+     * `?token=latest` is documented to answer an empty page and a `deltaLink` — "no items, just where
+     * the feed is now" — and **that has not been observed against Graph by anyone here** except through
+     * the first real sign-in, which is what showed that the alternative (list everything) never ends.
+     */
+    private suspend fun startOver(kind: DeltaKind, scope: List<String>): DavOutcome<ChangeBatch> {
+        val marker = when (val latest = readPages("$drive/root/delta?token=latest")) {
+            is DavOutcome.Ok -> latest.value.deltaLink
+            is DavOutcome.Failed -> return latest
+        }
+        val found = ArrayList<RemoteChange>()
+        return when (val walked = walk(scope, found)) {
+            is DavOutcome.Ok -> DavOutcome.Ok(ChangeBatch(found, marker, kind))
+            is DavOutcome.Failed -> walked
+        }
+    }
+
+    /**
+     * Breadth-first over [scope], collecting PDFs. A folder that does not exist is skipped (the default
+     * folder usually does not, until the first upload); any other failure fails the walk, because a
+     * listing that stopped half-way must not be mistaken for a complete one.
+     *
+     * A blank root is the drive's top level, listed **without descending** — a binding at the top of the
+     * drive must not turn into a walk of everything. Folders are capped at [MAX_FOLDERS]; what lies past
+     * the cap is simply not adopted now (never *trashed*: a first enumeration's silence proves nothing,
+     * [DeltaKind]) and is seen if it changes.
+     */
+    private suspend fun walk(scope: List<String>, out: MutableList<RemoteChange>): DavOutcome<Unit> {
+        val queue = ArrayDeque<Folder>()
+        for (root in scope.map { it.trim('/') }.distinct()) queue.addLast(Folder(root, null, 0))
+        val seen = HashSet<String>()
+        while (queue.isNotEmpty() && seen.size < MAX_FOLDERS) {
+            val queued = queue.removeFirst()
+            if (!seen.add(queued.path)) continue
+            when (val step = visit(queued, queue, out)) {
+                is DavOutcome.Failed -> return step
+                is DavOutcome.Ok -> Unit
+            }
+        }
+        return DavOutcome.Ok(Unit)
+    }
+
+    /**
+     * One folder: learn its id (a scope root arrives with a path only; the incremental feed gives every
+     * file its parent's id, so a first pass does too), list it, record its PDFs and queue its folders.
+     * A folder that does not exist is *not* a failure: the default folder usually does not, until the
+     * first upload.
+     */
+    private suspend fun visit(
+        queued: Folder,
+        queue: ArrayDeque<Folder>,
+        out: MutableList<RemoteChange>,
+    ): DavOutcome<Unit> {
+        val folder = when (val resolved = withId(queued)) {
+            is DavOutcome.Ok -> resolved.value
+            is DavOutcome.Failed -> return missingIsEmpty(resolved)
+        }
+        val children = when (val reply = listChildren(folder.path)) {
+            is DavOutcome.Ok -> reply.value
+            is DavOutcome.Failed -> return missingIsEmpty(reply)
+        }
+        for (child in children) {
+            // A blank root is the drive's top level and is never descended into.
+            if (child.isCollection && folder.path.isNotEmpty() && folder.depth < MAX_DEPTH) {
+                queue.addLast(Folder(child.path.trim('/'), child.ocId, folder.depth + 1))
+            } else if (!child.isCollection && child.name.endsWith(PDF_SUFFIX, ignoreCase = true)) {
+                out += RemoteChange.File(child, folder.id)
+            }
+        }
+        return DavOutcome.Ok(Unit)
+    }
+
+    private suspend fun withId(folder: Folder): DavOutcome<Folder> {
+        if (folder.id != null || folder.path.isEmpty()) return DavOutcome.Ok(folder)
+        return when (val self = folderOf(folder.path)) {
+            is DavOutcome.Ok -> DavOutcome.Ok(Folder(folder.path, self.value.ocId, folder.depth))
+            is DavOutcome.Failed -> self
+        }
+    }
+
+    private fun missingIsEmpty(failed: DavOutcome.Failed): DavOutcome<Unit> =
+        if (failed.error is DavFailure.NotFound) DavOutcome.Ok(Unit) else failed
+
+    private class Folder(val path: String, val id: String?, val depth: Int)
 
     private class FeedItem(
         val id: String,
@@ -209,6 +308,7 @@ internal class GraphFeedReader(
     private companion object {
         const val HTTP_GONE = 410
         const val MAX_FEED_PAGES = 5_000
+        const val MAX_FOLDERS = 2_000
         const val MAX_DEPTH = 64
         const val PDF_SUFFIX = ".pdf"
         const val ROOT_MARKER = "root:"

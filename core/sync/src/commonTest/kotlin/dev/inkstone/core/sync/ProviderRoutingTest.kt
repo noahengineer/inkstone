@@ -42,7 +42,7 @@ class ProviderRoutingTest {
 
         override suspend fun locate(fileId: Long): DavOutcome<List<DavResource>> = never()
 
-        override suspend fun changes(since: String?): DavOutcome<ChangeBatch> = never()
+        override suspend fun changes(since: String?, firstPassScope: List<String>): DavOutcome<ChangeBatch> = never()
     }
 
     private fun factory(kind: ProviderKind, opened: MutableList<String>) = CloudStoreFactory { account ->

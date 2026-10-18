@@ -58,7 +58,7 @@ class CloudStoreSeamTest {
             DavOutcome.Failed(DavFailure.NotFound(path))
 
         override suspend fun locate(fileId: Long): DavOutcome<List<DavResource>> = DavOutcome.Ok(emptyList())
-        override suspend fun changes(since: String?): DavOutcome<ChangeBatch> =
+        override suspend fun changes(since: String?, firstPassScope: List<String>): DavOutcome<ChangeBatch> =
             DavOutcome.Ok(ChangeBatch(emptyList(), "c", DeltaKind.INCREMENTAL))
     }
 

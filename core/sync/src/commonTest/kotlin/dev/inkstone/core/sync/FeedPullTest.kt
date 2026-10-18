@@ -59,7 +59,7 @@ class FeedPullTest {
         override val supportsUncheckedReplace: Boolean = false
         override val pullShape: PullShape = PullShape.FEED
 
-        override suspend fun changes(since: String?): DavOutcome<ChangeBatch> {
+        override suspend fun changes(since: String?, firstPassScope: List<String>): DavOutcome<ChangeBatch> {
             sinceSeen += since
             return script()
         }

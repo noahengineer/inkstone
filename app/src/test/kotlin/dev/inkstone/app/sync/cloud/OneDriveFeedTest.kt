@@ -73,7 +73,10 @@ class OneDriveFeedTest {
         ),
     )
 
-    private suspend fun OneDriveStore.read(since: String? = null): ChangeBatch = when (val out = changes(since)) {
+    private suspend fun OneDriveStore.read(
+        since: String? = null,
+        scope: List<String> = listOf("Inkstone"),
+    ): ChangeBatch = when (val out = changes(since, scope)) {
         is DavOutcome.Ok -> out.value
         is DavOutcome.Failed -> error("expected a batch but got ${out.error.describe}")
     }
@@ -107,20 +110,23 @@ class OneDriveFeedTest {
     @Test
     fun `a path does not depend on which order the feed lists a folder and its children`() = runTest {
         server.deltaChildrenFirst = true
+        val first = store().read()
         server.seedFile("A/B/C/Deep.pdf", "x".encodeToByteArray())
 
-        assertEquals(setOf("A/B/C/Deep.pdf"), store().read().files().keys)
+        assertEquals(setOf("A/B/C/Deep.pdf"), store().read(first.cursor).files().keys)
     }
 
     @Test
     fun `paging is followed to the end`() = runTest {
         server.deltaPageSize = 2
+        val first = store().read()
         repeat(5) { server.seedFile("Inkstone/Note$it.pdf", "x".encodeToByteArray()) }
+        val before = server.delta.count
 
-        val batch = store().read()
+        val batch = store().read(first.cursor)
 
         assertEquals(5, batch.files().size)
-        assertTrue(server.delta.count > 1, "five files and a folder tree cannot fit one page of two")
+        assertTrue(server.delta.count - before > 1, "five files and a folder tree cannot fit one page of two")
     }
 
     @Test
@@ -218,13 +224,83 @@ class OneDriveFeedTest {
         assertEquals(setOf("Inkstone/Lecture.pdf"), batch.files().keys)
     }
 
+    // -- the first pass must not be the whole drive --------------------------------------------------
+    //
+    // Found on the first real sign-in: a first enumeration asked Graph for `root/delta` with no token,
+    // which is every file in the account. On a real OneDrive (game folders, mod packs, a ComfyUI install)
+    // that was ~118 MB of metadata and a pull that never finished. The stand-in served it without
+    // complaint, because a small fake drive makes "everything" cheap — the fixture was more generous
+    // than production, which is this repo's oldest lesson.
+
+    @Test
+    fun `a first enumeration never asks for the whole drive`() = runTest {
+        repeat(30) { server.seedFile("Games/Pack$it/manual.pdf", "x".encodeToByteArray()) }
+        server.seedFile("Inkstone/Lecture.pdf", "a".encodeToByteArray())
+
+        val batch = store().read()
+
+        assertEquals(0, server.fullEnumerations.count, "a first pass walked the whole drive")
+        assertEquals(1, server.latestTokens.count, "a first pass must take the feed's latest cursor")
+        assertEquals(setOf("Inkstone/Lecture.pdf"), batch.files().keys, "only the scope is listed")
+        assertEquals(DeltaKind.FIRST, batch.kind)
+    }
+
+    @Test
+    fun `a resync is scoped the same way`() = runTest {
+        repeat(10) { server.seedFile("Games/Pack$it/manual.pdf", "x".encodeToByteArray()) }
+        server.seedFile("Inkstone/Lecture.pdf", "a".encodeToByteArray())
+        val first = store().read()
+        server.expireDeltaTokens = true
+
+        val batch = store().read(first.cursor)
+
+        assertEquals(DeltaKind.RESYNC, batch.kind)
+        assertEquals(0, server.fullEnumerations.count, "a resync walked the whole drive")
+        assertEquals(setOf("Inkstone/Lecture.pdf"), batch.files().keys)
+    }
+
+    @Test
+    fun `a change made after the first pass is seen anywhere in the drive`() = runTest {
+        val first = store().read()
+        server.seedFile("Elsewhere/Note.pdf", "x".encodeToByteArray())
+
+        val batch = store().read(first.cursor)
+
+        assertEquals(setOf("Elsewhere/Note.pdf"), batch.files().keys)
+    }
+
+    @Test
+    fun `a scope folder that does not exist yet is an empty answer and not a failure`() = runTest {
+        val batch = store().read(scope = listOf("Inkstone"))
+
+        assertTrue(batch.files().isEmpty())
+        assertTrue(batch.cursor.startsWith(server.baseUrl))
+    }
+
+    @Test
+    fun `the top of the drive is listed without descending into it`() = runTest {
+        server.seedFile("TopLevel.pdf", "a".encodeToByteArray())
+        server.seedFile("Games/Nested.pdf", "b".encodeToByteArray())
+
+        val batch = store().read(scope = listOf(""))
+
+        assertEquals(setOf("TopLevel.pdf"), batch.files().keys, "a blank root turned into a walk of everything")
+    }
+
+    @Test
+    fun `a scope folder is listed to its depth`() = runTest {
+        server.seedFile("Inkstone/A/B/C/Deep.pdf", "x".encodeToByteArray())
+
+        assertEquals(setOf("Inkstone/A/B/C/Deep.pdf"), store().read().files().keys)
+    }
+
     // -- hostile or broken feeds --------------------------------------------------------------------
 
     @Test
     fun `a cursor for another host is refused before any request is made`() = runTest {
         val before = server.api.count + server.tokenEndpoint.count
 
-        val out = store().changes("https://evil.invalid/v1.0/drives/x/root/delta?token=S1")
+        val out = store().changes("https://evil.invalid/v1.0/drives/x/root/delta?token=S1", listOf("Inkstone"))
 
         assertIs<DavFailure.Malformed>((out as DavOutcome.Failed).error)
         assertEquals(before, server.api.count + server.tokenEndpoint.count, "a request went out for a foreign cursor")
@@ -232,14 +308,16 @@ class OneDriveFeedTest {
 
     @Test
     fun `a next link on another host is not followed so the bearer token stays home`() = runTest {
+        val first = store().read()
         server.deltaPageSize = 1
         server.deltaPointsElsewhere = true
         repeat(3) { server.seedFile("Inkstone/Note$it.pdf", "x".encodeToByteArray()) }
+        val before = server.delta.count
 
-        val out = store().changes(null)
+        val out = store().changes(first.cursor, listOf("Inkstone"))
 
         assertIs<DavFailure.Malformed>((out as DavOutcome.Failed).error)
-        assertEquals(1, server.delta.count, "the store followed a link to somebody else's server")
+        assertEquals(1, server.delta.count - before, "the store followed a link to somebody else's server")
     }
 
     @Test
@@ -249,7 +327,7 @@ class OneDriveFeedTest {
         store.read() // gets a token
         server.rejectAccessTokens = true
 
-        val out = store.changes(null)
+        val out = store.changes(null, listOf("Inkstone"))
 
         assertEquals(DavFailure.Unauthorized, (out as DavOutcome.Failed).error)
     }

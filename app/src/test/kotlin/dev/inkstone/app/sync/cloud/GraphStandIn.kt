@@ -137,6 +137,12 @@ internal class GraphStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
 
     val delta = Counter()
 
+    /** `delta` requests with no token at all: the whole drive. The thing a first sync must never do. */
+    val fullEnumerations = Counter()
+
+    /** `delta?token=latest` requests. */
+    val latestTokens = Counter()
+
     // -- sign-in (authorization code + PKCE) ---------------------------------------------------
     private class Grant(val challenge: String, val redirectUri: String, val scope: String)
 
@@ -431,12 +437,18 @@ internal class GraphStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
         val token = Regex("token=([^&]+)").find(request.query)?.groupValues?.get(1)?.let {
             URLDecoder.decode(it, "UTF-8")
         }
-        if (token != null && expireDeltaTokens) {
+        // `latest` is not a cursor the service could have expired: it is how a client asks for one.
+        if (token != null && token != "latest" && expireDeltaTokens) {
             return json(410, error("resyncRequired"), mapOf("Location" to "$baseUrl/drives/$driveId/root/delta"))
         }
+        if (token == null) fullEnumerations.hit()
+        if (token == "latest") latestTokens.hit()
         // `S<seq>` is a finished feed's cursor; `P<from>:<offset>:<snapshot>` is a page in progress.
         val (from, offset, snapshot) = when {
             token == null -> Triple(0L, 0, seq)
+
+            // Graph: `?token=latest` — no items, only the cursor for "now". What a first sync must use.
+            token == "latest" -> Triple(seq, 0, seq)
 
             token.startsWith("S") -> Triple(token.substring(1).toLong(), 0, seq)
 
