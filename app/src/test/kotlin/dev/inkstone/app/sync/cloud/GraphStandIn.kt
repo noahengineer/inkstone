@@ -138,7 +138,14 @@ internal class GraphStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
     val delta = Counter()
 
     // -- sign-in (authorization code + PKCE) ---------------------------------------------------
-    private class Grant(val challenge: String, val redirectUri: String)
+    private class Grant(val challenge: String, val redirectUri: String, val scope: String)
+
+    /**
+     * The scope the last *browser* sign-in was granted. Graph refuses `GET /me` without `User.Read`; this is how a
+     * test sees a sign-in that forgot to ask for it. Null (never signed in through the browser) permits everything,
+     * so the tests that seed tokens directly are unchanged.
+     */
+    @Volatile var grantedScope: String? = null
 
     private val authCodes = HashMap<String, Grant>()
     private var codeCounter = 0
@@ -377,6 +384,9 @@ internal class GraphStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
         }
         val decoded = decode(path)
         return when {
+            decoded == "/me" && grantedScope?.contains("User.Read") == false ->
+                json(403, error("Authorization_RequestDenied"))
+
             decoded == "/me" -> json(
                 200,
                 "{\"id\":\"$signedInUserId\",\"displayName\":\"Test User\",\"mail\":\"$signedInMail\"," +
@@ -486,7 +496,7 @@ internal class GraphStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
             "$redirect?error=access_denied&error_description=The+user+cancelled&state=$state"
         } else {
             val code = "code-${++codeCounter}"
-            authCodes[code] = Grant(query["code_challenge"].orEmpty(), redirect)
+            authCodes[code] = Grant(query["code_challenge"].orEmpty(), redirect, query["scope"].orEmpty())
             "$redirect?code=$code&state=$state"
         }
         val label = if (userDeclines) "Cancel" else "Continue as $signedInMail"
@@ -505,6 +515,7 @@ internal class GraphStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
         if (grant == null || grant.redirectUri != form["redirect_uri"] || grant.challenge != derived) {
             return json(400, """{"error":"invalid_grant","error_description":"The code or verifier is invalid."}""")
         }
+        grantedScope = grant.scope
         val chain = chains.size + 1
         val n = ++tokenCounter
         val refresh = "rt-$n"

@@ -210,12 +210,17 @@ public class MicrosoftSignIn(
         // Rule 4: durable before anything — including the two calls just below — uses the access token.
         vault.put(accountId, OAuthSecret(tokens.refreshToken))
 
-        val identity = identityOf(tokens.accessToken)
-        if (identity == null) {
-            // Nothing is left behind: a half-made account with a token and no identity is the orphan
-            // the Nextcloud flow's `cleanUp` exists for.
-            vault.remove(accountId)
-            return SignInResult.Failed("Signed in, but Microsoft would not say who you are. Try again.")
+        val identity = when (val found = identityOf(tokens.accessToken)) {
+            is IdentityAnswer.Found -> found.identity
+
+            is IdentityAnswer.Missing -> {
+                // Nothing is left behind: a half-made account with a token and no identity is the orphan
+                // the Nextcloud flow's `cleanUp` exists for.
+                vault.remove(accountId)
+                return SignInResult.Failed(
+                    "Signed in, but Microsoft would not say who you are (${found.why}). Try again.",
+                )
+            }
         }
         return SignInResult.Success(identity, saved.expectedAccountId)
     }
@@ -265,23 +270,41 @@ public class MicrosoftSignIn(
         return TokenAnswer.Issued(access, refresh)
     }
 
-    private suspend fun identityOf(accessToken: String): SignedInIdentity? {
-        val me = getJson("${config.graphBase}/me?\$select=id,displayName,mail,userPrincipalName", accessToken)
-        val drive = getJson("${config.graphBase}/me/drive?\$select=id", accessToken)
-        val userId = me?.text("id") ?: return null
-        val driveId = drive?.text("id") ?: return null
-        val name = me.text("mail") ?: me.text("userPrincipalName") ?: me.text("displayName") ?: userId
-        return SignedInIdentity(userId, name, me.text("displayName"), driveId)
+    private sealed interface IdentityAnswer {
+        data class Found(val identity: SignedInIdentity) : IdentityAnswer
+
+        /** [why] names the call and what came back, so a refusal is diagnosable from the message alone. */
+        data class Missing(val why: String) : IdentityAnswer
     }
 
-    @Suppress("TooGenericExceptionCaught", "SwallowedException")
-    private suspend fun getJson(url: String, accessToken: String): JsonObject? = try {
+    private suspend fun identityOf(accessToken: String): IdentityAnswer {
+        val me = getJson("${config.graphBase}/me?\$select=id,displayName,mail,userPrincipalName", accessToken, "/me")
+        val meBody = me.body ?: return IdentityAnswer.Missing(me.why)
+        val drive = getJson("${config.graphBase}/me/drive?\$select=id", accessToken, "/me/drive")
+        val driveBody = drive.body ?: return IdentityAnswer.Missing(drive.why)
+        val userId = meBody.text("id") ?: return IdentityAnswer.Missing("/me had no id")
+        val driveId = driveBody.text("id") ?: return IdentityAnswer.Missing("/me/drive had no id")
+        val name = meBody.text("mail") ?: meBody.text("userPrincipalName") ?: meBody.text("displayName") ?: userId
+        return IdentityAnswer.Found(SignedInIdentity(userId, name, meBody.text("displayName"), driveId))
+    }
+
+    private class Fetched(val body: JsonObject?, val why: String)
+
+    @Suppress("TooGenericExceptionCaught")
+    private suspend fun getJson(url: String, accessToken: String, label: String): Fetched = try {
         val response = transport.client.get(url) { header("Authorization", "Bearer $accessToken") }
-        if (response.status.value == HTTP_OK) parse(response.body<String>()).takeIf { it.isNotEmpty() } else null
+        val parsed = if (response.status.value ==
+            HTTP_OK
+        ) {
+            parse(response.body<String>()).takeIf { it.isNotEmpty() }
+        } else {
+            null
+        }
+        Fetched(parsed, "$label answered HTTP ${response.status.value}")
     } catch (cancellation: CancellationException) {
         throw cancellation
     } catch (failure: Throwable) {
-        null
+        Fetched(null, "$label could not be reached: ${failure.message ?: failure}")
     }
 
     @Suppress("SwallowedException", "TooGenericExceptionCaught")

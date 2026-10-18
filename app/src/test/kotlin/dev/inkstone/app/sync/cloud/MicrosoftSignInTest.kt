@@ -150,6 +150,7 @@ class MicrosoftSignInTest {
         assertEquals(redirectUri, param(url, "redirect_uri"))
         assertEquals("select_account", param(url, "prompt"))
         assertTrue(param(url, "scope").orEmpty().contains("offline_access"), "no offline_access, no refresh token")
+        assertTrue(param(url, "scope").orEmpty().contains("User.Read"), "no User.Read, and /me is refused")
         assertTrue(saved.codeVerifier.length >= 43, "RFC 7636's minimum verifier length")
     }
 
@@ -261,7 +262,8 @@ class MicrosoftSignInTest {
 
         val result = flow.complete(redirect, "provisional")
 
-        assertIs<SignInResult.Failed>(result)
+        val failed = assertIs<SignInResult.Failed>(result)
+        assertTrue(failed.reason.contains("HTTP 401"), "the failure must say what Microsoft answered: ${failed.reason}")
         assertTrue(vault.secrets.isEmpty(), "an account with a token and no identity is an orphan")
         assertTrue(server.log.any { it.startsWith("vault put") } && server.log.contains("vault remove"))
     }

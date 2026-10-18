@@ -64,8 +64,12 @@ public data class MicrosoftOAuthConfig(
         /** `common`: personal Microsoft accounts and work/school accounts both sign in. */
         public const val DEFAULT_TOKEN_ENDPOINT: String = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 
-        /** docs §5.1 — `Files.ReadWrite` (D3), plus `offline_access` or there is no refresh token. */
-        public const val DEFAULT_SCOPE: String = "Files.ReadWrite offline_access"
+        /**
+         * docs §5.1 — `Files.ReadWrite` (D3), `offline_access` or there is no refresh token, and `User.Read`:
+         * without it `GET /me` is refused, so a sign-in that succeeded cannot say *who* signed in (found on the
+         * first real sign-in; the stand-in answered `/me` for any token and could not have shown it).
+         */
+        public const val DEFAULT_SCOPE: String = "User.Read Files.ReadWrite offline_access"
     }
 }
 
