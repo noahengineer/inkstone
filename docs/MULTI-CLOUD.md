@@ -47,9 +47,9 @@ another**, so there is no cross-cloud protocol and no cross-cloud loop, only the
 - **The note's sync state is derived**: `SYNCED` only when **every** binding is; otherwise the worst one, with a
   per-cloud breakdown for the screen ("Nextcloud ✓ · OneDrive ✓ · Drive — waiting"). A cloud that is offline
   must not make a note look unsaved everywhere, and must not make it look saved when it is not.
-- **Mirror policy.** A binding set is explicit per note/folder, **plus** an optional "all accounts" flag on a
-  folder pin so a *newly connected* cloud adopts it (with a confirmation, because that starts uploading a
-  library). See decision D2.
+- **Mirror policy and presets.** A binding set is explicit per note/folder, **plus** an optional "all accounts"
+  flag on a folder pin (D2). The path choice is a *preset* (D3): stored once, applied to as many notes and folders
+  as the user likes, and each binding records the path it was actually given.
 
 ## 4. What must stay true (CLAUDE.md, applied to many accounts)
 
@@ -63,22 +63,31 @@ another**, so there is no cross-cloud protocol and no cross-cloud loop, only the
 5. **No conflict dialogs.** A divergence between clouds heals by merge and shows in "Needs attention" if it
    cannot, as today.
 
-## 5. Decisions that are the user's
+## 5. Decisions
 
-- **D1 — Deletion.** *Locally trashing a note* trashes it in every cloud (each soft-trash, never permanent) — that
-  is what "mirror" means. But *a deletion noticed on one cloud*: (a) detaches only that cloud and keeps the note
-  and the other clouds' copies, or (b) propagates (local trash → trashed everywhere). **Recommend (a)**: a
-  mirror whose purpose is redundancy should not let one cloud's mistake or one person with access to one
-  account delete the other two copies. It is the safer reading of rule 1.
-- **D2 — Which accounts.** (a) an explicit set chosen per note/folder, (b) always every account, or (c) explicit
-  set **plus** an "all accounts" flag on a folder pin. **Recommend (c).**
-- **D3 — The shared path's meaning.** One relative path (`School/Physics/Waves.pdf`) used under each account's own
-  default folder, so each cloud keeps its own top-level folder name. Or one absolute path required to exist
-  identically everywhere. **Recommend relative-under-default-folder**; Drive's folders are by id, so an absolute
-  path is not even a stable idea there.
-- **D4 — Order of work and the risk budget.** This rewrites the schema under every synced note. Recommend
-  doing it in the phases of §6, stopping after each for the user to try it on the emulator, **not** on the
-  tablet's real library until phase 1's migration has run on a real device DB.
+**Decided by the user (2026-10-18):**
+
+- **D1 — Deletion: detach that cloud only.** A deletion *noticed on one cloud* detaches that binding; the note and
+  the other clouds' copies stay. *Trashing a note inside Inkstone* trashes it in every cloud (each a soft trash,
+  never permanent). A mirror whose purpose is redundancy must not let one account's mistake delete the others.
+- **D2 — Which accounts: an explicit set per note/folder, plus an "all accounts" option on a folder.** A cloud
+  connected later adopts an "all accounts" folder after a confirmation (it starts uploading a library).
+- **D3 — The path is a *preset*.** The user's words: *"same for every cloud but not relative to an Inkstone folder,
+  plus you can make each cloud save to a different place — basically this makes it a preset."* So:
+  - A **preset** is a saved choice: a name, the accounts it covers, and **one path per account**. The path defaults
+    to the same value everywhere (`School/Physics`) and any account may override it (`Backups/Physics` on Drive).
+  - Paths are counted **from each cloud's own root**, not under the default `Inkstone` folder. (The per-account
+    default folder stays as the *browser's starting point* only.)
+  - Applying a preset to a note or a pinned folder creates one binding per account in it, at that account's path.
+  - ⚠️ **Google Drive cannot reuse the user's existing folders.** Under the `drive.file` scope the app sees only what
+    it created, so `School/Physics` from Drive's root is made *new* by the app — and Drive allows two folders of
+    one name, so a `School` the user already has will sit beside the app's. Nextcloud and OneDrive reuse an
+    existing folder. This is a property of the scope the user chose (D3 of the providers doc), and the preset
+    screen must say it next to the Drive row.
+
+**Still open — D4, the order of work and the risk budget.** This rewrites the schema under every synced note.
+Proposed: phases of §6, **stopping after each** for the user to try it on the emulator, and **not** putting
+phase 1 on the tablet's real library until its migration has run on a throwaway device database.
 
 ## 6. Phases (each one shippable and checkable on its own)
 
@@ -91,8 +100,10 @@ another**, so there is no cross-cloud protocol and no cross-cloud loop, only the
    moved. This is the phase that can lose data if wrong, so it ships alone.
 2. **Fan-out.** `noteChanged`/`noteTrashed`/`noteMoved` enqueue per binding; the drainer already isolates by
    row; add the cross-account propagation after a pull. New matrix rows (§7).
-3. **UI.** "Save to…" becomes a checklist of accounts with **one** path; folder pin the same, with the
-   "all accounts" flag; per-cloud state on the note and in Sync; "add this cloud to my synced notes".
+3. **Presets and UI.** A `syncPreset` table (name; per-account path rows; migration 13). "Save to…" and a folder's
+   "Always sync to…" become *choose a preset* (or build one: tick accounts, one path, override per account),
+   with the "all accounts" flag; Settings gets a presets editor; per-cloud state on the note and in Sync;
+   "add this cloud to my synced notes". The Drive-folders caveat is shown on its row.
 4. **Backfill and edge cases.** Connecting a new cloud to a library already bound elsewhere; disconnecting one;
    a note bound to the same account twice (refused).
 
@@ -101,6 +112,8 @@ another**, so there is no cross-cloud protocol and no cross-cloud loop, only the
 - Two accounts converge: edit on A is on B and C; edit on B while A is offline merges when A returns.
 - **Isolation:** A returns 401/412/429/500 while B and C drain — B and C complete, A parks or halts alone.
 - A remote deletion on one account follows D1; a local trash reaches every account as a trash, not a delete.
+- A preset with an override path: each account receives the note at *its* path; renaming the preset's path later
+  moves nothing already on a server (CLAUDE.md rule 1 — a settings change is not a licence to move files).
 - The same note bound to two accounts whose paths differ; a rename on one only.
 - A new account connected to a library: uploads begin only after confirmation, one account's rows at a time,
   and nothing already on that account is overwritten (`CreateOnly`).
