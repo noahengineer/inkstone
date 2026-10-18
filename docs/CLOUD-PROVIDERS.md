@@ -193,9 +193,12 @@ Also found, not caused by the code: an emulator started without `-dns-server` ca
 token stored sealed; account row; folder browse of the real top level; creating `Inkstone/` and uploading a
 new note (`createUploadSession`, create-only); an edit re-uploading against the stored version tag (rev 3 → 5,
 tag `…},3`); a first pull and a second incremental pull, both clean; and token refresh with rotation (access tokens are
-not persisted, so every new process refreshes — several have, against the real token endpoint). **Not proven:** that the uploaded PDF
-opens correctly in OneDrive's own viewer (the user is asked to look); a remote edit or a newly dropped PDF
-arriving on the device; a stale `If-Match` actually answering 412 on Graph (M-M1); a rename or move
+not persisted, so every new process refreshes — several have, against the real token endpoint). Then, with the user looking in OneDrive: the uploaded note opens in OneDrive's own viewer with all five strokes;
+a PDF the user dropped into `Inkstone/` was seen by the periodic pull and recorded as a foreign (non-Inkstone)
+PDF with no note, conflict or warning; *Import → From Nextcloud* (the old name) downloaded it, bound it at the
+downloaded version tag, uploaded it (`…},1` → `},2`), then three strokes uploaded again (`},3`); the user
+confirmed the original page plus the strokes in OneDrive; a pull straight after the app's own write raised nothing.
+**Not proven:** a stale `If-Match` actually answering 412 on Graph (M-M1); a rename or move
 made on the server; the physical Galaxy Tab.
 
 ## Original design (2026-10-17)
