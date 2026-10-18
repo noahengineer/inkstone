@@ -251,6 +251,15 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // docs/CLOUD-PROVIDERS.md §5.1 — the OneDrive sign-in page. The result does not come back through
+        // here: it arrives at OAuthRedirectActivity, which may be a different process by then.
+        LaunchedEffect(syncState.openUrl) {
+            syncState.openUrl?.let { url ->
+                sync.urlOpened()
+                openLoginPage(url)
+            }
+        }
+
         // A PDF adopted off the server opens straight away — and the Sync screen is left standing
         // behind it holding the sentence that says where the ink will go, because the editor
         // arriving over a snackbar is how that sentence gets dismissed unread (SPEC §5.6 point 4,
@@ -391,6 +400,9 @@ class MainActivity : ComponentActivity() {
         onPickPdf = sync::pickPdf,
         onCancelBrowse = sync::cancelBrowse,
         onSyncNow = sync::syncNow,
+        onSignInOneDrive = { sync.startOneDriveLogin() },
+        oneDriveConfigured = sync.oneDriveConfigured,
+        oneDriveRedirect = sync.oneDriveRedirect,
     )
 
     /**

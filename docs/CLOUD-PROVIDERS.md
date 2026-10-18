@@ -83,8 +83,80 @@
   - the feed is **unverified against Graph**: that parents repeat, that delta items have no path, what
     `410` carries. M-M7 in the spike is that check, and it has not run.
 
-  The sign-in (Custom Tab + PKCE), the Keystore `TokenVault`, the Sync-screen chooser and the device walk are
-  P4. **It still must not reach the UI before the spike has run.**
+- **P4 — sign-in, key storage, the Sync-screen button, and an emulator walk** (peer message relaying the
+  user's "get this working end to end"). *The spike still has not run, so what follows is proven against a
+  stand-in only.*
+  - `MicrosoftSignIn` (`:core:sync`, pure protocol, no SDK): authorization code + **PKCE S256** with a
+    32-byte verifier from a platform `SecureRandom`, a `state`, and a **pending record written before the
+    URL is returned** and **taken (read and deleted) by the redirect**, so a redirect delivered twice or
+    forged finds nothing. `state` is checked before the code is looked at; a redirect not starting with
+    ours is refused; a 15-minute-old record is refused; `access_denied` is a *cancel*, not an error.
+    **The refresh token is saved before the access token is used — including by this class's own `/me` and
+    `/me/drive` calls** — and if Microsoft will not say who the user is the token is removed again, so no
+    orphan is left. Nothing here retries: an authorization code is single-use, so a failed exchange is a
+    failed sign-in and the user presses the button again.
+  - `:app`: `SealedFiles` (the same AES-GCM envelope as `KeystoreCredentialStore`, key as a parameter),
+    `KeystoreTokenVault` (alias `inkstone.oauth.v1`, its own key), `KeystorePendingSignInStore`,
+    `AndroidPkceCrypto`; `MicrosoftSettings` (client id from the `inkstone.msClientId` Gradle property, and
+    the redirect `msauth://dev.inkstone/<URL-encoded base64 SHA-1 of the signing certificate>` **computed at
+    run time and shown on the Sync screen**, so the user registers exactly what the installed APK will send);
+    `OAuthRedirectActivity` (exported, `msauth://${applicationId}` only; hands the URL to a singleton scope
+    because the process may have been restarted while the user was on Microsoft's page);
+    `OneDriveAccounts` (begin / complete / sign out / forget / browse / fetch / create folder, and
+    `repairAndRefresh`). `NextcloudAccounts` delegates to it for every account whose provider is OneDrive and
+    is otherwise unchanged. `ProviderRoutingFactory` is now what the drainer and reconciler are given.
+  - **Lost token.** An ACTIVE OneDrive account whose token this device cannot open (a deleted or
+    undecryptable file — what an invalidated Keystore key looks like to the vault) is flagged `NEEDS_REAUTH`
+    with its own message **without any request**: nobody refused anything. A 401 while browsing goes through
+    the same single permitted `confirmStillAuthorised` as everywhere else and halts the account; a halted
+    account is not asked again. Signing in again releases the in-process `invalid_grant` latch
+    (`OneDriveStoreFactory.forget`), which is per object and otherwise outlives the sign-in.
+  - **Identity.** Re-signing-in to an account refuses a different Microsoft identity (`driveId` must match)
+    and leaves nothing behind; signing in again as the same person finds the existing account rather than
+    making a second, which would orphan every bound note. *Sign-out* forgets the token on the device and
+    **does not claim to revoke it** — Microsoft has no such call for a public client — and says where to.
+  - **Tests, with what each proves.** `MicrosoftSignInTest` (10, over `GraphStandIn`'s new authorize page,
+    code grant and `/me`: the RFC 7636 vector, state mismatch, single use, cancel, stale, foreign redirect,
+    a verifier that does not match, no identity → no token); `OneDriveAccountsTest` (12: production
+    `MicrosoftSignIn`, vault, pending store, SQL stores and transport — one account per person, resume,
+    identity refusal, lost token with **zero requests**, 401 halts once, latch release, an unconfigured
+    build offers nothing); `OAuthStoresTest` (9: envelope, tamper, wrong key, traversal, single-use pending);
+    `MicrosoftRedirectTest` (2, SHA-1 and base64url vectors). Mutation checks, each *red*: state check off,
+    token saved after identity, redirect prefix unchecked, expiry off, orphan kept, latch not released,
+    identity check off, missing-token repair off, 401 halt off, duplicate-redirect dedupe off.
+  - **Driven on the emulator** (`Test_Tablet`, debug APK built with `-Pinkstone.msClientId=standin-client
+    -Pinkstone.msStandIn=http://10.0.2.2:8099`, `GraphStandInHost` serving the stand-in on the host): the
+    Sync screen's OneDrive button opened a **Chrome Custom Tab**; pressing *Continue* on the stand-in page
+    sent `msauth://…` back to `OAuthRedirectActivity`; the app exchanged the code, called `/me` and
+    `/me/drive`, wrote `account` (`ONEDRIVE`, `ACTIVE`, drive id in `uid`) and one sealed file named after
+    that account id; *Browse folders* listed the stand-in's folders (the refresh token rotated `rt-2 → rt-3`
+    as designed); *Sign out* removed the file and kept the row; *Sign in again* resumed the **same** account;
+    a corrupted token file gave `NEEDS_REAUTH` and the "no longer holds the saved sign-in" card with **no
+    request logged**; *Remove* deleted the row and left `files/oauth` empty. The `provider` and
+    `providerData` columns were present on an install that had been upgraded in place (migration 10 ran on a
+    real device; the instrumented test written for it has still **not** run — see below).
+    The displayed redirect hash was checked against `keytool`'s SHA-1 of the debug key.
+  - **Debug-only plumbing**: a `src/debug` network-security overlay allowing cleartext to `10.0.2.2` only,
+    and `BuildConfig.MS_STAND_IN`, which the release block pins to the empty string. Neither exists in a
+    release APK.
+  - **Not proven, in order of how much it matters:**
+    1. **Microsoft accepting any of it.** The authorize URL's parameters, `response_mode=query`, the
+       `msauth://` redirect for a hand-rolled (non-MSAL) flow, `prompt=select_account`, the scopes, and the
+       token response carrying a refresh token — all from documentation. The user's real sign-in is the
+       test, and the first thing to look at if it fails is the redirect URI string against the registration.
+    2. **The Android Keystore on a real tablet.** The envelope is tested with a plain key; the emulator
+       exercised the real Keystore, but a hardware-backed key on the Galaxy Tab has not been used.
+    3. **Sign-in is the only OneDrive path driven through the UI.** Upload, pull and the two-tablet cases
+       are tested on the stand-in in `:app`'s JVM suite and have not been driven on a device.
+    4. **A forged `msauth://` intent** can consume the pending record (the user presses the button again).
+       It cannot sign anyone in — `state` and the verifier stand in the way — but it is a nuisance.
+    5. The on-device schema-migration test (`MigrationOnDeviceTest`) was written and **has not been run**:
+       `connectedAndroidTest` uninstalls the app, and `Test_Tablet` holds the user's physics-note fixture.
+  - **Merge hazard with the unmerged Nextcloud sign-out fix** (`claude/nextcloud-signout-cloud-integration-5e9675`):
+    that branch flags any account with no *Nextcloud* credential as `NEEDS_REAUTH`, which would hit every
+    OneDrive account unless it skips `provider != NEXTCLOUD`. It edits the same lines of `SyncScreen`
+    (the `NEEDS_REAUTH` button — made identical here, on purpose), `NextcloudAccounts`, `SyncPorts`,
+    `OutboxDrainer` and `Reconciler`. Merge them together, not one after the other.
 
 ## Original design (2026-10-17)
 

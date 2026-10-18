@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DEBUG BUILDS ONLY — replaces app/src/main/res/xml/network_security_config.xml in a debug APK.
+
+  docs/CLOUD-PROVIDERS.md §P4. The OneDrive sign-in is driven on an emulator against `GraphStandIn`
+  running on the developer's machine, which the emulator reaches at 10.0.2.2. That stand-in speaks
+  plain HTTP, and the production file forbids cleartext everywhere (SPEC §14).
+
+  Scoped to the one address that is, by definition, the host machine of an emulator. It names no
+  Nextcloud host, adds no trust anchor, and does not touch the production file: CLAUDE.md is right
+  that a debug overlay does not make a plain-HTTP *Nextcloud* signable (LoginFlowV2 refuses `http://`
+  before a socket is opened), and this does not try to.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">10.0.2.2</domain>
+    </domain-config>
+</network-security-config>

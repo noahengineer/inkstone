@@ -82,6 +82,8 @@ class OfflineFolderBrowserTest {
         sync = engine,
         clock = clock,
         folderCache = cache,
+        // Never reached: these tests are about a Nextcloud account.
+        oneDrive = unusedOneDrive(accountStore, bindings, engine, clock, cache, transport),
     )
 
     /** The third party — how folders get onto the server without going through the browser. */

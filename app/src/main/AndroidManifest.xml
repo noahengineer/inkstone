@@ -76,6 +76,29 @@
         </activity>
 
         <!--
+          docs/CLOUD-PROVIDERS.md §5.1 — where Microsoft's sign-in page sends the browser back to.
+          `msauth://<package>/<signature hash>`: only the scheme and host are filtered here, because
+          the hash depends on the key that signed this APK and is not known at build time. The full
+          URI is checked in code (`MicrosoftSignIn.complete`). `exported` because a browser must be
+          able to start it; see OAuthRedirectActivity for why that is safe.
+        -->
+        <activity
+            android:name=".sync.OAuthRedirectActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTask"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data
+                    android:scheme="msauth"
+                    android:host="${applicationId}" />
+            </intent-filter>
+        </activity>
+
+        <!--
           The editor (M3). Its own activity so that "which note" survives a process kill
           through the intent extras, and so that leaving a note is an onStop with isFinishing.
           That stop is where SPEC §5.1 materializes and where §5.7 redraws the thumbnail. Any

@@ -4,6 +4,10 @@ import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
+import dev.inkstone.app.platform.AndroidPkceCrypto
+import dev.inkstone.app.platform.KeystorePendingSignInStore
+import dev.inkstone.app.platform.KeystoreTokenVault
+import dev.inkstone.app.sync.MicrosoftSettings
 import dev.inkstone.app.sync.NoteSessionHost
 import dev.inkstone.core.database.InkstoneDatabase
 import dev.inkstone.core.database.sync.SqlAccountStore
@@ -28,14 +32,21 @@ import dev.inkstone.core.model.WorkScheduler
 import dev.inkstone.core.sync.AccountStore
 import dev.inkstone.core.sync.AttentionLog
 import dev.inkstone.core.sync.BindingStore
+import dev.inkstone.core.sync.CloudStoreFactory
 import dev.inkstone.core.sync.DirectoryCache
 import dev.inkstone.core.sync.FolderBindingStore
 import dev.inkstone.core.sync.ForeignRemoteCache
+import dev.inkstone.core.sync.NextcloudStoreFactory
 import dev.inkstone.core.sync.NextcloudTransport
+import dev.inkstone.core.sync.OneDriveStoreFactory
 import dev.inkstone.core.sync.OutboxDrainer
 import dev.inkstone.core.sync.OutboxStore
 import dev.inkstone.core.sync.PeerClockStore
 import dev.inkstone.core.sync.PendingDownloadStore
+import dev.inkstone.core.sync.PendingSignInStore
+import dev.inkstone.core.sync.PkceCrypto
+import dev.inkstone.core.sync.ProviderKind
+import dev.inkstone.core.sync.ProviderRoutingFactory
 import dev.inkstone.core.sync.ReconcileStores
 import dev.inkstone.core.sync.Reconciler
 import dev.inkstone.core.sync.RecordingUploads
@@ -45,6 +56,7 @@ import dev.inkstone.core.sync.SyncCursorStore
 import dev.inkstone.core.sync.SyncEngine
 import dev.inkstone.core.sync.SyncNotes
 import dev.inkstone.core.sync.SyncStores
+import dev.inkstone.core.sync.TokenVault
 import kotlinx.coroutines.Dispatchers
 import javax.inject.Singleton
 import kotlin.random.Random
@@ -76,6 +88,54 @@ object SyncModule {
     @Provides
     @Singleton
     fun provideNextcloudTransport(): NextcloudTransport = NextcloudTransport.create()
+
+    // -----------------------------------------------------------------------
+    // Providers (docs/CLOUD-PROVIDERS.md §5)
+    // -----------------------------------------------------------------------
+
+    /** OAuth refresh tokens, sealed under a Keystore key of their own. */
+    @Provides
+    @Singleton
+    fun provideTokenVault(vault: KeystoreTokenVault): TokenVault = vault
+
+    @Provides
+    @Singleton
+    fun providePendingSignIns(store: KeystorePendingSignInStore): PendingSignInStore = store
+
+    @Provides
+    @Singleton
+    fun providePkceCrypto(crypto: AndroidPkceCrypto): PkceCrypto = crypto
+
+    /**
+     * One factory for the life of the process: it keeps a token source per account, so an access token
+     * is reused across drain passes and `OneDriveAccounts` can `forget` the dead-grant latch on sign-in.
+     */
+    @Provides
+    @Singleton
+    fun provideOneDriveStoreFactory(
+        settings: MicrosoftSettings,
+        vault: TokenVault,
+        transport: NextcloudTransport,
+        clock: Clock,
+    ): OneDriveStoreFactory = OneDriveStoreFactory(settings.oauth, vault, transport, clock)
+
+    /**
+     * ⭐ The only way the drainer and the reconciler get a store. **No fallback**: an account whose
+     * provider is unknown opens nothing, because falling back to Nextcloud would send a OneDrive
+     * account's bearer token — or a stranger's app password — to the wrong server.
+     */
+    @Provides
+    @Singleton
+    fun provideCloudStoreFactory(
+        credentials: CredentialStore,
+        transport: NextcloudTransport,
+        oneDrive: OneDriveStoreFactory,
+    ): CloudStoreFactory = ProviderRoutingFactory(
+        mapOf(
+            ProviderKind.NEXTCLOUD to NextcloudStoreFactory(credentials, transport),
+            ProviderKind.ONEDRIVE to oneDrive,
+        ),
+    )
 
     @Provides
     @Singleton
@@ -228,6 +288,7 @@ object SyncModule {
         extractor: RemoteBundleExtractor,
         gate: RemoteMergeGate,
         engine: SyncEngine,
+        storeFactory: CloudStoreFactory,
     ): Reconciler = Reconciler(
         stores = stores,
         pull = pull,
@@ -238,6 +299,7 @@ object SyncModule {
         extractor = extractor,
         gate = gate,
         engine = engine,
+        storeFactory = storeFactory,
     )
 
     /**
@@ -281,6 +343,7 @@ object SyncModule {
         fs: FileSystem,
         clock: Clock,
         transport: NextcloudTransport,
+        storeFactory: CloudStoreFactory,
     ): OutboxDrainer = OutboxDrainer(
         stores = stores,
         credentials = credentials,
@@ -288,6 +351,7 @@ object SyncModule {
         fs = fs,
         clock = clock,
         transport = transport,
+        storeFactory = storeFactory,
         // Real randomness in the app, a fixed value in tests. Backoff jitter is what stops
         // every note that failed during one offline period becoming due at the same
         // instant — which is how a client turns its own server's brute-force protection on

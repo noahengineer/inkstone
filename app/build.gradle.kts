@@ -9,7 +9,32 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+// docs/CLOUD-PROVIDERS.md §5.1. The Entra app registration's client id. **Not a secret** — a public
+// client has no secret, which is the whole point of PKCE — so it may live in a Gradle property
+// (`~/.gradle/gradle.properties` or `-Pinkstone.msClientId=…`). Blank means "OneDrive is not configured
+// in this build", and the Sync screen then says so instead of offering a button that cannot work.
+val msClientId = providers.gradleProperty("inkstone.msClientId").orElse("").get().trim()
+
+// DEBUG BUILDS ONLY. A host:port that stands in for login.microsoftonline.com and graph.microsoft.com,
+// so the sign-in can be driven on an emulator against `GraphStandIn` (docs/CLOUD-PROVIDERS.md §P4).
+// The release block below pins it to the empty string, so the property cannot reach a release APK.
+val msStandIn = providers.gradleProperty("inkstone.msStandIn").orElse("").get().trim()
+
 android {
+    buildFeatures {
+        buildConfig = true
+    }
+    defaultConfig {
+        buildConfigField("String", "MS_CLIENT_ID", "\"$msClientId\"")
+    }
+    buildTypes {
+        getByName("debug") {
+            buildConfigField("String", "MS_STAND_IN", "\"$msStandIn\"")
+        }
+        getByName("release") {
+            buildConfigField("String", "MS_STAND_IN", "\"\"")
+        }
+    }
     testOptions {
         // M6. SPEC §13.2's merge matrix lives in this module's unit tests, because :app is the
         // only source set that sees :core:sync, :core:storage and :android:pdf at once — the

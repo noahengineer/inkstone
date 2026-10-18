@@ -16,6 +16,7 @@ import dev.inkstone.core.sync.DavResource
 import dev.inkstone.core.sync.LoginFlowResult
 import dev.inkstone.core.sync.LoginFlowStart
 import dev.inkstone.core.sync.OutboxStore
+import dev.inkstone.core.sync.ProviderKind
 import dev.inkstone.core.sync.RemoteVersion
 import dev.inkstone.core.sync.SyncAccount
 import dev.inkstone.core.sync.SyncEngine
@@ -47,6 +48,8 @@ import javax.inject.Inject
 @HiltViewModel
 class SyncViewModel @Inject constructor(
     private val accounts: NextcloudAccounts,
+    /** docs/CLOUD-PROVIDERS.md §5 — the OneDrive sign-in. Everything else reaches it through [accounts]. */
+    private val oneDrive: OneDriveAccounts,
     private val library: LibraryRepository,
     private val outbox: OutboxStore,
     /** M12 §11 — how many lectures are waiting, and how much of the tablet they hold. */
@@ -60,7 +63,24 @@ class SyncViewModel @Inject constructor(
 
     private var pollingJob: Job? = null
 
+    /** Static for the life of the install, so they travel in `SyncActions` rather than in resettable state. */
+    val oneDriveConfigured: Boolean get() = oneDrive.configured
+
+    /** The redirect URI this install must be registered under; shown so it can be copied, not derived. */
+    val oneDriveRedirect: String get() = oneDrive.redirectUri
+
     init {
+        // The OneDrive sign-in finishes in OneDriveAccounts' own scope (the redirect can arrive in a
+        // restarted process), and says so here. Consumed on read so it is shown once.
+        viewModelScope.launch {
+            oneDrive.notice.collect { notice ->
+                if (notice != null) {
+                    mutable.update { it.copy(busy = false, message = notice.message) }
+                    oneDrive.noticeShown()
+                    refresh()
+                }
+            }
+        }
         // SPEC §0.1 #3 and §7.9, once per launch: finish any account whose `ocs.data.id`
         // was never fetched (the recoverable half of §7.1's rule 3 / rule 6 tension), and
         // fill in capabilities for any account that has none. Both are no-ops on the
@@ -236,8 +256,40 @@ class SyncViewModel @Inject constructor(
      */
     fun signInAgain(accountId: String) {
         val account = mutable.value.accounts.firstOrNull { it.id == accountId } ?: return
+        if (account.provider == ProviderKind.ONEDRIVE) {
+            startOneDriveLogin(accountId)
+            return
+        }
         mutable.update { it.copy(serverUrl = account.serverUrl) }
         startLogin()
+    }
+
+    /**
+     * Step one of the OneDrive sign-in: the URL goes to a Custom Tab, and the answer comes back through
+     * `OAuthRedirectActivity`, not through this call. Nothing polls — unlike Nextcloud's Login Flow —
+     * so there is no dialog to cancel and nothing left running if the user walks away.
+     *
+     * @param accountId set to sign in *again* to a known account, which then refuses a different identity.
+     */
+    fun startOneDriveLogin(accountId: String? = null) {
+        viewModelScope.launch {
+            val url = oneDrive.begin(accountId)
+            mutable.update {
+                if (url == null) {
+                    it.copy(
+                        message = "This build of Inkstone was not given a Microsoft app registration, " +
+                            "so it cannot sign in to OneDrive.",
+                    )
+                } else {
+                    it.copy(message = null, openUrl = url)
+                }
+            }
+        }
+    }
+
+    /** The Activity has opened the sign-in page; do not open it again on the next recomposition. */
+    fun urlOpened() {
+        mutable.update { it.copy(openUrl = null) }
     }
 
     /**
@@ -312,13 +364,25 @@ class SyncViewModel @Inject constructor(
 
     fun signOut(accountId: String) {
         viewModelScope.launch {
+            val oneDriveAccount = mutable.value.accounts.firstOrNull { it.id == accountId }
+                ?.takeIf { it.provider == ProviderKind.ONEDRIVE }
             val result = accounts.signOut(accountId)
             mutable.update {
                 it.copy(
-                    // Says what was kept, not just what was revoked. A sign-out that only
-                    // mentions the revocation reads as "everything is gone", which is what
-                    // this used to actually mean.
-                    message = if (result.pausedNotes == 0) {
+                    // Microsoft offers a public client no way to revoke a refresh token, so this must not
+                    // claim to have: the grant is forgotten here and can be removed at its source.
+                    message = if (oneDriveAccount != null) {
+                        "Signed out of OneDrive on this device. To remove Inkstone's access entirely, " +
+                            "use account.microsoft.com → Privacy → Apps and services. " +
+                            if (result.pausedNotes == 0) {
+                                ""
+                            } else {
+                                "${result.pausedNotes} linked notes will resume when you sign in again."
+                            }
+                    } else if (result.pausedNotes == 0) {
+                        // Says what was kept, not just what was revoked. A sign-out that only
+                        // mentions the revocation reads as "everything is gone", which is what
+                        // this used to actually mean.
                         "Signed out. The app password has been revoked."
                     } else {
                         "Signed out — app password revoked. ${result.pausedNotes} " +
@@ -697,6 +761,8 @@ data class SyncUiState(
     val pendingLogin: LoginFlowStart? = null,
     /** Set once, consumed by the Activity, which owns launching a browser. */
     val openInBrowser: LoginFlowStart? = null,
+    /** The OneDrive sign-in URL, set once and consumed the same way. */
+    val openUrl: String? = null,
     val browser: RemoteBrowser? = null,
     val bindingNote: DocumentId? = null,
     /** Non-null while a synced note's remote copy is being relocated (a MOVE, not a re-bind). */

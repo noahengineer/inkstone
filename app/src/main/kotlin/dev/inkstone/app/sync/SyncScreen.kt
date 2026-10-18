@@ -38,6 +38,7 @@ import dev.inkstone.app.ui.TextChip
 import dev.inkstone.app.ui.rememberDotGridBrush
 import dev.inkstone.core.sync.AccountState
 import dev.inkstone.core.sync.DavResource
+import dev.inkstone.core.sync.ProviderKind
 import dev.inkstone.core.sync.SyncAccount
 
 /**
@@ -169,7 +170,8 @@ private fun AccountsPane(state: SyncUiState, actions: SyncActions) {
 @Composable
 private fun AccountPanel(account: SyncAccount, actions: SyncActions) {
     GlassPanel(modifier = Modifier.fillMaxWidth()) {
-        MicroLabel("Account", color = account.state.tint())
+        val heading = if (account.provider == ProviderKind.ONEDRIVE) "OneDrive" else "Account"
+        MicroLabel(heading, color = account.state.tint())
         Text(
             account.displayName ?: account.loginName,
             style = MaterialTheme.typography.titleSmall,
@@ -177,10 +179,13 @@ private fun AccountPanel(account: SyncAccount, actions: SyncActions) {
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        Readout(account.serverUrl, color = Ink.TextMuted, maxLines = 2)
+        // A OneDrive row's "server" is Microsoft's API address, which says nothing a person needs.
+        if (account.provider != ProviderKind.ONEDRIVE) Readout(account.serverUrl, color = Ink.TextMuted, maxLines = 2)
         AccountStateLine(account)
         Row(horizontalArrangement = Arrangement.spacedBy(InkDims.ChipGap)) {
-            if (account.state == AccountState.SIGNED_OUT) {
+            // NEEDS_REAUTH gets the same one-tap way back as SIGNED_OUT: the card said "sign in
+            // again" and offered only Browse and Sign out, neither of which can.
+            if (account.state == AccountState.SIGNED_OUT || account.state == AccountState.NEEDS_REAUTH) {
                 // No URL to retype: the address is on the row above, and `signInAgain`
                 // uses it. The browser approval still happens — SPEC §7.1 is the only way
                 // to get an app password — but that is one tap and a confirm, not a
@@ -211,8 +216,19 @@ private fun AccountStateLine(account: SyncAccount) {
         // SPEC §7.2 / CLAUDE.md rule 5 — this is the *only* thing that happens after
         // a confirmed 401. No retry, no background attempt, just this line.
         AccountState.NEEDS_REAUTH -> StateLine(
-            "Signed out by the server. Sign in again to resume syncing — " +
-                "Inkstone will not retry on its own.",
+            if (account.provider == ProviderKind.ONEDRIVE) {
+                if (account.lastError == OneDriveAccounts.MISSING_TOKEN_REASON) {
+                    // Nobody refused anything: the saved sign-in is simply not on this device any more.
+                    "Signed out — ${OneDriveAccounts.MISSING_TOKEN_REASON} Sign in again to resume syncing; " +
+                        "your notes are still linked."
+                } else {
+                    "Microsoft signed this device out. Sign in again to resume syncing — " +
+                        "Inkstone will not retry on its own."
+                }
+            } else {
+                "Signed out by the server. Sign in again to resume syncing — " +
+                    "Inkstone will not retry on its own."
+            },
             Ink.Danger,
         )
 
@@ -266,7 +282,42 @@ private fun AddAccountPanel(state: SyncUiState, actions: SyncActions) {
             style = MaterialTheme.typography.bodySmall,
             color = Ink.TextMuted,
         )
+        OneDriveSignIn(actions)
     }
+}
+
+/**
+ * docs/CLOUD-PROVIDERS.md §5 — the second provider, below the first.
+ *
+ * When this build has no Microsoft client id the button is replaced by the sentence that says so,
+ * because a button that opens a page which immediately fails reads as a broken app. The redirect URI
+ * is shown either way: it is the one string a person has to paste into the Entra registration, and it
+ * depends on the key this APK was signed with, so only the installed app can tell them what it is.
+ */
+@Composable
+private fun OneDriveSignIn(actions: SyncActions) {
+    MicroLabel("Or use OneDrive")
+    if (actions.oneDriveConfigured) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(InkDims.GroupGap),
+        ) {
+            TextChip(label = "Sign in to OneDrive", selected = true, onClick = actions.onSignInOneDrive)
+        }
+        Text(
+            "You sign in on Microsoft’s own page; Inkstone never sees your password. Only the " +
+                "files Inkstone saves are written, and nothing is ever deleted for good.",
+            style = MaterialTheme.typography.bodySmall,
+            color = Ink.TextMuted,
+        )
+    } else {
+        Text(
+            "OneDrive needs a Microsoft app registration, and this build was not given one.",
+            style = MaterialTheme.typography.bodySmall,
+            color = Ink.TextMuted,
+        )
+    }
+    Readout("Redirect: ${actions.oneDriveRedirect}", color = Ink.TextMuted, maxLines = 3)
 }
 
 @Composable
@@ -566,6 +617,12 @@ data class SyncActions(
     val onPickPdf: (DavResource) -> Unit,
     val onCancelBrowse: () -> Unit,
     val onSyncNow: () -> Unit,
+    /** docs/CLOUD-PROVIDERS.md §5 — sign in to OneDrive in a Custom Tab. */
+    val onSignInOneDrive: () -> Unit,
+    /** False when this build has no Microsoft client id. Fixed for the install, so it is not in the UI state. */
+    val oneDriveConfigured: Boolean,
+    /** The `msauth://` redirect this install must be registered under. */
+    val oneDriveRedirect: String,
 )
 
 /** Whole megabytes. A lecture is tens of them, so a decimal place would be noise. */

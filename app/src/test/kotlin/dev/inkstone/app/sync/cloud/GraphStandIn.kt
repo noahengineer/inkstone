@@ -39,7 +39,7 @@ import kotlin.concurrent.thread
  * `tools/cloud/graph_spike.py` is how those stop being claims. **This file agreeing with the store is
  * evidence the store matches this file, and nothing more** — CLAUDE.md's oldest lesson.
  */
-internal class GraphStandIn {
+internal class GraphStandIn(port: Int = 0, publicHost: String = "127.0.0.1") {
 
     class Node(
         val id: String,
@@ -137,18 +137,38 @@ internal class GraphStandIn {
 
     val delta = Counter()
 
+    // -- sign-in (authorization code + PKCE) ---------------------------------------------------
+    private class Grant(val challenge: String, val redirectUri: String)
+
+    private val authCodes = HashMap<String, Grant>()
+    private var codeCounter = 0
+
+    /** What the browser was sent to `/oauth/authorize`, in order — so a test can read the PKCE parameters. */
+    val authorizeRequests: MutableList<Map<String, String>> = java.util.Collections.synchronizedList(ArrayList())
+
+    /** The consent page offers "Cancel" and the browser is sent back with `access_denied`. */
+    @Volatile var userDeclines: Boolean = false
+
+    /** Who `/me` says is signed in. Two tablets signing in as different people is how identity checks are tested. */
+    @Volatile var signedInUserId: String = "user-1"
+
+    @Volatile var signedInMail: String = "test.user@example.com"
+
+    @Volatile var signedInDriveId: String = "drive-1"
+
     /** One rotating refresh-token chain per signed-in device: chain number → the one token that works now. */
     private val chains = HashMap<Int, String>()
     private val validAccess = HashSet<String>()
 
-    private val socket = ServerSocket(0, BACKLOG, InetAddress.getByName("127.0.0.1"))
+    private val socket = ServerSocket(port, BACKLOG, InetAddress.getByName("127.0.0.1"))
     private val workers = Executors.newCachedThreadPool { r -> Thread(r, "graph-standin").apply { isDaemon = true } }
 
     @Volatile private var running = true
 
-    private val origin = "http://127.0.0.1:${socket.localPort}"
+    private val origin = "http://$publicHost:${socket.localPort}"
     val baseUrl: String = "$origin/v1.0"
     val tokenUrl: String = "$origin/oauth/token"
+    val authorizeUrl: String = "$origin/oauth/authorize"
     val driveId: String = "drive-1"
     val initialRefreshToken: String
 
@@ -265,7 +285,9 @@ internal class GraphStandIn {
             val head = buildString {
                 append("HTTP/1.1 ${response.status} ${if (response.status < 300) "OK" else "Status"}\r\n")
                 for ((name, value) in response.headers) append("$name: $value\r\n")
-                append("Content-Type: application/json\r\n")
+                if (response.headers.keys.none { it.equals("Content-Type", ignoreCase = true) }) {
+                    append("Content-Type: application/json\r\n")
+                }
                 append("Content-Length: ${response.body.size}\r\n")
                 append("Connection: close\r\n\r\n")
             }
@@ -334,6 +356,7 @@ internal class GraphStandIn {
         val path = request.path
         return when {
             path == "/oauth/token" && request.method == "POST" -> token(request)
+            path == "/oauth/authorize" && request.method == "GET" -> authorize(request)
             path.startsWith("/upload/") -> uploadFragment(request)
             path.startsWith("/download/") -> download(request)
             path.startsWith("/v1.0/") -> graph(request, path.removePrefix("/v1.0"))
@@ -354,8 +377,16 @@ internal class GraphStandIn {
         }
         val decoded = decode(path)
         return when {
-            decoded == "/me/drive" -> json(200, """{"id":"$driveId","driveType":"personal"}""")
+            decoded == "/me" -> json(
+                200,
+                "{\"id\":\"$signedInUserId\",\"displayName\":\"Test User\",\"mail\":\"$signedInMail\"," +
+                    "\"userPrincipalName\":\"$signedInMail\"}",
+            )
+
+            decoded == "/me/drive" -> json(200, "{\"id\":\"$signedInDriveId\",\"driveType\":\"personal\"}")
+
             decoded.startsWith("/drives/$driveId") -> drive(request, decoded.removePrefix("/drives/$driveId"))
+
             else -> json(404, error("itemNotFound"))
         }
     }
@@ -433,6 +464,58 @@ internal class GraphStandIn {
             "\"@odata.deltaLink\":\"${link}S$snapshot\""
         }
         return json(200, "{\"value\":[${page.joinToString(",")}],$tail}")
+    }
+
+    /**
+     * The Microsoft sign-in page, reduced to one button.
+     *
+     * A **link the user must press**, not a 302: a browser refuses to hand a server-side redirect to an
+     * app's custom scheme without a user gesture, so a stand-in that redirected would pass here and fail
+     * on every real device. The page and the button are what make driving it over `adb` honest.
+     */
+    private fun authorize(request: Request): Response = synchronized(lock) {
+        val query = request.query.split('&').filter { it.contains('=') }
+            .associate {
+                URLDecoder.decode(it.substringBefore('='), "UTF-8") to
+                    URLDecoder.decode(it.substringAfter('='), "UTF-8")
+            }
+        authorizeRequests += query
+        val redirect = query["redirect_uri"].orEmpty()
+        val state = query["state"].orEmpty()
+        val target = if (userDeclines) {
+            "$redirect?error=access_denied&error_description=The+user+cancelled&state=$state"
+        } else {
+            val code = "code-${++codeCounter}"
+            authCodes[code] = Grant(query["code_challenge"].orEmpty(), redirect)
+            "$redirect?code=$code&state=$state"
+        }
+        val label = if (userDeclines) "Cancel" else "Continue as $signedInMail"
+        val html = "<!doctype html><meta name=viewport content='width=device-width'>" +
+            "<title>Stand-in sign in</title><h1>Stand-in Microsoft sign-in</h1>" +
+            "<p>Client ${query["client_id"]}, scope ${query["scope"]}</p>" +
+            "<p><a id=go href=\"$target\" style='font-size:32px'>$label</a></p>"
+        Response(200, html.encodeToByteArray(), mapOf("Content-Type" to "text/html; charset=utf-8"))
+    }
+
+    private fun authorizationCodeGrant(form: Map<String, String>): Response {
+        val grant = authCodes.remove(form["code"]) // single use, like a real code
+        val verifier = form["code_verifier"].orEmpty()
+        val derived = java.util.Base64.getUrlEncoder().withoutPadding()
+            .encodeToString(java.security.MessageDigest.getInstance("SHA-256").digest(verifier.encodeToByteArray()))
+        if (grant == null || grant.redirectUri != form["redirect_uri"] || grant.challenge != derived) {
+            return json(400, """{"error":"invalid_grant","error_description":"The code or verifier is invalid."}""")
+        }
+        val chain = chains.size + 1
+        val n = ++tokenCounter
+        val refresh = "rt-$n"
+        chains[chain] = refresh
+        validAccess += "at-$n"
+        log += "token issued at-$n $refresh (authorization code)"
+        return json(
+            200,
+            "{\"access_token\":\"at-$n\",\"refresh_token\":\"$refresh\"," +
+                "\"expires_in\":$accessLifetimeSeconds,\"token_type\":\"Bearer\"}",
+        )
     }
 
     private fun byPath(request: Request, itemPath: String, suffix: String): Response {
@@ -571,6 +654,7 @@ internal class GraphStandIn {
                 URLDecoder.decode(it.substringBefore('='), "UTF-8") to
                     URLDecoder.decode(it.substringAfter('='), "UTF-8")
             }
+        if (form["grant_type"] == "authorization_code") return authorizationCodeGrant(form)
         log += "token refresh=${form["refresh_token"]}"
         val chain = chains.entries.firstOrNull { it.value == form["refresh_token"] }
         if (grantDead || form["grant_type"] != "refresh_token" || chain == null) {

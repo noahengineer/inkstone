@@ -11,8 +11,9 @@ there was no account to run it against. Read its raw statuses, not only its verd
    end. It does not touch anything else.
 2. **Register the app** — <https://entra.microsoft.com> → *App registrations* → *New registration*:
    - Name: `Inkstone` (the real name; this registration is the one the shipped app will use).
-   - Supported account types: **Accounts in any organizational directory and personal Microsoft
-     accounts**.
+   - Supported account types: **Any Entra ID Tenant + Personal Microsoft accounts** (the portal's
+     current wording; older text says "Accounts in any organizational directory and personal Microsoft
+     accounts"). It must not be a single-tenant choice, or a personal account cannot sign in.
    - Redirect URI: platform **Mobile and desktop applications**, value `http://localhost`.
    - Then *API permissions → Microsoft Graph → Delegated*: `Files.ReadWrite`, `offline_access`,
      `User.Read`. (No admin consent is needed for these.) Do **not** create a client secret.
