@@ -239,16 +239,34 @@ The user chose to build Drive with a **best-effort overwrite check** and to amen
   trash as a delete; identity check off; sign-out without revoke; launch check flagging an unreachable Google; dead grant not
   sticky; no cooldown; refused token not cleared; unreachable treated as dead. (One mutation first *survived* — it showed the
   first revision was never pinned; fixed.)
-- **Driven on the emulator:** the app builds (Hilt graph included), installs over the existing data, shows the Drive section,
-  and the button opens Google's own sign-in flow (no Google account on the emulator). **Nothing past that point has run.**
+- **Driven on the emulator against the real Google Drive** (user's personal Google account, `Test_Tablet`, debug build,
+  Cloud project with the Drive API, `drive.file` as the only scope and an Android OAuth client for `dev.inkstone` +
+  the debug key's SHA-1): the button opened Play Services' account flow and consent; **the grant came back as an access
+  token silently thereafter**; `about.get` answered under `drive.file` and the account was saved keyed on the permission id;
+  a `files.list` with the store's query was accepted (the missing `Inkstone/` folder read as not-found); a new note was
+  created into `Inkstone/` (folders made, resumable upload, create-only), then **an edit re-uploaded through
+  check → pinned write → verify** (rev 4 → 6, binding's head revision changed, nothing flagged); two forced pulls ran,
+  the first taking a real page token, the second reading an empty incremental batch, with no conflict or warning.
+  **Checked by the user in Drive's own UI:** the file opens with all five strokes, the folder holds no stray file, and
+  *Manage versions* shows the newest revision marked **Keep forever** — which is the first observation that
+  `keepRevisionForever` pins the new head on a real Drive.
 
-**Not proven — all of it is Google's behaviour, none of it observed:** that `If-Match` is ignored (the premise of the whole
-protocol, from one community report); that `keepRevisionForever` pins the new head; that `revisions.list` returns what the
-store assumes and in a sortable order; that a pinned revision is downloadable; that a resumable session URI needs no bearer;
-that `about.get` works under `drive.file`; what a stale `changes` token answers (400/404/410 are all treated as "start over");
-what Play Services answers for a granted, ungranted or mis-registered app; whether Testing mode ends the grant after 7 days.
-The sign-in itself needs the user's Google account on the device and the Cloud-console registration (package `dev.inkstone`
-+ SHA-1 `2D:ED:50:A6:71:32:4E:BF:80:94:86:C8:F6:AE:A0:2A:59:84:7B:90`).
+**Observed on real Google now:** `about.get` under `drive.file`; the `files.list` query and `fields` syntax; the resumable
+upload (create and update, session URI with no bearer); `keepRevisionForever` pinning the head; `revisions.list` returning
+something the verify step could read (a clean overwrite raised nothing, which is what *would* also happen if the list were
+empty — see below); the `changes` start token and first/empty reads; Play Services' silent token for a granted app.
+
+**Still not proven — all of it Google's behaviour, none observed:**
+- **The race path itself.** A concurrent writer landing between our check and our write has never happened on a real Drive,
+  so *detecting* it, pinning and downloading their revision, and writing the `(displaced …)` file are tested only against the
+  stand-in. The clean path passing says nothing about this one. It needs a second device or a scripted second writer.
+- That `If-Match` on a content update is ignored (the premise of the whole protocol — one community report).
+- That `revisions.list` is ordered by time as the store sorts it, and that a pinned *other writer's* revision is downloadable.
+- What a stale `changes` token answers (400/404/410 are all treated as "start over").
+- A change made in Drive's own UI (rename, trash, an edit) arriving on the device; a stale-version conflict on Drive.
+- Whether Testing mode ends the grant after 7 days (the user is in Testing), and what Play Services answers for a revoked or
+  mis-registered app beyond the one `DEVELOPER_ERROR` assumption.
+- The physical tablet: the emulator is a Play Store image; the tablet's Google account and Play Services are untried.
 
 **Residual risk, said plainly:** between the check and the write, a concurrent writer is overwritten *in the head* — detectable
 and recoverable (their revision is pinned and kept as a file), but the head is briefly not theirs. Nextcloud and OneDrive
