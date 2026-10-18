@@ -18,7 +18,8 @@ These exist because violating them causes damage that's expensive or impossible 
 
 - **No hard deletes.** Everything goes to a trash with 30-day retention — local trash for local deletes, Nextcloud trash for remote.
 - **Never resolve a sync conflict by discarding bytes.** If two versions can't merge, keep both as a conflicted copy.
-- **Never overwrite a remote file without `If-Match`.** A 412 means someone else changed it; that is a conflict, not a retry.
+- **Never overwrite a remote file without a precondition.** On Nextcloud that is `If-Match`; on OneDrive it is `If-Match` on `createUploadSession`. A 412 means someone else changed it; that is a conflict, not a retry.
+  - ⚠️ **One exception, by the user's decision of 2026-10-18, and only for Google Drive** (docs/CLOUD-PROVIDERS.md §3.2): Drive v3 has no precondition — `If-Match` on a content update is accepted and ignored — so there the substitute is *check, write pinned, verify*. Read `version`/`headRevisionId` and refuse to write if they differ from what the binding last saw (that is the 412); write with the new head revision kept; then confirm the revision *before* ours is the one we based the write on. If not, a concurrent writer landed inside the window: their revision is pinned, downloaded, and merged or kept as a conflicted copy — never discarded. **The window between the check and the write is not closed**, only made detectable and recoverable. No other provider may use this; a store that *has* a precondition must use it.
 - An imported PDF's **original bytes are preserved forever** — as the verbatim prefix of `document.pdf`, guarded by `originalLength` truncate-rebase and `originalSha256` verification (docs/M4-PDF.md §7.3). There is no `assets/source.pdf` and never was (`Bundle.kt` says so); this bullet named a mechanism that was designed out in M4, and the invariant is what matters.
 - Before any destructive local operation, the previous version goes to trash first.
 

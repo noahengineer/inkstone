@@ -97,6 +97,19 @@ public sealed interface ForcedRefresh {
 }
 
 /**
+ * What a store needs of whoever holds its credential: a bearer to send, and the one refresh a 401 may
+ * cause. Microsoft's implementation refreshes a stored refresh token; Google's, in `:app`, asks Play
+ * Services for a fresh access token (no refresh token is kept on the device at all — docs §5.2).
+ */
+public interface AccessTokenSource {
+    /** A token to send, refreshing first only if it is missing or nearly spent. Never retries. */
+    public suspend fun bearer(): BearerResult
+
+    /** The single refresh a 401 may cause — see [MicrosoftTokenSource.refreshAfterRefusal]. */
+    public suspend fun refreshAfterRefusal(): ForcedRefresh
+}
+
+/**
  * One account's access token, kept fresh.
  *
  * ## When a refresh is allowed (docs §5.3)
@@ -129,7 +142,7 @@ public class MicrosoftTokenSource(
     private val vault: TokenVault,
     private val clock: Clock,
     private val accountId: String,
-) {
+) : AccessTokenSource {
 
     private val lock = Mutex()
     private var accessToken: String? = null
@@ -144,7 +157,7 @@ public class MicrosoftTokenSource(
     private var deadReason: String? = null
 
     /** A token to send, refreshing first only if it is missing or nearly spent. */
-    public suspend fun bearer(): BearerResult = lock.withLock {
+    override suspend fun bearer(): BearerResult = lock.withLock {
         deadReason?.let { return@withLock BearerResult.Dead(it) }
         val cached = accessToken
         if (cached != null && clock.nowEpochMillis() < accessExpiresAt - REFRESH_MARGIN_MILLIS) {
@@ -159,7 +172,7 @@ public class MicrosoftTokenSource(
      * Throws the cached token away first: the server just told us it is not good, and handing it out
      * again from [bearer] would be the same-request replay rule 5 forbids.
      */
-    public suspend fun refreshAfterRefusal(): ForcedRefresh = lock.withLock {
+    override suspend fun refreshAfterRefusal(): ForcedRefresh = lock.withLock {
         deadReason?.let { return@withLock ForcedRefresh.Dead(it) }
         val now = clock.nowEpochMillis()
         val secret = vault.get(accountId) ?: return@withLock ForcedRefresh.Dead(NO_REFRESH_TOKEN)

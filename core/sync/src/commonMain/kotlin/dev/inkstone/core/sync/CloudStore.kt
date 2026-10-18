@@ -24,6 +24,7 @@ import dev.inkstone.core.model.CredentialStore
 public enum class ProviderKind {
     NEXTCLOUD,
     ONEDRIVE,
+    GOOGLE_DRIVE,
 
     /**
      * A name this build does not know — an account written by a newer one. No factory opens it, so it
