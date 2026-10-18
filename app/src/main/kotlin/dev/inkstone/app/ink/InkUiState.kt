@@ -253,6 +253,13 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      */
     var gridSnapEnabled by mutableStateOf(STOCK.gridSnapEnabled)
 
+    /**
+     * ⭐ Whether the note scrolls from one page into the next like a PDF (`InkSurfaceView.continuousScroll`).
+     * Persisted with the rest of the toolbar's memory, and switched from the page bar's paper menu,
+     * which is where "what is a page in this note" already lives.
+     */
+    var scrollPagesEnabled by mutableStateOf(STOCK.scrollPagesEnabled)
+
     /** ⭐ The Write panel's neatness slider (docs/HANDWRITING-SYNTHESIS.md §6.2), persisted. */
     var handwritingNeatness by mutableFloatStateOf(STOCK.handwritingNeatness)
 
@@ -479,6 +486,7 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
         shapeSnapEnabled = prefs.shapeSnapEnabled
         arrowHeads = prefs.arrowHeads
         gridSnapEnabled = prefs.gridSnapEnabled
+        scrollPagesEnabled = prefs.scrollPagesEnabled
         handwritingNeatness = prefs.handwritingNeatness
         shownLayout = prefs.layout
         savedLayouts = prefs.savedLayouts
@@ -653,6 +661,7 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
         shapeSnapEnabled = shapeSnapEnabled,
         arrowHeads = arrowHeads,
         gridSnapEnabled = gridSnapEnabled,
+        scrollPagesEnabled = scrollPagesEnabled,
         handwritingNeatness = handwritingNeatness,
         layout = shownLayout,
         savedLayouts = savedLayouts,

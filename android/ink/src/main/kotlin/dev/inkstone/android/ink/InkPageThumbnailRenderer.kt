@@ -73,41 +73,8 @@ public class InkPageThumbnailRenderer(
 
     override suspend fun render(noteId: DocumentId, page: FoldedPage, widthPx: Int): ByteArray? =
         withContext(dispatcher) {
-            if (widthPx <= 0) return@withContext null
-            // The whole paper, wherever it sits in page space — a grown canvas has a negative
-            // origin, and a thumbnail scaled from the extent alone would show the wrong corner of
-            // it (SPEC §4.5, [PageCanvas]).
-            val paper = page.canvas
-            val size = paper.size
-            val heightPx = (widthPx * size.heightPt / size.widthPt).roundToInt().coerceAtLeast(1)
-
-            // Before the bitmap is allocated, because this is the one step that can be slow
-            // and a failed raster is a thumbnail on white paper, not a failed thumbnail.
-            val sourcePage = sourcePages.rasterize(noteId, page, widthPx)
-
-            val bitmap = Bitmap.createBitmap(widthPx, heightPx, Bitmap.Config.ARGB_8888)
+            val bitmap = draw(noteId, page, widthPx, Bitmap.Config.ARGB_8888) ?: return@withContext null
             try {
-                val canvas = Canvas(bitmap)
-                // Page points to thumbnail pixels. Uniform, taken from the width, so the aspect
-                // ratio is the page's and a thumbnail is never letterboxed or squashed.
-                // Page points to thumbnail pixels, with the paper's own top-left brought to the
-                // bitmap's. The translation is part of the same matrix so that everything below
-                // this line draws in plain page space, exactly as the editor does.
-                val scale = widthPx / size.widthPt
-                val pageToThumbnail = Matrix().apply {
-                    setScale(scale, scale)
-                    preTranslate(-paper.left, -paper.top)
-                }
-                canvas.concat(pageToThumbnail)
-
-                val painter = PagePainter()
-                painter.assets = assets
-                painter.paintBackground(canvas, paper, page.background, sourcePage, pageToThumbnail)
-                // No culling: the whole page is "on screen" in a thumbnail by definition, and a
-                // cull rect would only add a compare per stroke.
-                painter.paintObjects(canvas, toStrokeStore(page), pageToThumbnail, visibleBounds = null, paper = paper)
-                painter.paintBorder(canvas, paper)
-
                 val out = ByteArrayOutputStream(ESTIMATED_BYTES)
                 @Suppress("DEPRECATION") // WEBP_LOSSY is API 30+; WEBP itself is what's deprecated.
                 if (!bitmap.compress(Bitmap.CompressFormat.WEBP_LOSSY, QUALITY, out)) return@withContext null
@@ -119,6 +86,71 @@ public class InkPageThumbnailRenderer(
                 bitmap.recycle()
             }
         }
+
+    /**
+     * ⭐ The same picture as [render], **as a bitmap and not as bytes** — for the page above and the
+     * page below the one being edited, which the editor draws beside it while the note scrolls like a
+     * PDF (`PageStrip`).
+     *
+     * A WebP round trip would cost an encode and a decode of a picture that is shown within a
+     * second and then replaced, and would add lossy artefacts to the one thing on screen that is
+     * deliberately a stand-in. [config] is a parameter because the strip holds three of these at
+     * once and the paper is opaque: `RGB_565` is half the memory for pixels nobody can tell apart on
+     * ink.
+     *
+     * The caller owns the bitmap and must not recycle one the dry layer is still drawing.
+     */
+    public suspend fun renderBitmap(
+        noteId: DocumentId,
+        page: FoldedPage,
+        widthPx: Int,
+        config: Bitmap.Config = Bitmap.Config.RGB_565,
+    ): Bitmap? = withContext(dispatcher) { draw(noteId, page, widthPx, config) }
+
+    /** The one drawing routine behind both entry points, so a preview can never disagree with a thumbnail. */
+    private suspend fun draw(noteId: DocumentId, page: FoldedPage, widthPx: Int, config: Bitmap.Config): Bitmap? {
+        if (widthPx <= 0) return null
+        // The whole paper, wherever it sits in page space — a grown canvas has a negative
+        // origin, and a thumbnail scaled from the extent alone would show the wrong corner of
+        // it (SPEC §4.5, [PageCanvas]).
+        val paper = page.canvas
+        val size = paper.size
+        val heightPx = (widthPx * size.heightPt / size.widthPt).roundToInt().coerceAtLeast(1)
+
+        // Before the bitmap is allocated, because this is the one step that can be slow
+        // and a failed raster is a thumbnail on white paper, not a failed thumbnail.
+        val sourcePage = sourcePages.rasterize(noteId, page, widthPx)
+
+        val bitmap = Bitmap.createBitmap(widthPx, heightPx, config)
+        var drawn = false
+        try {
+            val canvas = Canvas(bitmap)
+            // Page points to thumbnail pixels. Uniform, taken from the width, so the aspect
+            // ratio is the page's and a thumbnail is never letterboxed or squashed.
+            // Page points to thumbnail pixels, with the paper's own top-left brought to the
+            // bitmap's. The translation is part of the same matrix so that everything below
+            // this line draws in plain page space, exactly as the editor does.
+            val scale = widthPx / size.widthPt
+            val pageToThumbnail = Matrix().apply {
+                setScale(scale, scale)
+                preTranslate(-paper.left, -paper.top)
+            }
+            canvas.concat(pageToThumbnail)
+
+            val painter = PagePainter()
+            painter.assets = assets
+            painter.paintBackground(canvas, paper, page.background, sourcePage, pageToThumbnail)
+            // No culling: the whole page is "on screen" in a thumbnail by definition, and a
+            // cull rect would only add a compare per stroke.
+            painter.paintObjects(canvas, toStrokeStore(page), pageToThumbnail, visibleBounds = null, paper = paper)
+            painter.paintBorder(canvas, paper)
+            drawn = true
+            return bitmap
+        } finally {
+            // Nobody else holds this bitmap yet, so a failed draw has to free it here.
+            if (!drawn) bitmap.recycle()
+        }
+    }
 
     /**
      * The folded page as render state.

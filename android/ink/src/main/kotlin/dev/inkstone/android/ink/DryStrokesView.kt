@@ -3,7 +3,9 @@ package dev.inkstone.android.ink
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.graphics.Paint
 import android.graphics.RecordingCanvas
+import android.graphics.RectF
 import android.graphics.RenderNode
 import android.view.View
 import androidx.ink.brush.TextureBitmapStore
@@ -127,6 +129,43 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
             invalidate()
         }
 
+    /**
+     * ⭐ The pages above and below the one being edited, as pictures (`PageNeighbour`), already
+     * placed in this page's space. Null for each when there is no such page, or when the note is not
+     * scrolling like a PDF.
+     *
+     * Drawn **outside the recorded node**, under it: a neighbour is not part of the page's display
+     * list, so a picture arriving from a background render never invalidates a recording that costs
+     * 48–105 ms to make.
+     */
+    var picturesAbove: PlacedPicture? = null
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    var picturesBelow: PlacedPicture? = null
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    /**
+     * ⭐ A picture of *this* page, drawn over its paper while its objects are still being built.
+     *
+     * Only ever set by a page turn made by scrolling: the page that was a neighbour a moment ago is
+     * now the one being edited, and for the frames before its ink is installed the paper would
+     * otherwise be bare — the scroll would visibly empty the page the user was reading.
+     */
+    var interim: PlacedPicture? = null
+        set(value) {
+            field = value
+            invalidate()
+        }
+
+    private val pictureDestination = RectF()
+    private val picturePaint = Paint(Paint.FILTER_BITMAP_FLAG)
+
     /** ⭐ The Element editor's grid in place of paper, or null for a note. See [PagePainter.backdrop]. */
     var backdrop: ElementBackdrop?
         get() = painter.backdrop
@@ -225,6 +264,9 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
         // ⚠️ **The node is NOT drawn under this transform** — it holds device pixels and carries
         // its own mapping (see [drawNode]). Only the page-space content drawn *beside* it — the
         // append tail, the search highlight, and the whole software fallback — is.
+        // The pages beside this one, under it. In page space, so they carry the camera themselves.
+        drawPicture(canvas, pageToView, picturesAbove)
+        drawPicture(canvas, pageToView, picturesBelow)
         val saved = canvas.save()
         // ⚠️ The size guard is the same one `resetCamera` and `onSizeChanged` carry: a zero
         // viewport makes the page-space rectangle degenerate, and `RenderNode.setPosition`
@@ -261,6 +303,8 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
             paintPage(canvas, pageToView, visibleBoundsInPageSpace())
         }
         canvas.restoreToCount(saved)
+        // Over the paper and its not-yet-built ink, and gone the moment the real ink is in.
+        drawPicture(canvas, pageToView, interim)
         // ⭐ Outside the node, deliberately. SPEC §8.4's search highlight changes when the user
         // steps through hits, and nothing about the ink under it has changed — re-recording the
         // whole page to move a translucent rectangle would make stepping through search results
@@ -271,6 +315,25 @@ internal class DryStrokesView(context: Context, private val store: StrokeStore, 
             painter.paintHighlight(canvas, it)
             canvas.restoreToCount(highlightSave)
         }
+    }
+
+    /**
+     * One [PlacedPicture] under the camera — nothing when it is absent, recycled, or entirely off
+     * screen. Allocation-free: this runs inside `onDraw`.
+     */
+    private fun drawPicture(canvas: Canvas, pageToView: android.graphics.Matrix, placed: PlacedPicture?) {
+        if (placed == null || placed.picture.bitmap.isRecycled) return
+        val rect = placed.rect
+        // Culled by the viewport in page space, so a neighbour three screens away costs a compare.
+        val scale = camera.scale
+        val top = -camera.translate.y / scale
+        val bottom = (height - camera.translate.y) / scale
+        if (rect.bottom < top || rect.top > bottom) return
+        val saved = canvas.save()
+        canvas.concat(pageToView)
+        pictureDestination.set(rect.left, rect.top, rect.right, rect.bottom)
+        canvas.drawBitmap(placed.picture.bitmap, null, pictureDestination, picturePaint)
+        canvas.restoreToCount(saved)
     }
 
     /**
