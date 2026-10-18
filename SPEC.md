@@ -1918,6 +1918,7 @@ the renderer.
 - Each PDF page → a `Page` with `Background.SourcePdfPage(index)`
 - **Page size from CropBox, with `/Rotate` applied** (§4.4)
 - Existing annotations: rendered, preserved on export, **not editable in v1**
+- **The paper is drawn from the original prefix, never from the whole `document.pdf`** (2026-10-18). The update section is the note's own ink, text boxes and images as of the last close; rendering it put them on the paper under their live copies, so a moved or undone object left a ghost no tool could reach. `OriginalPdfCache` copies the first `originalLength` bytes to the cache once per original.
 
 ### 6.3 Writing annotations
 

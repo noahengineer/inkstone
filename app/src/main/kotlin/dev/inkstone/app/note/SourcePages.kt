@@ -3,11 +3,14 @@ package dev.inkstone.app.note
 import android.content.Context
 import android.graphics.Bitmap
 import dagger.hilt.android.qualifiers.ApplicationContext
+import dev.inkstone.android.pdf.OriginalPdfCache
 import dev.inkstone.android.pdf.PdfPageRasterizer
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.PageSize
 import dev.inkstone.core.storage.NoteLayout
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -16,20 +19,15 @@ import kotlin.math.roundToInt
 /**
  * SPEC §6.2 — the paper under the ink, for a note imported from a PDF.
  *
- * ## Why the source is `document.pdf`
+ * ## ⛔ Why the source is the original, not `document.pdf`
  *
- * Because the imported PDF *is* the front of it, verbatim and forever (SPEC §5.2).
- * There is no second copy to render from, and that is the point of the incremental
- * update: a 20 MB lecture is stored once. Rendering page *n* of the published file
- * gives exactly the page that was imported, plus whatever ink the last
- * materialization wrote — which is not wanted here, but is also not a problem,
- * because the strokes are drawn live on top and the published copy of them is
- * underneath in the same place.
- *
- * *(That double-draw is worth watching. It is invisible today because both come
- * from the same geometry; if it ever shows as a subtle doubling on a translucent
- * highlighter, the fix is to render from the original prefix rather than the whole
- * file — `PdfReader.originalBytes` already returns it.)*
+ * The imported PDF is the front of `document.pdf`, verbatim (SPEC §5.2), and the rest
+ * of that file is the ink as of the last materialization. This class used to render the
+ * whole file and call the result harmless, because the live strokes drew over their
+ * published copy in the same place. That held until anything moved: every close baked
+ * the note's ink and text into the paper, as a faint outline around text, and a moved or
+ * erased object left its old copy on the paper where no tool could reach it. Seen on the
+ * tablet, 2026-10-18. [OriginalPdfCache] returns the original prefix as a file of its own.
  *
  * ## The cache
  *
@@ -47,6 +45,8 @@ class SourcePages @Inject constructor(
     @ApplicationContext private val context: Context,
     private val rasterizer: PdfPageRasterizer,
 ) {
+
+    private val originals = OriginalPdfCache(context.cacheDir)
 
     /**
      * ⚠️ [size] is part of the key because the bitmap's dimensions are derived from it at raster
@@ -71,7 +71,12 @@ class SourcePages @Inject constructor(
         val key = Key(id, index, size)
         cached?.takeIf { cachedKey == key && !it.isRecycled }?.let { return it }
 
-        val file = File(context.filesDir, NoteLayout.documentPdf(id))
+        val published = File(context.filesDir, NoteLayout.documentPdf(id))
+        // A failed copy falls back to the published file: old ink under the new is a blemish,
+        // white paper under an imported lecture reads as the lecture being lost.
+        val file = withContext(Dispatchers.IO) {
+            runCatching { originals.paperFor(id, published) }.getOrDefault(published)
+        }
         // Width, not height: page space is the CropBox with /Rotate applied (SPEC §4.4),
         // so a landscape page is wider than it is tall and sizing from the width keeps
         // the pixel density comparable either way.
