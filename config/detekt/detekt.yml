@@ -23,7 +23,14 @@ complexity:
     #
     # 700 rather than "off": it is roughly one more feature's worth of headroom, so the next
     # thing to cross it has to make this argument again rather than inherit it.
-    threshold: 700
+    #
+    # And it was made again: scrolling through the pages like a PDF crossed it. The decisions — which
+    # pictures, where they sit, when a crossing asks for a turn, what the strip is after one — are
+    # in `PageStripController` and `PageStrip`, which is the extraction the rule asks for. What is
+    # left in the view is the Android half and cannot be moved: the setting's setter, the camera it
+    # leashes and carries, the callback it posts and the three places a page load must consult it.
+    # 750, so the headroom is again about one feature's worth.
+    threshold: 750
   LongParameterList:
     functionThreshold: 8
     constructorThreshold: 10

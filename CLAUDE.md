@@ -292,6 +292,7 @@ A milestone is done when:
 | **Handwriting synthesis (M13) — typed text dropped onto a page in your own hand: the design D1–D15, the pen ledger, the profile on disk, and why the model's training data must allow commercial use** | `docs/HANDWRITING-SYNTHESIS.md` (§12 phases, §14 the user's answers, §16 phase 2 and §18 phase 3 per-claim status; `hw` is SPEC §4.10) |
 | **Line segmentation version 2 — columns and mind maps read, marks that attach instead of linking, and the search hit that opened its note somewhere else** | `docs/LINE-SEGMENTATION-V2.md` (§3 what was measured, §5 per-claim table, §7 unverified; SPEC §8.2) |
 | **Handwritten maths — the Write panel's *Maths* switch: stacked fractions, roots, scripts and stretched brackets, laid out from runs the gate read** | `docs/HANDWRITING-MATHS.md` (§2 the notation, §3 the layout, §5 what the sheet found, §6 per-claim table) |
+| **Scrolling through the pages like a PDF — a setting in the paper menu; neighbours are pictures, one page stays live, and a scroll writes no op** | `docs/PAGE-SCROLL.md` (§1 why pictures, §3 decisions, §5 per-claim table, §6 what is unverified; SPEC §4.5) |
 
 ---
 

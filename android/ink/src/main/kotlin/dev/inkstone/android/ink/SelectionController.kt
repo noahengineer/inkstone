@@ -533,6 +533,9 @@ internal class SelectionController(
     private var startSelected: List<SelectedObject> = emptyList()
     private var startBounds: PageRect? = null
 
+    /** The selection's own angle at pen-down — what a rotate snaps level from ([SelectionGesture.sharedRotation]). */
+    private var startRotation = 0f
+
     /**
      * ⭐ The selection's Element pivot at pen-down, in page space, or null — what a move lands on
      * the grid instead of the box's top-left (SPEC §4.9.7). Latched with [startBounds] for the same
@@ -686,6 +689,7 @@ internal class SelectionController(
                 startBounds = box
                 startPivot = pivot
                 startSelected = store.selected(selection)
+                startRotation = SelectionGesture.sharedRotation(startSelected.map { it.transform })
                 guideTargets = if (mode == Mode.MOVE) {
                     AlignmentGuides.AlignmentTargets(store.pageBoundsExcluding(selection), pageSize)
                 } else {
@@ -824,7 +828,7 @@ internal class SelectionController(
         alignment = Alignment.None
         startSelected = emptyList()
         startBounds = null
-        startPivot = null
+        startRotation = 0f
         startPivot = null
         startHandle = null
         startPoint = null
@@ -1048,7 +1052,9 @@ internal class SelectionController(
         val box = startBounds ?: return Matrix3.Identity
         val from = atan2(start.y - box.centreY, start.x - box.centreX)
         val to = atan2(current.y - box.centreY, current.x - box.centreX)
-        return SelectionGesture.rotate(box.centreX, box.centreY, to - from)
+        // Snapped while the pen is down, so the preview shows the angle the lift will write.
+        val turn = SelectionGesture.snappedRotation(startRotation, to - from)
+        return SelectionGesture.rotate(box.centreX, box.centreY, turn)
     }
 
     // -----------------------------------------------------------------------

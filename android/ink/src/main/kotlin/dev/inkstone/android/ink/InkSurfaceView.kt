@@ -25,8 +25,10 @@ import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.ObjectStyle
 import dev.inkstone.core.model.Offset
 import dev.inkstone.core.model.PageCanvas
+import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PageSize
+import dev.inkstone.core.model.PageStrip
 import dev.inkstone.core.model.ShapeEdit
 import dev.inkstone.core.model.ShapeKind
 import dev.inkstone.core.model.SnapGrid
@@ -467,6 +469,8 @@ public class InkSurfaceView @JvmOverloads constructor(
             toolOverlay.pageCanvas = value
             // The paper's lines start from its corner, so the lattice moves when the corner does.
             if (moved) refreshSnapGrid()
+            // The pages beside it hang from its edges, so they move when an edge does.
+            strip.layout(value.rect)
         }
 
     /**
@@ -726,13 +730,30 @@ public class InkSurfaceView @JvmOverloads constructor(
         // exist. A selection belongs to a page: carrying it across would leave the toolbar
         // offering "delete" for objects on a page the user has left.
         selectionController.clear()
+        // ⭐ Scrolling into the next page: remembered before anything is reset, because the strip,
+        // the camera and the pending turn all belong to the page being left.
+        val turn = strip.take(page.pageId)
+        val cameraBefore = camera
+        strip.rotate(turn?.target)
         strokes.reset()
+        strip.activePageId = page.pageId
         adoptCanvas(page.canvas)
+        strip.layout(pageCanvas.rect)
         // Before the refit below, which is what draws and centres a search hit on this page.
         searchHit.pageLoading(page.pageId)
-        // Explicit, because the setter above no longer does it. A page *switch* should fit the new
-        // page — it is a different piece of paper and the old camera means nothing on it.
-        fitOrFrame()
+        if (turn != null && width > 0 && height > 0) {
+            // ⭐ A page *scrolled into* is not a different piece of paper, it is the one already on
+            // the glass: carry the camera so every point stays where it was, and cover the paper
+            // with the picture that was there until the ink is built.
+            camera = PageStrip.carried(cameraBefore, turn.rect, pageCanvas.rect).leashed()
+            dryView.interim = PlacedPicture(turn.target, pageCanvas.rect)
+            showHit()
+        } else {
+            dryView.interim = null
+            // Explicit, because the setter above no longer does it. A page *switch* should fit the
+            // new page — it is a different piece of paper and the old camera means nothing on it.
+            fitOrFrame()
+        }
         dryView.pageBackground = page.background
         refreshSnapGrid()
         // Cleared, not kept: the next page's paper is not this one's, and leaving the
@@ -746,6 +767,8 @@ public class InkSurfaceView @JvmOverloads constructor(
 
     private fun finishPageLoad(prepared: PreparedPage) {
         strokes.install(prepared, brushFactory)
+        // The real ink is in, in the same frame the stand-in goes out.
+        dryView.interim = null
         // ⚠️ **A stroke the user erased away comes back from disk, invisible and expensive.**
         // `SetErasedRegion` is an absolute register (SPEC §3.5) and a fully erased stroke is not
         // deleted — the op says its whole area is gone, which is the correct and lossless record.
@@ -1045,9 +1068,87 @@ public class InkSurfaceView @JvmOverloads constructor(
         if (grown != pageCanvas) pageCanvas = grown
     }
 
-    /** Applies SPEC §4.5's leash: pan freely, but never lose the page. */
+    /**
+     * Applies SPEC §4.5's leash: pan freely, but never lose the page.
+     *
+     * Scrolling like a PDF widens *what* is leashed — the paper and the pages beside it — and
+     * nothing else: the rule is unchanged, so the camera still cannot be thrown away from every
+     * page there is.
+     */
     private fun Camera.leashed(): Camera =
-        leashedTo(pageCanvas, Viewport(width.toFloat(), height.toFloat()), minVisiblePx)
+        leashedTo(leashArea(), Viewport(width.toFloat(), height.toFloat()), minVisiblePx)
+
+    private fun leashArea(): PageCanvas = strip.reach(pageCanvas)
+
+    // -----------------------------------------------------------------------
+    // Scrolling through the pages like a PDF
+    // -----------------------------------------------------------------------
+
+    /** The pictures beside the page, and the decisions about them. See [PageStripController]. */
+    private val strip = PageStripController<PageNeighbour> { above, below ->
+        dryView.picturesAbove = above
+        dryView.picturesBelow = below
+    }
+
+    /**
+     * ⭐ **Scroll from one page into the next.** Off by default; a setting.
+     *
+     * The page above and the page below are drawn beside this one as pictures ([setStrip]), the
+     * camera may roam over all three, and when the middle of the view enters a neighbour that page
+     * becomes the one being edited ([onScrollTurn]) with the camera carried so that nothing on the
+     * glass moves ([PageStrip.carried]).
+     *
+     * Everything about editing is unchanged: there is still exactly one live page, and a stroke
+     * still belongs to it. What changes is that reaching the end of a page no longer stops the
+     * scroll, and turning the page no longer snaps back to the top of the next.
+     */
+    public var continuousScroll: Boolean
+        get() = strip.enabled
+        set(value) {
+            if (strip.enabled == value) return
+            strip.enabled = value
+            if (width > 0 && height > 0) camera = camera.leashed()
+        }
+
+    /**
+     * Told that the view has crossed into a neighbour (or a pen has landed on one) and its page
+     * should become the one being edited. The owner turns to it and then calls [endScrollTurn]
+     * whether or not it did, so a refused turn does not wedge the next one.
+     */
+    public var onScrollTurn: ((PageId) -> Unit)? = null
+
+    /**
+     * Hand over the pictures of the pages around [forPage]. Ignored unless it is the page on screen
+     * and scrolling is on: a render finishes some time after it was asked for, and the user may have
+     * turned the page twice since.
+     *
+     * [self] is a picture of [forPage] itself. It is not drawn; it is kept so that when the camera
+     * leaves this page, the page just left can be put straight into its place as a neighbour instead
+     * of vanishing for as long as the editor takes to render it again.
+     */
+    public fun setStrip(forPage: PageId, above: PageNeighbour?, self: PageNeighbour?, below: PageNeighbour?) {
+        if (strip.set(forPage, above, self, below, pageCanvas.rect) && width > 0 && height > 0) {
+            camera = camera.leashed()
+        }
+    }
+
+    /** The owner has finished (or refused) the turn it was asked for. */
+    public fun endScrollTurn() = strip.end()
+
+    /** After a pan: has the middle of the view entered a neighbour? */
+    private fun checkScrollTurn() {
+        if (pageLoading || width <= 0 || height <= 0) return
+        requestTurn(strip.crossing((height / 2f - camera.translate.y) / camera.scale))
+    }
+
+    private fun requestTurn(turn: StripTurn<PageNeighbour>?) {
+        val callback = onScrollTurn
+        if (turn == null || callback == null) return
+        strip.begin(turn)
+        // Posted rather than called: this runs inside touch dispatch, and the owner's turn starts
+        // saving the page the moment it is asked.
+        post { callback(turn.target.pageId) }
+    }
 
     /** Zoom as a percentage, for the toolbar readout. */
     public fun zoomPercent(): Float = camera.zoomPercent(pixelsPerPoint)
@@ -1396,7 +1497,14 @@ public class InkSurfaceView @JvmOverloads constructor(
         // point by the time this runs.
         toPageSpace(event.getX(pointerIndex), event.getY(pointerIndex), downPoint)
         growCanvasForPen(downPoint.x, downPoint.y)
-        if (!pageCanvas.contains(downPoint.x, downPoint.y, slackPt = EDGE_SLACK_PT)) return
+        if (!pageCanvas.contains(downPoint.x, downPoint.y, slackPt = EDGE_SLACK_PT)) {
+            // ⭐ A pen that lands on the page beside this one means *that page*. Refused for good it
+            // would be a page you can see and cannot write on until you scroll a little further; the
+            // stroke itself is dropped (there is nothing yet to put it on) and the page turns, so the
+            // next one lands.
+            requestTurn(strip.landing(downPoint.x, downPoint.y))
+            return
+        }
         // M12 — latched here, used when the stroke finishes. `elapsedRealtime` rather than
         // `event.eventTime`, which is `uptimeMillis` and stops during deep sleep: a recording holds
         // the CPU awake, so the two agree in practice, but only one of them is the clock the
@@ -1689,6 +1797,7 @@ public class InkSurfaceView @JvmOverloads constructor(
         }
         if (!gestures.isActive || !palmGuard.allowsFinger(event)) return false
         camera = gestures.onMove(event, camera).leashed()
+        checkScrollTurn()
         return true
     }
 

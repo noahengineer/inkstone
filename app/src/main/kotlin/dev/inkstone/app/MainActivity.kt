@@ -34,6 +34,7 @@ import dev.inkstone.app.handwriting.HandwritingScreen
 import dev.inkstone.app.handwriting.HandwritingViewModel
 import dev.inkstone.app.handwriting.ModelSpeedSpike
 import dev.inkstone.app.ink.EditorPreferences
+import dev.inkstone.app.ink.EditorPrefs
 import dev.inkstone.app.library.FolderCoverImage
 import dev.inkstone.app.library.LibraryActions
 import dev.inkstone.app.library.LibraryScreen
@@ -41,6 +42,10 @@ import dev.inkstone.app.library.LibraryUiState
 import dev.inkstone.app.library.LibraryViewModel
 import dev.inkstone.app.library.TrashScreen
 import dev.inkstone.app.note.NoteActivity
+import dev.inkstone.app.settings.ModelStatus
+import dev.inkstone.app.settings.SettingsActions
+import dev.inkstone.app.settings.SettingsScreen
+import dev.inkstone.app.settings.SettingsUiState
 import dev.inkstone.app.sync.AttentionActions
 import dev.inkstone.app.sync.AttentionViewModel
 import dev.inkstone.app.sync.NeedsAttentionScreen
@@ -77,7 +82,8 @@ import javax.inject.Inject
  * coming back would never stop anything.
  *
  * The trash is a Compose state flip rather than a third activity — nothing about it needs
- * to survive a kill, and coming back to the library is exactly what should happen.
+ * to survive a kill, and coming back to the library is exactly what should happen. Settings is
+ * the same, for the same reason.
  */
 @AndroidEntryPoint
 class MainActivity : ComponentActivity() {
@@ -187,6 +193,9 @@ class MainActivity : ComponentActivity() {
         // Only on a genuinely fresh start, not after a rotation: a saved instance state means this
         // process has been alive all along and anything interrupted has already been dealt with.
         if (savedInstanceState == null) recordings.recoverInterrupted()
+        // The Settings screen edits the same `EditorPrefs` the editor saves, so the store has to be
+        // read here too — the KDoc on [editorPreferences] said so before anything here needed it.
+        editorPreferences.warm()
         setContent { InkstoneTheme { Content() } }
     }
 
@@ -240,6 +249,10 @@ class MainActivity : ComponentActivity() {
         val syncState by sync.state.collectAsState()
         val snackbars = remember { SnackbarHostState() }
         var showing by rememberSaveable { mutableStateOf(Showing.LIBRARY) }
+        // Where Back from the trash, sync or attention screen goes: the library, or Settings when
+        // that is where the user came from. A Back that drops somebody where they had not been is
+        // the "random buttons everywhere" feeling the Settings screen exists to remove.
+        var backTo by rememberSaveable { mutableStateOf(Showing.LIBRARY) }
 
         LaunchedEffect(libraryState.message) {
             libraryState.message?.let {
@@ -293,7 +306,13 @@ class MainActivity : ComponentActivity() {
             Screens(
                 padding = Modifier.padding(innerPadding),
                 showing = showing,
-                onShow = { showing = it },
+                backTo = backTo,
+                onShow = { next ->
+                    // Leaving the library or Settings for a sub-screen records which it was.
+                    if (showing == Showing.LIBRARY || showing == Showing.SETTINGS) backTo = showing
+                    if (next == Showing.LIBRARY) backTo = Showing.LIBRARY
+                    showing = next
+                },
                 libraryState = libraryState,
                 syncState = syncState,
             )
@@ -312,7 +331,7 @@ class MainActivity : ComponentActivity() {
      * enum and not a sealed class: an enum is `Serializable`, which Compose's default saver already
      * accepts, so there is no custom `Saver` to keep in step with the cases.
      */
-    private enum class Showing { LIBRARY, TRASH, SYNC, ATTENTION, HANDWRITING }
+    private enum class Showing { LIBRARY, TRASH, SYNC, ATTENTION, SETTINGS, HANDWRITING }
 
     /**
      * The four screens, extracted so [Content] stays about *state* and this stays about *routing*.
@@ -324,6 +343,8 @@ class MainActivity : ComponentActivity() {
     private fun Screens(
         padding: Modifier,
         showing: Showing,
+        /** Where the sub-screens' Back goes — see `backTo` in [Content]. */
+        backTo: Showing,
         onShow: (Showing) -> Unit,
         libraryState: LibraryUiState,
         syncState: SyncUiState,
@@ -339,13 +360,13 @@ class MainActivity : ComponentActivity() {
                 nowEpochMillis = clock.nowEpochMillis(),
                 onRestoreNote = library::restoreNote,
                 onRestoreFolder = library::restoreFolder,
-                onBack = { onShow(Showing.LIBRARY) },
+                onBack = { onShow(backTo) },
                 modifier = padding,
             )
 
             Showing.SYNC -> SyncScreen(
                 state = syncState,
-                onBack = { onShow(Showing.LIBRARY) },
+                onBack = { onShow(backTo) },
                 actions = syncActions(),
                 modifier = padding,
             )
@@ -357,13 +378,15 @@ class MainActivity : ComponentActivity() {
                 actions = AttentionActions(
                     onAcknowledge = attention::acknowledge,
                     onOpenNote = ::openNote,
-                    onBack = { onShow(Showing.LIBRARY) },
+                    onBack = { onShow(backTo) },
                 ),
                 modifier = padding,
             )
 
             Showing.HANDWRITING ->
-                HandwritingScreen(handwriting, library::downloadRecognitionModel, { onShow(Showing.LIBRARY) }, padding)
+                HandwritingScreen(handwriting, library::downloadRecognitionModel, { onShow(backTo) }, padding)
+
+            Showing.SETTINGS -> SettingsArm(padding, onShow, libraryState, syncState)
 
             Showing.LIBRARY -> LibraryScreen(
                 state = libraryState,
@@ -384,7 +407,8 @@ class MainActivity : ComponentActivity() {
                         onShow(Showing.SYNC)
                     },
                     onOpenAttention = { onShow(Showing.ATTENTION) },
-                    onOpenHandwriting = { onShow(Showing.HANDWRITING) },
+                    // A clean sync state, as the old `NEXTCLOUD` chip had: last week's "saved to…" is not news.
+                    onOpenSettings = { openSettings(onShow) },
                     onImportFromNextcloud = {
                         // The folder on screen, so an adopted PDF is filed where the user is
                         // standing rather than at the root. It does not follow the file's remote
@@ -396,6 +420,65 @@ class MainActivity : ComponentActivity() {
             )
         }
     }
+
+    /**
+     * The Settings screen, assembled from the view models this activity already holds.
+     *
+     * The writing options are local state seeded from [EditorPreferences.current] and re-seeded when
+     * the store's first read lands, so a press made before then cannot save stock values over the
+     * user's own (`SettingsScreen`).
+     */
+    @Composable
+    private fun SettingsArm(
+        padding: Modifier,
+        onShow: (Showing) -> Unit,
+        libraryState: LibraryUiState,
+        syncState: SyncUiState,
+    ) {
+        val warmed by editorPreferences.snapshot.collectAsState()
+        var prefs by remember(warmed) { mutableStateOf<EditorPrefs?>(editorPreferences.current()) }
+        val model by library.recognitionModelStatus.collectAsState()
+        SettingsScreen(
+            state = SettingsUiState(
+                accounts = syncState.accounts,
+                outboxCount = syncState.outboxCount,
+                pendingRecordings = syncState.pendingRecordings,
+                attentionCount = libraryState.attentionCount,
+                syncMessage = syncState.message,
+                syncBusy = syncState.busy,
+                prefs = prefs,
+                model = ModelStatus(model.downloaded == true, model.downloading, model.error),
+                versionName = versionName(),
+            ),
+            actions = SettingsActions(
+                onBack = { onShow(Showing.LIBRARY) },
+                onOpenNextcloud = {
+                    sync.open(null)
+                    onShow(Showing.SYNC)
+                },
+                onSyncNow = sync::syncNow,
+                onOpenAttention = { onShow(Showing.ATTENTION) },
+                onPrefsChange = { next ->
+                    prefs = next
+                    editorPreferences.changed(next)
+                },
+                onDownloadModel = library::downloadRecognitionModel,
+                onOpenTrash = { onShow(Showing.TRASH) },
+                onFillForMeasurement = library::fillForMeasurement,
+                onOpenHandwriting = { onShow(Showing.HANDWRITING) },
+                onMeasureHandwritingModel = { lifecycleScope.launch(Dispatchers.Default) { ModelSpeedSpike.run() } },
+            ),
+            modifier = padding,
+        )
+    }
+
+    private fun openSettings(onShow: (Showing) -> Unit) {
+        sync.open(null)
+        onShow(Showing.SETTINGS)
+    }
+
+    private fun versionName(): String =
+        runCatching { packageManager.getPackageInfo(packageName, 0).versionName }.getOrNull().orEmpty()
 
     private fun syncActions() = SyncActions(
         onServerUrlChange = sync::setServerUrl,
@@ -445,11 +528,10 @@ class MainActivity : ComponentActivity() {
         onOpenSyncForFolder: (FolderId) -> Unit,
         onMoveSyncedNote: (DocumentId) -> Unit,
         onOpenAttention: () -> Unit,
+        onOpenSettings: () -> Unit,
         onImportFromNextcloud: () -> Unit,
-        onOpenHandwriting: () -> Unit,
     ) = LibraryActions(
         onOpenAttention = onOpenAttention,
-        onOpenHandwriting = onOpenHandwriting,
         onOpenNote = ::openNote,
         onOpenHit = ::openHit,
         onDownloadModel = library::downloadRecognitionModel,
@@ -488,9 +570,7 @@ class MainActivity : ComponentActivity() {
         autoRecordFolders = autoRecordFolders,
         onSetAutoRecord = library::setAutoRecord,
         onStopSyncing = sync::unbind,
-        onOpenNextcloud = { onOpenSync(null) },
-        onFillForMeasurement = library::fillForMeasurement,
-        onMeasureHandwritingModel = { lifecycleScope.launch(Dispatchers.Default) { ModelSpeedSpike.run() } },
+        onOpenSettings = onOpenSettings,
         thumbnail = library::thumbnail,
         folderCover = library::folderCover,
         // A drawn cover is an ordinary note in the ordinary editor — the same activity a

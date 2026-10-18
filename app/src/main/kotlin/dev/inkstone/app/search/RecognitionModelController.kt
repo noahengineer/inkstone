@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.getAndUpdate
@@ -97,6 +98,9 @@ class RecognitionModelController(
     /** What to draw. Null says nothing at all. */
     val panel: StateFlow<ModelPanel?> = combine(facts, seen, ModelPanels::panelFor)
         .stateIn(scope, SharingStarted.Eagerly, null)
+
+    /** Downloaded, downloading and the last error, for Settings' recognition-model section. */
+    val status: StateFlow<ModelFacts> = facts.asStateFlow()
 
     /** Whether the model is on the device; null until asked. *My handwriting* re-reads itself on a change. */
     val downloaded: StateFlow<Boolean?> = facts.map { it.downloaded }.distinctUntilChanged()

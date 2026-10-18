@@ -72,10 +72,12 @@ import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.model.LamportClock
 import dev.inkstone.core.model.ObjectId
 import dev.inkstone.core.model.PageCanvas
+import dev.inkstone.core.model.PageId
 import dev.inkstone.core.model.PageOp
 import dev.inkstone.core.model.PagePoint
 import dev.inkstone.core.model.PageRect
 import dev.inkstone.core.model.PageSize
+import dev.inkstone.core.model.PageStrip
 import dev.inkstone.core.model.SnapGrid
 import dev.inkstone.core.storage.Element
 import kotlinx.coroutines.CoroutineScope
@@ -115,6 +117,7 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
 
     SurfaceEffects(ui = ui, note = note, surface = surface)
     ObjectEffects(ui, objects, note, surface, editor, objectActions)
+    PageScrollEffects(ui, note, surface, editor)
     val elementDone = ElementEditorEffects(editor, objects, objectActions, surface, scope)
     SurfaceAttachment(surface, editor, scope)
 
@@ -140,7 +143,7 @@ fun InkScreen(modifier: Modifier = Modifier, editor: NoteEditorViewModel = hiltV
             wiring = ChromeWiring(
                 onSummon = { kind, at -> panel = panel.toggled(kind, at) },
                 note = note,
-                pageActions = pageBarActions(editor, note, { pageOverviewOpen = true }, exports),
+                pageActions = pageBarActions(editor, note, ui, { pageOverviewOpen = true }, exports),
                 exporting = exporting,
                 diagnosticsOpen = diagnosticsOpen,
                 onToggleDiagnostics = { diagnosticsOpen = !diagnosticsOpen },
@@ -700,6 +703,73 @@ private fun DockedSizePanel(geometry: ChromeGeometry, ui: InkUiState, onDismiss:
 }
 
 /**
+ * ⭐ Scrolling from one page into the next like a PDF — the two halves the surface cannot do alone.
+ *
+ * The surface draws the page above and the page below, and decides when the middle of the view has
+ * crossed into one (`InkSurfaceView.continuousScroll`). It cannot render a page, and it cannot turn
+ * one: rendering is `:app`'s ([NoteEditorViewModel.pagePicture]) and turning is the editor's, which
+ * saves the page being left before it shows the next. These are those two hand-offs:
+ *
+ * 1. **A crossing turns the page.** `showPage` is the same entry the page bar and a search hit use,
+ *    so the save, the undo bracket and the saved position all behave as they do for any other turn.
+ *    The surface is told when the turn is over — completed or refused — so a turn that went nowhere
+ *    cannot leave it believing one is still pending.
+ * 2. **The pictures are kept current.** Drawn at once when the page changes, and a couple of seconds
+ *    after the *last* change to the note otherwise: re-rendering a dense page on every two-second
+ *    autosave would put a software render of it behind every pause in writing.
+ *
+ * Both are inert unless the setting is on, and a note with it off pays nothing.
+ */
+@Composable
+private fun PageScrollEffects(
+    ui: InkUiState,
+    note: NoteEditorState,
+    surface: InkSurfaceView?,
+    editor: NoteEditorViewModel,
+) {
+    DisposableEffect(surface) {
+        val view = surface
+        if (view != null) {
+            view.onScrollTurn = { pageId ->
+                editor.showPage(pageId).invokeOnCompletion { view.post { view.endScrollTurn() } }
+            }
+        }
+        onDispose { view?.onScrollTurn = null }
+    }
+
+    val current = note.pageIds.getOrNull(note.pageIndex)
+    // The page the pictures were last drawn for. A revision change on the *same* page is the user
+    // writing, and waits; a different page is a turn, and does not.
+    val drawnFor = remember { arrayOfNulls<PageId>(1) }
+    LaunchedEffect(surface, ui.scrollPagesEnabled, current, note.pageIds, note.localRev) {
+        val view = surface
+        if (!ui.scrollPagesEnabled || view == null || current == null) {
+            drawnFor[0] = null
+            return@LaunchedEffect
+        }
+        if (drawnFor[0] == current) delay(STRIP_REFRESH_MS)
+        if (view.width <= 0) return@LaunchedEffect
+        val widthPx = PageStrip.pictureWidthPx(view.width, STRIP_PICTURE_CEILING_PX)
+        val previous = note.pageIds.getOrNull(note.pageIndex - 1)
+        val next = note.pageIds.getOrNull(note.pageIndex + 1)
+        val self = editor.pagePicture(current, widthPx)
+        val above = previous?.let { editor.pagePicture(it, widthPx) }
+        val below = next?.let { editor.pagePicture(it, widthPx) }
+        drawnFor[0] = current
+        view.setStrip(current, above, self, below)
+    }
+}
+
+/** How long after the last change to the note the pictures beside the page are drawn again. */
+private const val STRIP_REFRESH_MS = 2_500L
+
+/**
+ * The widest a neighbour is drawn. Three of these are held at once: at 1,200 px a Letter page in
+ * `RGB_565` is about 3.7 MB, where the screen's own 2,560 px would be 100 MB across the three.
+ */
+private const val STRIP_PICTURE_CEILING_PX = 1_200
+
+/**
  * ⭐ M8c — the effects that keep the object layers in step with the note.
  *
  * Beside [SurfaceEffects] and for the same reason, and each is a bug that would otherwise be
@@ -1096,6 +1166,7 @@ private class Exports(
 private fun pageBarActions(
     editor: NoteEditorViewModel,
     note: NoteEditorState,
+    ui: InkUiState,
     onShowPages: () -> Unit,
     exports: Exports,
 ) = PageBarActions(
@@ -1108,6 +1179,8 @@ private fun pageBarActions(
     onMoveRight = { editor.movePage(note.pageIndex + 1) },
     onTemplate = { template -> editor.setTemplate(template) },
     onToggleInfiniteCanvas = { editor.setInfiniteCanvas(!note.infiniteCanvas) },
+    scrollPages = ui.scrollPagesEnabled,
+    onToggleScrollPages = { ui.scrollPagesEnabled = !ui.scrollPagesEnabled },
     onShowPages = onShowPages,
     onShare = { exports.run(::exportAndShare) },
     onShareRecording = { exports.run(::exportRecordingAndShare) },
@@ -1296,6 +1369,10 @@ private fun InkSurface(
             // the shape definition-of-done #6 describes: a preference that round-trips through the
             // settings table perfectly and does nothing to a shape.
             view.gridSnapEnabled = ui.gridSnapEnabled
+            // ⭐ Scroll from page to page like a PDF. Like the line above it, a setting that
+            // round-trips through the preferences table and reaches nothing is the shape
+            // definition-of-done #6 describes, so the assignment is here with the rest.
+            view.continuousScroll = ui.scrollPagesEnabled
             view.marqueeSelection = ui.marqueeSelection
         },
     )

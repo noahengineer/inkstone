@@ -357,9 +357,6 @@ private fun LibraryToolbar(state: LibraryUiState, actions: LibraryActions, onNew
         ChipDivider()
         TextChip(label = "New folder", onClick = onNewFolder)
         TextChip(label = "Trash", onClick = actions.onOpenTrash)
-        TextChip(label = "Nextcloud", onClick = actions.onOpenNextcloud)
-        TextChip(label = "Handwriting", onClick = actions.onOpenHandwriting)
-        MeasureMenu(actions)
 
         // ⭐ SPEC §7.7's list, and it appears only when there is something in it (M6). A
         // permanently visible "Needs attention" is a permanent suggestion that something is
@@ -368,6 +365,13 @@ private fun LibraryToolbar(state: LibraryUiState, actions: LibraryActions, onNew
             ChipDivider()
             TextChip(label = "⚑ ${state.attentionCount}", kind = ChipKind.VALUE, onClick = actions.onOpenAttention)
         }
+
+        // ⭐ Everything that is a preference rather than something done to a note — the account,
+        // the pen, the toolbars, the handwriting model — behind one chip, last, where a settings
+        // button is looked for. It replaced `NEXTCLOUD` and `MEASURE`, which sat beside *New folder*
+        // and read as two more things to do to the library (`SettingsScreen`).
+        ChipDivider()
+        TextChip(label = "Settings", onClick = actions.onOpenSettings)
     }
 }
 
@@ -676,7 +680,8 @@ data class LibraryActions(
     val onSetAutoRecord: (FolderId, Boolean?) -> Unit,
     /** Stop syncing a bound note. Not a remote delete — the copy on the server stays. */
     val onStopSyncing: (DocumentId) -> Unit,
-    val onOpenNextcloud: () -> Unit,
+    /** The Settings screen: account and sync, writing options, toolbars, the handwriting model. */
+    val onOpenSettings: () -> Unit,
     /**
      * ⭐ SPEC §7.7 — open the "Needs attention" list (M6).
      *
@@ -684,15 +689,6 @@ data class LibraryActions(
      * rule 6). Everything in that list has already been resolved without losing anything.
      */
     val onOpenAttention: () -> Unit,
-    /**
-     * Handwriting synthesis — *My handwriting* (docs/HANDWRITING-SYNTHESIS.md §5.7): what has been
-     * learned from the user's writing, with every label correctable and everything deletable.
-     */
-    val onOpenHandwriting: () -> Unit,
-    /** ROADMAP M3's frame-rate gate needs 500 notes. See `LibraryFixture`. */
-    val onFillForMeasurement: () -> Unit,
-    /** docs/HANDWRITING-SYNTHESIS.md §7.5 — phase 4.0's speed spike, written to logcat. */
-    val onMeasureHandwritingModel: () -> Unit = {},
     val thumbnail: suspend (NoteSummary) -> androidx.compose.ui.graphics.ImageBitmap?,
     /** A folder's cover picture, or null when it shows its icon (SPEC §9). */
     val folderCover: suspend (Folder) -> androidx.compose.ui.graphics.ImageBitmap?,
@@ -719,41 +715,6 @@ private fun rememberFolderCover(folder: Folder, actions: LibraryActions): ImageB
         image = actions.folderCover(folder)
     }
     return image
-}
-
-/**
- * The measurement tool, behind a menu so it is not mistaken for a feature.
- *
- * The library-scale twin of the ink toolbar's Measure panel, and there for the same reason:
- * ROADMAP M3's frame-rate criterion needs 500 notes across 50 nested folders, and generating
- * them is the only honest way to get there.
- *
- * There is deliberately no "remove the fixture" item. That would be a hard delete with a
- * wildcard's blast radius, which is the one thing this milestone rules out. The generated
- * notes are ordinary notes: select them and move them to the trash.
- */
-@Composable
-private fun MeasureMenu(actions: LibraryActions) {
-    var open by remember { mutableStateOf(false) }
-    Box {
-        TextChip(label = "Measure", selected = open, onClick = { open = true })
-        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            DropdownMenuItem(
-                text = { MicroLabel("Fill library (500 notes, 50 folders)") },
-                onClick = {
-                    actions.onFillForMeasurement()
-                    open = false
-                },
-            )
-            DropdownMenuItem(
-                text = { MicroLabel("Handwriting model speed (logcat)") },
-                onClick = {
-                    actions.onMeasureHandwritingModel()
-                    open = false
-                },
-            )
-        }
-    }
 }
 
 /**

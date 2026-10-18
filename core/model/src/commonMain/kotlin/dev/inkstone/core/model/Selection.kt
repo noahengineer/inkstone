@@ -1,7 +1,11 @@
 package dev.inkstone.core.model
 
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.round
 
 /**
  * ROADMAP M8a — what a selection gesture writes down, as a pure function of the
@@ -293,6 +297,64 @@ public object SelectionGesture {
     /** [radians] about ([pivotX], [pivotY]) in page space — y-down, so positive is clockwise. */
     public fun rotate(pivotX: Float, pivotY: Float, radians: Float): Matrix3 =
         Matrix3.translate(pivotX, pivotY) * Matrix3.rotate(radians) * Matrix3.translate(-pivotX, -pivotY)
+
+    /**
+     * ⭐ The turn a rotate drag applies, pulled onto a round angle when it is close to one.
+     *
+     * What snaps is the **result** — [base] + [delta] — not the drag: a picture already at 7°
+     * should settle level, which snapping the drag by 15° steps would carry to 22° instead.
+     * Magnetic rather than stepped, so every angle between the steps is still reachable; only a
+     * [tolerance] either side of each multiple of [step] is pulled in.
+     *
+     * @param base the selection's own angle when the drag began — see [sharedRotation].
+     * @return the delta to rotate by, which equals [delta] when nothing is near enough.
+     */
+    public fun snappedRotation(
+        base: Float,
+        delta: Float,
+        step: Float = ROTATION_SNAP_STEP,
+        tolerance: Float = ROTATION_SNAP_TOLERANCE,
+    ): Float {
+        val target = base + delta
+        val nearest = round(target / step) * step
+        return if (abs(target - nearest) <= tolerance) nearest - base else delta
+    }
+
+    /**
+     * The angle every one of [transforms] is turned by, or 0 when they disagree.
+     *
+     * Read off the x axis (`atan2(m10, m00)`), which is the axis a flip leaves pointing the
+     * same way. When the selection is a mix of angles there is no one angle to make level, so
+     * the drag itself is what snaps — a quarter turn is still a quarter turn of all of them.
+     */
+    public fun sharedRotation(transforms: List<Matrix3>): Float {
+        val first = transforms.firstOrNull() ?: return 0f
+        val angle = first.rotationRadians
+        val agree = transforms.all { abs(angleBetween(it.rotationRadians, angle)) < SHARED_ANGLE_EPSILON }
+        return if (agree) angle else 0f
+    }
+
+    private val Matrix3.rotationRadians: Float get() = atan2(m10, m00)
+
+    private fun angleBetween(a: Float, b: Float): Float {
+        val d = (a - b) % FULL_TURN
+        return when {
+            d > HALF_TURN -> d - FULL_TURN
+            d < -HALF_TURN -> d + FULL_TURN
+            else -> d
+        }
+    }
+
+    private const val HALF_TURN = PI.toFloat()
+    private const val FULL_TURN = 2f * HALF_TURN
+
+    /** 15° — the steps of a protractor, and every quarter and eighth turn among them. */
+    public const val ROTATION_SNAP_STEP: Float = HALF_TURN / 12f
+
+    /** 4° either side of a step: enough to land on by hand, and leaves 7° of every 15° free. */
+    public const val ROTATION_SNAP_TOLERANCE: Float = HALF_TURN / 45f
+
+    private const val SHARED_ANGLE_EPSILON = 1e-3f
 }
 
 /**

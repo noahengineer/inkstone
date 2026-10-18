@@ -706,6 +706,33 @@ page with a slab of blank paper down one side. That was caught by reading the pu
 back with something that is **not** PDFBox; every assertion made with the writing library agreed
 with itself.
 
+#### Scrolling through the pages like a PDF
+
+A **setting**, off by default (the paper menu: *Scroll pages like a PDF*; `EditorPrefs.scrollPagesEnabled`).
+Without it the editor shows one page, panning stops at its edge (§4.5's leash) and the next page is
+the page bar's `›`. With it the pages run on down the screen with a 24 pt gap between them.
+
+- **Neighbours are pictures; one page is live.** The editor holds one fold, one stroke store, one op
+  recorder and one undo stack per page, and every writer — pen, eraser, selection, undo — is bound to
+  it. Two live pages would make *"which page does this stroke belong to"* a question every input path
+  had to answer. So the page above and the page below are bitmaps (`PageNeighbour`), rendered by the
+  thumbnail renderer from the open session, placed in the **active page's** space
+  (`PageStrip.above/below`), and drawn under the page and outside its cached display list.
+- **The page that is editable changes when the middle of the view enters a neighbour**
+  (`PageStrip.turnFor`) — through the same `showPage` the page bar and a search hit use, so the save,
+  the undo bracket and the remembered position behave as for any other turn. The camera is *carried*
+  (`PageStrip.carried`): its translation absorbs the difference between the two pages' spaces, so no
+  point on the glass moves. **Page space is never re-anchored and no op is written for a scroll.**
+- **The turn has hysteresis.** Entering a neighbour leaves the view a full gap inside its new page;
+  turning back needs it to cross that gap again. A threshold at the gap's midpoint ping-pongs under a
+  resting hand.
+- **A pen that lands on a neighbour turns to it** and its first stroke is dropped (there is nothing
+  yet to put it on); the next lands. Refused for ever it would be a page you can see and cannot write on.
+- **The leash widens to the paper plus its neighbours** (`PageStrip.reach`) and is otherwise the
+  same rule.
+- Not a layout of the *file*: the published PDF, the sync and the journal are untouched, which is what
+  makes this safe to switch on and off. `docs/PAGE-SCROLL.md`.
+
 ### 4.6 Undo/redo
 
 Undo is a **new op appended to the log**, never a pop:
@@ -1895,6 +1922,7 @@ the renderer.
 - Each PDF page → a `Page` with `Background.SourcePdfPage(index)`
 - **Page size from CropBox, with `/Rotate` applied** (§4.4)
 - Existing annotations: rendered, preserved on export, **not editable in v1**
+- **The paper is drawn from the original prefix, never from the whole `document.pdf`** (2026-10-18). The update section is the note's own ink, text boxes and images as of the last close; rendering it put them on the paper under their live copies, so a moved or undone object left a ghost no tool could reach. `OriginalPdfCache` copies the first `originalLength` bytes to the cache once per original.
 
 ### 6.3 Writing annotations
 

@@ -38,8 +38,19 @@ class EditorPrefsCodecTest {
             shapeSnapEnabled = false,
             arrowHeads = true,
             gridSnapEnabled = true,
+            scrollPagesEnabled = true,
         )
         assertEquals(prefs, EditorPrefsCodec.decode(EditorPrefsCodec.encode(prefs)))
+    }
+
+    @Test
+    fun `scrolling pages like a PDF is off on a fresh install and survives being switched on`() {
+        // Off by default: a note that has always stopped at the page's edge keeps doing so.
+        assertEquals(false, EditorPrefsCodec.decode(emptyMap()).scrollPagesEnabled)
+        val on = EditorPrefs(scrollPagesEnabled = true)
+        assertEquals(true, EditorPrefsCodec.decode(EditorPrefsCodec.encode(on)).scrollPagesEnabled)
+        val off = on.copy(scrollPagesEnabled = false)
+        assertEquals(false, EditorPrefsCodec.decode(EditorPrefsCodec.encode(off)).scrollPagesEnabled)
     }
 
     @Test

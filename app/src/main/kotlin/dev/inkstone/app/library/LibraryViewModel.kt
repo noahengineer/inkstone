@@ -161,6 +161,9 @@ class LibraryViewModel @Inject constructor(
     /** SPEC §8.1 — only ever from a press. See [RecognitionModelController.download]. */
     fun downloadRecognitionModel() = recognitionModel.download()
 
+    /** Settings' view of the recognition model. */
+    val recognitionModelStatus = recognitionModel.status
+
     /** The user's OK on the model panel's *Ready*, or on a failed download's error. */
     fun dismissModelPanel() = recognitionModel.dismiss()
 

@@ -4,11 +4,14 @@ import android.content.Context
 import android.graphics.Bitmap
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dev.inkstone.android.ink.ThumbnailSourcePages
+import dev.inkstone.android.pdf.OriginalPdfCache
 import dev.inkstone.android.pdf.PdfPageRasterizer
 import dev.inkstone.core.model.Background
 import dev.inkstone.core.model.DocumentId
 import dev.inkstone.core.model.FoldedPage
 import dev.inkstone.core.storage.NoteLayout
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -42,9 +45,16 @@ class ThumbnailSourcePagesImpl @Inject constructor(
     private val rasterizer: PdfPageRasterizer,
 ) : ThumbnailSourcePages {
 
+    private val originals = OriginalPdfCache(context.cacheDir)
+
     override suspend fun rasterize(noteId: DocumentId, page: FoldedPage, widthPx: Int): Bitmap? {
         val index = (page.background as? Background.SourcePdfPage)?.index ?: return null
-        val file = File(context.filesDir, NoteLayout.documentPdf(noteId))
+        val published = File(context.filesDir, NoteLayout.documentPdf(noteId))
+        // The original, not the published file, for the reason `OriginalPdfCache` gives: the
+        // cover draws the ink on top too, and an erased stroke must not survive on the paper.
+        val file = withContext(Dispatchers.IO) {
+            runCatching { originals.paperFor(noteId, published) }.getOrDefault(published)
+        }
         return rasterizer.rasterize(file, index, widthPx, page.size)
     }
 }
