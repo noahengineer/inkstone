@@ -38,9 +38,19 @@ class EditorPrefsCodecTest {
             shapeSnapEnabled = false,
             arrowHeads = true,
             gridSnapEnabled = true,
+            rotationSnapDegrees = 45,
             scrollPagesEnabled = true,
         )
         assertEquals(prefs, EditorPrefsCodec.decode(EditorPrefsCodec.encode(prefs)))
+    }
+
+    @Test
+    fun `rotation snaps to 15 degrees until a step is chosen and an unknown step reads as the stock one`() {
+        assertEquals(15, EditorPrefsCodec.decode(emptyMap()).rotationSnapDegrees)
+        assertEquals(0, EditorPrefsCodec.decode(mapOf("ink.rotationSnap" to "0")).rotationSnapDegrees)
+        // A step the chip does not offer could never be cycled back to, so it is not adopted.
+        assertEquals(15, EditorPrefsCodec.decode(mapOf("ink.rotationSnap" to "7")).rotationSnapDegrees)
+        assertEquals(15, EditorPrefsCodec.decode(mapOf("ink.rotationSnap" to "lots")).rotationSnapDegrees)
     }
 
     @Test

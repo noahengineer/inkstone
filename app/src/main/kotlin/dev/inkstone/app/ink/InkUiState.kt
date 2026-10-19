@@ -253,6 +253,15 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
      */
     var gridSnapEnabled by mutableStateOf(STOCK.gridSnapEnabled)
 
+    /** ⭐ The step a selection's rotate grip snaps to, in degrees, `0` for free — the pen bar's `Rotate` chip. */
+    var rotationSnapDegrees by mutableStateOf(STOCK.rotationSnapDegrees)
+
+    /** The next step in [EditorPrefs.ROTATION_SNAP_STEPS], wrapping round to free rotation. */
+    fun cycleRotationSnap() {
+        val steps = EditorPrefs.ROTATION_SNAP_STEPS
+        rotationSnapDegrees = steps[(steps.indexOf(rotationSnapDegrees) + 1) % steps.size]
+    }
+
     /**
      * ⭐ Whether the note scrolls from one page into the next like a PDF (`InkSurfaceView.continuousScroll`).
      * Persisted with the rest of the toolbar's memory, and switched from the page bar's paper menu,
@@ -486,6 +495,7 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
         shapeSnapEnabled = prefs.shapeSnapEnabled
         arrowHeads = prefs.arrowHeads
         gridSnapEnabled = prefs.gridSnapEnabled
+        rotationSnapDegrees = prefs.rotationSnapDegrees
         scrollPagesEnabled = prefs.scrollPagesEnabled
         handwritingNeatness = prefs.handwritingNeatness
         shownLayout = prefs.layout
@@ -661,6 +671,7 @@ class InkUiState(initial: EditorPrefs = EditorPrefs()) {
         shapeSnapEnabled = shapeSnapEnabled,
         arrowHeads = arrowHeads,
         gridSnapEnabled = gridSnapEnabled,
+        rotationSnapDegrees = rotationSnapDegrees,
         scrollPagesEnabled = scrollPagesEnabled,
         handwritingNeatness = handwritingNeatness,
         layout = shownLayout,

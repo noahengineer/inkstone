@@ -307,14 +307,18 @@ public object SelectionGesture {
      * [tolerance] either side of each multiple of [step] is pulled in.
      *
      * @param base the selection's own angle when the drag began — see [sharedRotation].
+     * @param step the user's choice from the pen bar; zero or less turns snapping off.
+     * @param tolerance never more than half a [step], so a small step becomes a stepped dial rather
+     *   than one magnet overlapping the next.
      * @return the delta to rotate by, which equals [delta] when nothing is near enough.
      */
     public fun snappedRotation(
         base: Float,
         delta: Float,
         step: Float = ROTATION_SNAP_STEP,
-        tolerance: Float = ROTATION_SNAP_TOLERANCE,
+        tolerance: Float = min(ROTATION_SNAP_TOLERANCE, step / 2f),
     ): Float {
+        if (step <= 0f) return delta
         val target = base + delta
         val nearest = round(target / step) * step
         return if (abs(target - nearest) <= tolerance) nearest - base else delta

@@ -1369,6 +1369,7 @@ private fun InkSurface(
             // the shape definition-of-done #6 describes: a preference that round-trips through the
             // settings table perfectly and does nothing to a shape.
             view.gridSnapEnabled = ui.gridSnapEnabled
+            view.rotationSnapDegrees = ui.rotationSnapDegrees
             // ⭐ Scroll from page to page like a PDF. Like the line above it, a setting that
             // round-trips through the preferences table and reaches nothing is the shape
             // definition-of-done #6 describes, so the assignment is here with the rest.

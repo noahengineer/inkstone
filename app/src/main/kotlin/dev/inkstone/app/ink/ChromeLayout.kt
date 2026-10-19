@@ -496,6 +496,7 @@ enum class ChromeItem(val home: ChromeBar, val group: String, val label: String,
     SNAP(ChromeBar.DRAW, "snap", "Snap"),
     ARROW(ChromeBar.DRAW, "snap", "Arrow"),
     GRID(ChromeBar.DRAW, "snap", "Grid"),
+    ROTATE_SNAP(ChromeBar.DRAW, "snap", "Rotation snap"),
 
     UNDO(ChromeBar.HISTORY, "history", "Undo"),
     REDO(ChromeBar.HISTORY, "history", "Redo"),

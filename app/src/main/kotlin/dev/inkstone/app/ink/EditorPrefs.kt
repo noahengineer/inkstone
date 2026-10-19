@@ -61,6 +61,11 @@ data class EditorPrefs(
     val arrowHeads: Boolean = false,
     val gridSnapEnabled: Boolean = false,
     /**
+     * ⭐ The step, in degrees, a selection's rotate grip snaps to — one of [ROTATION_SNAP_STEPS], and
+     * `0` for free rotation. Chosen from the pen bar's `Rotate` chip beside Snap, Arrow and Grid.
+     */
+    val rotationSnapDegrees: Int = DEFAULT_ROTATION_SNAP_DEGREES,
+    /**
      * ⭐ Scroll from one page into the next like a PDF, instead of stopping at the page's edge and
      * turning with the page bar. Off by default: a note that has always stopped at the page's edge
      * keeps doing so until its owner asks otherwise.
@@ -78,6 +83,12 @@ data class EditorPrefs(
 ) {
 
     companion object {
+
+        /** What the pen bar's `Rotate` chip cycles through, in order; `0` is free rotation. */
+        val ROTATION_SNAP_STEPS: List<Int> = listOf(0, 5, 15, 30, 45, 90)
+
+        /** 15° — what rotation snapped to before it could be chosen. */
+        const val DEFAULT_ROTATION_SNAP_DEGREES: Int = 15
 
         /**
          * SPEC §3.4 — *"12 saved slots"*.

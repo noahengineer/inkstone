@@ -105,6 +105,17 @@ class SelectionTest {
         assertNear(8f * degree, SelectionGesture.snappedRotation(0f, 8f * degree), "8° is between steps and must stay")
     }
 
+    /** The pen bar's choice: off leaves the drag alone, and a small step is a stepped dial. */
+    @Test
+    fun `the rotation step is the user's and zero turns it off`() {
+        val degree = (PI / 180).toFloat()
+
+        assertNear(37f * degree, SelectionGesture.snappedRotation(0f, 37f * degree, step = 0f), "off must not snap")
+        assertNear(35f * degree, SelectionGesture.snappedRotation(0f, 37f * degree, step = 5f * degree), "5° steps")
+        assertNear(90f * degree, SelectionGesture.snappedRotation(0f, 87f * degree, step = 90f * degree), "90° steps")
+        assertNear(60f * degree, SelectionGesture.snappedRotation(0f, 60f * degree, step = 90f * degree), "between")
+    }
+
     /** What snaps is the angle the object ends at, so a crooked picture can be made level. */
     @Test
     fun `a rotation snaps the result and not the drag`() {

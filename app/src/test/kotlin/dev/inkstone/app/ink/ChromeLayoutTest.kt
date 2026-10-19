@@ -35,7 +35,7 @@ class ChromeLayoutTest {
         assertEquals(
             listOf(
                 "Fountain", "Ballpoint", "Pencil", "Highlighter", "|", "Width slider", "Width", "|", "Colours",
-                "|", "Snap", "Arrow", "Grid",
+                "|", "Snap", "Arrow", "Grid", "Rotation snap",
             ),
             withDividers(stock.visibleItemsOf(draw)),
         )
@@ -63,7 +63,14 @@ class ChromeLayoutTest {
             (if (line.startsGroup) "+" else "") + line.items.joinToString(" ") { it.label }
         }
         assertEquals(
-            listOf("+Fountain Ballpoint", "Pencil Highlighter", "+Width slider Width", "+Colours", "+Snap Arrow Grid"),
+            listOf(
+                "+Fountain Ballpoint",
+                "Pencil Highlighter",
+                "+Width slider Width",
+                "+Colours",
+                "+Snap Arrow",
+                "Grid Rotation snap",
+            ),
             lines,
         )
     }

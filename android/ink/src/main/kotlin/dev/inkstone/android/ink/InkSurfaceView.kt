@@ -1007,6 +1007,13 @@ public class InkSurfaceView @JvmOverloads constructor(
             selectionController.marquee = value
         }
 
+    /** ⭐ The step a selection's rotate grip snaps to, in degrees; 0 rotates freely. The pen bar's `Rotate` chip. */
+    public var rotationSnapDegrees: Int
+        get() = Math.round(Math.toDegrees(selectionController.rotationSnapRadians.toDouble())).toInt()
+        set(value) {
+            selectionController.rotationSnapRadians = Math.toRadians(value.toDouble()).toFloat()
+        }
+
     // -----------------------------------------------------------------------
     // ⭐ The infinite canvas (SPEC §4.5)
     // -----------------------------------------------------------------------

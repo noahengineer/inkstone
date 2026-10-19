@@ -58,6 +58,7 @@ internal object EditorPrefsCodec {
         put(SHAPE_SNAP, prefs.shapeSnapEnabled.toString())
         put(ARROW_HEADS, prefs.arrowHeads.toString())
         put(GRID_SNAP, prefs.gridSnapEnabled.toString())
+        put(ROTATION_SNAP, prefs.rotationSnapDegrees.toString())
         put(SCROLL_PAGES, prefs.scrollPagesEnabled.toString())
         put(NEATNESS, prefs.handwritingNeatness.toString())
         putAll(ChromeLayoutCodec.encode(prefs.layout))
@@ -84,6 +85,11 @@ internal object EditorPrefsCodec {
             shapeSnapEnabled = stored.flag(SHAPE_SNAP, true),
             arrowHeads = stored.flag(ARROW_HEADS, false),
             gridSnapEnabled = stored.flag(GRID_SNAP, false),
+            // Only a step the chip offers: anything else would be a chip showing a value it can never
+            // cycle back to.
+            rotationSnapDegrees = stored[ROTATION_SNAP]?.trim()?.toIntOrNull()
+                ?.takeIf { it in EditorPrefs.ROTATION_SNAP_STEPS }
+                ?: EditorPrefs.DEFAULT_ROTATION_SNAP_DEGREES,
             scrollPagesEnabled = stored.flag(SCROLL_PAGES, false),
             handwritingNeatness = stored[NEATNESS]?.toFloatOrNull()?.takeIf { it in 0f..1f }
                 ?: EditorPrefs.DEFAULT_NEATNESS,
@@ -178,6 +184,7 @@ internal object EditorPrefsCodec {
     private const val SHAPE_SNAP = "ink.shapeSnap"
     private const val ARROW_HEADS = "ink.arrowHeads"
     private const val GRID_SNAP = "ink.gridSnap"
+    private const val ROTATION_SNAP = "ink.rotationSnap"
     private const val SCROLL_PAGES = "ink.scrollPages"
     private const val NEATNESS = "ink.handwriting.neatness"
 }

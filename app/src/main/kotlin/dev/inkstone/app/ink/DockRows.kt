@@ -99,6 +99,14 @@ internal fun DrawChip(item: ChromeItem, state: InkUiState, onSummon: (PanelKind,
             onClick = { state.gridSnapEnabled = !state.gridSnapEnabled },
         )
 
+        // ⭐ How far a selection's rotate grip turns between snaps. One chip that cycles rather than a
+        // panel: there are six answers, and the one showing is the one in force.
+        ChromeItem.ROTATE_SNAP -> TextChip(
+            label = if (state.rotationSnapDegrees == 0) "Rotate free" else "Rotate ${state.rotationSnapDegrees}°",
+            selected = state.rotationSnapDegrees != 0,
+            onClick = { state.cycleRotationSnap() },
+        )
+
         else -> Unit
     }
 }

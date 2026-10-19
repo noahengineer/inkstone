@@ -499,6 +499,9 @@ internal class SelectionController(
      */
     var marquee: Boolean = false
 
+    /** The angle a rotate drag snaps to, in radians; zero is free rotation — see [SelectionGesture.snappedRotation]. */
+    var rotationSnapRadians: Float = SelectionGesture.ROTATION_SNAP_STEP
+
     /**
      * ⭐ The lattice a shape drag lands on — see [InkSurfaceView.gridSnapEnabled].
      *
@@ -1053,7 +1056,7 @@ internal class SelectionController(
         val from = atan2(start.y - box.centreY, start.x - box.centreX)
         val to = atan2(current.y - box.centreY, current.x - box.centreX)
         // Snapped while the pen is down, so the preview shows the angle the lift will write.
-        val turn = SelectionGesture.snappedRotation(startRotation, to - from)
+        val turn = SelectionGesture.snappedRotation(startRotation, to - from, rotationSnapRadians)
         return SelectionGesture.rotate(box.centreX, box.centreY, turn)
     }
 
